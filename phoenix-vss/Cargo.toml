@@ -1,0 +1,12 @@
+[package]
+name = "phoenix-vss"
+description = "Carbon Phoenix VSS snapshot integration for live Windows backups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
