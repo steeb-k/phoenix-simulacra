@@ -1,11 +1,16 @@
+mod job;
+
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use phoenix_capture::backup::{run_backup, BackupOptions};
+use phoenix_capture::backup::BackupOptions;
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
+use phoenix_core::ProgressHandle;
 use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
-use phoenix_restore::restore::{run_restore, verify_backup, RestoreOptions};
+use phoenix_restore::restore::RestoreOptions;
+
+use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob};
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -37,6 +42,7 @@ struct PhoenixApp {
     target_disk_index: u32,
     status: String,
     tab: Tab,
+    job: Option<BackgroundJob>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,6 +65,7 @@ impl PhoenixApp {
             target_disk_index: 0,
             status: "Ready".into(),
             tab: Tab::Backup,
+            job: None,
         };
         app.refresh_disks();
         app
@@ -82,39 +89,110 @@ impl PhoenixApp {
             Err(e) => self.status = format!("Disk enumeration failed: {e}"),
         }
     }
+
+    fn busy(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.is_running())
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        if let Some(result) = job.poll() {
+            self.job = None;
+            self.status = match result {
+                Ok(msg) => msg,
+                Err(e) => format!("Error: {e}"),
+            };
+        } else {
+            ctx.request_repaint();
+        }
+    }
 }
 
 impl eframe::App for PhoenixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_job(ctx);
+
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(self.tab == Tab::Backup, "Backup").clicked() {
-                    self.tab = Tab::Backup;
-                }
-                if ui.selectable_label(self.tab == Tab::Restore, "Restore").clicked() {
-                    self.tab = Tab::Restore;
-                }
-                if ui.selectable_label(self.tab == Tab::Verify, "Verify").clicked() {
-                    self.tab = Tab::Verify;
-                }
-                ui.separator();
-                if ui.button("Refresh disks").clicked() {
-                    self.refresh_disks();
-                }
+            ui.add_enabled_ui(!self.busy(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.tab == Tab::Backup, "Backup").clicked() {
+                        self.tab = Tab::Backup;
+                    }
+                    if ui.selectable_label(self.tab == Tab::Restore, "Restore").clicked() {
+                        self.tab = Tab::Restore;
+                    }
+                    if ui.selectable_label(self.tab == Tab::Verify, "Verify").clicked() {
+                        self.tab = Tab::Verify;
+                    }
+                    ui.separator();
+                    if ui.button("Refresh disks").clicked() {
+                        self.refresh_disks();
+                    }
+                });
             });
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            if let Some(job) = &self.job {
+                show_progress(ui, &job.progress);
+            }
             ui.label(&self.status);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            match self.tab {
+            let busy = self.busy();
+            ui.add_enabled_ui(!busy, |ui| match self.tab {
                 Tab::Backup => self.ui_backup(ui),
                 Tab::Restore => self.ui_restore(ui),
                 Tab::Verify => self.ui_verify(ui),
+            });
+            if busy {
+                ui.separator();
+                ui.label("Operation in progress…");
             }
         });
+    }
+}
+
+fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle) {
+    let snap = progress.snapshot();
+    if !snap.active {
+        return;
+    }
+    ui.label(&snap.phase);
+    if !snap.detail.is_empty() {
+        ui.label(&snap.detail);
+    }
+    if snap.total > 0 {
+        ui.add(
+            egui::ProgressBar::new(snap.fraction())
+                .text(format!(
+                    "{} / {} ({:.1}%)",
+                    format_bytes(snap.current),
+                    format_bytes(snap.total),
+                    snap.fraction() * 100.0
+                ))
+                .animate(true),
+        );
+    } else {
+        ui.add(egui::Spinner::new());
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.2} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
     }
 }
 
@@ -196,18 +274,15 @@ impl PhoenixApp {
                 return;
             }
 
+            let progress = ProgressHandle::new();
             self.status = format!("Backing up to {}…", self.backup_path);
-            ui.ctx().request_repaint();
-
-            match run_backup(BackupOptions {
+            self.job = Some(spawn_backup(BackupOptions {
                 disk_index: disk.index,
                 partition_indices: parts,
                 output: output_path,
                 use_vss: self.use_vss,
-            }) {
-                Ok(()) => self.status = format!("Backup completed: {}", self.backup_path),
-                Err(e) => self.status = format!("Backup failed: {e}"),
-            }
+                progress: Some(progress),
+            }));
         }
     }
 
@@ -257,7 +332,10 @@ impl PhoenixApp {
 
         for entry in &mut self.restore_plan_entries {
             ui.group(|ui| {
-                ui.checkbox(&mut entry.restore, format!("Partition {}", entry.source_partition_index));
+                ui.checkbox(
+                    &mut entry.restore,
+                    format!("Partition {}", entry.source_partition_index),
+                );
                 ui.label(format!("Offset: {} bytes", entry.target_offset_bytes));
                 ui.add(
                     egui::DragValue::new(&mut entry.target_size_bytes)
@@ -278,14 +356,14 @@ impl PhoenixApp {
                 target_disk_index: self.target_disk_index,
                 entries: self.restore_plan_entries.clone(),
             };
-            match run_restore(RestoreOptions {
+            let progress = ProgressHandle::new();
+            self.status = "Restore in progress…".into();
+            self.job = Some(spawn_restore(RestoreOptions {
                 backup_path,
                 plan,
                 verify_on_restore: true,
-            }) {
-                Ok(()) => self.status = "Restore completed".into(),
-                Err(e) => self.status = format!("Restore failed: {e}"),
-            }
+                progress: Some(progress),
+            }));
         }
     }
 
@@ -305,32 +383,22 @@ impl PhoenixApp {
             }
         });
         if ui.button("Quick verify").clicked() {
-            let path = match resolve_backup_open_path(&self.restore_backup_path) {
-                Some(p) => p,
-                None => {
-                    self.status = "Verify cancelled — no backup file chosen".into();
-                    return;
-                }
+            let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
+                self.status = "Verify cancelled — no backup file chosen".into();
+                return;
             };
             self.restore_backup_path = path.display().to_string();
-            match verify_backup(path.as_path(), true) {
-                Ok(()) => self.status = "Quick verify OK".into(),
-                Err(e) => self.status = format!("Verify failed: {e}"),
-            }
+            self.status = "Quick verify in progress…".into();
+            self.job = Some(spawn_verify(path, true));
         }
         if ui.button("Full verify").clicked() {
-            let path = match resolve_backup_open_path(&self.restore_backup_path) {
-                Some(p) => p,
-                None => {
-                    self.status = "Verify cancelled — no backup file chosen".into();
-                    return;
-                }
+            let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
+                self.status = "Verify cancelled — no backup file chosen".into();
+                return;
             };
             self.restore_backup_path = path.display().to_string();
-            match verify_backup(path.as_path(), false) {
-                Ok(()) => self.status = "Full verify OK".into(),
-                Err(e) => self.status = format!("Verify failed: {e}"),
-            }
+            self.status = "Full verify in progress…".into();
+            self.job = Some(spawn_verify(path, false));
         }
     }
 }
@@ -383,7 +451,6 @@ fn pick_backup_open_path(current: &str) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
-/// Use typed path if it exists; otherwise prompt for a file.
 fn resolve_backup_open_path(current: &str) -> Option<PathBuf> {
     let path = PathBuf::from(current.trim());
     if path.is_file() {

@@ -81,6 +81,7 @@ fn main() -> anyhow::Result<()> {
                 partition_indices: partitions,
                 output,
                 use_vss: vss,
+                progress: None,
             })?;
         }
         Commands::List { backup } => cmd_list_backup(&backup)?,
@@ -99,6 +100,7 @@ fn main() -> anyhow::Result<()> {
                 backup_path: backup,
                 plan,
                 verify_on_restore: verify,
+                progress: None,
             })?;
         }
     }

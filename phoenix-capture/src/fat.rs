@@ -2,7 +2,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use phoenix_core::container::{Extent, CHUNK_SIZE};
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
-use phoenix_core::manifest::ChunkRecord;
+use phoenix_core::ProgressHandle;
 
 use crate::reader::PartitionReader;
 
@@ -190,7 +190,9 @@ pub fn restore_fat(
     writer: &mut crate::raw::PartitionWriter,
     target_size: u64,
     verify: bool,
-) -> Result<()> {
+    progress: Option<&ProgressHandle>,
+    chunks_done: u64,
+) -> Result<u64> {
     if entry.used_bytes > target_size {
         return Err(PhoenixError::PartitionTooSmall {
             partition_index: entry.index,
@@ -198,5 +200,5 @@ pub fn restore_fat(
             required: entry.used_bytes,
         });
     }
-    crate::raw::restore_raw(reader, entry, writer, verify)
+    crate::raw::restore_raw(reader, entry, writer, verify, progress, chunks_done)
 }

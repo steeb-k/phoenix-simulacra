@@ -277,12 +277,8 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
 
     let layout = unsafe { &*(buffer.as_ptr() as *const DRIVE_LAYOUT_INFORMATION_EX) };
     if layout.PartitionStyle == PARTITION_STYLE_GPT as u32 {
-        // DiskId follows the fixed header; offset after PartitionStyle(u32)+PartitionCount(u32)
-        let disk_id_offset = 8usize;
-        let mut disk_guid_arr = [0u8; 16];
-        if buffer.len() >= disk_id_offset + 16 {
-            disk_guid_arr.copy_from_slice(&buffer[disk_id_offset..disk_id_offset + 16]);
-        }
+        let gpt = unsafe { layout.Anonymous.Gpt };
+        let disk_guid_arr: [u8; 16] = unsafe { std::mem::transmute(gpt.DiskId) };
 
         let entry_ptr = layout.PartitionEntry.as_ptr();
         let mut entries = Vec::new();

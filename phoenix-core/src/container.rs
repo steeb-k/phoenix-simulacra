@@ -9,6 +9,7 @@ use crate::disk::{CaptureMode, FilesystemKind};
 use crate::error::{PhoenixError, Result};
 use crate::hash::{self, crc32};
 use crate::manifest::{BackupManifest, ChunkRecord};
+use crate::progress::ProgressHandle;
 
 pub const MAGIC: &[u8; 4] = b"PHNX";
 pub const FOOTER_MAGIC: &[u8; 4] = b"PHNX";
@@ -239,10 +240,19 @@ pub struct PhnxWriter {
     header: Header,
     index_entries: Vec<PartitionIndexEntry>,
     current_offset: u64,
+    progress: Option<ProgressHandle>,
 }
 
 impl PhnxWriter {
     pub fn create(path: &Path, header: Header) -> Result<Self> {
+        Self::create_with_progress(path, header, None)
+    }
+
+    pub fn create_with_progress(
+        path: &Path,
+        header: Header,
+        progress: Option<ProgressHandle>,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -253,6 +263,7 @@ impl PhnxWriter {
             header,
             index_entries: Vec::new(),
             current_offset: HEADER_SIZE as u64,
+            progress,
         };
         w.header.partition_count = 0;
         w.header.write(&mut w.file)?;
@@ -398,6 +409,9 @@ impl PartitionStreamWriter<'_> {
             blake3: hash_hex,
         });
         self.chunk_in_extent += 1;
+        if let Some(ref progress) = self.writer.progress {
+            progress.bump(plaintext.len() as u64);
+        }
         Ok(())
     }
 
@@ -555,14 +569,92 @@ impl PhnxReader {
     }
 
     pub fn verify_all(&mut self, quick: bool) -> Result<()> {
+        self.verify_all_with_progress(quick, None)
+    }
+
+    pub fn verify_all_with_progress(
+        &mut self,
+        quick: bool,
+        progress: Option<ProgressHandle>,
+    ) -> Result<()> {
         if quick {
+            if let Some(ref p) = progress {
+                p.begin(1, "Verify");
+                p.set(1, "Metadata check");
+                p.end();
+            }
             return Ok(());
         }
+
+        let total_chunks: u64 = self
+            .manifest
+            .partitions
+            .iter()
+            .map(|p| p.chunks.len() as u64)
+            .sum();
+
+        if let Some(ref p) = progress {
+            p.begin(total_chunks.max(1), "Verify");
+        }
+
+        let mut done = 0u64;
         let indices: Vec<u32> = self.index.iter().map(|e| e.index).collect();
         for idx in indices {
-            self.verify_partition(idx, false)?;
+            if let Some(ref p) = progress {
+                let name = self
+                    .index
+                    .iter()
+                    .find(|e| e.index == idx)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("partition");
+                p.set_phase(format!("Verifying {name}"));
+            }
+            done += self.verify_partition_with_progress(idx, progress.as_ref(), done)?;
+        }
+
+        if let Some(ref p) = progress {
+            p.end();
         }
         Ok(())
+    }
+
+    fn verify_partition_with_progress(
+        &mut self,
+        partition_index: u32,
+        progress: Option<&ProgressHandle>,
+        mut done: u64,
+    ) -> Result<u64> {
+        let entry = self
+            .index
+            .iter()
+            .find(|e| e.index == partition_index)
+            .cloned()
+            .ok_or_else(|| PhoenixError::InvalidFormat("partition not found".into()))?;
+
+        let stream = self.read_stream_header(&entry)?;
+        let chunk_records: Vec<ChunkRecord> = self
+            .manifest
+            .partitions
+            .iter()
+            .find(|p| p.index == partition_index)
+            .map(|p| p.chunks.clone())
+            .ok_or_else(|| PhoenixError::Manifest("partition manifest missing".into()))?;
+
+        for (chunk, record) in stream.chunks.iter().zip(chunk_records.iter()) {
+            let data = self.read_chunk(chunk)?;
+            let computed = hash::hash_hex(&data);
+            if computed != record.blake3 {
+                return Err(PhoenixError::HashMismatch {
+                    partition_index,
+                    chunk_index: record.chunk_index,
+                });
+            }
+            done += 1;
+            if let Some(p) = progress {
+                p.set(done, format!("Chunk {} / {}", done, p.snapshot().total));
+            }
+        }
+        Ok(done)
     }
 }
 

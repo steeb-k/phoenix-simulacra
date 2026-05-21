@@ -6,6 +6,7 @@ use phoenix_capture::raw::{restore_raw, PartitionWriter};
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, FilesystemKind};
 use phoenix_core::error::Result;
+use phoenix_core::ProgressHandle;
 use phoenix_core::manifest::fs_kind_from_string;
 use tracing::info;
 
@@ -16,6 +17,7 @@ pub struct RestoreOptions {
     pub backup_path: std::path::PathBuf,
     pub plan: RestorePlan,
     pub verify_on_restore: bool,
+    pub progress: Option<ProgressHandle>,
 }
 
 pub fn run_restore(opts: RestoreOptions) -> Result<()> {
@@ -32,8 +34,30 @@ pub fn run_restore(opts: RestoreOptions) -> Result<()> {
     info!("Restoring to disk {} ({})", disk.index, disk.path);
 
     if disk.is_gpt {
+        if let Some(ref p) = opts.progress {
+            p.set_phase("Writing partition layout");
+        }
         apply_gpt_layout(&disk.path, &opts.plan)?;
     }
+
+    let restoring: Vec<_> = opts.plan.entries.iter().filter(|e| e.restore).collect();
+    let total_chunks: u64 = restoring
+        .iter()
+        .filter_map(|entry| {
+            reader
+                .manifest
+                .partitions
+                .iter()
+                .find(|p| p.index == entry.source_partition_index)
+        })
+        .map(|p| p.chunks.len() as u64)
+        .sum();
+
+    if let Some(ref p) = opts.progress {
+        p.begin(total_chunks.max(1), "Restore");
+    }
+
+    let mut chunks_done = 0u64;
 
     for entry in &opts.plan.entries {
         if !entry.restore {
@@ -59,6 +83,13 @@ pub fn run_restore(opts: RestoreOptions) -> Result<()> {
         let mut writer =
             PartitionWriter::open_disk(&disk.path, entry.target_offset_bytes)?;
 
+        if let Some(ref p) = opts.progress {
+            p.set_phase(format!(
+                "Restoring partition {} ({})",
+                entry.source_partition_index, idx_entry.name
+            ));
+        }
+
         info!(
             "Restoring partition {} ({}) to offset {}",
             entry.source_partition_index, idx_entry.name, entry.target_offset_bytes
@@ -66,40 +97,57 @@ pub fn run_restore(opts: RestoreOptions) -> Result<()> {
 
         match fs {
             FilesystemKind::Ntfs => {
-                restore_ntfs(
+                chunks_done += restore_ntfs(
                     &mut reader,
                     &idx_entry,
                     &mut writer,
                     entry.target_size_bytes,
                     opts.verify_on_restore,
+                    opts.progress.as_ref(),
+                    chunks_done,
                 )?;
             }
             FilesystemKind::Fat | FilesystemKind::Exfat => {
-                restore_fat(
+                chunks_done += restore_fat(
                     &mut reader,
                     &idx_entry,
                     &mut writer,
                     entry.target_size_bytes,
                     opts.verify_on_restore,
+                    opts.progress.as_ref(),
+                    chunks_done,
                 )?;
             }
             _ => {
-                restore_raw(
+                chunks_done += restore_raw(
                     &mut reader,
                     &idx_entry,
                     &mut writer,
                     opts.verify_on_restore,
+                    opts.progress.as_ref(),
+                    chunks_done,
                 )?;
             }
         }
     }
 
+    if let Some(ref p) = opts.progress {
+        p.end();
+    }
     info!("Restore complete");
     Ok(())
 }
 
 pub fn verify_backup(path: &Path, quick: bool) -> Result<()> {
+    verify_backup_with_progress(path, quick, None)
+}
+
+pub fn verify_backup_with_progress(
+    path: &Path,
+    quick: bool,
+    progress: Option<ProgressHandle>,
+) -> Result<()> {
     let mut reader = PhnxReader::open(path)?;
-    reader.verify_all(quick)?;
+    reader.verify_all_with_progress(quick, progress)?;
     Ok(())
 }

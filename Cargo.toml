@@ -36,7 +36,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
 ] }
-ntfs = "0.4"
 byteorder = "1"
 toml = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

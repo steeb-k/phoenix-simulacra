@@ -1,6 +1,8 @@
 # Carbon Phoenix — Backup and Restore
 
-Windows-first disk backup tool written in Rust. Creates single-file `.phnx` backups with partition metadata, used-block capture for NTFS/FAT/exFAT, and raw capture for EFI/MSR partitions.
+Windows disk backup tool written in Rust. Creates single-file `.phnx` backups with partition metadata, used-block capture for NTFS/FAT/exFAT, and raw capture for EFI/MSR partitions.
+
+**Platforms:** Tier-1 support for **Windows x64** and **Windows ARM64** with identical behavior; ship the native binary for each architecture. See [docs/WINDOWS-ARM64.md](docs/WINDOWS-ARM64.md).
 
 ## Features
 
@@ -14,16 +16,29 @@ Windows-first disk backup tool written in Rust. Creates single-file `.phnx` back
 
 ## Build
 
-Requires Rust 1.70+ and Windows for full functionality.
+Requires Rust 1.70+, Windows, and Visual Studio Build Tools (**Desktop development with C++**, including **x64** and **ARM64** MSVC when building both targets).
+
+**Release builds (x64 + ARM64):**
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+**Single-target dev build** (host default):
 
 ```bash
 cargo build --release
 ```
 
-Binaries (both embed a `requireAdministrator` manifest — Windows will prompt for UAC on launch):
+Binaries embed a `requireAdministrator` manifest (UAC on launch). Paths depend on target:
 
-- `target/release/carbon-phoenix.exe` — CLI
-- `target/release/carbon-phoenix-gui.exe` — GUI
+| Target | CLI | GUI |
+|--------|-----|-----|
+| Host default | `target/release/carbon-phoenix.exe` | `target/release/carbon-phoenix-gui.exe` |
+| `x86_64-pc-windows-msvc` | `target/x86_64-pc-windows-msvc/release/...` | same |
+| `aarch64-pc-windows-msvc` | `target/aarch64-pc-windows-msvc/release/...` | same |
+
+Packaged copies from the release script: `dist/<target>/`.
 
 ## CLI Usage
 
@@ -50,9 +65,11 @@ carbon-phoenix plan backup.phnx --disk 1 --output plan.toml
 carbon-phoenix restore backup.phnx --plan plan.toml
 ```
 
-## Format
+## Documentation
 
-See [docs/phnx-format.md](docs/phnx-format.md).
+- [BACKUP.md](BACKUP.md) — Backup process, capture modes, VSS, and options
+- [docs/WINDOWS-ARM64.md](docs/WINDOWS-ARM64.md) — x64 / ARM64 parity and build matrix
+- [docs/phnx-format.md](docs/phnx-format.md) — `.phnx` file format specification
 
 ## Requirements
 

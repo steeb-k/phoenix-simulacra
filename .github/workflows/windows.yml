@@ -1,0 +1,49 @@
+# Tier-1 Windows targets: same workspace, same features, no arch-specific code paths.
+name: Windows
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            msvc_arch: amd64
+          - target: aarch64-pc-windows-msvc
+            msvc_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC environment (${{ matrix.msvc_arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: carbon-phoenix-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/carbon-phoenix.exe
+            target/${{ matrix.target }}/release/carbon-phoenix-gui.exe

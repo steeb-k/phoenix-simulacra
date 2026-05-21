@@ -10,6 +10,7 @@ use phoenix_core::manifest::{
     capture_mode_to_string, fs_kind_to_string, BackupManifest, DiskManifest, PartitionManifest,
 };
 use phoenix_core::disk::guid_to_string;
+use phoenix_core::ProgressHandle;
 use tracing::info;
 use uuid::Uuid;
 
@@ -23,6 +24,7 @@ pub struct BackupOptions {
     pub partition_indices: Vec<u32>,
     pub output: std::path::PathBuf,
     pub use_vss: bool,
+    pub progress: Option<ProgressHandle>,
 }
 
 pub fn run_backup(opts: BackupOptions) -> Result<()> {
@@ -60,10 +62,27 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         partition_count: 0,
     };
 
-    let mut writer = PhnxWriter::create(&opts.output, header)?;
-    let mut partition_manifests = Vec::new();
+    let total_bytes: u64 = selected.iter().map(|p| p.size_bytes).sum();
+    if let Some(ref progress) = opts.progress {
+        progress.begin(total_bytes.max(1), "Backup");
+    }
 
-    for part in selected {
+    let mut writer =
+        PhnxWriter::create_with_progress(&opts.output, header, opts.progress.clone())?;
+    let mut partition_manifests = Vec::new();
+    let partition_count = selected.len();
+
+    for (part_idx, part) in selected.iter().enumerate() {
+        if let Some(ref progress) = opts.progress {
+            progress.set_phase(format!(
+                "Partition {} — {} ({}/{})",
+                part.index,
+                part.name,
+                part_idx + 1,
+                partition_count
+            ));
+        }
+
         info!(
             "Backing up partition {} ({})",
             part.index, part.name
@@ -156,7 +175,13 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         partitions: partition_manifests,
     };
 
+    if let Some(ref progress) = opts.progress {
+        progress.set_phase("Finalizing backup file");
+    }
     writer.finalize(&manifest)?;
+    if let Some(ref progress) = opts.progress {
+        progress.end();
+    }
     info!("Backup written to {}", opts.output.display());
     Ok(())
 }

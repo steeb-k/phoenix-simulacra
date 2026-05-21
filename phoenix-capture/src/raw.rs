@@ -3,6 +3,7 @@ use std::os::windows::ffi::OsStrExt;
 use phoenix_core::container::{Extent, CHUNK_SIZE};
 use phoenix_core::error::Result;
 use phoenix_core::manifest::ChunkRecord;
+use phoenix_core::ProgressHandle;
 
 use crate::reader::PartitionReader;
 
@@ -39,7 +40,9 @@ pub fn restore_raw(
     entry: &phoenix_core::container::PartitionIndexEntry,
     writer: &mut PartitionWriter,
     verify: bool,
-) -> Result<()> {
+    progress: Option<&ProgressHandle>,
+    mut chunks_done: u64,
+) -> Result<u64> {
     let stream = reader.read_stream_header(entry)?;
     let chunk_records: Vec<phoenix_core::manifest::ChunkRecord> = reader
         .manifest
@@ -64,8 +67,13 @@ pub fn restore_raw(
         let extent = &stream.extents[chunk.extent_index as usize];
         let offset = extent.start_sector * sector_size;
         writer.write_at(offset, &data)?;
+        chunks_done += 1;
+        if let Some(p) = progress {
+            let total = p.snapshot().total;
+            p.set(chunks_done, format!("Chunk {chunks_done} / {total}"));
+        }
     }
-    Ok(())
+    Ok(chunks_done)
 }
 
 pub struct PartitionWriter {
