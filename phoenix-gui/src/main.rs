@@ -1,6 +1,9 @@
 mod job;
+mod sidebar;
+mod theme;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use phoenix_capture::backup::BackupOptions;
@@ -11,6 +14,10 @@ use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEn
 use phoenix_restore::restore::RestoreOptions;
 
 use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob};
+use crate::sidebar::Page;
+use crate::theme::Palette;
+
+const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -21,7 +28,7 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -41,19 +48,22 @@ struct PhoenixApp {
     restore_plan_entries: Vec<RestorePlanEntry>,
     target_disk_index: u32,
     status: String,
-    tab: Tab,
+    page: Page,
     job: Option<BackgroundJob>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Tab {
-    Backup,
-    Restore,
-    Verify,
+    palette: Palette,
+    last_theme_refresh: Instant,
 }
 
 impl PhoenixApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
+
+        let palette = theme::refresh(&cc.egui_ctx);
+
         let mut app = Self {
             disks: Vec::new(),
             selected_disk: 0,
@@ -64,8 +74,10 @@ impl PhoenixApp {
             restore_plan_entries: Vec::new(),
             target_disk_index: 0,
             status: "Ready".into(),
-            tab: Tab::Backup,
+            page: Page::Backup,
             job: None,
+            palette,
+            last_theme_refresh: Instant::now(),
         };
         app.refresh_disks();
         app
@@ -108,52 +120,77 @@ impl PhoenixApp {
             ctx.request_repaint();
         }
     }
+
+    fn maybe_refresh_theme(&mut self, ctx: &egui::Context) {
+        if self.last_theme_refresh.elapsed() >= THEME_REFRESH_INTERVAL {
+            self.palette = theme::refresh(ctx);
+            self.last_theme_refresh = Instant::now();
+        }
+    }
 }
 
 impl eframe::App for PhoenixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job(ctx);
+        self.maybe_refresh_theme(ctx);
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.add_enabled_ui(!self.busy(), |ui| {
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(self.tab == Tab::Backup, "Backup").clicked() {
-                        self.tab = Tab::Backup;
-                    }
-                    if ui.selectable_label(self.tab == Tab::Restore, "Restore").clicked() {
-                        self.tab = Tab::Restore;
-                    }
-                    if ui.selectable_label(self.tab == Tab::Verify, "Verify").clicked() {
-                        self.tab = Tab::Verify;
-                    }
-                    ui.separator();
-                    if ui.button("Refresh disks").clicked() {
-                        self.refresh_disks();
-                    }
+        let busy = self.busy();
+        sidebar::show(ctx, &mut self.page, &self.palette, busy);
+
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::none()
+                    .fill(self.palette.sidebar_bg)
+                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                if let Some(job) = &self.job {
+                    show_progress(ui, &job.progress);
+                }
+                ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(24.0, 20.0)))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!busy, |ui| match self.page {
+                    Page::Backup => self.ui_backup(ui),
+                    Page::Clone => self.ui_clone(ui),
+                    Page::Restore => self.ui_restore(ui),
+                    Page::Verify => self.ui_verify(ui),
+                    Page::Mount => self.ui_mount(ui),
+                    Page::History => self.ui_history(ui),
+                    Page::Options => self.ui_options(ui),
                 });
+                if busy {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("Operation in progress…");
+                }
             });
-        });
-
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            if let Some(job) = &self.job {
-                show_progress(ui, &job.progress);
-            }
-            ui.label(&self.status);
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let busy = self.busy();
-            ui.add_enabled_ui(!busy, |ui| match self.tab {
-                Tab::Backup => self.ui_backup(ui),
-                Tab::Restore => self.ui_restore(ui),
-                Tab::Verify => self.ui_verify(ui),
-            });
-            if busy {
-                ui.separator();
-                ui.label("Operation in progress…");
-            }
-        });
     }
+}
+
+fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(title).strong().size(22.0));
+    ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
+    ui.add_space(14.0);
+}
+
+fn coming_soon(ui: &mut egui::Ui, palette: &Palette, blurb: &str) {
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(egui_phosphor::regular::SPARKLE)
+                .size(56.0)
+                .color(palette.accent),
+        );
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Coming soon").strong().size(18.0));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(blurb).color(palette.subtle_text));
+    });
 }
 
 fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle) {
@@ -198,9 +235,18 @@ fn format_bytes(n: u64) -> String {
 
 impl PhoenixApp {
     fn ui_backup(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Create backup");
+        page_header(
+            ui,
+            &self.palette,
+            "Create Backup",
+            "Create a disk or partition image backup with optional compression and verification.",
+        );
+
         if self.disks.is_empty() {
             ui.label("No disks found. Run as Administrator.");
+            if ui.button("Refresh disks").clicked() {
+                self.refresh_disks();
+            }
             return;
         }
 
@@ -209,7 +255,10 @@ impl PhoenixApp {
             egui::ComboBox::from_id_salt("disk")
                 .selected_text(format!(
                     "PhysicalDrive{}",
-                    self.disks.get(self.selected_disk).map(|d| d.index).unwrap_or(0)
+                    self.disks
+                        .get(self.selected_disk)
+                        .map(|d| d.index)
+                        .unwrap_or(0)
                 ))
                 .show_ui(ui, |ui| {
                     for (i, d) in self.disks.iter().enumerate() {
@@ -221,13 +270,19 @@ impl PhoenixApp {
                         }
                     }
                 });
+            if ui.button("Refresh").clicked() {
+                self.refresh_disks();
+            }
         });
 
         if let Some(disk) = self.disks.get(self.selected_disk) {
             ui.label("Partitions:");
             for (i, p) in disk.partitions.iter().enumerate() {
                 let mut sel = self.selected_partitions.get(i).copied().unwrap_or(false);
-                ui.checkbox(&mut sel, format!("[{}] {} ({:?})", p.index, p.name, p.fs_kind));
+                ui.checkbox(
+                    &mut sel,
+                    format!("[{}] {} ({:?})", p.index, p.name, p.fs_kind),
+                );
                 if i < self.selected_partitions.len() {
                     self.selected_partitions[i] = sel;
                 }
@@ -287,7 +342,12 @@ impl PhoenixApp {
     }
 
     fn ui_restore(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Restore");
+        page_header(
+            ui,
+            &self.palette,
+            "Restore",
+            "Apply a .phnx backup back onto a target disk.",
+        );
         ui.label("Backup file:");
         ui.horizontal(|ui| {
             ui.add(
@@ -368,7 +428,12 @@ impl PhoenixApp {
     }
 
     fn ui_verify(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Verify backup");
+        page_header(
+            ui,
+            &self.palette,
+            "Verify Backup",
+            "Run a quick header check or a full BLAKE3 verification across the archive.",
+        );
         ui.label("Backup file:");
         ui.horizontal(|ui| {
             ui.add(
@@ -399,6 +464,85 @@ impl PhoenixApp {
             self.restore_backup_path = path.display().to_string();
             self.status = "Full verify in progress…".into();
             self.job = Some(spawn_verify(path, false));
+        }
+    }
+
+    fn ui_clone(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            &self.palette,
+            "Clone",
+            "Copy one disk directly to another without going through a backup file.",
+        );
+        let palette = self.palette;
+        coming_soon(
+            ui,
+            &palette,
+            "Disk-to-disk cloning will land in a future release.",
+        );
+    }
+
+    fn ui_mount(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            &self.palette,
+            "Mount",
+            "Browse partitions inside a .phnx backup as if they were drives.",
+        );
+        let palette = self.palette;
+        coming_soon(
+            ui,
+            &palette,
+            "Backup mounting is on the roadmap — files inside backups will be browsable soon.",
+        );
+    }
+
+    fn ui_history(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            &self.palette,
+            "History",
+            "Previous backups, restores, and verification runs from this machine.",
+        );
+        let palette = self.palette;
+        coming_soon(
+            ui,
+            &palette,
+            "Job history will be tracked once persistent settings land.",
+        );
+    }
+
+    fn ui_options(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            &self.palette,
+            "Options",
+            "Application preferences and live theme info.",
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Accent color:");
+            let (r, g, b, _) = self.palette.accent.to_tuple();
+            let swatch_size = egui::vec2(20.0, 20.0);
+            let (rect, _) = ui.allocate_exact_size(swatch_size, egui::Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                egui::Rounding::same(4.0),
+                self.palette.accent,
+            );
+            ui.monospace(format!("#{:02X}{:02X}{:02X}", r, g, b));
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Theme:");
+            ui.label(if self.palette.light_mode { "Light" } else { "Dark" });
+        });
+
+        ui.add_space(8.0);
+        if ui.button("Refresh theme from Windows").clicked() {
+            self.palette = theme::refresh(ui.ctx());
+            self.last_theme_refresh = Instant::now();
+            self.status = "Theme refreshed from Windows settings".into();
         }
     }
 }
