@@ -7,6 +7,7 @@ mod util;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -27,16 +28,26 @@ const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const REFRESH_BTN_SIZE: f32 = 52.0;
 const REFRESH_ICON_SIZE: f32 = 32.0;
 
+/// Decode the embedded application icon for the window / taskbar.
+fn app_icon() -> egui::IconData {
+    let bytes = include_bytes!("../../carbon-phoenix-icon.ico");
+    let image = image::load_from_memory(bytes).expect("failed to decode carbon-phoenix-icon.ico");
+    let image = image.into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
-        )
-        .init();
+    let _log_guard = init_logging();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 720.0])
+            .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };
     eframe::run_native(
@@ -44,6 +55,50 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(PhoenixApp::new(cc)))),
     )
+}
+
+/// Sets up tracing to BOTH stderr (for users who launch from a terminal) and
+/// a rolling log file in `%LOCALAPPDATA%\CarbonPhoenix\logs\` so users who
+/// double-click the .exe can still hand us a log when something goes wrong.
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "phoenix_core=info,phoenix_gui=info,warn".into());
+
+    let log_dir = std::env::var("LOCALAPPDATA")
+        .map(|p| std::path::PathBuf::from(p).join("CarbonPhoenix").join("logs"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("CarbonPhoenix").join("logs"));
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(true);
+
+    let (file_layer, guard) = match std::fs::create_dir_all(&log_dir) {
+        Ok(()) => {
+            let appender =
+                tracing_appender::rolling::daily(&log_dir, "carbon-phoenix.log");
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            let layer = tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true);
+            (Some(layer), Some(guard))
+        }
+        Err(_) => (None, None),
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
+
+    if guard.is_some() {
+        tracing::info!(log_dir = %log_dir.display(), "log file initialized");
+    }
+    guard
 }
 
 struct PhoenixApp {

@@ -5,10 +5,11 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use tracing::{debug, warn};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetVolumeInformationW, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+    CreateFileW, GetDiskFreeSpaceExW, GetVolumeInformationW, ReadFile, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::Ioctl::{
     DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
@@ -27,6 +28,10 @@ pub enum FilesystemKind {
     Exfat = 3,
     Efi = 4,
     Msr = 5,
+    /// BitLocker-encrypted volume whose decrypted view we can't read (no key /
+    /// volume in suspended state). The boot sector starts with `-FVE-FS-`.
+    /// Treated as raw for backup purposes.
+    Bitlocker = 6,
 }
 
 impl FilesystemKind {
@@ -37,6 +42,7 @@ impl FilesystemKind {
             3 => Self::Exfat,
             4 => Self::Efi,
             5 => Self::Msr,
+            6 => Self::Bitlocker,
             _ => Self::Unknown,
         }
     }
@@ -160,6 +166,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                     let fs_kind = classify_partition(&e.type_guid, &e.name);
                     let capture_mode = if fs_kind == FilesystemKind::Efi
                         || fs_kind == FilesystemKind::Msr
+                        || fs_kind == FilesystemKind::Bitlocker
                         || fs_kind == FilesystemKind::Unknown
                     {
                         CaptureMode::Raw
@@ -395,14 +402,27 @@ fn classify_partition(type_guid: &[u8; 16], name: &str) -> FilesystemKind {
 }
 
 pub fn detect_volume_fs(volume_path: &str) -> FilesystemKind {
+    if let Some(detected) = detect_volume_fs_via_get_volume_information(volume_path) {
+        return detected;
+    }
+    // GetVolumeInformationW returns success-with-"Unknown" on some
+    // BitLocker-protected NTFS volumes even when they're unlocked, because the
+    // BitLocker filter driver intercepts the FS query. Fall back to reading
+    // the partition's first sector and matching well-known FS magic bytes.
+    detect_volume_fs_via_boot_sector(volume_path).unwrap_or(FilesystemKind::Unknown)
+}
+
+/// Ask Windows for the filesystem name via `GetVolumeInformationW`. Returns
+/// `None` either when the call fails or when the reported FS name is
+/// something we don't know how to map (e.g. the literal string "Unknown" that
+/// Windows can return for BitLocker-protected volumes).
+fn detect_volume_fs_via_get_volume_information(volume_path: &str) -> Option<FilesystemKind> {
     // GetVolumeInformationW expects a volume mount point such as `C:\` or
     // `\\?\Volume{guid}\`. The `\\.\X:` device-namespace form used elsewhere
     // for CreateFileW is rejected, which is why every NTFS drive previously
     // came back as Unknown. Convert to the `X:\` root form here.
-    let root = match parse_drive_letter(volume_path) {
-        Some(letter) => format!("{letter}:\\"),
-        None => return FilesystemKind::Unknown,
-    };
+    let letter = parse_drive_letter(volume_path)?;
+    let root = format!("{letter}:\\");
     let wide = to_wide(&root);
     let mut fs_name = [0u16; 64];
     let ok = unsafe {
@@ -418,16 +438,139 @@ pub fn detect_volume_fs(volume_path: &str) -> FilesystemKind {
         )
     };
     if ok == 0 {
-        return FilesystemKind::Unknown;
+        warn!(
+            volume = root.as_str(),
+            err = unsafe { GetLastError() },
+            "GetVolumeInformationW failed (will try boot-sector fallback)"
+        );
+        return None;
     }
     let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
     let fs = String::from_utf16_lossy(&fs_name[..len]).to_uppercase();
+    debug!(
+        volume = root.as_str(),
+        fs = fs.as_str(),
+        "GetVolumeInformationW returned"
+    );
     match fs.as_str() {
-        "NTFS" => FilesystemKind::Ntfs,
-        "FAT" | "FAT32" => FilesystemKind::Fat,
-        "EXFAT" => FilesystemKind::Exfat,
-        _ => FilesystemKind::Unknown,
+        "NTFS" => Some(FilesystemKind::Ntfs),
+        "FAT" | "FAT32" | "FAT16" | "FAT12" => Some(FilesystemKind::Fat),
+        "EXFAT" => Some(FilesystemKind::Exfat),
+        _ => None,
     }
+}
+
+/// Open the partition by its `\\.\X:` path and read the first 512 bytes; match
+/// well-known signatures in the boot sector / VBR. This sidesteps
+/// `GetVolumeInformationW` entirely, so it works for BitLocker-protected NTFS
+/// volumes whose decrypted view the filter driver hides from the FS query.
+///
+/// Magic bytes:
+/// - `NTFS    ` at offset 3 (8 bytes) -> NTFS
+/// - `EXFAT   ` at offset 3           -> exFAT
+/// - `FAT32   ` at offset 82          -> FAT32
+/// - `FAT12   ` / `FAT16   ` at offset 54 -> FAT
+/// - `-FVE-FS-` at offset 3           -> BitLocker (locked or
+///   metadata-shadowed view; we can't read the underlying NTFS).
+///
+/// Returns `None` when the volume can't be opened (typically locked
+/// BitLocker, raw EFI/MSR, or otherwise unmounted).
+pub fn detect_volume_fs_via_boot_sector(volume_path: &str) -> Option<FilesystemKind> {
+    let wide = to_wide(volume_path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0x8000_0000, // GENERIC_READ
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        warn!(
+            volume = volume_path,
+            err = unsafe { GetLastError() },
+            "detect_volume_fs_via_boot_sector: CreateFileW failed"
+        );
+        return None;
+    }
+
+    let mut buf = [0u8; 512];
+    let mut read = 0u32;
+    let ok = unsafe {
+        ReadFile(
+            handle,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut read,
+            ptr::null_mut(),
+        )
+    };
+    let read_err = unsafe { GetLastError() };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        warn!(
+            volume = volume_path,
+            err = read_err,
+            "detect_volume_fs_via_boot_sector: ReadFile failed"
+        );
+        return None;
+    }
+    if (read as usize) < buf.len() {
+        warn!(
+            volume = volume_path,
+            read = read,
+            "detect_volume_fs_via_boot_sector: short read"
+        );
+        return None;
+    }
+
+    let result = classify_boot_sector(&buf);
+    if result.is_none() {
+        warn!(
+            volume = volume_path,
+            oem = String::from_utf8_lossy(&buf[3..11]).to_string().as_str(),
+            "detect_volume_fs_via_boot_sector: no FS magic recognized"
+        );
+    } else {
+        debug!(
+            volume = volume_path,
+            kind = ?result,
+            "detect_volume_fs_via_boot_sector: success"
+        );
+    }
+    result
+}
+
+/// Pure helper for `detect_volume_fs_via_boot_sector`; split out so it can be
+/// unit-tested without touching Win32.
+fn classify_boot_sector(buf: &[u8]) -> Option<FilesystemKind> {
+    if buf.len() < 512 {
+        return None;
+    }
+    let oem = &buf[3..11];
+    if oem == b"NTFS    " {
+        return Some(FilesystemKind::Ntfs);
+    }
+    if oem == b"EXFAT   " {
+        return Some(FilesystemKind::Exfat);
+    }
+    if oem == b"-FVE-FS-" {
+        return Some(FilesystemKind::Bitlocker);
+    }
+    // FAT32 stores its FS-type label at offset 82..90.
+    let fat32_label = &buf[82..90];
+    if fat32_label == b"FAT32   " {
+        return Some(FilesystemKind::Fat);
+    }
+    // FAT12/FAT16 store theirs at offset 54..62.
+    let fat1216_label = &buf[54..62];
+    if fat1216_label == b"FAT12   " || fat1216_label == b"FAT16   " || fat1216_label == b"FAT     " {
+        return Some(FilesystemKind::Fat);
+    }
+    None
 }
 
 pub fn refine_partition_fs(part: &mut PartitionInfo) {
@@ -436,7 +579,9 @@ pub fn refine_partition_fs(part: &mut PartitionInfo) {
         if detected != FilesystemKind::Unknown {
             part.fs_kind = detected;
             part.capture_mode = match detected {
-                FilesystemKind::Efi | FilesystemKind::Msr => CaptureMode::Raw,
+                FilesystemKind::Efi
+                | FilesystemKind::Msr
+                | FilesystemKind::Bitlocker => CaptureMode::Raw,
                 _ => CaptureMode::UsedBlocks,
             };
         }
@@ -489,6 +634,11 @@ pub fn query_volume_label(volume_path: &str) -> Option<String> {
         )
     };
     if ok == 0 {
+        warn!(
+            volume = root.as_str(),
+            err = unsafe { GetLastError() },
+            "query_volume_label: GetVolumeInformationW failed"
+        );
         return None;
     }
     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
@@ -518,9 +668,27 @@ pub fn query_partition_usage(volume_path: &str) -> Option<PartitionUsage> {
             &mut total_free,
         )
     };
-    if ok == 0 || total == 0 {
+    if ok == 0 {
+        warn!(
+            volume = root.as_str(),
+            err = unsafe { GetLastError() },
+            "query_partition_usage: GetDiskFreeSpaceExW failed"
+        );
         return None;
     }
+    if total == 0 {
+        warn!(
+            volume = root.as_str(),
+            "query_partition_usage: GetDiskFreeSpaceExW reported total=0"
+        );
+        return None;
+    }
+    debug!(
+        volume = root.as_str(),
+        total = total,
+        free = total_free,
+        "query_partition_usage: success"
+    );
     Some(PartitionUsage {
         total_bytes: total,
         free_bytes: total_free,
@@ -533,7 +701,12 @@ fn find_volume_for_partition(
     length: u64,
 ) -> Option<String> {
     for letter in b'C'..=b'Z' {
-        let vol = format!("{}:\\", letter as char);
+        // Open the volume *device* (`\\.\C:`), not the directory `C:\`. The
+        // latter requires `FILE_FLAG_BACKUP_SEMANTICS` to open at all, and
+        // even then it's a directory handle that IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
+        // doesn't accept. The previous formatting silently failed for every
+        // letter, leaving `volume_path = None` for all partitions.
+        let vol = format!(r"\\.\{}:", letter as char);
         let wide = to_wide(&vol);
         let handle = unsafe {
             CreateFileW(
@@ -588,9 +761,23 @@ fn find_volume_for_partition(
             && extents.extents[0].starting_offset as u64 == offset
             && extents.extents[0].extent_length as u64 == length
         {
-            return Some(format!(r"\\.\{letter}:"));
+            let path = format!(r"\\.\{}:", letter as char);
+            debug!(
+                volume = path.as_str(),
+                disk = disk_index,
+                offset = offset,
+                length = length,
+                "find_volume_for_partition: matched"
+            );
+            return Some(path);
         }
     }
+    debug!(
+        disk = disk_index,
+        offset = offset,
+        length = length,
+        "find_volume_for_partition: no match"
+    );
     None
 }
 
@@ -620,4 +807,62 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 pub fn guid_to_string(g: &[u8; 16]) -> String {
     format_guid(g)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boot_sector_with(oem: &[u8; 8]) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        buf[3..11].copy_from_slice(oem);
+        buf
+    }
+
+    #[test]
+    fn classify_boot_sector_recognizes_ntfs() {
+        let buf = boot_sector_with(b"NTFS    ");
+        assert_eq!(classify_boot_sector(&buf), Some(FilesystemKind::Ntfs));
+    }
+
+    #[test]
+    fn classify_boot_sector_recognizes_exfat() {
+        let buf = boot_sector_with(b"EXFAT   ");
+        assert_eq!(classify_boot_sector(&buf), Some(FilesystemKind::Exfat));
+    }
+
+    #[test]
+    fn classify_boot_sector_recognizes_bitlocker() {
+        let buf = boot_sector_with(b"-FVE-FS-");
+        assert_eq!(classify_boot_sector(&buf), Some(FilesystemKind::Bitlocker));
+    }
+
+    #[test]
+    fn classify_boot_sector_recognizes_fat32_label() {
+        let mut buf = [0u8; 512];
+        buf[3..11].copy_from_slice(b"MSWIN4.1");
+        buf[82..90].copy_from_slice(b"FAT32   ");
+        assert_eq!(classify_boot_sector(&buf), Some(FilesystemKind::Fat));
+    }
+
+    #[test]
+    fn classify_boot_sector_recognizes_fat16_label() {
+        let mut buf = [0u8; 512];
+        buf[54..62].copy_from_slice(b"FAT16   ");
+        assert_eq!(classify_boot_sector(&buf), Some(FilesystemKind::Fat));
+    }
+
+    #[test]
+    fn classify_boot_sector_returns_none_for_garbage() {
+        let buf = [0u8; 512];
+        assert_eq!(classify_boot_sector(&buf), None);
+    }
+
+    #[test]
+    fn parse_drive_letter_handles_dos_namespace() {
+        assert_eq!(parse_drive_letter(r"\\.\C:"), Some('C'));
+        assert_eq!(parse_drive_letter(r"\\?\D:\"), Some('D'));
+        assert_eq!(parse_drive_letter("E:"), Some('E'));
+        assert_eq!(parse_drive_letter(r"\\.\PhysicalDrive0"), None);
+    }
 }

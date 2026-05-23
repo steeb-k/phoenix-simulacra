@@ -70,6 +70,7 @@ pub fn fs_kind_to_string(k: FilesystemKind) -> &'static str {
         FilesystemKind::Exfat => "exfat",
         FilesystemKind::Efi => "efi",
         FilesystemKind::Msr => "msr",
+        FilesystemKind::Bitlocker => "bitlocker",
     }
 }
 
@@ -87,6 +88,7 @@ pub fn fs_kind_from_string(s: &str) -> FilesystemKind {
         "exfat" => FilesystemKind::Exfat,
         "efi" => FilesystemKind::Efi,
         "msr" => FilesystemKind::Msr,
+        "bitlocker" => FilesystemKind::Bitlocker,
         _ => FilesystemKind::Unknown,
     }
 }

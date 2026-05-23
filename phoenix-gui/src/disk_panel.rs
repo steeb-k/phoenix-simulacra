@@ -78,7 +78,8 @@ fn draw_disk_row(
         egui::pos2(checkbox_rect.right() + CHECKBOX_GAP, row_rect.top()),
         Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT),
     );
-    draw_disk_info_card(ui, info_rect, disk, palette);
+    let fully_selected = disk_check_state(disk, selections) == DiskCheckState::All;
+    draw_disk_info_card(ui, info_rect, disk, palette, fully_selected);
 
     let map_left = info_rect.right() + 10.0;
     let map_rect = Rect::from_min_max(
@@ -187,9 +188,27 @@ fn draw_disk_checkbox(
     }
 }
 
-fn draw_disk_info_card(ui: &mut Ui, rect: Rect, disk: &DiskInfo, palette: &Palette) {
+fn draw_disk_info_card(
+    ui: &mut Ui,
+    rect: Rect,
+    disk: &DiskInfo,
+    palette: &Palette,
+    selected: bool,
+) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, Rounding::same(SEGMENT_ROUNDING), palette.sidebar_hover_bg);
+    let bg = if selected {
+        blend(palette.sidebar_hover_bg, palette.accent, 0.18)
+    } else {
+        palette.sidebar_hover_bg
+    };
+    painter.rect_filled(rect, Rounding::same(SEGMENT_ROUNDING), bg);
+    if selected {
+        painter.rect_stroke(
+            rect,
+            Rounding::same(SEGMENT_ROUNDING),
+            Stroke::new(2.0, palette.accent),
+        );
+    }
 
     let icon_pos = egui::pos2(rect.left() + 28.0, rect.center().y);
     painter.text(
@@ -492,6 +511,7 @@ fn describe_filesystem(p: &PartitionInfo) -> String {
         FilesystemKind::Exfat => Some("exFAT"),
         FilesystemKind::Efi => Some("EFI System"),
         FilesystemKind::Msr => Some("Microsoft Reserved"),
+        FilesystemKind::Bitlocker => Some("BitLocker"),
         FilesystemKind::Unknown => None,
     };
     if let Some(label) = known {

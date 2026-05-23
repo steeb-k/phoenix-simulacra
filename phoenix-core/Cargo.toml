@@ -16,6 +16,7 @@ byteorder.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 windows-sys = { workspace = true }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

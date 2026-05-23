@@ -37,9 +37,13 @@ pub fn install(ctx: &egui::Context) {
     // Icons must use the phosphor family directly. Inter sits first in
     // Proportional and claims PUA codepoints with blank/wrong glyphs, so
     // fallback never reaches phosphor when using FontId::proportional.
+    //
+    // Include Inter as a fallback here too: epaint needs '?' (or '◻') in the
+    // font chain to build a "missing glyph" placeholder. Phosphor has neither,
+    // which produced three WARN lines per startup (one per icon atlas size).
     fonts.families.insert(
         FontFamily::Name(PHOSPHOR.into()),
-        vec![PHOSPHOR.into()],
+        vec![PHOSPHOR.into(), REGULAR.into()],
     );
 
     ctx.set_fonts(fonts);
