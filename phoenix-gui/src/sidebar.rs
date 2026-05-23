@@ -1,8 +1,9 @@
 use eframe::egui;
 use egui::{
-    Align, Align2, Color32, FontId, Layout, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2,
+    Align, Align2, Color32, Layout, Rect, Response, Rounding, Sense, Ui, Vec2,
 };
 
+use crate::fonts;
 use crate::theme::Palette;
 
 /// All top-level pages the app can show.
@@ -66,7 +67,7 @@ const BOTTOM_ITEMS: &[NavItem] = &[
 
 const SIDEBAR_WIDTH: f32 = 220.0;
 const ROW_HEIGHT: f32 = 40.0;
-const LOGO_SIZE: f32 = 96.0;
+const LOGO_SIZE: f32 = 192.0; // display size; source is 256×256 carbon-phoenix-sidebar.png
 
 /// Render the left sidebar. `current` is updated when the user clicks a nav
 /// item. While `busy` is true, items remain visible but click-through is
@@ -101,20 +102,11 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
 fn draw_brand(ui: &mut Ui, palette: &Palette) {
     ui.vertical_centered(|ui| {
         ui.add(
-            egui::Image::new(egui::include_image!("../../carbon-phoenix.png"))
+            egui::Image::new(egui::include_image!("../../carbon-phoenix-sidebar.png"))
                 .fit_to_exact_size(Vec2::splat(LOGO_SIZE)),
         );
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("Carbon Phoenix")
-                .strong()
-                .size(16.0)
-                .color(if palette.light_mode {
-                    Color32::from_rgb(0x20, 0x20, 0x20)
-                } else {
-                    Color32::WHITE
-                }),
-        );
+        
     });
 }
 
@@ -126,9 +118,9 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
     let hovered = response.hovered();
     let painter = ui.painter_at(rect);
 
-    let bg = if selected {
-        palette.sidebar_selected_bg
-    } else if hovered {
+    // Selected and hovered rows share the same fill; the accent dot on the
+    // left is the only visual cue for the selected state.
+    let bg = if selected || hovered {
         palette.sidebar_hover_bg
     } else {
         Color32::TRANSPARENT
@@ -145,13 +137,6 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
         painter.rect_filled(bar, Rounding::same(2.0), palette.accent);
     }
 
-    let icon_color = if selected {
-        palette.accent
-    } else if hovered {
-        palette.icon_color
-    } else {
-        palette.icon_color.gamma_multiply(0.85)
-    };
     let text_color = if selected {
         // Strong contrast for the selected label.
         if palette.light_mode {
@@ -159,16 +144,19 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
         } else {
             Color32::WHITE
         }
-    } else {
+    } else if hovered {
         palette.icon_color
+    } else {
+        palette.icon_color.gamma_multiply(0.85)
     };
+    let icon_color = text_color;
 
     let icon_pos = rect.left_center() + Vec2::new(18.0, 0.0);
     painter.text(
         icon_pos,
         Align2::CENTER_CENTER,
         item.icon,
-        FontId::proportional(20.0),
+        fonts::icon(20.0),
         icon_color,
     );
 
@@ -177,22 +165,12 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
         text_pos,
         Align2::LEFT_CENTER,
         item.label,
-        FontId::proportional(14.0),
+        fonts::regular(14.0),
         text_color,
     );
 
     if response.clicked() {
         *current = item.page;
-    }
-
-    // A faint border around the selected row helps in light mode where the
-    // tinted fill alone can read as a tooltip.
-    if selected && palette.light_mode {
-        painter.rect_stroke(
-            rect,
-            Rounding::same(6.0),
-            Stroke::new(1.0, palette.accent.gamma_multiply(0.4)),
-        );
     }
 
     response

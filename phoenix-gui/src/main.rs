@@ -1,11 +1,16 @@
+mod disk_panel;
+mod fonts;
 mod job;
 mod sidebar;
 mod theme;
+mod util;
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui::{Align2, Response, Rounding, Sense, Ui, Vec2};
 use phoenix_capture::backup::BackupOptions;
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
@@ -16,8 +21,11 @@ use phoenix_restore::restore::RestoreOptions;
 use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob};
 use crate::sidebar::Page;
 use crate::theme::Palette;
+use crate::util::format_bytes;
 
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const REFRESH_BTN_SIZE: f32 = 52.0;
+const REFRESH_ICON_SIZE: f32 = 32.0;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -40,10 +48,21 @@ fn main() -> eframe::Result<()> {
 
 struct PhoenixApp {
     disks: Vec<DiskInfo>,
-    selected_disk: usize,
-    selected_partitions: Vec<bool>,
+    /// Set of `(disk_index, partition_index)` pairs the user has clicked on
+    /// in the partition map. Survives disk refreshes by index, but stale
+    /// entries get filtered out when partitions change.
+    selections: HashSet<(u32, u32)>,
     backup_path: String,
     use_vss: bool,
+    /// FIFO queue of remaining backup jobs when a multi-disk selection is
+    /// in flight. The currently-running job lives in `job`; on completion
+    /// we pop the next entry here and spawn it.
+    pending_backups: Vec<BackupOptions>,
+    /// Total number of jobs in the current multi-disk run (for "Disk N of M"
+    /// status text). Reset to 0 when the queue drains.
+    total_backups: usize,
+    /// 1-based index of the job currently running for the status text.
+    current_backup_index: usize,
     restore_backup_path: String,
     restore_plan_entries: Vec<RestorePlanEntry>,
     target_disk_index: u32,
@@ -57,19 +76,18 @@ struct PhoenixApp {
 impl PhoenixApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
-
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-        cc.egui_ctx.set_fonts(fonts);
+        fonts::install(&cc.egui_ctx);
 
         let palette = theme::refresh(&cc.egui_ctx);
 
         let mut app = Self {
             disks: Vec::new(),
-            selected_disk: 0,
-            selected_partitions: Vec::new(),
+            selections: HashSet::new(),
             backup_path: default_backup_path(),
             use_vss: false,
+            pending_backups: Vec::new(),
+            total_backups: 0,
+            current_backup_index: 0,
             restore_backup_path: String::new(),
             restore_plan_entries: Vec::new(),
             target_disk_index: 0,
@@ -91,19 +109,29 @@ impl PhoenixApp {
                         refine_partition_fs(p);
                     }
                 }
-                if !disks.is_empty() {
-                    let idx = self.selected_disk.min(disks.len() - 1);
-                    self.selected_partitions = vec![false; disks[idx].partitions.len()];
-                }
                 self.disks = disks;
+                self.prune_stale_selections();
                 self.status = format!("Found {} disk(s)", self.disks.len());
             }
             Err(e) => self.status = format!("Disk enumeration failed: {e}"),
         }
     }
 
+    /// Drop selection entries whose `(disk_index, partition_index)` no
+    /// longer matches any partition currently visible. Avoids ghost
+    /// selections after a `Refresh disks` if the layout changed.
+    fn prune_stale_selections(&mut self) {
+        self.selections.retain(|(disk_idx, part_idx)| {
+            self.disks
+                .iter()
+                .find(|d| d.index == *disk_idx)
+                .map(|d| d.partitions.iter().any(|p| p.index == *part_idx))
+                .unwrap_or(false)
+        });
+    }
+
     fn busy(&self) -> bool {
-        self.job.as_ref().is_some_and(|j| j.is_running())
+        self.job.as_ref().is_some_and(|j| j.is_running()) || !self.pending_backups.is_empty()
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -112,10 +140,40 @@ impl PhoenixApp {
         };
         if let Some(result) = job.poll() {
             self.job = None;
-            self.status = match result {
-                Ok(msg) => msg,
-                Err(e) => format!("Error: {e}"),
-            };
+            match result {
+                Ok(msg) => {
+                    if let Some(next) = self.pending_backups.pop() {
+                        self.current_backup_index += 1;
+                        let path_display = next.output.display().to_string();
+                        self.status = format!(
+                            "Backing up disk {} of {} to {}…",
+                            self.current_backup_index, self.total_backups, path_display
+                        );
+                        self.job = Some(spawn_backup(next));
+                    } else {
+                        self.status = if self.total_backups > 1 {
+                            format!("All {} backups completed", self.total_backups)
+                        } else {
+                            msg
+                        };
+                        self.total_backups = 0;
+                        self.current_backup_index = 0;
+                    }
+                }
+                Err(e) => {
+                    if !self.pending_backups.is_empty() {
+                        self.status = format!(
+                            "Error on disk {} of {}: {e}. Remaining jobs cancelled.",
+                            self.current_backup_index, self.total_backups
+                        );
+                        self.pending_backups.clear();
+                    } else {
+                        self.status = format!("Error: {e}");
+                    }
+                    self.total_backups = 0;
+                    self.current_backup_index = 0;
+                }
+            }
         } else {
             ctx.request_repaint();
         }
@@ -173,7 +231,7 @@ impl eframe::App for PhoenixApp {
 
 fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(title).strong().size(22.0));
+    ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
     ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
     ui.add_space(14.0);
 }
@@ -183,11 +241,11 @@ fn coming_soon(ui: &mut egui::Ui, palette: &Palette, blurb: &str) {
     ui.vertical_centered(|ui| {
         ui.label(
             egui::RichText::new(egui_phosphor::regular::SPARKLE)
-                .size(56.0)
+                .font(fonts::icon(56.0))
                 .color(palette.accent),
         );
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Coming soon").strong().size(18.0));
+        ui.label(egui::RichText::new("Coming soon").font(fonts::bold(18.0)));
         ui.add_space(4.0);
         ui.label(egui::RichText::new(blurb).color(palette.subtle_text));
     });
@@ -218,19 +276,31 @@ fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle) {
     }
 }
 
-fn format_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if n >= GB {
-        format!("{:.2} GB", n as f64 / GB as f64)
-    } else if n >= MB {
-        format!("{:.2} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.2} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
+/// Large phosphor refresh control for re-enumerating disks.
+fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
+    let size = Vec2::splat(REFRESH_BTN_SIZE);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+
+    let hovered = response.hovered();
+    let painter = ui.painter_at(rect);
+    if hovered {
+        painter.rect_filled(rect, Rounding::same(8.0), palette.sidebar_hover_bg);
     }
+
+    let icon_color = if hovered {
+        palette.accent
+    } else {
+        palette.icon_color
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        egui_phosphor::regular::ARROWS_CLOCKWISE,
+        fonts::icon(REFRESH_ICON_SIZE),
+        icon_color,
+    );
+
+    response.on_hover_text("Refresh disks")
 }
 
 impl PhoenixApp {
@@ -244,52 +314,36 @@ impl PhoenixApp {
 
         if self.disks.is_empty() {
             ui.label("No disks found. Run as Administrator.");
-            if ui.button("Refresh disks").clicked() {
+            if refresh_disks_button(ui, &self.palette).clicked() {
                 self.refresh_disks();
             }
             return;
         }
 
         ui.horizontal(|ui| {
-            ui.label("Disk:");
-            egui::ComboBox::from_id_salt("disk")
-                .selected_text(format!(
-                    "PhysicalDrive{}",
-                    self.disks
-                        .get(self.selected_disk)
-                        .map(|d| d.index)
-                        .unwrap_or(0)
-                ))
-                .show_ui(ui, |ui| {
-                    for (i, d) in self.disks.iter().enumerate() {
-                        if ui
-                            .selectable_value(&mut self.selected_disk, i, &d.path)
-                            .clicked()
-                        {
-                            self.selected_partitions = vec![false; d.partitions.len()];
-                        }
-                    }
-                });
-            if ui.button("Refresh").clicked() {
-                self.refresh_disks();
-            }
-        });
-
-        if let Some(disk) = self.disks.get(self.selected_disk) {
-            ui.label("Partitions:");
-            for (i, p) in disk.partitions.iter().enumerate() {
-                let mut sel = self.selected_partitions.get(i).copied().unwrap_or(false);
-                ui.checkbox(
-                    &mut sel,
-                    format!("[{}] {} ({:?})", p.index, p.name, p.fs_kind),
-                );
-                if i < self.selected_partitions.len() {
-                    self.selected_partitions[i] = sel;
+            ui.label(egui::RichText::new("Select Source").font(fonts::bold(16.0)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if refresh_disks_button(ui, &self.palette).clicked() {
+                    self.refresh_disks();
                 }
-            }
-        }
+            });
+        });
+        ui.label(
+            egui::RichText::new("Choose the partitions you want to back up.")
+                .color(self.palette.subtle_text),
+        );
+        ui.add_space(8.0);
 
+        egui::ScrollArea::vertical()
+            .max_height(360.0)
+            .show(ui, |ui| {
+                disk_panel::show(ui, &self.disks, &mut self.selections, &self.palette);
+            });
+
+        ui.add_space(8.0);
         ui.separator();
+        ui.add_space(4.0);
+
         ui.label("Save backup to:");
         ui.horizontal(|ui| {
             ui.add(
@@ -304,41 +358,83 @@ impl PhoenixApp {
             }
         });
 
+        let grouped = self.group_selections();
+        if grouped.len() > 1 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} disks selected — output files will be auto-suffixed with -disk<N>.",
+                    grouped.len()
+                ))
+                .color(self.palette.subtle_text),
+            );
+        }
+
         ui.checkbox(&mut self.use_vss, "Use VSS (live Windows)");
 
         if ui.button("Start backup").clicked() {
-            let Some(output_path) = pick_backup_save_path(&self.backup_path) else {
-                self.status = "Backup cancelled — no save location chosen".into();
-                return;
-            };
-            self.backup_path = output_path.display().to_string();
-
-            let Some(disk) = self.disks.get(self.selected_disk) else {
-                return;
-            };
-            let parts: Vec<u32> = disk
-                .partitions
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.selected_partitions.get(*i).copied().unwrap_or(false))
-                .map(|(_, p)| p.index)
-                .collect();
-
-            if parts.is_empty() {
-                self.status = "Select at least one partition to back up".into();
-                return;
-            }
-
-            let progress = ProgressHandle::new();
-            self.status = format!("Backing up to {}…", self.backup_path);
-            self.job = Some(spawn_backup(BackupOptions {
-                disk_index: disk.index,
-                partition_indices: parts,
-                output: output_path,
-                use_vss: self.use_vss,
-                progress: Some(progress),
-            }));
+            self.start_backup();
         }
+    }
+
+    /// Group the current selection set by disk index, returning a sorted map
+    /// of `disk_index -> Vec<partition_index>` (partition indices sorted).
+    fn group_selections(&self) -> BTreeMap<u32, Vec<u32>> {
+        let mut grouped: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (disk_idx, part_idx) in &self.selections {
+            grouped.entry(*disk_idx).or_default().push(*part_idx);
+        }
+        for parts in grouped.values_mut() {
+            parts.sort_unstable();
+        }
+        grouped
+    }
+
+    fn start_backup(&mut self) {
+        let grouped = self.group_selections();
+        if grouped.is_empty() {
+            self.status = "Select at least one partition to back up".into();
+            return;
+        }
+
+        let Some(base_path) = pick_backup_save_path(&self.backup_path) else {
+            self.status = "Backup cancelled — no save location chosen".into();
+            return;
+        };
+        self.backup_path = base_path.display().to_string();
+
+        let multi = grouped.len() > 1;
+        let mut queue: Vec<BackupOptions> = Vec::with_capacity(grouped.len());
+        for (disk_idx, parts) in grouped {
+            let output = if multi {
+                suffix_path(&base_path, disk_idx)
+            } else {
+                base_path.clone()
+            };
+            queue.push(BackupOptions {
+                disk_index: disk_idx,
+                partition_indices: parts,
+                output,
+                use_vss: self.use_vss,
+                progress: Some(ProgressHandle::new()),
+            });
+        }
+
+        self.total_backups = queue.len();
+        self.current_backup_index = 1;
+        // pop() draws from the back, so reverse to preserve disk-index order.
+        queue.reverse();
+        let first = queue.pop().expect("queue non-empty");
+        self.pending_backups = queue;
+        let path_display = first.output.display().to_string();
+        self.status = if self.total_backups > 1 {
+            format!(
+                "Backing up disk 1 of {} to {}…",
+                self.total_backups, path_display
+            )
+        } else {
+            format!("Backing up to {}…", path_display)
+        };
+        self.job = Some(spawn_backup(first));
     }
 
     fn ui_restore(&mut self, ui: &mut egui::Ui) {
@@ -552,6 +648,19 @@ fn default_backup_path() -> String {
         return format!(r"{profile}\Documents\carbon-phoenix-backup.phnx");
     }
     "backup.phnx".into()
+}
+
+/// Insert `-disk<N>` before the extension of `base`. Used when the user
+/// picked one save path but selected partitions from multiple physical
+/// disks, so each disk gets its own `.phnx` next to the chosen file.
+fn suffix_path(base: &Path, disk_index: u32) -> PathBuf {
+    let parent = base.parent().unwrap_or_else(|| Path::new(""));
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("backup");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("phnx");
+    parent.join(format!("{stem}-disk{disk_index}.{ext}"))
 }
 
 fn pick_backup_save_path(current: &str) -> Option<PathBuf> {

@@ -7,8 +7,8 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetVolumeInformationW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+    CreateFileW, GetDiskFreeSpaceExW, GetVolumeInformationW, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::Ioctl::{
     DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
@@ -58,6 +58,18 @@ impl CaptureMode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionUsage {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+impl PartitionUsage {
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.free_bytes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PartitionInfo {
     pub index: u32,
@@ -68,6 +80,9 @@ pub struct PartitionInfo {
     pub fs_kind: FilesystemKind,
     pub capture_mode: CaptureMode,
     pub volume_path: Option<String>,
+    pub drive_letter: Option<char>,
+    pub volume_label: Option<String>,
+    pub usage: Option<PartitionUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +166,20 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                     } else {
                         CaptureMode::UsedBlocks
                     };
+                    let volume_path = find_volume_for_partition(
+                        index,
+                        e.starting_offset,
+                        e.length,
+                    );
+                    let drive_letter = volume_path
+                        .as_deref()
+                        .and_then(parse_drive_letter);
+                    let volume_label = volume_path
+                        .as_deref()
+                        .and_then(query_volume_label);
+                    let usage = volume_path
+                        .as_deref()
+                        .and_then(query_partition_usage);
                     PartitionInfo {
                         index: i as u32,
                         name: e.name,
@@ -159,11 +188,10 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         size_bytes: e.length,
                         fs_kind,
                         capture_mode,
-                        volume_path: find_volume_for_partition(
-                            index,
-                            e.starting_offset,
-                            e.length,
-                        ),
+                        volume_path,
+                        drive_letter,
+                        volume_label,
+                        usage,
                     }
                 })
                 .collect();
@@ -175,6 +203,20 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                 .enumerate()
                 .map(|(i, e)| {
                     let fs_kind = FilesystemKind::Unknown;
+                    let volume_path = find_volume_for_partition(
+                        index,
+                        e.starting_offset,
+                        e.length,
+                    );
+                    let drive_letter = volume_path
+                        .as_deref()
+                        .and_then(parse_drive_letter);
+                    let volume_label = volume_path
+                        .as_deref()
+                        .and_then(query_volume_label);
+                    let usage = volume_path
+                        .as_deref()
+                        .and_then(query_partition_usage);
                     PartitionInfo {
                         index: i as u32,
                         name: format!("Partition{i}"),
@@ -183,11 +225,10 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         size_bytes: e.length,
                         fs_kind,
                         capture_mode: CaptureMode::Raw,
-                        volume_path: find_volume_for_partition(
-                            index,
-                            e.starting_offset,
-                            e.length,
-                        ),
+                        volume_path,
+                        drive_letter,
+                        volume_label,
+                        usage,
                     }
                 })
                 .collect();
@@ -354,7 +395,15 @@ fn classify_partition(type_guid: &[u8; 16], name: &str) -> FilesystemKind {
 }
 
 pub fn detect_volume_fs(volume_path: &str) -> FilesystemKind {
-    let wide = to_wide(volume_path);
+    // GetVolumeInformationW expects a volume mount point such as `C:\` or
+    // `\\?\Volume{guid}\`. The `\\.\X:` device-namespace form used elsewhere
+    // for CreateFileW is rejected, which is why every NTFS drive previously
+    // came back as Unknown. Convert to the `X:\` root form here.
+    let root = match parse_drive_letter(volume_path) {
+        Some(letter) => format!("{letter}:\\"),
+        None => return FilesystemKind::Unknown,
+    };
+    let wide = to_wide(&root);
     let mut fs_name = [0u16; 64];
     let ok = unsafe {
         GetVolumeInformationW(
@@ -371,7 +420,7 @@ pub fn detect_volume_fs(volume_path: &str) -> FilesystemKind {
     if ok == 0 {
         return FilesystemKind::Unknown;
     }
-    let len = fs_name.iter().position(|&c| c == 0).unwrap_or(0);
+    let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
     let fs = String::from_utf16_lossy(&fs_name[..len]).to_uppercase();
     match fs.as_str() {
         "NTFS" => FilesystemKind::Ntfs,
@@ -392,6 +441,90 @@ pub fn refine_partition_fs(part: &mut PartitionInfo) {
             };
         }
     }
+    if part.drive_letter.is_none() {
+        part.drive_letter = part.volume_path.as_deref().and_then(parse_drive_letter);
+    }
+    if part.volume_label.is_none() {
+        part.volume_label = part.volume_path.as_deref().and_then(query_volume_label);
+    }
+    if part.usage.is_none() {
+        part.usage = part.volume_path.as_deref().and_then(query_partition_usage);
+    }
+}
+
+/// Extract the drive letter (e.g. `'C'`) from a `\\.\X:` style volume path.
+pub fn parse_drive_letter(volume_path: &str) -> Option<char> {
+    // Accept formats produced by find_volume_for_partition (`\\.\X:`) and the
+    // Win32 `\\?\X:\` form for good measure.
+    let stripped = volume_path
+        .strip_prefix(r"\\.\")
+        .or_else(|| volume_path.strip_prefix(r"\\?\"))
+        .unwrap_or(volume_path);
+    let mut chars = stripped.chars();
+    let letter = chars.next()?;
+    let colon = chars.next()?;
+    if colon != ':' || !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(letter.to_ascii_uppercase())
+}
+
+/// Read the volume label using `GetVolumeInformationW` on the `X:\` form of
+/// the volume path. Returns `None` for unmounted, locked, or unlabeled volumes.
+pub fn query_volume_label(volume_path: &str) -> Option<String> {
+    let letter = parse_drive_letter(volume_path)?;
+    let root = format!("{letter}:\\");
+    let wide = to_wide(&root);
+    let mut name = [0u16; 64];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide.as_ptr(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let label = String::from_utf16_lossy(&name[..len]);
+    if label.trim().is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+/// Query total/free bytes for a partition using `GetDiskFreeSpaceExW`. Returns
+/// `None` for volumes that aren't mounted or whose filesystem can't be read
+/// (BitLocker-locked drives, raw EFI/MSR partitions, etc.).
+pub fn query_partition_usage(volume_path: &str) -> Option<PartitionUsage> {
+    let letter = parse_drive_letter(volume_path)?;
+    let root = format!("{letter}:\\");
+    let wide = to_wide(&root);
+    let mut free_to_caller = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    if ok == 0 || total == 0 {
+        return None;
+    }
+    Some(PartitionUsage {
+        total_bytes: total,
+        free_bytes: total_free,
+    })
 }
 
 fn find_volume_for_partition(
