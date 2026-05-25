@@ -1,10 +1,9 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use phoenix_core::container::{Extent, CHUNK_SIZE};
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
-use phoenix_core::manifest::ChunkRecord;
 use phoenix_core::ProgressHandle;
 
 use crate::reader::PartitionReader;
@@ -117,27 +116,42 @@ fn read_bitmap(
     cluster_size: u64,
     total_clusters: u64,
 ) -> Result<Vec<u8>> {
-    // Simplified: mark all clusters as used if bitmap unavailable (safe fallback)
-    let bitmap_bytes = ((total_clusters + 7) / 8) as usize;
-    let mut bitmap = vec![0xFFu8; bitmap_bytes];
-
-    // Try reading $Bitmap via MFT record 6 — use ntfs crate for robust path
-    if let Ok(bm) = read_bitmap_via_ntfs(reader) {
-        if !bm.is_empty() {
-            let copy = bm.len().min(bitmap.len());
-            bitmap[..copy].copy_from_slice(&bm[..copy]);
-            return Ok(bitmap);
+    // Preferred path: ask the filesystem driver via FSCTL_GET_VOLUME_BITMAP.
+    // This works for any handle opened against a mounted volume — including
+    // VSS shadow-copy device paths, which are also volume devices — and is the
+    // only way to get an accurate allocation map without re-implementing an
+    // NTFS MFT parser. Without this, the fallback below treats every cluster
+    // as used and silently turns a "used blocks" backup into a full raw clone
+    // of the partition.
+    if let Some(bm) = reader.try_volume_bitmap(total_clusters) {
+        let bitmap_bytes = ((total_clusters + 7) / 8) as usize;
+        if bm.len() >= bitmap_bytes {
+            tracing::info!(
+                total_clusters,
+                "FSCTL_GET_VOLUME_BITMAP returned allocation map; capturing only used clusters"
+            );
+            return Ok(bm);
         }
+        tracing::debug!(
+            got = bm.len(),
+            expected = bitmap_bytes,
+            "FSCTL_GET_VOLUME_BITMAP returned a short bitmap; padding with all-used"
+        );
+        let mut padded = vec![0xFFu8; bitmap_bytes];
+        padded[..bm.len()].copy_from_slice(&bm);
+        return Ok(padded);
     }
 
+    // Fallback: mark every cluster as used. This is the conservative choice
+    // (correct, just wasteful) for handles where the IOCTL doesn't apply,
+    // such as raw `\\.\PhysicalDriveN` access in WinPE.
+    tracing::warn!(
+        total_clusters,
+        "FSCTL_GET_VOLUME_BITMAP unavailable; falling back to full-partition capture"
+    );
+    let bitmap_bytes = ((total_clusters + 7) / 8) as usize;
     let _ = (bs, cluster_size);
-    Ok(bitmap)
-}
-
-fn read_bitmap_via_ntfs(reader: &mut PartitionReader) -> Result<Vec<u8>> {
-    // Volume must be readable as file; for physical partition use boot+MFT scan
-    let _ = reader;
-    Ok(Vec::new())
+    Ok(vec![0xFFu8; bitmap_bytes])
 }
 
 fn cluster_used(bitmap: &[u8], cluster: usize) -> bool {

@@ -24,11 +24,19 @@ use crate::util::format_bytes;
 const CHECKBOX_COLUMN_WIDTH: f32 = 36.0;
 const CHECKBOX_GAP: f32 = 6.0;
 const INFO_CARD_WIDTH: f32 = 150.0;
+const INFO_CARD_GAP: f32 = 10.0;
 const ROW_HEIGHT: f32 = 92.0;
 const SEGMENT_GUTTER: f32 = 4.0;
 const FILL_BAR_HEIGHT: f32 = 5.0;
 const SEGMENT_ROUNDING: f32 = 6.0;
 const ROW_VERTICAL_GAP: f32 = 12.0;
+
+/// Vertical space one drive row occupies including its trailing gap. Used by
+/// the Backup page to cap the drive list height to ~3.5 rows so a 4th drive
+/// peeks in to hint at scrollability.
+pub fn row_stride() -> f32 {
+    ROW_HEIGHT + ROW_VERTICAL_GAP
+}
 /// Anything below this is just metadata padding (e.g. the leading 1 MiB GPT
 /// header gap or alignment tail) and we hide it from the partition map.
 const MIN_GAP_BYTES: u64 = 4 * 1024 * 1024;
@@ -38,6 +46,18 @@ const MIN_GAP_BYTES: u64 = 4 * 1024 * 1024;
 const MIN_PARTITION_WIDTH: f32 = 95.0;
 const MIN_UNALLOCATED_WIDTH: f32 = 70.0;
 
+/// Sense used for each partition segment inside the partition map.
+/// `Sense::click()` would also set `focusable: true`, putting every
+/// partition cell into the global Tab cycle, which adds many redundant
+/// stops between the top-of-page controls. Per-partition selection is a
+/// mouse-driven affordance; keyboard users toggle whole disks via the
+/// disk-level tri-state checkbox below, which is still tab-focusable.
+const PARTITION_SENSE: Sense = Sense {
+    click: true,
+    drag: false,
+    focusable: false,
+};
+
 enum Segment<'a> {
     Partition(&'a PartitionInfo),
     Unallocated { length: u64 },
@@ -46,26 +66,62 @@ enum Segment<'a> {
 /// Render every disk as a row of `[info card | partition map]`. Toggles
 /// `(disk.index, partition.index)` entries in `selections` when the user
 /// clicks a partition segment.
+///
+/// `viewport_width` is the visible width available outside any horizontal
+/// scroll area. Each row is sized to `max(viewport_width, natural_min_width)`
+/// so when the window is too narrow to render every partition at a readable
+/// size, the row simply overflows and the surrounding ScrollArea exposes a
+/// horizontal scrollbar — partitions never get squished below their minimum
+/// label width.
 pub fn show(
     ui: &mut Ui,
     disks: &[DiskInfo],
     selections: &mut HashSet<(u32, u32)>,
     palette: &Palette,
+    viewport_width: f32,
 ) {
+    // All rows share the same width so the info cards line up horizontally
+    // even when one disk has many partitions and another has few.
+    let natural_min = disks
+        .iter()
+        .map(min_disk_row_width)
+        .fold(0.0_f32, f32::max);
+    let row_width = viewport_width.max(natural_min);
+
     for disk in disks {
-        draw_disk_row(ui, disk, selections, palette);
+        draw_disk_row(ui, row_width, disk, selections, palette);
         ui.add_space(ROW_VERTICAL_GAP);
     }
 }
 
+/// Smallest width a single disk row can be drawn at without shrinking any
+/// partition segment below its readable minimum.
+fn min_disk_row_width(disk: &DiskInfo) -> f32 {
+    let segments = build_segments(disk);
+    let segment_min_total: f32 = segments
+        .iter()
+        .map(|s| match s {
+            Segment::Partition(_) => MIN_PARTITION_WIDTH,
+            Segment::Unallocated { .. } => MIN_UNALLOCATED_WIDTH,
+        })
+        .sum();
+    let gutter_total = SEGMENT_GUTTER * (segments.len().saturating_sub(1) as f32);
+    CHECKBOX_COLUMN_WIDTH
+        + CHECKBOX_GAP
+        + INFO_CARD_WIDTH
+        + INFO_CARD_GAP
+        + segment_min_total
+        + gutter_total
+}
+
 fn draw_disk_row(
     ui: &mut Ui,
+    row_width: f32,
     disk: &DiskInfo,
     selections: &mut HashSet<(u32, u32)>,
     palette: &Palette,
 ) {
-    let total_width = ui.available_width();
-    let row_size = Vec2::new(total_width, ROW_HEIGHT);
+    let row_size = Vec2::new(row_width, ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
 
     let checkbox_rect = Rect::from_min_size(
@@ -81,7 +137,7 @@ fn draw_disk_row(
     let fully_selected = disk_check_state(disk, selections) == DiskCheckState::All;
     draw_disk_info_card(ui, info_rect, disk, palette, fully_selected);
 
-    let map_left = info_rect.right() + 10.0;
+    let map_left = info_rect.right() + INFO_CARD_GAP;
     let map_rect = Rect::from_min_max(
         egui::pos2(map_left, row_rect.top()),
         row_rect.right_bottom(),
@@ -170,6 +226,18 @@ fn draw_disk_checkbox(
                 Color32::WHITE,
             );
         }
+    }
+
+    // Custom-drawn checkbox: egui's standard `widgets.active.bg_stroke`
+    // focus indicator doesn't reach us since we paint everything by hand.
+    // Draw an explicit focus ring around the box itself (not the wider
+    // hit-test column) so the keyboard-focused disk is unambiguous.
+    if response.has_focus() {
+        painter.rect_stroke(
+            box_rect.expand(3.0),
+            Rounding::same(6.0),
+            Stroke::new(2.0, palette.icon_color),
+        );
     }
 
     if response.clicked() {
@@ -401,7 +469,7 @@ fn draw_partition_segment(
     palette: &Palette,
 ) {
     let id = ui.id().with(("partition", disk_index, p.index));
-    let response = ui.interact(rect, id, Sense::click());
+    let response = ui.interact(rect, id, PARTITION_SENSE);
     let selected = selections.contains(&(disk_index, p.index));
 
     let painter = ui.painter_at(rect);

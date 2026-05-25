@@ -27,6 +27,18 @@ pub enum PhoenixError {
     },
     #[error("restore plan error: {0}")]
     Plan(String),
+    #[error("operation cancelled by user")]
+    Cancelled,
+    /// `FSCTL_LOCK_VOLUME` failed for the named drive after exhausting all
+    /// retries. The message embeds the most common holders so the user has
+    /// somewhere actionable to look without consulting separate docs.
+    #[error(
+        "Failed to lock {drive} for exclusive backup access (last Win32 error: {last_error}). \
+         Another process has files open on this volume. Common culprits: File Explorer windows, \
+         antivirus or backup agents, the search indexer, or any open applications using files on \
+         this drive. Close them and retry, or enable Use VSS for an alternative consistency strategy."
+    )]
+    VolumeLockFailed { drive: String, last_error: u32 },
     #[error("{0}")]
     Other(String),
 }

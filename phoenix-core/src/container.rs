@@ -385,6 +385,17 @@ impl PartitionStreamWriter<'_> {
     }
 
     pub fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
+        // Single cancel chokepoint for every capture path. `capture_raw`,
+        // `capture_fat`, and `capture_ntfs` all funnel each chunk through
+        // here, so a check before we hash + compress aborts the backup at
+        // the next chunk boundary regardless of which filesystem driver
+        // was used. Latency to honor a Cancel click is bounded by one
+        // chunk's worth of read + write.
+        if let Some(ref progress) = self.writer.progress {
+            if progress.is_cancelled() {
+                return Err(PhoenixError::Cancelled);
+            }
+        }
         let hash_hex = hash::hash_hex(plaintext);
         let compressed = compress_chunk(plaintext)?;
         let file_offset = self.current_data_offset;
@@ -641,6 +652,11 @@ impl PhnxReader {
             .ok_or_else(|| PhoenixError::Manifest("partition manifest missing".into()))?;
 
         for (chunk, record) in stream.chunks.iter().zip(chunk_records.iter()) {
+            if let Some(p) = progress {
+                if p.is_cancelled() {
+                    return Err(PhoenixError::Cancelled);
+                }
+            }
             let data = self.read_chunk(chunk)?;
             let computed = hash::hash_hex(&data);
             if computed != record.blake3 {

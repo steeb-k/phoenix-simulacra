@@ -27,6 +27,21 @@ use crate::util::format_bytes;
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const REFRESH_BTN_SIZE: f32 = 52.0;
 const REFRESH_ICON_SIZE: f32 = 32.0;
+/// Form-action button width on the Backup page (Browse, Start backup).
+/// Tuned to comfortably fit "Start backup" at 16pt so both buttons render
+/// at the same width.
+const FORM_BUTTON_W: f32 = 130.0;
+/// Padding added back to a `TextEdit::singleline` response rect to recover
+/// its outer visible height — `TextEdit::ui` subtracts its margin from
+/// the returned rect, so `response.rect.height() + INPUT_MARGIN_RESTORE`
+/// equals the field's visible outer height. With our `margin(10, 8)`
+/// that's `2 * 8 = 16`.
+const INPUT_MARGIN_RESTORE: f32 = 16.0;
+/// Default height for the colored Start/Cancel action buttons on pages
+/// that don't have a nearby `TextEdit` response to measure from
+/// (Restore, Verify). Tuned to match the Backup page's computed
+/// `input_height` (roughly 16pt text + 2×8px TextEdit margin).
+const ACTION_BUTTON_HEIGHT: f32 = 36.0;
 
 /// Decode the embedded application icon for the window / taskbar.
 fn app_icon() -> egui::IconData {
@@ -41,12 +56,22 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+/// Approximate height of the bottom status bar (`Margin::symmetric(16.0,
+/// 8.0)` + one text line). Added to the sidebar's minimum content height to
+/// derive the OS window's `min_inner_size` so the sidebar can always show
+/// the brand, History/Options, and 1.5 scrollable items at the smallest
+/// allowed window size.
+const STATUS_BAR_HEIGHT_ESTIMATE: f32 = 40.0;
+const MIN_WINDOW_WIDTH: f32 = 640.0;
+
 fn main() -> eframe::Result<()> {
     let _log_guard = init_logging();
 
+    let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
+            .with_min_inner_size([MIN_WINDOW_WIDTH, min_height])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };
@@ -107,7 +132,14 @@ struct PhoenixApp {
     /// in the partition map. Survives disk refreshes by index, but stale
     /// entries get filtered out when partitions change.
     selections: HashSet<(u32, u32)>,
-    backup_path: String,
+    /// Directory the `.phnx` file(s) get written into. The full output path
+    /// is composed as `{backup_folder}/{backup_name}.phnx`, with `-disk<N>`
+    /// inserted before the extension when more than one disk is selected.
+    backup_folder: String,
+    /// User-entered base filename (no extension, no disk suffix). Empty
+    /// means "not yet provided" — the Backup name input is tinted red and
+    /// the Start backup button is disabled until something is typed here.
+    backup_name: String,
     use_vss: bool,
     /// FIFO queue of remaining backup jobs when a multi-disk selection is
     /// in flight. The currently-running job lives in `job`; on completion
@@ -138,7 +170,8 @@ impl PhoenixApp {
         let mut app = Self {
             disks: Vec::new(),
             selections: HashSet::new(),
-            backup_path: default_backup_path(),
+            backup_folder: default_backup_folder(),
+            backup_name: String::new(),
             use_vss: false,
             pending_backups: Vec::new(),
             total_backups: 0,
@@ -193,6 +226,7 @@ impl PhoenixApp {
         let Some(job) = &self.job else {
             return;
         };
+        let job_kind = job.kind;
         if let Some(result) = job.poll() {
             self.job = None;
             match result {
@@ -216,7 +250,17 @@ impl PhoenixApp {
                     }
                 }
                 Err(e) => {
-                    if !self.pending_backups.is_empty() {
+                    // `phoenix-core` returns `PhoenixError::Cancelled` with this
+                    // exact Display string — match on it so the status reads as
+                    // a clean "Backup cancelled" instead of "Error: operation
+                    // cancelled by user". Cross-checking the kind from the job
+                    // keeps the wording accurate even if the user has navigated
+                    // to another page while the worker was winding down.
+                    let cancelled = e.contains("cancelled by user");
+                    if cancelled {
+                        self.status = job_kind.cancelled_message().to_string();
+                        self.pending_backups.clear();
+                    } else if !self.pending_backups.is_empty() {
                         self.status = format!(
                             "Error on disk {} of {}: {e}. Remaining jobs cancelled.",
                             self.current_backup_index, self.total_backups
@@ -232,6 +276,24 @@ impl PhoenixApp {
         } else {
             ctx.request_repaint();
         }
+    }
+
+    /// Request the active worker to wind down at the next chunk boundary
+    /// and drop any queued multi-disk backups so they don't auto-start
+    /// after the current worker exits. We deliberately do NOT clear
+    /// `self.job` here — the worker will finish its current chunk, return
+    /// `Err(Cancelled)`, and `poll_job` will translate that into the
+    /// final "Backup cancelled" / "Restore cancelled" / "Verify cancelled"
+    /// status text.
+    fn cancel_current_job(&mut self) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        job.progress.cancel();
+        self.pending_backups.clear();
+        self.total_backups = 0;
+        self.current_backup_index = 0;
+        self.status = "Cancelling…".into();
     }
 
     fn maybe_refresh_theme(&mut self, ctx: &egui::Context) {
@@ -266,22 +328,149 @@ impl eframe::App for PhoenixApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(24.0, 20.0)))
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!busy, |ui| match self.page {
-                    Page::Backup => self.ui_backup(ui),
-                    Page::Clone => self.ui_clone(ui),
-                    Page::Restore => self.ui_restore(ui),
-                    Page::Verify => self.ui_verify(ui),
-                    Page::Mount => self.ui_mount(ui),
-                    Page::History => self.ui_history(ui),
-                    Page::Options => self.ui_options(ui),
-                });
-                if busy {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label("Operation in progress…");
+                // Pages handle `busy` themselves now so the Cancel button
+                // on each action row can stay live while the rest of the
+                // form is greyed out. `add_enabled_ui` is a one-way ratchet
+                // — `(true, ...)` inside `(false, ...)` does NOT re-enable
+                // — so a single whole-page disable would block Cancel too.
+                match self.page {
+                    Page::Backup => self.ui_backup(ui, busy),
+                    Page::Clone => disabled_when(ui, busy, |ui| self.ui_clone(ui)),
+                    Page::Restore => self.ui_restore(ui, busy),
+                    Page::Verify => self.ui_verify(ui, busy),
+                    Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
+                    Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
+                    Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
                 }
             });
     }
+}
+
+/// Wrap a "no own action row yet" page in `add_enabled_ui(!busy, …)`
+/// so its widgets grey out while another page's job is running.
+fn disabled_when<R>(ui: &mut egui::Ui, busy: bool, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.add_enabled_ui(!busy, body).inner
+}
+
+/// A single "start" affordance configured by [`action_row`]: green pill,
+/// disabled-and-dimmed when `enabled` is false, with an optional
+/// `disabled_hint` shown on hover when the user cannot click it.
+pub struct StartAction<'a> {
+    pub label: &'a str,
+    pub enabled: bool,
+    pub disabled_hint: Option<&'a str>,
+}
+
+/// Render `starts` (one or more green Start-style buttons) followed by a
+/// single red Cancel button at the end of the row. Returns `(Some(start_idx), false)`
+/// when one of the start buttons was clicked, `(None, true)` when Cancel
+/// was clicked, or `(None, false)` otherwise.
+///
+/// All buttons land at `FORM_BUTTON_W` × `height`. Disabled colored
+/// buttons stay tinted (faded, via `Palette::dim`) instead of going
+/// fully grey so the user still recognizes which control is Go vs Stop.
+fn action_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    height: f32,
+    starts: &[StartAction<'_>],
+    cancel_enabled: bool,
+) -> (Option<usize>, bool) {
+    let mut clicked_start: Option<usize> = None;
+    let mut clicked_cancel = false;
+    ui.horizontal(|ui| {
+        for (idx, start) in starts.iter().enumerate() {
+            let fill = if start.enabled {
+                palette.success
+            } else {
+                palette.dim(palette.success)
+            };
+            let resp = ui
+                .add_enabled_ui(start.enabled, |ui| {
+                    ui.add_sized(
+                        [FORM_BUTTON_W, height],
+                        egui::Button::new(
+                            egui::RichText::new(start.label).color(egui::Color32::WHITE),
+                        )
+                        .fill(fill),
+                    )
+                })
+                .inner;
+            let resp = match start.disabled_hint {
+                Some(hint) => resp.on_disabled_hover_text(hint),
+                None => resp,
+            };
+            if resp.clicked() {
+                clicked_start = Some(idx);
+            }
+        }
+        let cancel_fill = if cancel_enabled {
+            palette.danger
+        } else {
+            palette.dim(palette.danger)
+        };
+        let cancel_resp = ui
+            .add_enabled_ui(cancel_enabled, |ui| {
+                ui.add_sized(
+                    [FORM_BUTTON_W, height],
+                    egui::Button::new(
+                        egui::RichText::new("Cancel").color(egui::Color32::WHITE),
+                    )
+                    .fill(cancel_fill),
+                )
+            })
+            .inner
+            .on_disabled_hover_text("No operation is currently running");
+        if cancel_resp.clicked() {
+            clicked_cancel = true;
+        }
+    });
+    (clicked_start, clicked_cancel)
+}
+
+/// Bold "label + TextEdit + Browse…" row used by both the Verify and Restore
+/// pages for picking an existing `.phnx` file. Mirrors the styling of the
+/// "Save backup to folder" row on the Backup page: 14pt bold label, 16pt
+/// field text with `(10, 8)` margins, and a `Browse…` button whose width
+/// is reserved on the right so it never falls off the side of the pane.
+fn backup_path_picker(ui: &mut egui::Ui, label: &str, hint: &str, path: &mut String) {
+    ui.label(egui::RichText::new(label).font(fonts::bold(14.0)));
+    ui.horizontal(|ui| {
+        // Same trick as the folder picker on the Backup page: take the
+        // button's fixed width out of `available_width` before sizing the
+        // field, so the field can't grow tall enough to push Browse past
+        // the right edge of the central panel.
+        let spacing = ui.spacing().item_spacing.x;
+        let text_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
+
+        let field_response = ui.add(
+            egui::TextEdit::singleline(path)
+                .desired_width(text_w)
+                .font(fonts::regular(16.0))
+                .hint_text_font(fonts::regular(16.0))
+                .margin(egui::Margin::symmetric(10.0, 8.0))
+                .hint_text(hint),
+        );
+
+        // Outer (visible) height of the TextEdit — the response rect is
+        // the inner text area, so add back the vertical margin to get the
+        // height the user actually sees and size Browse to match.
+        let visible_h = field_response.rect.height() + INPUT_MARGIN_RESTORE;
+
+        if ui
+            .add_sized(
+                [FORM_BUTTON_W, visible_h],
+                egui::Button::new(
+                    egui::RichText::new("Browse…").font(fonts::regular(16.0)),
+                ),
+            )
+            .clicked()
+        {
+            if let Some(picked) = pick_backup_open_path(path) {
+                *path = picked.display().to_string();
+            }
+        }
+    });
 }
 
 fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
@@ -355,11 +544,28 @@ fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
         icon_color,
     );
 
-    response.on_hover_text("Refresh disks")
+    let response = response.on_hover_text("Refresh disks");
+    // This button paints itself directly with the phosphor icon and has no
+    // egui-managed frame, so the global `widgets.active.bg_stroke` focus
+    // bump never applies — add an explicit focus ring here.
+    theme::draw_focus_outline(ui, &response, palette);
+    response
 }
 
 impl PhoenixApp {
-    fn ui_backup(&mut self, ui: &mut egui::Ui) {
+    fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
+        // Whole-page scroll: when the window is too short, the entire backup
+        // page (header, drive list, path field, options, buttons) scrolls as
+        // a unit. The inner drive list still has its own scroll area capped
+        // at ~3.5 rows so the rest of the controls stay close at hand.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.ui_backup_inner(ui, busy);
+            });
+    }
+
+    fn ui_backup_inner(&mut self, ui: &mut egui::Ui, busy: bool) {
         page_header(
             ui,
             &self.palette,
@@ -367,12 +573,94 @@ impl PhoenixApp {
             "Create a disk or partition image backup with optional compression and verification.",
         );
 
+        // Compute name_missing OUTSIDE the disabled scope so the action
+        // row below can still gate Start on it.
+        let name_missing = self.backup_name.trim().is_empty();
+
+        // We need to fish the Backup name TextEdit's response out of an
+        // `add_enabled_ui` scope so the rest of the page can size buttons
+        // to match its height. `ui.add_enabled_ui` returns `InnerResponse`,
+        // so we just bubble the inner closure value back up.
+        let name_response = ui
+            .add_enabled_ui(!busy, |ui| {
+                self.ui_backup_form(ui, name_missing)
+            })
+            .inner;
+
+        let input_height = name_response.rect.height() + INPUT_MARGIN_RESTORE;
+
+        // Action row sits OUTSIDE the disabled wrap so the Cancel button
+        // can stay live while the form is greyed out.
+        let starts = [StartAction {
+            label: "Start backup",
+            enabled: !busy && !name_missing,
+            disabled_hint: Some(if busy {
+                "A backup is already running"
+            } else {
+                "Enter a backup name first"
+            }),
+        }];
+        let (start_clicked, cancel_clicked) =
+            action_row(ui, &self.palette, input_height, &starts, busy);
+        if start_clicked == Some(0) {
+            self.start_backup();
+        }
+        if cancel_clicked {
+            self.cancel_current_job();
+        }
+    }
+
+    /// The greyed-when-busy portion of the Backup page: name field,
+    /// folder field, disk list, and VSS toggle. Returns the Backup-name
+    /// `TextEdit` response so the caller can use its height to size the
+    /// action row's buttons.
+    fn ui_backup_form(&mut self, ui: &mut egui::Ui, name_missing: bool) -> egui::Response {
+        ui.label(egui::RichText::new("Backup name").font(fonts::bold(14.0)));
+
+        let name_response = ui
+            .scope(|ui| {
+                if name_missing {
+                    // `extreme_bg_color` is what TextEdit uses as its field
+                    // fill. Hint text is drawn with `weak_text_color()`,
+                    // which blends `text_color()` toward `weak_bg_fill` —
+                    // so we also steer that weak_bg_fill to the error tint
+                    // so the placeholder lands on a readable pinkish color
+                    // instead of disappearing into the red.
+                    ui.visuals_mut().extreme_bg_color = self.palette.error_bg;
+                    ui.visuals_mut().widgets.noninteractive.weak_bg_fill =
+                        self.palette.error_bg;
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backup_name)
+                        .desired_width(f32::INFINITY)
+                        .font(fonts::regular(16.0))
+                        .hint_text_font(fonts::regular(16.0))
+                        .margin(egui::Margin::symmetric(10.0, 8.0))
+                        .hint_text("e.g. workstation-2026-05-23"),
+                )
+            })
+            .inner;
+
+        // Single source of truth for the visible outer height of an input
+        // on this page. Reused for the Browse button so every form widget
+        // sits on a consistent baseline.
+        let input_height = name_response.rect.height() + INPUT_MARGIN_RESTORE;
+
+        ui.label(
+            egui::RichText::new(
+                "Used as the base filename. `.phnx` is added automatically, and a \
+                 `-disk<N>` suffix is inserted when multiple disks are selected.",
+            )
+            .color(self.palette.subtle_text),
+        );
+        ui.add_space(12.0);
+
         if self.disks.is_empty() {
             ui.label("No disks found. Run as Administrator.");
             if refresh_disks_button(ui, &self.palette).clicked() {
                 self.refresh_disks();
             }
-            return;
+            return name_response;
         }
 
         ui.horizontal(|ui| {
@@ -389,26 +677,65 @@ impl PhoenixApp {
         );
         ui.add_space(8.0);
 
-        egui::ScrollArea::vertical()
-            .max_height(360.0)
+        // Capture the visible viewport width BEFORE entering the inner
+        // ScrollArea::both — inside `both()` `available_width()` is virtual
+        // and would push rows arbitrarily wide. We use this to size each
+        // drive row to `max(viewport, natural_min)` so:
+        //   * wide window → rows fit, no horizontal scroll;
+        //   * narrow window → rows overflow horizontally rather than
+        //     squishing partition labels into illegibility.
+        let viewport_width = ui.available_width();
+        let drive_pane_max_height = disk_panel::row_stride() * 3.5;
+
+        egui::ScrollArea::both()
+            .id_salt("backup_drive_list")
+            .max_height(drive_pane_max_height)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                disk_panel::show(ui, &self.disks, &mut self.selections, &self.palette);
+                disk_panel::show(
+                    ui,
+                    &self.disks,
+                    &mut self.selections,
+                    &self.palette,
+                    viewport_width,
+                );
             });
 
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(4.0);
 
-        ui.label("Save backup to:");
+        ui.label(egui::RichText::new("Save backup to folder").font(fonts::bold(14.0)));
         ui.horizontal(|ui| {
+            // Reserve fixed width for the Browse button on the right so it
+            // always fits inside the central panel, then let the TextEdit
+            // fill the remainder. Without this reservation, the field's
+            // `desired_width(f32::INFINITY)` consumed everything in the
+            // horizontal row and pushed Browse off the right edge of the
+            // window at every window size.
+            let spacing = ui.spacing().item_spacing.x;
+            let text_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
+
             ui.add(
-                egui::TextEdit::singleline(&mut self.backup_path)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(r"e.g. D:\Backups\machine.phnx"),
+                egui::TextEdit::singleline(&mut self.backup_folder)
+                    .desired_width(text_w)
+                    .font(fonts::regular(16.0))
+                    .hint_text_font(fonts::regular(16.0))
+                    .margin(egui::Margin::symmetric(10.0, 8.0))
+                    .hint_text(r"e.g. D:\Backups"),
             );
-            if ui.button("Browse…").clicked() {
-                if let Some(path) = pick_backup_save_path(&self.backup_path) {
-                    self.backup_path = path.display().to_string();
+
+            if ui
+                .add_sized(
+                    [FORM_BUTTON_W, input_height],
+                    egui::Button::new(
+                        egui::RichText::new("Browse…").font(fonts::regular(16.0)),
+                    ),
+                )
+                .clicked()
+            {
+                if let Some(path) = pick_backup_save_folder(&self.backup_folder) {
+                    self.backup_folder = path.display().to_string();
                 }
             }
         });
@@ -424,11 +751,10 @@ impl PhoenixApp {
             );
         }
 
-        ui.checkbox(&mut self.use_vss, "Use VSS (live Windows)");
+        let vss_response = ui.checkbox(&mut self.use_vss, "Use VSS (live Windows)");
+        theme::draw_focus_outline(ui, &vss_response, &self.palette);
 
-        if ui.button("Start backup").clicked() {
-            self.start_backup();
-        }
+        name_response
     }
 
     /// Group the current selection set by disk index, returning a sorted map
@@ -445,17 +771,48 @@ impl PhoenixApp {
     }
 
     fn start_backup(&mut self) {
+        let name = sanitize_backup_name(&self.backup_name);
+        if name.is_empty() {
+            self.status = "Enter a backup name first".into();
+            return;
+        }
+
         let grouped = self.group_selections();
         if grouped.is_empty() {
             self.status = "Select at least one partition to back up".into();
             return;
         }
 
-        let Some(base_path) = pick_backup_save_path(&self.backup_path) else {
-            self.status = "Backup cancelled — no save location chosen".into();
-            return;
+        // Fall back to the default Documents folder if the user blanked the
+        // folder field — better than erroring out with "folder is empty".
+        let folder_input = self.backup_folder.trim();
+        let folder = if folder_input.is_empty() {
+            let default_dir = default_backup_folder();
+            self.backup_folder = default_dir.clone();
+            PathBuf::from(default_dir)
+        } else {
+            PathBuf::from(folder_input)
         };
-        self.backup_path = base_path.display().to_string();
+        if folder.as_os_str().is_empty() {
+            self.status = "Choose a folder to save the backup into".into();
+            return;
+        }
+        if !folder.exists() {
+            self.status = format!(
+                "Backup folder does not exist: {}",
+                folder.display()
+            );
+            return;
+        }
+        if !folder.is_dir() {
+            self.status = format!(
+                "Backup destination is not a folder: {}",
+                folder.display()
+            );
+            return;
+        }
+
+        let base_path = folder.join(format!("{name}.phnx"));
 
         let multi = grouped.len() > 1;
         let mut queue: Vec<BackupOptions> = Vec::with_capacity(grouped.len());
@@ -492,26 +849,46 @@ impl PhoenixApp {
         self.job = Some(spawn_backup(first));
     }
 
-    fn ui_restore(&mut self, ui: &mut egui::Ui) {
+    fn ui_restore(&mut self, ui: &mut egui::Ui, busy: bool) {
         page_header(
             ui,
             &self.palette,
             "Restore",
             "Apply a .phnx backup back onto a target disk.",
         );
-        ui.label("Backup file:");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.restore_backup_path)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Path to .phnx file"),
-            );
-            if ui.button("Browse…").clicked() {
-                if let Some(path) = pick_backup_open_path(&self.restore_backup_path) {
-                    self.restore_backup_path = path.display().to_string();
-                }
-            }
+
+        ui.add_enabled_ui(!busy, |ui| {
+            self.ui_restore_form(ui);
         });
+
+        let plan_ready = !self.restore_plan_entries.is_empty();
+        let starts = [StartAction {
+            label: "Run restore",
+            enabled: !busy && plan_ready,
+            disabled_hint: Some(if busy {
+                "A restore is already running"
+            } else {
+                "Load a backup & plan first"
+            }),
+        }];
+        let (start_clicked, cancel_clicked) =
+            action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts, busy);
+        if start_clicked == Some(0) {
+            self.start_restore();
+        }
+        if cancel_clicked {
+            self.cancel_current_job();
+        }
+    }
+
+    /// Greyed-when-busy portion of the Restore page.
+    fn ui_restore_form(&mut self, ui: &mut egui::Ui) {
+        backup_path_picker(
+            ui,
+            "Backup file",
+            "Path to .phnx file",
+            &mut self.restore_backup_path,
+        );
         ui.add(egui::DragValue::new(&mut self.target_disk_index).prefix("Target disk "));
 
         if ui.button("Load backup & plan").clicked() {
@@ -555,67 +932,88 @@ impl PhoenixApp {
                 );
             });
         }
-
-        if ui.button("Run restore").clicked() {
-            let Some(backup_path) = resolve_backup_open_path(&self.restore_backup_path) else {
-                self.status = "Restore cancelled — no backup file chosen".into();
-                return;
-            };
-            self.restore_backup_path = backup_path.display().to_string();
-            let plan = RestorePlan {
-                backup_path: self.restore_backup_path.clone(),
-                target_disk_index: self.target_disk_index,
-                entries: self.restore_plan_entries.clone(),
-            };
-            let progress = ProgressHandle::new();
-            self.status = "Restore in progress…".into();
-            self.job = Some(spawn_restore(RestoreOptions {
-                backup_path,
-                plan,
-                verify_on_restore: true,
-                progress: Some(progress),
-            }));
-        }
     }
 
-    fn ui_verify(&mut self, ui: &mut egui::Ui) {
+    fn start_restore(&mut self) {
+        let Some(backup_path) = resolve_backup_open_path(&self.restore_backup_path) else {
+            self.status = "Restore cancelled — no backup file chosen".into();
+            return;
+        };
+        self.restore_backup_path = backup_path.display().to_string();
+        let plan = RestorePlan {
+            backup_path: self.restore_backup_path.clone(),
+            target_disk_index: self.target_disk_index,
+            entries: self.restore_plan_entries.clone(),
+        };
+        let progress = ProgressHandle::new();
+        self.status = "Restore in progress…".into();
+        self.job = Some(spawn_restore(RestoreOptions {
+            backup_path,
+            plan,
+            verify_on_restore: true,
+            progress: Some(progress),
+        }));
+    }
+
+    fn ui_verify(&mut self, ui: &mut egui::Ui, busy: bool) {
         page_header(
             ui,
             &self.palette,
             "Verify Backup",
             "Run a quick header check or a full BLAKE3 verification across the archive.",
         );
-        ui.label("Backup file:");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.restore_backup_path)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Path to .phnx file"),
+
+        ui.add_enabled_ui(!busy, |ui| {
+            backup_path_picker(
+                ui,
+                "Backup file",
+                "Path to .phnx file",
+                &mut self.restore_backup_path,
             );
-            if ui.button("Browse…").clicked() {
-                if let Some(path) = pick_backup_open_path(&self.restore_backup_path) {
-                    self.restore_backup_path = path.display().to_string();
-                }
-            }
         });
-        if ui.button("Quick verify").clicked() {
-            let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
-                self.status = "Verify cancelled — no backup file chosen".into();
-                return;
-            };
-            self.restore_backup_path = path.display().to_string();
-            self.status = "Quick verify in progress…".into();
-            self.job = Some(spawn_verify(path, true));
+
+        let path_filled = !self.restore_backup_path.trim().is_empty();
+        let disabled_hint = if busy {
+            "A verify is already running"
+        } else {
+            "Choose a backup file first"
+        };
+        let starts = [
+            StartAction {
+                label: "Quick verify",
+                enabled: !busy && path_filled,
+                disabled_hint: Some(disabled_hint),
+            },
+            StartAction {
+                label: "Full verify",
+                enabled: !busy && path_filled,
+                disabled_hint: Some(disabled_hint),
+            },
+        ];
+        let (start_clicked, cancel_clicked) =
+            action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts, busy);
+        match start_clicked {
+            Some(0) => self.start_verify(true),
+            Some(1) => self.start_verify(false),
+            _ => {}
         }
-        if ui.button("Full verify").clicked() {
-            let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
-                self.status = "Verify cancelled — no backup file chosen".into();
-                return;
-            };
-            self.restore_backup_path = path.display().to_string();
-            self.status = "Full verify in progress…".into();
-            self.job = Some(spawn_verify(path, false));
+        if cancel_clicked {
+            self.cancel_current_job();
         }
+    }
+
+    fn start_verify(&mut self, quick: bool) {
+        let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
+            self.status = "Verify cancelled — no backup file chosen".into();
+            return;
+        };
+        self.restore_backup_path = path.display().to_string();
+        self.status = if quick {
+            "Quick verify in progress…".into()
+        } else {
+            "Full verify in progress…".into()
+        };
+        self.job = Some(spawn_verify(path, quick));
     }
 
     fn ui_clone(&mut self, ui: &mut egui::Ui) {
@@ -698,11 +1096,11 @@ impl PhoenixApp {
     }
 }
 
-fn default_backup_path() -> String {
+fn default_backup_folder() -> String {
     if let Ok(profile) = std::env::var("USERPROFILE") {
-        return format!(r"{profile}\Documents\carbon-phoenix-backup.phnx");
+        return format!(r"{profile}\Documents");
     }
-    "backup.phnx".into()
+    String::new()
 }
 
 /// Insert `-disk<N>` before the extension of `base`. Used when the user
@@ -718,23 +1116,34 @@ fn suffix_path(base: &Path, disk_index: u32) -> PathBuf {
     parent.join(format!("{stem}-disk{disk_index}.{ext}"))
 }
 
-fn pick_backup_save_path(current: &str) -> Option<PathBuf> {
-    let mut dialog = rfd::FileDialog::new()
-        .add_filter("Carbon Phoenix backup", &["phnx"])
-        .set_title("Save backup as");
+/// Trim the user-entered backup name and strip a trailing `.phnx` (any
+/// case) so that the final output is always `<name>.phnx` rather than
+/// `<name>.phnx.phnx` when someone helpfully types the extension.
+fn sanitize_backup_name(name: &str) -> String {
+    let trimmed = name.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".phnx") {
+        // Safe: `.phnx` is pure ASCII, so the last 5 bytes are 1-byte chars
+        // and `len - 5` is on a UTF-8 boundary regardless of earlier glyphs.
+        trimmed[..trimmed.len() - 5].trim_end().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn pick_backup_save_folder(current: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Choose backup folder");
 
     let path = Path::new(current);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    if path.is_dir() {
+        dialog = dialog.set_directory(path);
+    } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
         dialog = dialog.set_directory(parent);
     } else if let Ok(profile) = std::env::var("USERPROFILE") {
         dialog = dialog.set_directory(format!(r"{profile}\Documents"));
     }
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .unwrap_or("carbon-phoenix-backup.phnx");
-    dialog.set_file_name(name).save_file()
+
+    dialog.pick_folder()
 }
 
 fn pick_backup_open_path(current: &str) -> Option<PathBuf> {

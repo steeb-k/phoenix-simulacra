@@ -8,7 +8,28 @@ use phoenix_restore::restore::{run_restore, verify_backup_with_progress, Restore
 /// Result message for the status bar (success text or error).
 pub type JobResult = Result<String, String>;
 
+/// What kind of long-running operation a [`BackgroundJob`] is performing.
+/// Lets the GUI tailor the "cancelled" status text per page even if the
+/// user has navigated away from the page that kicked the job off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    Backup,
+    Restore,
+    Verify,
+}
+
+impl JobKind {
+    pub fn cancelled_message(self) -> &'static str {
+        match self {
+            JobKind::Backup => "Backup cancelled",
+            JobKind::Restore => "Restore cancelled",
+            JobKind::Verify => "Verify cancelled",
+        }
+    }
+}
+
 pub struct BackgroundJob {
+    pub kind: JobKind,
     pub progress: ProgressHandle,
     rx: mpsc::Receiver<JobResult>,
 }
@@ -28,18 +49,35 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
     let progress = opts.progress.clone().unwrap_or_default();
     let progress_worker = progress.clone();
 
-    let output_display = opts.output.display().to_string();
+    let output_path = opts.output.clone();
+    let output_display = output_path.display().to_string();
     thread::spawn(move || {
         let result = run_backup(BackupOptions {
-            progress: Some(progress_worker),
+            progress: Some(progress_worker.clone()),
             ..opts
-        })
-        .map(|()| format!("Backup completed: {output_display}"))
-        .map_err(|e| e.to_string());
+        });
+
+        // If the worker bailed because the user cancelled, the partial
+        // `.phnx` on disk has no manifest footer and is unopenable. Best-
+        // effort delete it so the user's backup folder doesn't accumulate
+        // half-finished files after a cancel. We deliberately don't fail
+        // the result if removal fails — the cancel is still the headline
+        // outcome.
+        if result.is_err() && progress_worker.is_cancelled() {
+            let _ = std::fs::remove_file(&output_path);
+        }
+
+        let result = result
+            .map(|()| format!("Backup completed: {output_display}"))
+            .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
 
-    BackgroundJob { progress, rx }
+    BackgroundJob {
+        kind: JobKind::Backup,
+        progress,
+        rx,
+    }
 }
 
 pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
@@ -57,7 +95,11 @@ pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
         let _ = tx.send(result);
     });
 
-    BackgroundJob { progress, rx }
+    BackgroundJob {
+        kind: JobKind::Restore,
+        progress,
+        rx,
+    }
 }
 
 pub fn spawn_verify(path: PathBuf, quick: bool) -> BackgroundJob {
@@ -73,5 +115,9 @@ pub fn spawn_verify(path: PathBuf, quick: bool) -> BackgroundJob {
         let _ = tx.send(result);
     });
 
-    BackgroundJob { progress, rx }
+    BackgroundJob {
+        kind: JobKind::Verify,
+        progress,
+        rx,
+    }
 }

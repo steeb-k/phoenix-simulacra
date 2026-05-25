@@ -1,9 +1,7 @@
-use std::path::Path;
-
 use chrono::Utc;
 use phoenix_core::container::{Extent, Header, PhnxWriter, FORMAT_VERSION};
 use phoenix_core::disk::{
-    enumerate_disks, refine_partition_fs, CaptureMode, DiskInfo, FilesystemKind, PartitionInfo,
+    enumerate_disks, refine_partition_fs, CaptureMode, FilesystemKind, PartitionInfo,
 };
 use phoenix_core::error::Result;
 use phoenix_core::manifest::{
@@ -62,7 +60,23 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         partition_count: 0,
     };
 
-    let total_bytes: u64 = selected.iter().map(|p| p.size_bytes).sum();
+    // Estimate the total bytes we'll actually stream. For UsedBlocks
+    // partitions we can use the OS-reported used bytes from
+    // `GetDiskFreeSpaceExW`, which is dramatically smaller than the raw
+    // partition size on a half-empty drive. Falling back to `size_bytes`
+    // keeps progress bounded even when the volume isn't mounted (raw / EFI /
+    // BitLocker-locked partitions all stream the full size).
+    let total_bytes: u64 = selected
+        .iter()
+        .map(|p| match p.capture_mode {
+            CaptureMode::UsedBlocks => p
+                .usage
+                .map(|u| u.used_bytes())
+                .filter(|n| *n > 0)
+                .unwrap_or(p.size_bytes),
+            CaptureMode::Raw => p.size_bytes,
+        })
+        .sum();
     if let Some(ref progress) = opts.progress {
         progress.begin(total_bytes.max(1), "Backup");
     }
@@ -71,9 +85,18 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         PhnxWriter::create_with_progress(&opts.output, header, opts.progress.clone())?;
     let mut partition_manifests = Vec::new();
     let partition_count = selected.len();
+    // Owns every shadow we create across all selected partitions; its Drop
+    // tears them down even if we error or panic out of this loop.
+    let mut vss = phoenix_vss::VssSession::new();
 
     for (part_idx, part) in selected.iter().enumerate() {
+        // Short-circuit between partitions so a cancel during a long
+        // VSS snapshot setup or partition reader open doesn't have to
+        // wait until the next chunk write to honor the user's click.
         if let Some(ref progress) = opts.progress {
+            if progress.is_cancelled() {
+                return Err(phoenix_core::error::PhoenixError::Cancelled);
+            }
             progress.set_phase(format!(
                 "Partition {} — {} ({}/{})",
                 part.index,
@@ -90,11 +113,9 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 
         let read_path = if opts.use_vss {
             if let Some(ref vol) = part.volume_path {
-                phoenix_vss::snapshot_volume_path(vol)?
+                vss.snapshot_volume(vol)?
             } else {
-                part.volume_path
-                    .clone()
-                    .unwrap_or_else(|| disk.path.clone())
+                disk.path.clone()
             }
         } else if let Some(ref vol) = part.volume_path {
             vol.clone()

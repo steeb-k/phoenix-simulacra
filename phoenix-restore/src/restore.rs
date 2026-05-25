@@ -63,6 +63,14 @@ pub fn run_restore(opts: RestoreOptions) -> Result<()> {
         if !entry.restore {
             continue;
         }
+        // Honor cancel between partitions — restore reopens the disk
+        // handle for each partition, so a check here lets us bail before
+        // any extra Win32 setup work.
+        if let Some(ref p) = opts.progress {
+            if p.is_cancelled() {
+                return Err(phoenix_core::error::PhoenixError::Cancelled);
+            }
+        }
         let idx_entry = reader
             .index
             .iter()

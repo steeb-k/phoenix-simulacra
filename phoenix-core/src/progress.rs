@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Thread-safe progress snapshot for GUI or CLI.
@@ -19,9 +20,15 @@ impl ProgressSnapshot {
     }
 }
 
+/// Progress + cancellation handle shared between the worker thread and the
+/// GUI (or any other observer). The cancel flag rides along on the same
+/// handle so every operation that already accepts an `Option<ProgressHandle>`
+/// — backup, restore, verify, future clone — automatically gets a uniform
+/// cancellation point without growing extra parameters in its signature.
 #[derive(Clone, Default)]
 pub struct ProgressHandle {
     inner: Arc<Mutex<ProgressSnapshot>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl ProgressHandle {
@@ -67,5 +74,25 @@ impl ProgressHandle {
 
     pub fn snapshot(&self) -> ProgressSnapshot {
         self.inner.lock().expect("progress lock").clone()
+    }
+
+    /// Signal the worker that the operation should abort at the next
+    /// chunk boundary. Cheap, lock-free, idempotent.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Read the cancel flag. Workers call this at chunk-loop granularity
+    /// to keep the wakeup latency bounded by a single chunk's worth of I/O.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Clear the cancel flag. Useful when reusing a `ProgressHandle`
+    /// across multiple sequential operations (we currently always create
+    /// a fresh one per worker, but exposing this avoids surprises if a
+    /// future caller decides to share).
+    pub fn reset_cancel(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
     }
 }

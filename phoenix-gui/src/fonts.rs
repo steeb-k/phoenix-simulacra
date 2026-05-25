@@ -52,9 +52,22 @@ pub fn install(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.text_styles.insert(TextStyle::Heading, FontId::new(22.0, bold_family.clone()));
     style.text_styles.insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
-    style.text_styles.insert(TextStyle::Button, FontId::new(14.0, FontFamily::Proportional));
+    // Buttons app-wide land at 16pt to match the form inputs on the Backup
+    // page (and the upgraded action row everywhere else). Pairs with the
+    // larger `button_padding` set below so every button reads as the same
+    // chunky pill-shaped control.
+    style.text_styles.insert(TextStyle::Button, FontId::new(16.0, FontFamily::Proportional));
     style.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
     style.text_styles.insert(TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace));
+
+    // Wider button padding so every `ui.button(…)` in the app renders at
+    // ~36px tall (16pt text + 2*10px padding) and matches the TextEdit
+    // outer height used on the Backup page. `interact_size.y` bumps the
+    // minimum hit-target for buttons that compute their natural size
+    // (e.g. short labels like "Browse…") so they don't collapse to the
+    // old 18px default.
+    style.spacing.button_padding = egui::vec2(12.0, 10.0);
+    style.spacing.interact_size.y = 36.0;
     ctx.set_style(style);
 }
 

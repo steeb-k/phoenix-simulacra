@@ -54,6 +54,11 @@ pub fn restore_raw(
 
     let sector_size = entry.sector_size as u64;
     for (chunk, record) in stream.chunks.iter().zip(chunk_records.iter()) {
+        if let Some(p) = progress {
+            if p.is_cancelled() {
+                return Err(phoenix_core::error::PhoenixError::Cancelled);
+            }
+        }
         let data = reader.read_chunk(chunk)?;
         if verify {
             let computed = phoenix_core::hash::hash_hex(&data);
