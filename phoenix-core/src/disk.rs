@@ -13,7 +13,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Ioctl::{
     DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
-    PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT,
+    IOCTL_STORAGE_QUERY_PROPERTY, PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT,
+    PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
+    StorageDeviceProperty,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -100,6 +102,14 @@ pub struct DiskInfo {
     pub disk_guid: Option<[u8; 16]>,
     pub disk_signature: u64,
     pub sector_size: u32,
+    /// Best-effort human label for the physical device. Populated from
+    /// `IOCTL_STORAGE_QUERY_PROPERTY` (vendor + product strings) when the
+    /// device exposes them; falls back to a `BusType`-derived hint
+    /// ("USB", "NVMe", "Virtual", ...) for devices that return blanks
+    /// (USB enclosures, RAID volumes, virtual disks). `None` only when
+    /// the IOCTL itself fails — the GUI then omits the trailing
+    /// " - <model>" segment in the disk label.
+    pub model: Option<String>,
     pub partitions: Vec<PartitionInfo>,
 }
 
@@ -152,6 +162,8 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
     let size_bytes = get_disk_length(handle)?;
     let layout = get_drive_layout(handle)?;
     let sector_size = 512u32;
+    // Failure here is non-fatal: the disk still enumerates without a model.
+    let model = query_disk_model(handle);
 
     let (is_gpt, disk_guid, disk_signature, partitions) = match layout {
         LayoutInfo::Gpt {
@@ -251,8 +263,109 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
         disk_guid,
         disk_signature,
         sector_size,
+        model,
         partitions,
     })
+}
+
+/// Ask the storage driver for the device's vendor + product strings via
+/// `IOCTL_STORAGE_QUERY_PROPERTY`. When those are blank (common for USB
+/// bridges, virtual disks, and some RAID controllers) fall back to a label
+/// derived from `BusType` / `RemovableMedia` so the GUI dropdown still has
+/// *something* useful to show. Any IOCTL or parse failure produces `None`,
+/// which the caller treats as "this disk has no model" — the dropdown just
+/// omits the trailing segment.
+///
+/// The 1024-byte buffer is intentionally generous: the descriptor header
+/// is ~40 bytes and Windows packs the four ASCIIZ strings (vendor, product,
+/// revision, serial) at the offsets it returns, all of which sit well
+/// inside that limit on every real device we've seen. If a device ever
+/// returns a longer descriptor we silently truncate at the buffer end.
+fn query_disk_model(handle: HANDLE) -> Option<String> {
+    const BUF_SIZE: usize = 1024;
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0u8; 1],
+    };
+    let mut buffer = [0u8; BUF_SIZE];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *const _,
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            buffer.as_mut_ptr() as *mut _,
+            BUF_SIZE as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 || (returned as usize) < size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+        debug!(last_error = unsafe { GetLastError() }, "IOCTL_STORAGE_QUERY_PROPERTY failed; model unknown");
+        return None;
+    }
+
+    // Pull the fixed header out before any pointer arithmetic on the buffer.
+    let descriptor = unsafe { &*(buffer.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
+    let vendor_off = descriptor.VendorIdOffset as usize;
+    let product_off = descriptor.ProductIdOffset as usize;
+    let bus_type = descriptor.BusType;
+    let removable = descriptor.RemovableMedia;
+
+    let read_at = |off: usize| -> Option<String> {
+        if off == 0 || off >= BUF_SIZE {
+            return None;
+        }
+        let bytes = &buffer[off..];
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let s = std::str::from_utf8(&bytes[..len]).ok()?.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    };
+
+    let combined = match (read_at(vendor_off), read_at(product_off)) {
+        (Some(v), Some(p)) if v.eq_ignore_ascii_case(&p) => Some(p),
+        (Some(v), Some(p)) => Some(format!("{v} {p}")),
+        (Some(v), None) => Some(v),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+
+    combined.or_else(|| Some(bus_type_label(bus_type, removable)))
+}
+
+/// Map `STORAGE_BUS_TYPE` values (defined in `ntddstor.h`) to a short
+/// human label. Used as the fallback when the device descriptor returns
+/// no vendor/product strings; falls through to "Removable" / "Fixed"
+/// for bus types we don't have a friendlier label for. windows-sys
+/// exposes `STORAGE_BUS_TYPE` as `i32`, so we match on that directly.
+fn bus_type_label(bus_type: i32, removable: u8) -> String {
+    match bus_type {
+        0x01 => "SCSI".into(),
+        0x03 => "ATA".into(),
+        0x04 => "FireWire".into(),
+        0x07 => "USB".into(),
+        0x08 => "RAID".into(),
+        0x09 => "iSCSI".into(),
+        0x0A => "SAS".into(),
+        0x0B => "SATA".into(),
+        0x0C => "SD".into(),
+        0x0D => "MMC".into(),
+        0x0E | 0x0F => "Virtual".into(),
+        0x11 => "NVMe".into(),
+        _ => {
+            if removable != 0 {
+                "Removable".into()
+            } else {
+                "Fixed".into()
+            }
+        }
+    }
 }
 
 struct GptEntry {

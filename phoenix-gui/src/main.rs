@@ -908,6 +908,80 @@ impl PhoenixApp {
         }
     }
 
+    /// "Select target" header + disk dropdown + refresh button on the
+    /// Restore page. Mirrors the layout of the Backup page's "Select
+    /// Source" header (header label on the left, refresh affordance on
+    /// the right) and binds the dropdown directly to
+    /// `self.target_disk_index` so the existing restore plumbing — which
+    /// already keys off that field — works unchanged.
+    ///
+    /// When `self.disks` is empty (typically because we're not running
+    /// elevated or `enumerate_disks` failed), the dropdown is replaced
+    /// with the same "No disks found / Refresh" affordance the Backup
+    /// page shows in that situation.
+    fn ui_restore_target_picker(&mut self, ui: &mut egui::Ui) {
+        if self.disks.is_empty() {
+            ui.label("No disks found. Run as Administrator.");
+            if refresh_disks_button(ui, &self.palette).clicked() {
+                self.refresh_disks();
+            }
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Select target").font(fonts::bold(16.0)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if refresh_disks_button(ui, &self.palette).clicked() {
+                    self.refresh_disks();
+                    // After a refresh the previously-selected disk may
+                    // have vanished (drive yanked, virtual disk
+                    // unmounted). Snap to the first disk in the new list
+                    // so the dropdown's `selected_text` always reflects
+                    // a real entry rather than stranding the user on a
+                    // ghost index.
+                    if !self
+                        .disks
+                        .iter()
+                        .any(|d| d.index == self.target_disk_index)
+                    {
+                        if let Some(first) = self.disks.first() {
+                            self.target_disk_index = first.index;
+                        }
+                    }
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("Choose the physical disk to restore the backup onto.")
+                .color(self.palette.subtle_text),
+        );
+        ui.add_space(4.0);
+
+        let selected_label = self
+            .disks
+            .iter()
+            .find(|d| d.index == self.target_disk_index)
+            .map(format_disk_choice)
+            .unwrap_or_else(|| "Pick a target disk".to_string());
+
+        // `from_id_salt` (rather than `from_label`) keeps the dropdown
+        // anonymous: the heading row above already announces what this
+        // control is, and a duplicate "Select target" tag next to the
+        // box would just be visual noise.
+        egui::ComboBox::from_id_salt("restore_target_disk")
+            .selected_text(selected_label)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for disk in &self.disks {
+                    ui.selectable_value(
+                        &mut self.target_disk_index,
+                        disk.index,
+                        format_disk_choice(disk),
+                    );
+                }
+            });
+    }
+
     /// Greyed-when-busy portion of the Restore page.
     fn ui_restore_form(&mut self, ui: &mut egui::Ui) {
         backup_path_picker(
@@ -916,7 +990,10 @@ impl PhoenixApp {
             "Path to .phnx file",
             &mut self.restore_backup_path,
         );
-        ui.add(egui::DragValue::new(&mut self.target_disk_index).prefix("Target disk "));
+
+        ui.add_space(8.0);
+        self.ui_restore_target_picker(ui);
+        ui.add_space(4.0);
 
         if ui.button("Load backup & plan").clicked() {
             let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
@@ -926,8 +1003,13 @@ impl PhoenixApp {
             self.restore_backup_path = path.display().to_string();
             match PhnxReader::open(&path) {
                 Ok(reader) => {
-                    let disks = enumerate_disks().unwrap_or_default();
-                    let size = disks
+                    // `self.disks` is the single source of truth — the new
+                    // target picker drives `self.target_disk_index` from
+                    // exactly that vector, and the user can re-poll Windows
+                    // via the picker's Refresh button. No need to re-run
+                    // `enumerate_disks` here.
+                    let size = self
+                        .disks
                         .iter()
                         .find(|d| d.index == self.target_disk_index)
                         .map(|d| d.size_bytes)
@@ -1128,6 +1210,21 @@ fn default_backup_folder() -> String {
         return format!(r"{profile}\Documents");
     }
     String::new()
+}
+
+/// Render a disk as the `"Disk N - 3.67 TB - Samsung SSD 970 EVO"` label
+/// used by the Restore page's target dropdown. The model segment is
+/// elided when `DiskInfo::model` is `None` (the IOCTL queried in
+/// `phoenix-core` failed) so the dropdown collapses cleanly to
+/// `"Disk N - 3.67 TB"` rather than printing a meaningless dangling
+/// dash.
+fn format_disk_choice(disk: &DiskInfo) -> String {
+    match disk.model.as_deref() {
+        Some(model) if !model.is_empty() => {
+            format!("Disk {} - {} - {}", disk.index, format_bytes(disk.size_bytes), model)
+        }
+        _ => format!("Disk {} - {}", disk.index, format_bytes(disk.size_bytes)),
+    }
 }
 
 /// Insert `-disk<N>` before the extension of `base`. Used when the user
