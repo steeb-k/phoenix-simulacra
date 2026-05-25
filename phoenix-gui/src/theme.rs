@@ -142,8 +142,12 @@ pub fn draw_focus_outline(ui: &Ui, response: &Response, palette: &Palette) {
     );
 }
 
-/// Lerp `a` toward `b` by `t` (0..1).
-fn tint(a: Color32, t: f32, b: Color32) -> Color32 {
+/// Lerp `a` toward `b` by `t` (0..1). Operates per-channel in sRGB space,
+/// which is "good enough" for picking palette tints — strict color
+/// correctness would do the lerp in linear-light, but for our use cases
+/// (subtle hover tints, the progress bar's breathing animation) the
+/// sRGB lerp matches what people expect a paint program would do.
+pub fn tint(a: Color32, t: f32, b: Color32) -> Color32 {
     let mix = |x: u8, y: u8| ((x as f32) * (1.0 - t) + (y as f32) * t) as u8;
     Color32::from_rgba_unmultiplied(
         mix(a.r(), b.r()),

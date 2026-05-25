@@ -320,7 +320,7 @@ impl eframe::App for PhoenixApp {
             )
             .show(ctx, |ui| {
                 if let Some(job) = &self.job {
-                    show_progress(ui, &job.progress);
+                    show_progress(ui, &job.progress, &self.palette);
                 }
                 ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
             });
@@ -495,7 +495,7 @@ fn coming_soon(ui: &mut egui::Ui, palette: &Palette, blurb: &str) {
     });
 }
 
-fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle) {
+fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle, palette: &Palette) {
     let snap = progress.snapshot();
     if !snap.active {
         return;
@@ -505,16 +505,43 @@ fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle) {
         ui.label(&snap.detail);
     }
     if snap.total > 0 {
+        let fraction = snap.fraction();
+        // Custom breathing fill: lerps the bar between a desaturated
+        // ~30%-accent + ~70%-input_bg blend and the full accent over a
+        // ~2s cycle. This swaps egui's built-in `.animate(true)` — which
+        // adds a hard-to-see grey "spinner arc" at the bar's leading edge
+        // and only pulses brightness by a barely-visible 30% — for a
+        // noticeably louder "this UI is alive" cue that doesn't need a
+        // spinner widget at all. We pulse via `ProgressBar::fill()` (a
+        // public builder method) instead of forking the widget.
+        let fill = if fraction >= 1.0 {
+            palette.accent
+        } else {
+            let t = ui.input(|i| i.time) as f32;
+            // 0..1 sinusoidal pulse with a ~2s period — matches the
+            // tempo of a calm human exhale-inhale, which avoids feeling
+            // anxious / busy.
+            let pulse = 0.5 + 0.5 * (t * std::f32::consts::PI).sin();
+            let dim_end = theme::tint(palette.accent, 0.7, palette.input_bg);
+            theme::tint(dim_end, pulse, palette.accent)
+        };
+
         ui.add(
-            egui::ProgressBar::new(snap.fraction())
+            egui::ProgressBar::new(fraction)
+                .fill(fill)
                 .text(format!(
                     "{} / {} ({:.1}%)",
                     format_bytes(snap.current),
                     format_bytes(snap.total),
-                    snap.fraction() * 100.0
-                ))
-                .animate(true),
+                    fraction * 100.0
+                )),
         );
+        if fraction < 1.0 {
+            // egui's `.animate(true)` would call this for us. Now that
+            // we're driving the animation ourselves we have to ask for
+            // the next frame explicitly or the pulse would freeze.
+            ui.ctx().request_repaint();
+        }
     } else {
         ui.add(egui::Spinner::new());
     }
