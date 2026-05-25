@@ -19,53 +19,23 @@ struct NtfsBootSector {
     clusters_per_mft_record: i8,
 }
 
+/// Stream every byte covered by `extents` from the (possibly volume-locked)
+/// reader through `stream`. The extents and `bitmap_hash` are produced by
+/// [`ntfs_plan`] **before** the volume is locked — this function deliberately
+/// does not re-read the boot sector or the allocation bitmap, because
+/// `FSCTL_GET_VOLUME_BITMAP` returns `ERROR_NOT_READY` (Win32 error 21) on a
+/// locked NTFS volume on at least some Windows builds (USB-attached volumes
+/// being a confirmed offender). All metadata work has to happen up front.
+///
+/// The extents passed in are the same ones written into the partition
+/// manifest, so `set_extent(ext_idx)` is unambiguous and there's no risk of
+/// two-bitmap-reads-can-disagree drift.
 pub fn capture_ntfs(
     reader: &mut PartitionReader,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
+    extents: &[Extent],
+    bitmap_hash: Option<String>,
 ) -> Result<(u64, Option<String>)> {
-    let mut boot = vec![0u8; 512];
-    reader.read_at(0, &mut boot)?;
-    let bs = parse_boot_sector(&boot)?;
-    let cluster_size = bs.bytes_per_sector as u64 * bs.sectors_per_cluster as u64;
-    let total_clusters = (bs.total_sectors * SECTOR_SIZE + cluster_size - 1) / cluster_size;
-
-    let mft_lcn = bs.mft_cluster.max(0) as u64;
-    let mft_offset = mft_lcn * cluster_size;
-
-    let bitmap = read_bitmap(reader, &bs, cluster_size, total_clusters)?;
-    let bitmap_hash = Some(hash::hash_hex(&bitmap));
-
-    let mut used_extents = Vec::new();
-    let mut i = 0u64;
-    while i < total_clusters {
-        if cluster_used(&bitmap, i as usize) {
-            let start = i;
-            while i < total_clusters && cluster_used(&bitmap, i as usize) {
-                i += 1;
-            }
-            used_extents.push((start, i - start));
-        } else {
-            i += 1;
-        }
-    }
-
-    // Always include boot sector region (first cluster)
-    let extents: Vec<Extent> = if used_extents.is_empty() {
-        vec![Extent {
-            start_sector: 0,
-            sector_count: (cluster_size / SECTOR_SIZE).max(1),
-        }]
-    } else {
-        used_extents
-            .iter()
-            .map(|(start_cluster, count)| Extent {
-                start_sector: (start_cluster * cluster_size) / SECTOR_SIZE,
-                sector_count: (count * cluster_size) / SECTOR_SIZE,
-            })
-            .collect()
-    };
-
-    stream.set_extent(0);
     let mut total_used = 0u64;
     for (ext_idx, extent) in extents.iter().enumerate() {
         stream.set_extent(ext_idx as u32);
@@ -84,7 +54,6 @@ pub fn capture_ntfs(
             pos += n as u64;
         }
     }
-
     Ok((total_used, bitmap_hash))
 }
 
@@ -207,13 +176,25 @@ fn patch_ntfs_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> R
     Ok(())
 }
 
-pub fn ntfs_extents(reader: &mut PartitionReader) -> Result<Vec<Extent>> {
+/// Read the NTFS boot sector and allocation bitmap once and translate them
+/// into `(used_extents, bitmap_hash)`. Callers must invoke this exactly once
+/// per partition, **before** acquiring `FSCTL_LOCK_VOLUME` on the same
+/// handle: the FSCTL_GET_VOLUME_BITMAP IOCTL fails with `ERROR_NOT_READY` on
+/// a locked NTFS volume on some Windows builds (USB-attached drives being a
+/// reliable reproducer), so the bitmap query has to happen on an unlocked
+/// handle. The returned extents are then handed to both
+/// `PhnxWriter::begin_partition_stream` (for the manifest) and
+/// [`capture_ntfs`] (for the data stream); reading the bitmap a second time
+/// would risk re-tripping the same IOCTL failure and re-introduce the
+/// previously-flagged two-reads-can-disagree race.
+pub fn ntfs_plan(reader: &mut PartitionReader) -> Result<(Vec<Extent>, Option<String>)> {
     let mut boot = vec![0u8; 512];
     reader.read_at(0, &mut boot)?;
     let bs = parse_boot_sector(&boot)?;
     let cluster_size = bs.bytes_per_sector as u64 * bs.sectors_per_cluster as u64;
     let total_clusters = (bs.total_sectors * SECTOR_SIZE + cluster_size - 1) / cluster_size;
     let bitmap = read_bitmap(reader, &bs, cluster_size, total_clusters)?;
+    let bitmap_hash = Some(hash::hash_hex(&bitmap));
 
     let mut extents = Vec::new();
     let mut i = 0u64;
@@ -232,10 +213,14 @@ pub fn ntfs_extents(reader: &mut PartitionReader) -> Result<Vec<Extent>> {
         }
     }
     if extents.is_empty() {
+        // The bitmap reported nothing allocated. This is almost always the
+        // fallback case (FSCTL unavailable -> read_bitmap returned all
+        // zeros); capture at least the boot region so a restored volume
+        // still has a recognizable header.
         extents.push(Extent {
             start_sector: 0,
             sector_count: (cluster_size / SECTOR_SIZE).max(8),
         });
     }
-    Ok(extents)
+    Ok((extents, bitmap_hash))
 }

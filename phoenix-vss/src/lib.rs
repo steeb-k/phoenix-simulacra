@@ -14,7 +14,12 @@
 //! reuse the OS's snapshot machinery without dragging a COM dependency into
 //! the build.
 
-use phoenix_core::error::{PhoenixError, Result};
+use phoenix_core::error::Result;
+// `PhoenixError` is only constructed on non-Windows hosts where VSS isn't
+// available; gating the import keeps the Windows build warning-free without
+// introducing dead `#[allow]` attributes scattered through the file.
+#[cfg(not(windows))]
+use phoenix_core::error::PhoenixError;
 
 /// A scope-bound set of VSS shadow copies. Snapshots created via
 /// [`VssSession::snapshot_volume`] are tracked by ShadowID and torn down on
