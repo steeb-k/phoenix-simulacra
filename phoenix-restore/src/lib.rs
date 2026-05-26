@@ -5,5 +5,8 @@ pub mod plan;
 pub mod relocation;
 pub mod restore;
 
-pub use plan::{RestorePlan, RestorePlanEntry};
+pub use plan::{
+    build_full_disk_plan, build_partial_plan, default_plan_from_backup, partition_allows_resize,
+    RestoreMode, RestorePlan, RestorePlanEntry,
+};
 pub use restore::{run_restore, verify_backup, verify_backup_with_progress};

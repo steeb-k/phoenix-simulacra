@@ -11,9 +11,11 @@ use phoenix_core::manifest::fs_kind_from_string;
 use tracing::info;
 
 use crate::partition_table::{
-    init_target_disk_as_gpt, notify_disk_updated, write_partition_layout, GptInitState,
+    init_target_disk_as_gpt, init_target_disk_as_mbr, notify_disk_updated,
+    update_partition_layout_existing, write_mbr_partition_layout, write_partition_layout,
+    GptInitState,
 };
-use crate::plan::RestorePlan;
+use crate::plan::{RestoreMode, RestorePlan};
 
 pub struct RestoreOptions {
     pub backup_path: std::path::PathBuf,
@@ -91,8 +93,9 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // *source* manifest style — a freshly `diskpart clean`-ed target
     // reports as MBR/RAW so `disk.is_gpt` would be `false` and we'd
     // skip the whole step.
+    let mode = opts.plan.mode();
     let source_was_gpt = reader.manifest.disk.style.eq_ignore_ascii_case("gpt");
-    let gpt_state: Option<GptInitState> = if source_was_gpt {
+    let gpt_state: Option<GptInitState> = if mode == RestoreMode::FullDisk && source_was_gpt {
         if let Some(ref p) = opts.progress {
             p.set_phase("Initializing target disk as GPT");
         }
@@ -103,6 +106,13 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             source_disk_guid,
         )?)
     } else {
+        if mode == RestoreMode::FullDisk && !source_was_gpt {
+            if let Some(ref p) = opts.progress {
+                p.set_phase("Initializing target disk as MBR");
+            }
+            let sig = (reader.header.disk_signature & 0xFFFF_FFFF) as u32;
+            init_target_disk_as_mbr(&disk.path, sig)?;
+        }
         None
     };
 
@@ -115,11 +125,12 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     let total_bytes: u64 = restoring
         .iter()
         .filter_map(|entry| {
+            let src = entry.source_partition_index?;
             reader
                 .manifest
                 .partitions
                 .iter()
-                .find(|p| p.index == entry.source_partition_index)
+                .find(|p| p.index == src)
         })
         .map(|p| p.used_bytes)
         .sum();
@@ -143,10 +154,13 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                 return Err(phoenix_core::error::PhoenixError::Cancelled);
             }
         }
+        let src_index = entry.source_partition_index.ok_or_else(|| {
+            phoenix_core::error::PhoenixError::Plan("restore entry missing source".into())
+        })?;
         let idx_entry = reader
             .index
             .iter()
-            .find(|e| e.index == entry.source_partition_index)
+            .find(|e| e.index == src_index)
             .cloned()
             .ok_or_else(|| {
                 phoenix_core::error::PhoenixError::Plan("partition index missing".into())
@@ -156,7 +170,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             .manifest
             .partitions
             .iter()
-            .find(|p| p.index == entry.source_partition_index)
+            .find(|p| p.index == src_index)
             .unwrap();
 
         let fs = fs_kind_from_string(&part_manifest.fs);
@@ -171,13 +185,13 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         if let Some(ref p) = opts.progress {
             p.set_phase(format!(
                 "Restoring partition {} ({})",
-                entry.source_partition_index, idx_entry.name
+                src_index, idx_entry.name
             ));
         }
 
         info!(
             "Restoring partition {} ({}) to offset {}",
-            entry.source_partition_index, idx_entry.name, entry.target_offset_bytes
+            src_index, idx_entry.name, entry.target_offset_bytes
         );
 
         // For NTFS shrink restores we build a relocation map up front
@@ -200,7 +214,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         };
         if let Some(ref m) = relocation {
             info!(
-                partition = entry.source_partition_index,
+                partition = src_index,
                 entries = m.entries.len(),
                 new_total_clusters = m.new_total_clusters,
                 "built NTFS relocation map for shrink"
@@ -267,11 +281,31 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         if let Some(ref p) = opts.progress {
             p.set_phase("Writing partition layout");
         }
-        write_partition_layout(&disk.path, &opts.plan, &state)?;
+        write_partition_layout(&disk.path, &opts.plan, &state, mode)?;
         if let Some(ref p) = opts.progress {
             p.set_phase("Notifying Windows of the new partition layout");
         }
         notify_disk_updated(&disk.path);
+    } else if mode == RestoreMode::FullDisk && !source_was_gpt {
+        if let Some(ref p) = opts.progress {
+            p.set_phase("Writing MBR partition layout");
+        }
+        write_mbr_partition_layout(&disk.path, &opts.plan)?;
+        notify_disk_updated(&disk.path);
+    } else if mode == RestoreMode::Partial && disk.is_gpt {
+        if let Some(guid_bytes) = disk.disk_guid {
+            if let Some(ref p) = opts.progress {
+                p.set_phase("Updating partition layout");
+            }
+            let disk_guid = bytes_to_guid(guid_bytes);
+            update_partition_layout_existing(
+                &disk.path,
+                &opts.plan,
+                &disk_guid,
+                disk.size_bytes,
+            )?;
+            notify_disk_updated(&disk.path);
+        }
     }
 
     if let Some(ref p) = opts.progress {
@@ -291,6 +325,15 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
 /// the same byte order `phoenix-core::disk` reads via `mem::transmute`
 /// from `windows-sys::core::GUID`. Returns `None` when the manifest
 /// didn't record a GUID (MBR sources) or when the string is malformed.
+fn bytes_to_guid(bytes: [u8; 16]) -> windows_sys::core::GUID {
+    windows_sys::core::GUID {
+        data1: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        data2: u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+        data3: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+        data4: bytes[8..16].try_into().unwrap(),
+    }
+}
+
 fn parse_disk_guid(s: Option<&str>) -> Option<[u8; 16]> {
     let s = s?;
     let parsed = uuid::Uuid::parse_str(s).ok()?;

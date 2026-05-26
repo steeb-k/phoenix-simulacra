@@ -31,12 +31,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    CREATE_DISK, CREATE_DISK_GPT, DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_CREATE_DISK,
-    IOCTL_DISK_SET_DRIVE_LAYOUT_EX, IOCTL_DISK_UPDATE_PROPERTIES, PARTITION_INFORMATION_EX,
-    PARTITION_STYLE_GPT,
+    CREATE_DISK, CREATE_DISK_GPT, CREATE_DISK_MBR, DRIVE_LAYOUT_INFORMATION_EX,
+    IOCTL_DISK_CREATE_DISK, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, IOCTL_DISK_UPDATE_PROPERTIES,
+    PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT, PARTITION_STYLE_MBR,
 };
 
-use crate::plan::RestorePlan;
+use crate::plan::{RestoreMode, RestorePlan};
 
 /// Standard ESP-data GUID — `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`. We
 /// stamp every restored partition with this type for now; per-partition
@@ -89,6 +89,37 @@ pub struct GptInitState {
 /// with `ERROR_ACCESS_DENIED` (Win32 5). The fix is to plant the
 /// partition entries *after* the data writes are done, which is what
 /// [`write_partition_layout`] takes care of.
+/// Initialize a target disk as MBR (full-disk restore from MBR backups).
+pub fn init_target_disk_as_mbr(disk_path: &str, disk_signature: u32) -> Result<()> {
+    let handle = open_disk_for_write(disk_path)?;
+    let mut create: CREATE_DISK = unsafe { std::mem::zeroed() };
+    create.PartitionStyle = PARTITION_STYLE_MBR;
+    create.Anonymous.Mbr = CREATE_DISK_MBR {
+        Signature: disk_signature,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_CREATE_DISK,
+            &create as *const _ as *mut _,
+            size_of::<CREATE_DISK>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(PhoenixError::Disk(format!(
+            "IOCTL_DISK_CREATE_DISK (MBR) failed (Win32 error {err})"
+        )));
+    }
+    Ok(())
+}
+
 pub fn init_target_disk_as_gpt(
     disk_path: &str,
     disk_size_bytes: u64,
@@ -120,13 +151,46 @@ pub fn write_partition_layout(
     disk_path: &str,
     plan: &RestorePlan,
     state: &GptInitState,
+    mode: RestoreMode,
 ) -> Result<()> {
-    let restoring: Vec<_> = plan.entries.iter().filter(|e| e.restore).collect();
-    if restoring.is_empty() {
+    let layout_entries: Vec<_> = match mode {
+        RestoreMode::FullDisk => plan.entries.iter().filter(|e| e.restore).collect(),
+        RestoreMode::Partial => plan.entries.iter().collect(),
+    };
+    if layout_entries.is_empty() {
         return Ok(());
     }
     let handle = open_disk_for_write(disk_path)?;
-    let res = set_drive_layout(handle, &restoring, &state.disk_guid, state.disk_size_bytes);
+    let res = set_drive_layout(handle, &layout_entries, &state.disk_guid, state.disk_size_bytes);
+    unsafe { CloseHandle(handle) };
+    res
+}
+
+/// Write an MBR partition table after a full-disk restore onto MBR media.
+pub fn write_mbr_partition_layout(disk_path: &str, plan: &RestorePlan) -> Result<()> {
+    let layout_entries: Vec<_> = plan.entries.iter().filter(|e| e.restore).collect();
+    if layout_entries.is_empty() {
+        return Ok(());
+    }
+    let handle = open_disk_for_write(disk_path)?;
+    let res = set_drive_layout_mbr(handle, &layout_entries);
+    unsafe { CloseHandle(handle) };
+    res
+}
+
+/// Update GPT entries on an already-initialized disk (partial restore).
+pub fn update_partition_layout_existing(
+    disk_path: &str,
+    plan: &RestorePlan,
+    disk_guid: &GUID,
+    disk_size_bytes: u64,
+) -> Result<()> {
+    let layout_entries: Vec<_> = plan.entries.iter().collect();
+    if layout_entries.is_empty() {
+        return Ok(());
+    }
+    let handle = open_disk_for_write(disk_path)?;
+    let res = set_drive_layout(handle, &layout_entries, disk_guid, disk_size_bytes);
     unsafe { CloseHandle(handle) };
     res
 }
@@ -197,6 +261,64 @@ fn create_gpt_disk(handle: HANDLE, disk_guid: &GUID) -> Result<()> {
         let err = unsafe { GetLastError() };
         return Err(PhoenixError::Disk(format!(
             "IOCTL_DISK_CREATE_DISK failed (Win32 error {err}); the target disk could not be initialized as GPT. Common causes: another process holds the disk open, the disk is read-only, or the application is not running as Administrator."
+        )));
+    }
+    Ok(())
+}
+
+fn set_drive_layout_mbr(handle: HANDLE, restoring: &[&crate::plan::RestorePlanEntry]) -> Result<()> {
+    const PARTITION_IFS: u8 = 0x07;
+    let header_size = size_of::<DRIVE_LAYOUT_INFORMATION_EX>();
+    let entry_size = size_of::<PARTITION_INFORMATION_EX>();
+    let buf_size = header_size + restoring.len() * entry_size;
+    let mut buffer = vec![0u8; buf_size];
+    let layout = unsafe { &mut *(buffer.as_mut_ptr() as *mut DRIVE_LAYOUT_INFORMATION_EX) };
+    layout.PartitionStyle = PARTITION_STYLE_MBR as u32;
+    layout.PartitionCount = restoring.len() as u32;
+    layout.Anonymous.Mbr = windows_sys::Win32::System::Ioctl::DRIVE_LAYOUT_INFORMATION_MBR {
+        Signature: 0,
+        CheckSum: 0,
+    };
+
+    let entry_ptr = layout.PartitionEntry.as_mut_ptr();
+    for (i, entry) in restoring.iter().enumerate() {
+        let part = unsafe { &mut *entry_ptr.add(i) };
+        part.PartitionStyle = PARTITION_STYLE_MBR;
+        part.StartingOffset = entry.target_offset_bytes as i64;
+        part.PartitionLength = entry.target_size_bytes as i64;
+        part.PartitionNumber = (i + 1) as u32;
+        part.RewritePartition = 1;
+        part.Anonymous.Mbr = windows_sys::Win32::System::Ioctl::PARTITION_INFORMATION_MBR {
+            PartitionType: PARTITION_IFS,
+            BootIndicator: if i == 0 { 1 } else { 0 },
+            RecognizedPartition: 1,
+            HiddenSectors: (entry.target_offset_bytes / 512) as u32,
+            PartitionId: GUID {
+                data1: 0,
+                data2: 0,
+                data3: 0,
+                data4: [0; 8],
+            },
+        };
+    }
+
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_SET_DRIVE_LAYOUT_EX,
+            buffer.as_ptr() as *mut _,
+            buf_size as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(PhoenixError::Disk(format!(
+            "IOCTL_DISK_SET_DRIVE_LAYOUT_EX (MBR) failed (Win32 error {err})"
         )));
     }
     Ok(())
