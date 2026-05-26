@@ -1,5 +1,8 @@
+mod disk_map;
 mod disk_panel;
 mod fonts;
+mod restore_layout;
+mod restore_panel;
 mod job;
 mod sidebar;
 mod theme;
@@ -16,7 +19,6 @@ use phoenix_capture::backup::BackupOptions;
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
 use phoenix_core::ProgressHandle;
-use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
 use phoenix_restore::restore::RestoreOptions;
 
 use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob, JobKind};
@@ -159,7 +161,7 @@ struct PhoenixApp {
     restore_backup_load_after: Option<Instant>,
     /// Set by Browse to load immediately on the next frame.
     restore_backup_load_now: bool,
-    restore_plan_entries: Vec<RestorePlanEntry>,
+    restore_layout: Option<restore_layout::RestoreLayoutState>,
     target_disk_index: u32,
     status: String,
     page: Page,
@@ -188,7 +190,7 @@ impl PhoenixApp {
             restore_loaded_path: String::new(),
             restore_backup_load_after: None,
             restore_backup_load_now: false,
-            restore_plan_entries: Vec::new(),
+            restore_layout: None,
             target_disk_index: 0,
             status: "Ready".into(),
             page: Page::Backup,
@@ -237,7 +239,7 @@ impl PhoenixApp {
         self.restore_loaded_path.clear();
         self.restore_backup_load_after = None;
         self.restore_backup_load_now = false;
-        self.restore_plan_entries.clear();
+        self.restore_layout = None;
     }
 
     fn target_disk_size_bytes(&self) -> u64 {
@@ -263,22 +265,15 @@ impl PhoenixApp {
         }
         match PhnxReader::open(path) {
             Ok(reader) => {
-                let plan = default_plan_from_backup(
-                    path_str,
-                    &reader,
-                    self.target_disk_index,
-                    self.target_disk_size_bytes(),
-                );
-                self.restore_plan_entries = plan.entries;
+                self.restore_layout =
+                    Some(restore_layout::RestoreLayoutState::from_backup(path_str, &reader));
                 self.restore_loaded_path = path_str.to_string();
-                self.status = format!(
-                    "Loaded backup — {} partition(s)",
-                    self.restore_plan_entries.len()
-                );
+                let n = reader.index.len();
+                self.status = format!("Loaded backup — {n} partition(s)");
             }
             Err(e) => {
                 self.restore_loaded_path.clear();
-                self.restore_plan_entries.clear();
+                self.restore_layout = None;
                 self.status = format!("Load failed: {e}");
             }
         }
@@ -998,7 +993,10 @@ impl PhoenixApp {
             self.ui_restore_form(ui);
         });
 
-        let plan_ready = !self.restore_plan_entries.is_empty();
+        let plan_ready = self
+            .restore_layout
+            .as_ref()
+            .is_some_and(|l| l.has_restorable_entries());
         let starts = [StartAction {
             label: "Run restore",
             enabled: !busy && plan_ready,
@@ -1122,13 +1120,28 @@ impl PhoenixApp {
         }
         ui.add_space(4.0);
 
-        if !self.restore_plan_entries.is_empty() {
+        if let Some(target) = self
+            .disks
+            .iter()
+            .find(|d| d.index == self.target_disk_index)
+            .cloned()
+        {
+            if let Some(layout) = self.restore_layout.as_mut() {
+                let panel_out = restore_panel::show(
+                    ui,
+                    layout,
+                    &target,
+                    &self.palette,
+                    ui.available_width(),
+                );
+                if panel_out.plan_entries_updated {
+                    // layout drives plan at run time
+                }
+            }
+        } else if self.restore_layout.is_some() {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} partition(s) in plan",
-                    self.restore_plan_entries.len()
-                ))
-                .color(self.palette.subtle_text),
+                egui::RichText::new("Select a target disk to map partitions.")
+                    .color(self.palette.subtle_text),
             );
         }
     }
@@ -1139,11 +1152,25 @@ impl PhoenixApp {
             return;
         };
         self.restore_backup_path = backup_path.display().to_string();
-        let plan = RestorePlan {
-            backup_path: self.restore_backup_path.clone(),
-            target_disk_index: self.target_disk_index,
-            entries: self.restore_plan_entries.clone(),
+        let Some(layout) = self.restore_layout.as_ref() else {
+            self.status = "No restore layout — load a backup first".into();
+            return;
         };
+        let Some(target) = self.disks.iter().find(|d| d.index == self.target_disk_index) else {
+            self.status = "Target disk not found".into();
+            return;
+        };
+        let plan = layout.to_restore_plan(target);
+        if let Ok(mut reader) = PhnxReader::open(&backup_path) {
+            if let Err(e) = plan.validate_against_backup(&reader.manifest) {
+                self.status = format!("Plan invalid: {e}");
+                return;
+            }
+            if let Err(e) = plan.validate_extents_fit(&mut reader) {
+                self.status = format!("Plan invalid: {e}");
+                return;
+            }
+        }
         let progress = ProgressHandle::new();
         // Surfaces while `run_restore` is doing its pre-flight work
         // (opening the .phnx, validating the plan, enumerating disks,
