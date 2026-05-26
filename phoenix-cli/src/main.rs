@@ -115,11 +115,21 @@ fn main() -> anyhow::Result<()> {
                 verify_on_restore: verify,
                 progress: None,
             })?;
-            if summary.partitions_resized > 0 {
+            // Mirror the GUI logic: only emit the chkdsk hint for
+            // partitions that didn't get our metadata rewriter pass.
+            // NTFS shrinks (with or without relocation) already get
+            // their `$Bitmap` / `$LogFile` / MFT mirror reconciled by
+            // `ntfs_meta`, so the hint would just be wrong noise for
+            // them. Other resize cases (NTFS grows, FAT/exFAT resizes)
+            // still need user-side chkdsk until those FS-specific
+            // cleanup paths land.
+            let needs_chkdsk = summary.partitions_needing_chkdsk();
+            if needs_chkdsk > 0 {
                 info!(
-                    partitions_resized = summary.partitions_resized,
-                    "One or more partitions were resized — run `chkdsk /F` on each restored \
-                     volume so Windows can reconcile filesystem metadata"
+                    partitions_needing_chkdsk = needs_chkdsk,
+                    "One or more partitions were resized without automatic metadata cleanup — \
+                     run `chkdsk /F` on each restored volume so Windows can reconcile \
+                     filesystem metadata"
                 );
             }
         }

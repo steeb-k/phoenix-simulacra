@@ -107,7 +107,23 @@ pub fn build_relocation_map(
     }
 
     if !needs_relocation {
-        return Ok(None);
+        // No clusters past the boundary — no physical relocation
+        // required. We still return Some(empty_map) rather than
+        // None so the NTFS metadata rewriter runs in `restore_ntfs`
+        // and gets a chance to truncate `$Bitmap` past the new
+        // boundary, stamp `$LogFile` clean, and re-mirror the first
+        // four MFT records. Without that step, a shrink restore is
+        // technically mountable but Windows still wants `chkdsk /F`
+        // to reconcile `$Bitmap` against the new total_clusters.
+        // The empty `entries` vec means `translate_write` and
+        // `relocate_runs` are identity transforms in this mode.
+        return Ok(Some(RelocationMap {
+            sector_size,
+            cluster_size,
+            safe_max_cluster,
+            new_total_clusters,
+            entries: Vec::new(),
+        }));
     }
 
     below_used.sort_by_key(|&(s, _)| s);
@@ -200,11 +216,19 @@ mod tests {
     const CLUSTER: u64 = 4096;
 
     #[test]
-    fn no_relocation_when_data_fits() {
+    fn no_relocation_returns_empty_map_when_data_fits() {
+        // Used data lives entirely below the boundary, so no clusters
+        // need physical relocation. We still expect a map so the
+        // NTFS metadata rewriter runs (truncates `$Bitmap`, stamps
+        // `$LogFile`, etc.) — just one with no entries.
         let extents = vec![ext(0, 100 * 8)];
         let target_bytes = 200 * CLUSTER;
-        let map = build_relocation_map(&extents, SECTOR, CLUSTER, target_bytes).unwrap();
-        assert!(map.is_none());
+        let map = build_relocation_map(&extents, SECTOR, CLUSTER, target_bytes)
+            .unwrap()
+            .expect("expected Some(empty_map), not None");
+        assert!(map.entries.is_empty());
+        assert_eq!(map.new_total_clusters, 200);
+        assert_eq!(map.safe_max_cluster, 199);
     }
 
     #[test]
