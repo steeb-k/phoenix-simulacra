@@ -19,12 +19,14 @@ use phoenix_core::ProgressHandle;
 use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
 use phoenix_restore::restore::RestoreOptions;
 
-use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob};
+use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob, JobKind};
 use crate::sidebar::Page;
 use crate::theme::Palette;
 use crate::util::format_bytes;
 
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Debounce before auto-loading a `.phnx` path typed into the Restore page.
+const RESTORE_BACKUP_LOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 const REFRESH_BTN_SIZE: f32 = 52.0;
 const REFRESH_ICON_SIZE: f32 = 32.0;
 /// Form-action button width on the Backup page (Browse, Start backup).
@@ -151,6 +153,12 @@ struct PhoenixApp {
     /// 1-based index of the job currently running for the status text.
     current_backup_index: usize,
     restore_backup_path: String,
+    /// Path we last successfully loaded (skip redundant opens).
+    restore_loaded_path: String,
+    /// When the user edits the backup path, load after this instant.
+    restore_backup_load_after: Option<Instant>,
+    /// Set by Browse to load immediately on the next frame.
+    restore_backup_load_now: bool,
     restore_plan_entries: Vec<RestorePlanEntry>,
     target_disk_index: u32,
     status: String,
@@ -177,6 +185,9 @@ impl PhoenixApp {
             total_backups: 0,
             current_backup_index: 0,
             restore_backup_path: String::new(),
+            restore_loaded_path: String::new(),
+            restore_backup_load_after: None,
+            restore_backup_load_now: false,
             restore_plan_entries: Vec::new(),
             target_disk_index: 0,
             status: "Ready".into(),
@@ -222,6 +233,77 @@ impl PhoenixApp {
         self.job.as_ref().is_some_and(|j| j.is_running()) || !self.pending_backups.is_empty()
     }
 
+    fn clear_restore_ui_state(&mut self) {
+        self.restore_loaded_path.clear();
+        self.restore_backup_load_after = None;
+        self.restore_backup_load_now = false;
+        self.restore_plan_entries.clear();
+    }
+
+    fn target_disk_size_bytes(&self) -> u64 {
+        self.disks
+            .iter()
+            .find(|d| d.index == self.target_disk_index)
+            .map(|d| d.size_bytes)
+            .unwrap_or(0)
+    }
+
+    fn try_load_restore_backup(&mut self) {
+        let path_str = self.restore_backup_path.trim();
+        if path_str.is_empty() {
+            self.clear_restore_ui_state();
+            return;
+        }
+        let path = Path::new(path_str);
+        if !path.is_file() {
+            return;
+        }
+        if self.restore_loaded_path == path_str {
+            return;
+        }
+        match PhnxReader::open(path) {
+            Ok(reader) => {
+                let plan = default_plan_from_backup(
+                    path_str,
+                    &reader,
+                    self.target_disk_index,
+                    self.target_disk_size_bytes(),
+                );
+                self.restore_plan_entries = plan.entries;
+                self.restore_loaded_path = path_str.to_string();
+                self.status = format!(
+                    "Loaded backup — {} partition(s)",
+                    self.restore_plan_entries.len()
+                );
+            }
+            Err(e) => {
+                self.restore_loaded_path.clear();
+                self.restore_plan_entries.clear();
+                self.status = format!("Load failed: {e}");
+            }
+        }
+    }
+
+    fn schedule_restore_backup_load(&mut self) {
+        self.restore_backup_load_after =
+            Some(Instant::now() + RESTORE_BACKUP_LOAD_DEBOUNCE);
+    }
+
+    fn poll_restore_backup_load(&mut self) {
+        if self.restore_backup_load_now {
+            self.restore_backup_load_now = false;
+            self.restore_backup_load_after = None;
+            self.try_load_restore_backup();
+            return;
+        }
+        if let Some(deadline) = self.restore_backup_load_after {
+            if Instant::now() >= deadline {
+                self.restore_backup_load_after = None;
+                self.try_load_restore_backup();
+            }
+        }
+    }
+
     fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else {
             return;
@@ -245,6 +327,9 @@ impl PhoenixApp {
                         } else {
                             msg
                         };
+                        if job_kind == JobKind::Restore {
+                            self.clear_restore_ui_state();
+                        }
                         self.total_backups = 0;
                         self.current_backup_index = 0;
                     }
@@ -308,6 +393,9 @@ impl eframe::App for PhoenixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job(ctx);
         self.maybe_refresh_theme(ctx);
+        if self.page == Page::Restore {
+            self.poll_restore_backup_load();
+        }
 
         let busy = self.busy();
         sidebar::show(ctx, &mut self.page, &self.palette, busy);
@@ -433,7 +521,17 @@ fn action_row(
 /// "Save backup to folder" row on the Backup page: 14pt bold label, 16pt
 /// field text with `(10, 8)` margins, and a `Browse…` button whose width
 /// is reserved on the right so it never falls off the side of the pane.
-fn backup_path_picker(ui: &mut egui::Ui, label: &str, hint: &str, path: &mut String) {
+///
+/// When `on_path_changed` is `Some`, it is called after the text field
+/// loses focus with a changed value, and immediately after Browse picks a file.
+/// Returns `true` if Browse selected a new file.
+fn backup_path_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: &str,
+    path: &mut String,
+    mut on_path_changed: Option<&mut dyn FnMut()>,
+) -> bool {
     ui.label(egui::RichText::new(label).font(fonts::bold(14.0)));
     ui.horizontal(|ui| {
         // Same trick as the folder picker on the Backup page: take the
@@ -451,12 +549,18 @@ fn backup_path_picker(ui: &mut egui::Ui, label: &str, hint: &str, path: &mut Str
                 .margin(egui::Margin::symmetric(10.0, 8.0))
                 .hint_text(hint),
         );
+        if let Some(cb) = on_path_changed.as_deref_mut() {
+            if field_response.lost_focus() && field_response.changed() {
+                cb();
+            }
+        }
 
         // Outer (visible) height of the TextEdit — the response rect is
         // the inner text area, so add back the vertical margin to get the
         // height the user actually sees and size Browse to match.
         let visible_h = field_response.rect.height() + INPUT_MARGIN_RESTORE;
 
+        let mut browsed = false;
         if ui
             .add_sized(
                 [FORM_BUTTON_W, visible_h],
@@ -468,9 +572,15 @@ fn backup_path_picker(ui: &mut egui::Ui, label: &str, hint: &str, path: &mut Str
         {
             if let Some(picked) = pick_backup_open_path(path) {
                 *path = picked.display().to_string();
+                browsed = true;
+                if let Some(cb) = on_path_changed.as_deref_mut() {
+                    cb();
+                }
             }
         }
-    });
+        browsed
+    })
+    .inner
 }
 
 fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
@@ -895,7 +1005,7 @@ impl PhoenixApp {
             disabled_hint: Some(if busy {
                 "A restore is already running"
             } else {
-                "Load a backup & plan first"
+                "Choose a backup file first"
             }),
         }];
         let (start_clicked, cancel_clicked) =
@@ -984,62 +1094,42 @@ impl PhoenixApp {
 
     /// Greyed-when-busy portion of the Restore page.
     fn ui_restore_form(&mut self, ui: &mut egui::Ui) {
-        backup_path_picker(
+        let path_before = self.restore_backup_path.clone();
+        let mut path_edited = false;
+        let browsed = backup_path_picker(
             ui,
-            "Backup file",
+            "Source media",
             "Path to .phnx file",
             &mut self.restore_backup_path,
+            Some(&mut || path_edited = true),
         );
-
-        ui.add_space(8.0);
-        self.ui_restore_target_picker(ui);
-        ui.add_space(4.0);
-
-        if ui.button("Load backup & plan").clicked() {
-            let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
-                self.status = "Load cancelled — no backup file chosen".into();
-                return;
-            };
-            self.restore_backup_path = path.display().to_string();
-            match PhnxReader::open(&path) {
-                Ok(reader) => {
-                    // `self.disks` is the single source of truth — the new
-                    // target picker drives `self.target_disk_index` from
-                    // exactly that vector, and the user can re-poll Windows
-                    // via the picker's Refresh button. No need to re-run
-                    // `enumerate_disks` here.
-                    let size = self
-                        .disks
-                        .iter()
-                        .find(|d| d.index == self.target_disk_index)
-                        .map(|d| d.size_bytes)
-                        .unwrap_or(0);
-                    let plan = default_plan_from_backup(
-                        &self.restore_backup_path,
-                        &reader,
-                        self.target_disk_index,
-                        size,
-                    );
-                    self.restore_plan_entries = plan.entries;
-                    self.status = "Plan loaded — edit sizes below".into();
-                }
-                Err(e) => self.status = format!("Load failed: {e}"),
+        if browsed {
+            self.restore_backup_load_now = true;
+        } else if path_edited && self.restore_backup_path != path_before {
+            if self.restore_backup_path.trim().is_empty() {
+                self.clear_restore_ui_state();
+            } else {
+                self.schedule_restore_backup_load();
             }
         }
 
-        for entry in &mut self.restore_plan_entries {
-            ui.group(|ui| {
-                ui.checkbox(
-                    &mut entry.restore,
-                    format!("Partition {}", entry.source_partition_index),
-                );
-                ui.label(format!("Offset: {} bytes", entry.target_offset_bytes));
-                ui.add(
-                    egui::DragValue::new(&mut entry.target_size_bytes)
-                        .speed(1_000_000)
-                        .prefix("Size "),
-                );
-            });
+        ui.add_space(8.0);
+        let prev_target = self.target_disk_index;
+        self.ui_restore_target_picker(ui);
+        if self.target_disk_index != prev_target && !self.restore_backup_path.trim().is_empty() {
+            self.restore_loaded_path.clear();
+            self.restore_backup_load_now = true;
+        }
+        ui.add_space(4.0);
+
+        if !self.restore_plan_entries.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} partition(s) in plan",
+                    self.restore_plan_entries.len()
+                ))
+                .color(self.palette.subtle_text),
+            );
         }
     }
 
@@ -1079,11 +1169,12 @@ impl PhoenixApp {
         );
 
         ui.add_enabled_ui(!busy, |ui| {
-            backup_path_picker(
+            let _ = backup_path_picker(
                 ui,
                 "Backup file",
                 "Path to .phnx file",
                 &mut self.restore_backup_path,
+                None,
             );
         });
 
