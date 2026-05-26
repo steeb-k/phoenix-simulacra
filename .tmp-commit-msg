@@ -1,6 +1,0 @@
-chore: drop stray .git-commit-msg.tmp checked in by mistake
-
-The previous commit accidentally added the temporary file used to
-hand a multi-line commit message to git on PowerShell (which doesn't
-support bash-style heredocs). Remove it; future commits will
-.gitignore the path or use a different mechanism.
