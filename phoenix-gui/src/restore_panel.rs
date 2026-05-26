@@ -220,27 +220,31 @@ fn draw_target_row(
             }
         }
 
-        let fs = layout.target_partition_fs(target, part);
+        let fs = layout.target_partition_fs(view, part);
         let resizable = phoenix_restore::plan::partition_allows_resize(fs);
-        let body_rect = if resizable {
+
+        // Every assigned partition can be moved by dragging its body.
+        let move_rect = if resizable {
             seg_rect.shrink2(egui::vec2(EDGE_HANDLE_PX, 0.0))
         } else {
             seg_rect
         };
-        let body = ui.interact(body_rect, id.with("body"), Sense::click_and_drag());
+        let move_body = ui.interact(move_rect, id.with("move"), Sense::drag());
 
-        if body.drag_started() && assigned {
-            let off = pixel_to_disk_offset(map_rect, view.size_bytes, body.interact_pointer_pos().unwrap().x);
-            layout.begin_move(part, off);
+        if move_body.drag_started() && assigned {
+            if let Some(pos) = move_body.interact_pointer_pos() {
+                let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
+                layout.begin_move(part, off);
+            }
         }
-        if body.dragged() && layout.drag.is_some() {
-            if let Some(pos) = body.interact_pointer_pos() {
+        if move_body.dragged() && layout.drag.is_some() {
+            if let Some(pos) = move_body.interact_pointer_pos() {
                 let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
                 layout.update_drag(view, off);
                 changed = true;
             }
         }
-        if body.drag_stopped() {
+        if move_body.drag_stopped() {
             layout.end_drag();
         }
 
@@ -278,7 +282,7 @@ fn draw_target_row(
             seg_rect,
             p,
             palette,
-            body.hovered(),
+            move_body.hovered() || move_body.dragged(),
             assigned,
             overlay.as_deref(),
         );

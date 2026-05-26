@@ -213,6 +213,13 @@ pub fn align_up(value: u64, align: u64) -> u64 {
     ((value + align - 1) / align) * align
 }
 
+pub fn align_down(value: u64, align: u64) -> u64 {
+    if align == 0 {
+        return value;
+    }
+    (value / align) * align
+}
+
 pub fn default_plan_from_backup(
     backup_path: &str,
     reader: &PhnxReader,
@@ -253,18 +260,15 @@ pub fn build_full_disk_plan(
     }
 }
 
+/// Grow NTFS partition(s) into free space at the end of the disk. Partitions that
+/// sat after NTFS in the backup layout (e.g. Windows RE) are moved to the tail
+/// so NTFS can expand without overlapping them.
 fn expand_ntfs_slack(
     entries: &mut [RestorePlanEntry],
     reader: &PhnxReader,
     target_disk_size: u64,
     align: u64,
 ) {
-    let used: u64 = entries.iter().map(|e| e.target_size_bytes).sum();
-    let slack = target_disk_size.saturating_sub(used);
-    if slack < align {
-        return;
-    }
-
     let ntfs_indices: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -283,28 +287,81 @@ fn expand_ntfs_slack(
         return;
     }
 
-    let total_ntfs_orig: u64 = ntfs_indices
+    // Latest-starting NTFS is treated as the main data partition to expand.
+    let primary_ntfs = *ntfs_indices
         .iter()
-        .map(|&i| entries[i].target_size_bytes)
-        .sum();
+        .max_by_key(|&&i| entries[i].target_offset_bytes)
+        .unwrap();
+    let ntfs_start = entries[primary_ntfs].target_offset_bytes;
+    let ntfs_orig_end = ntfs_start.saturating_add(entries[primary_ntfs].target_size_bytes);
 
-    if ntfs_indices.len() == 1 {
-        entries[ntfs_indices[0]].target_size_bytes =
-            align_up(entries[ntfs_indices[0]].target_size_bytes + slack, align);
-        return;
+    // Tail = every other partition at/after the original NTFS end (RE, etc.).
+    let mut tail: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            *i != primary_ntfs
+                && !ntfs_indices.contains(i)
+                && e.target_offset_bytes >= ntfs_orig_end.saturating_sub(align)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    tail.sort_by_key(|&i| entries[i].target_offset_bytes);
+
+    // Pack tail partitions against the end of the disk.
+    let mut cursor = align_down(target_disk_size, align);
+    for &i in tail.iter().rev() {
+        let size = entries[i].target_size_bytes;
+        if size > cursor {
+            break;
+        }
+        cursor = cursor.saturating_sub(size);
+        entries[i].target_offset_bytes = align_down(cursor, align);
+        cursor = entries[i].target_offset_bytes;
     }
 
-    let mut remaining = slack;
-    for (pos, &idx) in ntfs_indices.iter().enumerate() {
-        let share = if pos + 1 == ntfs_indices.len() {
+    // Main NTFS fills the gap from its start to the first tail partition (or disk end).
+    let ntfs_end = if let Some(&first_tail) = tail.first() {
+        entries[first_tail].target_offset_bytes
+    } else {
+        align_down(target_disk_size, align)
+    };
+
+    if ntfs_end > ntfs_start {
+        entries[primary_ntfs].target_size_bytes = align_down(ntfs_end.saturating_sub(ntfs_start), align);
+    }
+
+    // Additional NTFS volumes (rare) share any space after the tail pack.
+    let extra_ntfs: Vec<usize> = ntfs_indices
+        .iter()
+        .copied()
+        .filter(|&i| i != primary_ntfs)
+        .collect();
+    if extra_ntfs.is_empty() {
+        return;
+    }
+    let layout_end = entries
+        .iter()
+        .map(|e| e.target_offset_bytes.saturating_add(e.target_size_bytes))
+        .max()
+        .unwrap_or(0);
+    let trailing = target_disk_size.saturating_sub(layout_end);
+    if trailing < align {
+        return;
+    }
+    let total_extra_orig: u64 = extra_ntfs.iter().map(|&i| entries[i].target_size_bytes).sum();
+    let mut remaining = trailing;
+    for (pos, &idx) in extra_ntfs.iter().enumerate() {
+        let share = if pos + 1 == extra_ntfs.len() {
             remaining
-        } else if total_ntfs_orig > 0 {
-            slack * entries[idx].target_size_bytes / total_ntfs_orig
+        } else if total_extra_orig > 0 {
+            trailing * entries[idx].target_size_bytes / total_extra_orig
         } else {
-            slack / ntfs_indices.len() as u64
+            trailing / extra_ntfs.len() as u64
         };
         remaining = remaining.saturating_sub(share);
-        entries[idx].target_size_bytes = align_up(entries[idx].target_size_bytes + share, align);
+        entries[idx].target_size_bytes =
+            align_up(entries[idx].target_size_bytes.saturating_add(share), align);
     }
 }
 

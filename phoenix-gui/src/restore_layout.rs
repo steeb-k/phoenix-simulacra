@@ -323,10 +323,22 @@ impl RestoreLayoutState {
                     pointer_offset.saturating_sub(grab_offset_in_part),
                     self.align_bytes,
                 );
-                if let Some(a) = self.assignments.get_mut(&target_part) {
-                    if new_offset + a.size_bytes <= layout_disk.size_bytes
-                        && !overlaps_other(layout_disk, target_part, new_offset, a.size_bytes)
-                    {
+                let size = self
+                    .assignments
+                    .get(&target_part)
+                    .map(|a| a.size_bytes)
+                    .unwrap_or(0);
+                if size > 0
+                    && new_offset.saturating_add(size) <= layout_disk.size_bytes
+                    && !overlaps_assignments(
+                        &self.assignments,
+                        target_part,
+                        new_offset,
+                        size,
+                        layout_disk.size_bytes,
+                    )
+                {
+                    if let Some(a) = self.assignments.get_mut(&target_part) {
                         a.offset_bytes = new_offset;
                     }
                 }
@@ -359,8 +371,16 @@ impl RestoreLayoutState {
                     let new_end = align_up(pointer_offset, self.align_bytes);
                     if new_end > a.offset_bytes {
                         let new_size = new_end - a.offset_bytes;
+                        let offset = a.offset_bytes;
                         if new_size >= a.source_used_bytes
-                            && a.offset_bytes + new_size <= layout_disk.size_bytes
+                            && offset.saturating_add(new_size) <= layout_disk.size_bytes
+                            && !overlaps_assignments(
+                                &self.assignments,
+                                target_part,
+                                offset,
+                                new_size,
+                                layout_disk.size_bytes,
+                            )
                         {
                             if let Some(slot) = self.assignments.get_mut(&target_part) {
                                 slot.size_bytes = new_size;
@@ -406,13 +426,33 @@ fn max_contiguous_free(target: &DiskInfo, offset: u64, size: u64) -> u64 {
     free
 }
 
+fn overlaps_assignments(
+    assignments: &HashMap<u32, TargetAssignment>,
+    skip: u32,
+    offset: u64,
+    size: u64,
+    disk_size: u64,
+) -> bool {
+    let end = offset.saturating_add(size);
+    if end > disk_size {
+        return true;
+    }
+    assignments.iter().any(|(slot, a)| {
+        if *slot == skip {
+            return false;
+        }
+        let a_end = a.offset_bytes.saturating_add(a.size_bytes);
+        offset < a_end && end > a.offset_bytes
+    })
+}
+
 fn overlaps_other(target: &DiskInfo, skip: u32, offset: u64, size: u64) -> bool {
-    let end = offset + size;
+    let end = offset.saturating_add(size);
     target.partitions.iter().any(|p| {
         if p.index == skip {
             return false;
         }
-        let p_end = p.offset_bytes + p.size_bytes;
+        let p_end = p.offset_bytes.saturating_add(p.size_bytes);
         offset < p_end && end > p.offset_bytes
     })
 }
