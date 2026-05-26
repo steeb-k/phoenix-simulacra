@@ -12,7 +12,7 @@ use phoenix_core::ProgressHandle;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::fat::{capture_exfat, capture_fat};
+use crate::fat::{capture_exfat, capture_fat, fat_plan};
 use crate::ntfs::{capture_ntfs, ntfs_plan};
 use crate::raw::{capture_raw, raw_extent_for_partition};
 use crate::reader::PartitionReader;
@@ -43,9 +43,12 @@ struct PreparedPartition<'a> {
     part: &'a PartitionInfo,
     reader: PartitionReader,
     /// Sector-aligned used-data extents written into the partition manifest
-    /// and re-iterated by `capture_ntfs` / `capture_raw`. For NTFS this is
-    /// the bitmap-derived used-cluster set; for FAT/exFAT and raw mode it
-    /// is the partition-spanning placeholder produced by `plan_capture`.
+    /// and re-iterated by `capture_ntfs` / `capture_fat` / `capture_raw`.
+    /// For NTFS this is the bitmap-derived used-cluster set; for FAT/exFAT
+    /// it is the FAT-derived used-cluster set from `fat_plan` (the
+    /// previous "single placeholder extent covering the whole partition"
+    /// behavior was a correctness bug — see `capture_fat`'s doc comment);
+    /// for raw mode it is a single full-partition extent.
     extents: Vec<Extent>,
     bytes_per_cluster: u32,
     capture_mode: CaptureMode,
@@ -283,9 +286,23 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 capture_ntfs(reader, &mut stream, &prep.extents, prep.bitmap_hash.clone())?
             }
             (FilesystemKind::Fat, CaptureMode::UsedBlocks) => {
-                capture_fat(reader, &mut stream, false)?
+                // Same shape as NTFS now: planned extents from `fat_plan`
+                // are the manifest's extent table, and the streamer just
+                // walks them. Eliminates the previous extent-table-vs-
+                // chunk-index mismatch that broke FAT/exFAT restores.
+                capture_fat(
+                    reader,
+                    &mut stream,
+                    &prep.extents,
+                    prep.bitmap_hash.clone(),
+                )?
             }
-            (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => capture_exfat(reader, &mut stream)?,
+            (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => capture_exfat(
+                reader,
+                &mut stream,
+                &prep.extents,
+                prep.bitmap_hash.clone(),
+            )?,
             _ => {
                 capture_raw(reader, &mut stream)?;
                 (reader.length(), None)
@@ -356,16 +373,17 @@ fn plan_capture(
             let (extents, bitmap_hash) = ntfs_plan(reader)?;
             Ok((extents, 4096, mode, fs, bitmap_hash))
         }
-        (FilesystemKind::Fat | FilesystemKind::Exfat, CaptureMode::UsedBlocks) => Ok((
-            vec![Extent {
-                start_sector: 0,
-                sector_count: part.size_bytes / 512,
-            }],
-            0,
-            mode,
-            fs,
-            None,
-        )),
+        (FilesystemKind::Fat, CaptureMode::UsedBlocks) => {
+            // FAT12/16/32: walk the FAT to derive extents up front so the
+            // manifest's extent table matches the chunks the streamer
+            // produces (see `capture_fat` for the rationale).
+            let (extents, bitmap_hash, bytes_per_cluster) = fat_plan(reader, false)?;
+            Ok((extents, bytes_per_cluster, mode, fs, bitmap_hash))
+        }
+        (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => {
+            let (extents, bitmap_hash, bytes_per_cluster) = fat_plan(reader, true)?;
+            Ok((extents, bytes_per_cluster, mode, fs, bitmap_hash))
+        }
         _ => Ok((
             raw_extent_for_partition(part.size_bytes, 512),
             0,

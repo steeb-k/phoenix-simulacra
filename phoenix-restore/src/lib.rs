@@ -2,6 +2,7 @@
 
 pub mod partition_table;
 pub mod plan;
+pub mod relocation;
 pub mod restore;
 
 pub use plan::{RestorePlan, RestorePlanEntry};

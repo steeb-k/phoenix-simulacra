@@ -1055,7 +1055,14 @@ impl PhoenixApp {
             entries: self.restore_plan_entries.clone(),
         };
         let progress = ProgressHandle::new();
-        self.status = "Restore in progress…".into();
+        // Surfaces while `run_restore` is doing its pre-flight work
+        // (opening the .phnx, validating the plan, enumerating disks,
+        // and on a GPT source initializing the target via
+        // CREATE_DISK + SET_DRIVE_LAYOUT_EX) before the first
+        // `set_phase` call inside the worker thread takes over the
+        // status text. The user perceives that gap as "the button
+        // didn't do anything", so we say so explicitly.
+        self.status = "Preparing to restore, please wait…".into();
         self.job = Some(spawn_restore(RestoreOptions {
             backup_path,
             plan,

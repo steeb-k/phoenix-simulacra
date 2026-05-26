@@ -90,7 +90,25 @@ pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
             progress: Some(progress_worker),
             ..opts
         })
-        .map(|()| "Restore completed".to_string())
+        .map(|summary| {
+            if summary.partitions_resized > 0 {
+                // The boot-sector patch makes the volume *mountable* at
+                // its new size, but `$Bitmap` (NTFS) / FAT (FAT32) /
+                // cluster-heap (exFAT) metadata still describes the
+                // source layout. Tell the user to run `chkdsk /F` so
+                // Windows can reconcile it. Without this nudge, the
+                // user might see chkdsk warnings on first mount and
+                // assume the restore actually corrupted something.
+                let plural = if summary.partitions_resized == 1 { "" } else { "s" };
+                format!(
+                    "Restore completed. {} partition{plural} resized — run `chkdsk /F X:` (replacing X: \
+                     with each restored drive letter) so Windows can reconcile filesystem metadata.",
+                    summary.partitions_resized
+                )
+            } else {
+                "Restore completed".to_string()
+            }
+        })
         .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });

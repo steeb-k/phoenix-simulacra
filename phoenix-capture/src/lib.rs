@@ -3,6 +3,7 @@
 pub mod backup;
 pub mod fat;
 pub mod ntfs;
+pub mod ntfs_meta;
 pub mod raw;
 pub mod reader;
 

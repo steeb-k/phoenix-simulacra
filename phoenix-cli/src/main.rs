@@ -57,6 +57,19 @@ enum Commands {
         #[arg(long, default_value_t = true)]
         verify: bool,
     },
+    /// Dump every partition's stream header (extents + chunks) for forensic
+    /// inspection. Useful when a manifest's extent table is suspected of
+    /// containing garbage values (e.g. start_sectors near `u64::MAX`) — the
+    /// restore path can't tell us anything about the bytes actually on disk
+    /// in the .phnx, only what the validation rules trip on.
+    Inspect {
+        backup: PathBuf,
+        /// Also dump per-chunk records (file_offset, compressed_len,
+        /// uncompressed_len, extent_index, chunk_index). Off by default
+        /// because a 21 GB partition has ~5400 chunks.
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -96,13 +109,21 @@ fn main() -> anyhow::Result<()> {
         } => cmd_plan(&backup, disk, &output)?,
         Commands::Restore { backup, plan, verify } => {
             let plan = RestorePlan::from_toml(&plan)?;
-            run_restore(RestoreOptions {
+            let summary = run_restore(RestoreOptions {
                 backup_path: backup,
                 plan,
                 verify_on_restore: verify,
                 progress: None,
             })?;
+            if summary.partitions_resized > 0 {
+                info!(
+                    partitions_resized = summary.partitions_resized,
+                    "One or more partitions were resized — run `chkdsk /F` on each restored \
+                     volume so Windows can reconcile filesystem metadata"
+                );
+            }
         }
+        Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
     }
     Ok(())
 }
@@ -177,5 +198,97 @@ fn cmd_plan(backup: &PathBuf, disk_index: u32, output: &PathBuf) -> anyhow::Resu
     );
     std::fs::write(output, plan.to_toml()?)?;
     println!("Wrote restore plan to {}", output.display());
+    Ok(())
+}
+
+/// Dump the on-disk structure of a `.phnx` so we can see what the
+/// capture path actually wrote. The high-level [`cmd_list_backup`]
+/// stops at the per-partition manifest summary; this goes one level
+/// deeper and reads each partition's stream header (extent table +
+/// chunk index). Used when a manifest is suspected of containing
+/// garbage values — the validate-extents-fit pre-flight will tell us
+/// "extent reaches sector N", but only this tool can say *which*
+/// extent and what its raw bytes look like.
+fn cmd_inspect(path: &PathBuf, full: bool) -> anyhow::Result<()> {
+    let mut reader = PhnxReader::open(path)?;
+    println!("Backup: {}", path.display());
+    println!("  ID:         {}", reader.header.backup_id);
+    println!("  Format ver: {}", reader.header.version);
+    println!("  Flags:      {} (bit 0 = GPT)", reader.header.flags);
+    println!("  Timestamp:  {}", reader.header.timestamp);
+    println!("  Host:       {}", reader.manifest.hostname);
+    println!(
+        "  Disk:       style={}, sector_size={}, signature={:#x}",
+        reader.manifest.disk.style, reader.manifest.disk.sector_size, reader.header.disk_signature,
+    );
+    println!("  Partitions: {}", reader.index.len());
+
+    let entries: Vec<_> = reader.index.clone();
+    for entry in &entries {
+        println!();
+        println!(
+            "Partition {} — \"{}\"",
+            entry.index, entry.name,
+        );
+        println!(
+            "  fs={:?}  capture={:?}  sector_size={}  original={} bytes  used={} bytes",
+            entry.fs_kind,
+            entry.capture_mode,
+            entry.sector_size,
+            entry.original_size,
+            entry.used_bytes,
+        );
+        println!(
+            "  stream_offset={}  stream_length={}",
+            entry.stream_offset, entry.stream_length,
+        );
+        let stream = match reader.read_stream_header(entry) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("  ! failed to read stream header: {e}");
+                continue;
+            }
+        };
+        println!(
+            "  bytes_per_cluster={}  extents={}  chunks={}",
+            stream.bytes_per_cluster,
+            stream.extents.len(),
+            stream.chunks.len(),
+        );
+        let sector_size = entry.sector_size.max(1) as u64;
+        // Sentinels for "this number is suspiciously close to u64::MAX",
+        // which is the symptom that triggered this whole investigation.
+        // Anything within 1 PiB of u64::MAX is impossible for any real
+        // storage device on Earth and almost certainly garbage.
+        let suspicious_threshold: u64 = u64::MAX - (1u64 << 50);
+        for (idx, ext) in stream.extents.iter().enumerate() {
+            let last_sector = ext.start_sector.saturating_add(ext.sector_count);
+            let last_byte = last_sector.saturating_mul(sector_size);
+            let flag = if ext.start_sector > suspicious_threshold
+                || ext.sector_count > suspicious_threshold
+                || last_sector > suspicious_threshold
+            {
+                "  [SUSPICIOUS — values near u64::MAX]"
+            } else {
+                ""
+            };
+            println!(
+                "    extent[{idx:5}] start={:>20}  count={:>20}  last_sector={:>20}  last_byte~{:>20}{flag}",
+                ext.start_sector, ext.sector_count, last_sector, last_byte,
+            );
+        }
+        if full {
+            for (idx, chunk) in stream.chunks.iter().enumerate() {
+                println!(
+                    "    chunk[{idx:6}] file_offset={:>14}  compressed_len={:>10}  uncompressed_len={:>10}  extent_index={:>5}  chunk_index={:>5}",
+                    chunk.file_offset,
+                    chunk.compressed_len,
+                    chunk.uncompressed_len,
+                    chunk.extent_index,
+                    chunk.chunk_index,
+                );
+            }
+        }
+    }
     Ok(())
 }

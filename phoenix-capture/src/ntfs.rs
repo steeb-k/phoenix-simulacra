@@ -145,6 +145,21 @@ pub fn estimate_used_bytes(reader: &mut PartitionReader) -> Result<u64> {
     Ok(used_clusters * cluster_size + cluster_size) // + boot/metadata overhead
 }
 
+/// Restore an NTFS partition. Returns the number of bytes written so the
+/// caller can keep its byte-scaled progress meter accurate. `bytes_done`
+/// is the running total before this partition starts, used by
+/// `restore_raw` to render the in-flight progress bar; the function
+/// returns the *delta* (this partition's bytes) so the caller can
+/// accumulate it.
+///
+/// `relocation` is `Some` for shrink restores where data past the new
+/// boundary needs translating, `None` otherwise. It's threaded straight
+/// through to `restore_raw`; see `phoenix-core/src/relocation.rs` for
+/// the semantics. After the relocated data is on disk, the caller is
+/// expected to invoke the metadata rewriter (`phoenix-capture/src/
+/// ntfs_meta.rs`) before `patch_ntfs_size` so MFT records, `$Bitmap`,
+/// and `$LogFile` reflect the new cluster layout — otherwise the volume
+/// mounts but reads come back as garbage.
 pub fn restore_ntfs(
     reader: &mut phoenix_core::container::PhnxReader,
     entry: &phoenix_core::container::PartitionIndexEntry,
@@ -152,7 +167,8 @@ pub fn restore_ntfs(
     target_size: u64,
     verify: bool,
     progress: Option<&ProgressHandle>,
-    chunks_done: u64,
+    bytes_done: u64,
+    relocation: Option<&phoenix_core::relocation::RelocationMap>,
 ) -> Result<u64> {
     if entry.used_bytes > target_size {
         return Err(PhoenixError::PartitionTooSmall {
@@ -161,18 +177,104 @@ pub fn restore_ntfs(
             required: entry.used_bytes,
         });
     }
-    let done = crate::raw::restore_raw(reader, entry, writer, verify, progress, chunks_done)?;
+    let written =
+        crate::raw::restore_raw(reader, entry, writer, verify, progress, bytes_done, relocation)?;
+    if let Some(map) = relocation {
+        // Rewrite MFT data runs, $Bitmap, $LogFile, and the MFT mirror
+        // so the on-disk metadata points at the relocated cluster
+        // positions. Without this, a shrink with relocation produces a
+        // mountable-but-corrupt volume: the data bytes are on disk but
+        // every file references its old (now garbage) clusters.
+        crate::ntfs_meta::rewrite_metadata_after_relocation(writer, map)?;
+    }
     patch_ntfs_size(writer, target_size)?;
-    Ok(done)
+    Ok(written)
 }
 
+/// Patch the NTFS boot sector to match a resized target partition.
+///
+/// Why this matters: NTFS records the volume length in
+/// `BPB.TotalSectors` (8-byte LE at offset 40). At mount time Windows
+/// cross-checks that field against the partition table entry — if the
+/// boot sector says the volume is 4 TB but the partition is only 3 TB,
+/// or vice versa, mountmgr declines to recognize the file system and
+/// the user sees a RAW partition that `chkdsk` can't even examine. The
+/// previous behavior of this function — `Ok(())` — was correct only for
+/// the same-size restore path; the moment the GUI's per-partition size
+/// override changed, every restore came up RAW.
+///
+/// Convention: NTFS stores `total_sectors` as `partition_sectors - 1`.
+/// The very last sector of the partition is reserved for a duplicate of
+/// the boot sector so a damaged primary can be reconstructed from the
+/// tail (Windows verifies both at mount). Resizing therefore needs two
+/// writes: the patched primary at LBA 0, and a copy at the *new* last
+/// LBA. The old backup boot sector is either past the new boundary
+/// (shrink) or doesn't yet exist (grow); either way we replace it.
+///
+/// What this *doesn't* fix: `$Bitmap`, `$MFT`, and friends still
+/// describe the source volume's cluster layout. For grows, Windows
+/// treats clusters past the original boundary as untracked free space
+/// and `chkdsk /F` rebuilds `$Bitmap`. For shrinks, the trailing bits
+/// past the new `total_clusters` are leftover allocation state that
+/// `chkdsk /F` reconciles. The pre-flight extent-overflow check in
+/// `RestorePlan::validate_extents_fit` guarantees no captured data
+/// lives past the new boundary, so chkdsk's job is purely metadata
+/// reconciliation, not data recovery.
 fn patch_ntfs_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> Result<()> {
-    let sector_size = 512u64;
-    let new_sectors = new_size / sector_size;
-    let mut boot = vec![0u8; 512];
-    writer.write_at(0, &[])?; // no-op read - we need read support
-    let _ = (new_sectors, boot);
-    // Boot sector patch requires read-modify-write; documented for operator
+    // Make sure any pending data writes are off the cache before we read
+    // the boot sector back — see `PartitionWriter::flush` for the
+    // longer rationale.
+    writer.flush()?;
+
+    let mut sector = vec![0u8; 512];
+    writer.read_at(0, &mut sector)?;
+    if &sector[3..7] != b"NTFS" {
+        return Err(PhoenixError::Other(
+            "expected NTFS boot sector at LBA 0 of the restored partition; got something else \
+             (the data stream may not have been written correctly)"
+                .into(),
+        ));
+    }
+    let bytes_per_sector = u16::from_le_bytes(sector[11..13].try_into().unwrap()) as u64;
+    if bytes_per_sector == 0 {
+        return Err(PhoenixError::Other(
+            "NTFS boot sector reports zero bytes per sector".into(),
+        ));
+    }
+    if new_size < 4 * bytes_per_sector {
+        return Err(PhoenixError::Other(format!(
+            "target partition is too small ({} bytes) for an NTFS volume",
+            new_size
+        )));
+    }
+
+    let cur_total_field = u64::from_le_bytes(sector[40..48].try_into().unwrap());
+    let new_total_field = new_size / bytes_per_sector - 1;
+    if cur_total_field == new_total_field {
+        // Same size as the source. The boot sector is already correct;
+        // skip both writes. This is the common path when the user takes
+        // the default plan.
+        return Ok(());
+    }
+
+    sector[40..48].copy_from_slice(&new_total_field.to_le_bytes());
+
+    // Primary boot sector at LBA 0, duplicate at the new last LBA.
+    // We deliberately overwrite the existing backup-boot-sector area
+    // even though it might not be at the new position yet: the source's
+    // `total_sectors` tail data was at the old end (now possibly past
+    // the new end on shrink), so leaving it there would be both
+    // misleading and outside the new partition's bounds.
+    writer.write_at(0, &sector)?;
+    writer.write_at(new_size - bytes_per_sector, &sector)?;
+
+    tracing::info!(
+        old_total_sectors = cur_total_field,
+        new_total_sectors = new_total_field,
+        new_size_bytes = new_size,
+        bytes_per_sector,
+        "patched NTFS boot sector (primary + backup) to match resized partition"
+    );
     Ok(())
 }
 
