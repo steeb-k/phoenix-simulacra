@@ -57,7 +57,11 @@ pub fn show(
         .color(palette.subtle_text),
     );
     ui.add_space(4.0);
-    let target_view = crate::restore_layout::synthetic_target_view(target, layout);
+    let target_view = if layout.full_disk {
+        layout.planned_target_view(target)
+    } else {
+        crate::restore_layout::synthetic_target_view(target, layout)
+    };
     let target_row_width = viewport_width.max(disk_map::min_disk_row_width(&target_view));
     if draw_target_row(ui, target_row_width, layout, target, &target_view, palette) {
         out.plan_entries_updated = true;
@@ -197,37 +201,22 @@ fn draw_target_row(
         d.get_temp::<u32>(egui::Id::new("restore_drag_source"))
     });
 
-    if layout.full_disk {
-        draw_partition_map(ui, map_rect, view, palette, |ui, _, p, seg_rect| {
-            let overlay = layout.assignment_label(p.index, target);
-            draw_partition_segment_visual_styled(
-                ui,
-                seg_rect,
-                p,
-                palette,
-                false,
-                layout.assignments.contains_key(&p.index),
-                overlay.as_deref(),
-            );
-            true
-        });
-        return changed;
-    }
-
     draw_partition_map(ui, map_rect, view, palette, |ui, _, p, seg_rect| {
         let part = p.index;
         let id = ui.id().with(("restore_tgt", part));
         let assigned = layout.assignments.contains_key(&part);
         let overlay = layout.assignment_label(part, target);
 
-        if let Some(src) = dragging_source {
-            let drop = ui.interact(seg_rect, id.with("drop"), Sense::click());
-            if drop.hovered() && ui.input(|i| i.pointer.any_released()) {
-                layout.try_map_source_to_target(src, target, part);
-                ui.ctx().data_mut(|d| {
-                    d.remove::<u32>(egui::Id::new("restore_drag_source"));
-                });
-                changed = true;
+        if !layout.full_disk {
+            if let Some(src) = dragging_source {
+                let drop = ui.interact(seg_rect, id.with("drop"), Sense::click());
+                if drop.hovered() && ui.input(|i| i.pointer.any_released()) {
+                    layout.try_map_source_to_target(src, target, part);
+                    ui.ctx().data_mut(|d| {
+                        d.remove::<u32>(egui::Id::new("restore_drag_source"));
+                    });
+                    changed = true;
+                }
             }
         }
 
@@ -241,13 +230,13 @@ fn draw_target_row(
         let body = ui.interact(body_rect, id.with("body"), Sense::click_and_drag());
 
         if body.drag_started() && assigned {
-            let off = pixel_to_disk_offset(map_rect, target.size_bytes, body.interact_pointer_pos().unwrap().x);
+            let off = pixel_to_disk_offset(map_rect, view.size_bytes, body.interact_pointer_pos().unwrap().x);
             layout.begin_move(part, off);
         }
         if body.dragged() && layout.drag.is_some() {
             if let Some(pos) = body.interact_pointer_pos() {
-                let off = pixel_to_disk_offset(map_rect, target.size_bytes, pos.x);
-                layout.update_drag(target, off);
+                let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
+                layout.update_drag(view, off);
                 changed = true;
             }
         }
@@ -274,8 +263,8 @@ fn draw_target_row(
             }
             if l.dragged() || r.dragged() {
                 if let Some(pos) = l.interact_pointer_pos().or_else(|| r.interact_pointer_pos()) {
-                    let off = pixel_to_disk_offset(map_rect, target.size_bytes, pos.x);
-                    layout.update_drag(target, off);
+                    let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
+                    layout.update_drag(view, off);
                     changed = true;
                 }
             }

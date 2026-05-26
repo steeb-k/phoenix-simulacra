@@ -5,6 +5,7 @@ use std::path::Path;
 
 use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
 use phoenix_core::disk::{DiskInfo, FilesystemKind, PartitionInfo, PartitionUsage};
+use phoenix_core::manifest::fs_kind_from_string;
 use phoenix_restore::plan::{
     align_up, alignment_bytes, build_full_disk_plan, build_partial_plan, partition_allows_resize,
     RestorePlan,
@@ -57,7 +58,7 @@ pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
             type_guid: e.type_guid,
             offset_bytes: offset,
             size_bytes: e.original_size,
-            fs_kind: e.fs_kind,
+            fs_kind: fs_kind_for_entry(reader, e),
             capture_mode: e.capture_mode,
             volume_path: None,
             drive_letter: None,
@@ -129,10 +130,10 @@ impl RestoreLayoutState {
                 target.index,
                 target.size_bytes,
             );
-            for entry in plan.entries {
+            for (slot, entry) in plan.entries.iter().enumerate() {
                 if let Some(src) = entry.source_partition_index {
                     self.assignments.insert(
-                        entry.target_partition_index,
+                        slot as u32,
                         TargetAssignment {
                             source_index: src,
                             offset_bytes: entry.target_offset_bytes,
@@ -182,16 +183,67 @@ impl RestoreLayoutState {
         );
     }
 
-    pub fn assignment_label(&self, target_part: u32, target: &DiskInfo) -> Option<String> {
-        let a = self.assignments.get(&target_part)?;
+    pub fn assignment_label(&self, slot: u32, target: &DiskInfo) -> Option<String> {
+        let a = self.assignments.get(&slot)?;
         let src = self
             .source_disk
             .partitions
             .iter()
             .find(|p| p.index == a.source_index)?;
-        let slot = target.partitions.iter().find(|p| p.index == target_part)?;
         let src_title = partition_title(src);
-        Some(format!("← {src_title} on {}", partition_title(slot)))
+        if self.full_disk {
+            return Some(src_title);
+        }
+        let tgt = target.partitions.iter().find(|p| p.index == slot)?;
+        Some(format!("← {src_title} on {}", partition_title(tgt)))
+    }
+
+    /// Full-disk restore preview: planned offsets/sizes with source partition labels and FS types.
+    pub fn planned_target_view(&self, target: &DiskInfo) -> DiskInfo {
+        let mut ordered: Vec<&TargetAssignment> = self.assignments.values().collect();
+        ordered.sort_by_key(|a| a.offset_bytes);
+
+        let partitions: Vec<PartitionInfo> = ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, a)| {
+                let src = self
+                    .source_disk
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == a.source_index)?;
+                Some(PartitionInfo {
+                    index: slot as u32,
+                    name: src.name.clone(),
+                    type_guid: src.type_guid,
+                    offset_bytes: a.offset_bytes,
+                    size_bytes: a.size_bytes,
+                    fs_kind: src.fs_kind,
+                    capture_mode: src.capture_mode,
+                    volume_path: None,
+                    drive_letter: src.drive_letter,
+                    volume_label: src.volume_label.clone(),
+                    usage: src.usage.clone(),
+                })
+            })
+            .collect();
+
+        let layout_end = partitions
+            .last()
+            .map(|p| p.offset_bytes.saturating_add(p.size_bytes))
+            .unwrap_or(0);
+
+        DiskInfo {
+            index: target.index,
+            path: target.path.clone(),
+            size_bytes: target.size_bytes.max(layout_end),
+            is_gpt: target.is_gpt,
+            disk_guid: target.disk_guid,
+            disk_signature: target.disk_signature,
+            sector_size: target.sector_size,
+            model: target.model.clone(),
+            partitions,
+        }
     }
 
     pub fn to_restore_plan(&self, target: &DiskInfo) -> RestorePlan {
@@ -219,6 +271,19 @@ impl RestoreLayoutState {
     }
 
     pub fn target_partition_fs(&self, target: &DiskInfo, target_part: u32) -> FilesystemKind {
+        if self.full_disk {
+            return self
+                .assignments
+                .get(&target_part)
+                .and_then(|a| {
+                    self.source_disk
+                        .partitions
+                        .iter()
+                        .find(|p| p.index == a.source_index)
+                })
+                .map(|p| p.fs_kind)
+                .unwrap_or(FilesystemKind::Unknown);
+        }
         target
             .partitions
             .iter()
@@ -245,7 +310,7 @@ impl RestoreLayoutState {
         });
     }
 
-    pub fn update_drag(&mut self, target: &DiskInfo, pointer_offset: u64) {
+    pub fn update_drag(&mut self, layout_disk: &DiskInfo, pointer_offset: u64) {
         let Some(drag) = self.drag.clone() else {
             return;
         };
@@ -259,8 +324,8 @@ impl RestoreLayoutState {
                     self.align_bytes,
                 );
                 if let Some(a) = self.assignments.get_mut(&target_part) {
-                    if new_offset + a.size_bytes <= target.size_bytes
-                        && !overlaps_other(target, target_part, new_offset, a.size_bytes)
+                    if new_offset + a.size_bytes <= layout_disk.size_bytes
+                        && !overlaps_other(layout_disk, target_part, new_offset, a.size_bytes)
                     {
                         a.offset_bytes = new_offset;
                     }
@@ -268,7 +333,7 @@ impl RestoreLayoutState {
             }
             LayoutDrag::ResizeLeft { target_part } => {
                 if let Some(a) = self.assignments.get(&target_part).cloned() {
-                    let fs = self.target_partition_fs(target, target_part);
+                    let fs = self.target_partition_fs(layout_disk, target_part);
                     if !partition_allows_resize(fs) {
                         return;
                     }
@@ -287,7 +352,7 @@ impl RestoreLayoutState {
             }
             LayoutDrag::ResizeRight { target_part } => {
                 if let Some(a) = self.assignments.get(&target_part).cloned() {
-                    let fs = self.target_partition_fs(target, target_part);
+                    let fs = self.target_partition_fs(layout_disk, target_part);
                     if !partition_allows_resize(fs) {
                         return;
                     }
@@ -295,7 +360,7 @@ impl RestoreLayoutState {
                     if new_end > a.offset_bytes {
                         let new_size = new_end - a.offset_bytes;
                         if new_size >= a.source_used_bytes
-                            && a.offset_bytes + new_size <= target.size_bytes
+                            && a.offset_bytes + new_size <= layout_disk.size_bytes
                         {
                             if let Some(slot) = self.assignments.get_mut(&target_part) {
                                 slot.size_bytes = new_size;
@@ -350,6 +415,19 @@ fn overlaps_other(target: &DiskInfo, skip: u32, offset: u64, size: u64) -> bool 
         let p_end = p.offset_bytes + p.size_bytes;
         offset < p_end && end > p.offset_bytes
     })
+}
+
+fn fs_kind_for_entry(reader: &PhnxReader, e: &PartitionIndexEntry) -> FilesystemKind {
+    if e.fs_kind != FilesystemKind::Unknown {
+        return e.fs_kind;
+    }
+    reader
+        .manifest
+        .partitions
+        .iter()
+        .find(|p| p.index == e.index)
+        .map(|p| fs_kind_from_string(&p.fs))
+        .unwrap_or(FilesystemKind::Unknown)
 }
 
 pub fn synthetic_target_view(target: &DiskInfo, layout: &RestoreLayoutState) -> DiskInfo {
