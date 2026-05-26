@@ -1060,9 +1060,8 @@ impl PhoenixApp {
         // and on a GPT source initializing the target via
         // CREATE_DISK + SET_DRIVE_LAYOUT_EX) before the first
         // `set_phase` call inside the worker thread takes over the
-        // status text. The user perceives that gap as "the button
-        // didn't do anything", so we say so explicitly.
-        self.status = "Preparing to restore, please wait…".into();
+        // status text.
+        self.status = "Restoring, please wait…".into();
         self.job = Some(spawn_restore(RestoreOptions {
             backup_path,
             plan,
