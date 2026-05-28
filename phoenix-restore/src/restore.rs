@@ -3,19 +3,20 @@ use std::path::Path;
 use phoenix_capture::fat::restore_fat;
 use phoenix_capture::ntfs::restore_ntfs;
 use phoenix_capture::raw::{restore_raw, PartitionWriter};
-use phoenix_core::container::PhnxReader;
-use phoenix_core::disk::{enumerate_disks, FilesystemKind};
+use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
+use phoenix_core::disk::{enumerate_disks, DiskInfo, FilesystemKind};
 use phoenix_core::error::Result;
 use phoenix_core::ProgressHandle;
 use phoenix_core::manifest::fs_kind_from_string;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::grow::extend_ntfs_volume;
 use crate::partition_table::{
-    init_target_disk_as_gpt, init_target_disk_as_mbr, notify_disk_updated,
-    update_partition_layout_existing, write_mbr_partition_layout, write_partition_layout,
-    GptInitState,
+    bring_disk_online, flush_disk, init_target_disk_as_gpt, init_target_disk_as_mbr,
+    notify_disk_updated, update_partition_layout_existing, write_mbr_partition_layout,
+    write_partition_layout, GptEntry as GptLayoutEntry, GptInitState, MbrEntry as MbrLayoutEntry,
 };
-use crate::plan::{RestoreMode, RestorePlan};
+use crate::plan::{RestoreMode, RestorePlan, RestorePlanEntry};
 
 pub struct RestoreOptions {
     pub backup_path: std::path::PathBuf,
@@ -274,14 +275,20 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // the partition entry table on top of them. We held off on this
     // step until the data writes were done so partmgr/volmgr couldn't
     // notice the entries and lazy-mount empty volumes that would
-    // otherwise bounce raw writes with `ERROR_ACCESS_DENIED`. Then a
-    // best-effort `IOCTL_DISK_UPDATE_PROPERTIES` so Disk Management /
-    // Explorer pick up the new layout immediately.
+    // otherwise bounce raw writes with `ERROR_ACCESS_DENIED`.
+    //
+    // Belt-and-suspenders flush: raw `\\.\PhysicalDriveN` writes are
+    // already nominally uncached, but the cost of an explicit
+    // `FlushFileBuffers` here is one IOCTL and the safety win against
+    // a mountmgr-vs-data-write race when `IOCTL_DISK_UPDATE_PROPERTIES`
+    // fires below is real.
+    flush_disk(&disk.path);
     if let Some(state) = gpt_state {
         if let Some(ref p) = opts.progress {
             p.set_phase("Writing partition layout");
         }
-        write_partition_layout(&disk.path, &opts.plan, &state, mode)?;
+        let gpt_entries = build_gpt_layout_entries(&opts.plan, &reader, &disk, mode);
+        write_partition_layout(&disk.path, &gpt_entries, &state)?;
         if let Some(ref p) = opts.progress {
             p.set_phase("Notifying Windows of the new partition layout");
         }
@@ -290,7 +297,8 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         if let Some(ref p) = opts.progress {
             p.set_phase("Writing MBR partition layout");
         }
-        write_mbr_partition_layout(&disk.path, &opts.plan)?;
+        let mbr_entries = build_mbr_layout_entries(&opts.plan, &reader);
+        write_mbr_partition_layout(&disk.path, &mbr_entries)?;
         notify_disk_updated(&disk.path);
     } else if mode == RestoreMode::Partial && disk.is_gpt {
         if let Some(guid_bytes) = disk.disk_guid {
@@ -298,15 +306,81 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                 p.set_phase("Updating partition layout");
             }
             let disk_guid = bytes_to_guid(guid_bytes);
+            let gpt_entries = build_gpt_layout_entries(&opts.plan, &reader, &disk, mode);
             update_partition_layout_existing(
                 &disk.path,
-                &opts.plan,
+                &gpt_entries,
                 &disk_guid,
                 disk.size_bytes,
             )?;
             notify_disk_updated(&disk.path);
         }
     }
+
+    // PHASE 4 — for every NTFS partition we wrote at a larger size
+    // than the source, ask NTFS to extend its `$Bitmap` / `$MFT` /
+    // `total_sectors` to fill the new slot. We deliberately left the
+    // boot sector at source size in `patch_ntfs_size` so the volume
+    // would actually mount (Windows refuses to mount NTFS where
+    // `$Bitmap` doesn't cover the cluster range advertised by the
+    // boot sector — the symptom that prompted this whole pass:
+    // post-restore C: came up RAW). `FSCTL_EXTEND_VOLUME` is the same
+    // mechanism Disk Management's "Extend Volume" uses, so we're
+    // letting Windows do its own bookkeeping on a now-mounted volume
+    // rather than patching `$Bitmap` ourselves.
+    //
+    // Degrades gracefully: a failure here means the partition is on
+    // disk at the correct size with the source's NTFS still mounted
+    // at the source size. The user can extend manually via Disk
+    // Management. We log a warning but don't fail the restore.
+    for entry in &opts.plan.entries {
+        if !entry.restore {
+            continue;
+        }
+        let Some(src_index) = entry.source_partition_index else {
+            continue;
+        };
+        let idx_entry = match reader.index.iter().find(|e| e.index == src_index) {
+            Some(i) => i,
+            None => continue,
+        };
+        if !matches!(idx_entry.fs_kind, FilesystemKind::Ntfs) {
+            continue;
+        }
+        if entry.target_size_bytes <= idx_entry.original_size {
+            continue;
+        }
+        if let Some(ref p) = opts.progress {
+            p.set_phase(format!(
+                "Extending NTFS volume for partition {}",
+                src_index
+            ));
+        }
+        if let Err(e) = extend_ntfs_volume(
+            disk.index,
+            entry.target_offset_bytes,
+            entry.target_size_bytes,
+            idx_entry.sector_size as u64,
+        ) {
+            warn!(
+                partition = src_index,
+                error = %e,
+                "FSCTL_EXTEND_VOLUME failed; the partition was restored at source size and \
+                 can be extended manually via Disk Management"
+            );
+        }
+    }
+
+    // PHASE 5 — clear the "offline" disk attribute so volumes
+    // auto-mount with drive letters. Without this the user has to
+    // right-click → Online in Disk Management every time. See
+    // `bring_disk_online` for the full rationale (SAN policy +
+    // duplicate-signature handling). Best-effort: a warn is logged on
+    // failure, but the restored data is already valid on disk.
+    if let Some(ref p) = opts.progress {
+        p.set_phase("Bringing disk online");
+    }
+    bring_disk_online(&disk.path);
 
     if let Some(ref p) = opts.progress {
         p.end();
@@ -353,6 +427,194 @@ fn parse_disk_guid(s: Option<&str>) -> Option<[u8; 16]> {
     out[7] = be[6];
     out[8..16].copy_from_slice(&be[8..16]);
     Some(out)
+}
+
+/// Build the per-partition descriptors for `set_drive_layout`. Joins
+/// each plan entry to the backup's `PartitionIndexEntry` (restored
+/// partitions; carries `type_guid` from the source) and to the live
+/// target disk's `PartitionInfo` (preserved partitions in partial
+/// mode; carries `type_guid` / `gpt_attributes` / `name` from the
+/// existing on-disk entry).
+///
+/// This is the load-bearing fix for the EFI/MSR/Recovery-as-Basic-Data
+/// bug: previously every partition was stamped with the Basic Data
+/// GUID, so EFI got a drive letter, MSR became visible, and Recovery
+/// lost its no-auto-mount flag. Now we preserve the source's GUID.
+///
+/// Attributes are intentionally hardcoded to 0 for *restored* entries
+/// because the current backup format does not capture GPT attributes
+/// (per the design decision to keep older backups restorable as-is
+/// rather than inferring attributes from type GUIDs). Preserved
+/// partitions in partial mode still carry their live attributes.
+fn build_gpt_layout_entries(
+    plan: &RestorePlan,
+    reader: &PhnxReader,
+    target_disk: &DiskInfo,
+    mode: RestoreMode,
+) -> Vec<GptLayoutEntry> {
+    let pick: Vec<&RestorePlanEntry> = match mode {
+        RestoreMode::FullDisk => plan.entries.iter().filter(|e| e.restore).collect(),
+        RestoreMode::Partial => plan.entries.iter().collect(),
+    };
+    pick.into_iter()
+        .map(|entry| {
+            if entry.restore {
+                let src_index = entry.source_partition_index.unwrap_or(u32::MAX);
+                let idx_entry = reader.index.iter().find(|e| e.index == src_index);
+                let manifest_part = reader
+                    .manifest
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == src_index);
+                let (type_guid, name) = match (idx_entry, manifest_part) {
+                    (Some(idx), Some(m)) => (idx.type_guid, m.name.clone()),
+                    (Some(idx), None) => (idx.type_guid, idx.name.clone()),
+                    _ => ([0u8; 16], String::new()),
+                };
+                GptLayoutEntry {
+                    offset_bytes: entry.target_offset_bytes,
+                    size_bytes: entry.target_size_bytes,
+                    type_guid,
+                    attributes: 0,
+                    name,
+                }
+            } else {
+                // Preserved partition: keep its existing identity so a
+                // partial restore doesn't accidentally re-type an
+                // untouched Recovery/EFI as Basic Data.
+                let live = target_disk
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == entry.target_partition_index);
+                match live {
+                    Some(p) => GptLayoutEntry {
+                        offset_bytes: entry.target_offset_bytes,
+                        size_bytes: entry.target_size_bytes,
+                        type_guid: p.type_guid,
+                        attributes: p.gpt_attributes,
+                        name: p.name.clone(),
+                    },
+                    None => {
+                        warn!(
+                            target_part = entry.target_partition_index,
+                            "preserved partition has no matching live entry on target disk; \
+                             writing as anonymous Basic Data"
+                        );
+                        GptLayoutEntry {
+                            offset_bytes: entry.target_offset_bytes,
+                            size_bytes: entry.target_size_bytes,
+                            type_guid: [0u8; 16],
+                            attributes: 0,
+                            name: String::new(),
+                        }
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+/// Build the per-partition descriptors for the MBR writer. Only
+/// restored entries participate — `update_partition_layout_existing`'s
+/// non-restored case is GPT-only, since we don't currently support
+/// rewriting an MBR partition table during a partial restore.
+///
+/// Maps source [`FilesystemKind`] to the MBR partition-type byte. This
+/// fixes the analogue of the GPT type-GUID bug: previously every MBR
+/// partition got stamped 0x07 (NTFS/IFS) regardless of source, so a
+/// restored FAT or EFI partition would mount wrong (or not at all).
+fn build_mbr_layout_entries(plan: &RestorePlan, reader: &PhnxReader) -> Vec<MbrLayoutEntry> {
+    let restoring: Vec<&RestorePlanEntry> = plan.entries.iter().filter(|e| e.restore).collect();
+    // Pick which entry should carry the bootable flag. The backup
+    // format doesn't currently record the active-flag, so this is
+    // best-effort: prefer the first NTFS partition; if none, prefer
+    // the first FAT/exFAT partition; if neither, mark nothing
+    // bootable. Capturing the real active-flag at backup time is a
+    // separate format change.
+    let bootable_idx = restoring
+        .iter()
+        .enumerate()
+        .find(|(_, e)| {
+            e.source_partition_index
+                .and_then(|src| reader.index.iter().find(|i| i.index == src))
+                .map(|i| matches!(i.fs_kind, FilesystemKind::Ntfs))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            restoring.iter().enumerate().find(|(_, e)| {
+                e.source_partition_index
+                    .and_then(|src| reader.index.iter().find(|i| i.index == src))
+                    .map(|i| matches!(i.fs_kind, FilesystemKind::Fat | FilesystemKind::Exfat))
+                    .unwrap_or(false)
+            })
+        })
+        .map(|(idx, _)| idx);
+
+    restoring
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let idx_entry = entry
+                .source_partition_index
+                .and_then(|src| reader.index.iter().find(|e| e.index == src));
+            let partition_type = mbr_partition_type_for(idx_entry, entry.target_size_bytes);
+            MbrLayoutEntry {
+                offset_bytes: entry.target_offset_bytes,
+                size_bytes: entry.target_size_bytes,
+                partition_type,
+                bootable: bootable_idx == Some(i),
+            }
+        })
+        .collect()
+}
+
+/// Map source filesystem kind to MBR partition-type byte. The byte
+/// values are from the standard MBR partition-type table (see
+/// e.g. Microsoft KB or the Wikipedia article):
+///
+///   * 0x06  FAT16B (≥32 MiB CHS)
+///   * 0x07  IFS / NTFS / exFAT
+///   * 0x0B  FAT32 CHS
+///   * 0x0C  FAT32 LBA — what modern Windows formats default to
+///   * 0xEF  EFI System Partition (rare on MBR; legal but unusual)
+///
+/// Ambiguous source (MSR, BitLocker, Unknown) falls back to 0x07 with
+/// a warning — MSR on MBR isn't a real thing, BitLocker volumes
+/// preserve as 0x07 on round-trip, and Unknown means we couldn't
+/// classify but the user asked us to restore it anyway.
+fn mbr_partition_type_for(
+    idx_entry: Option<&PartitionIndexEntry>,
+    size_bytes: u64,
+) -> u8 {
+    let Some(idx) = idx_entry else {
+        warn!("MBR restore entry has no source partition; defaulting type to 0x07 (IFS)");
+        return 0x07;
+    };
+    match idx.fs_kind {
+        FilesystemKind::Ntfs => 0x07,
+        FilesystemKind::Exfat => 0x07,
+        FilesystemKind::Fat => {
+            // Modern Windows always formats FAT32 with type 0x0C (LBA).
+            // The 32 MiB threshold is the classic FAT16-vs-FAT32
+            // dividing line — below it FAT16 (0x06), above it FAT32
+            // LBA (0x0C). Real-world FAT12 on hard disks is rare and
+            // we don't try to distinguish it here.
+            if size_bytes < 32 * 1024 * 1024 {
+                0x06
+            } else {
+                0x0C
+            }
+        }
+        FilesystemKind::Efi => 0xEF,
+        FilesystemKind::Msr | FilesystemKind::Bitlocker | FilesystemKind::Unknown => {
+            warn!(
+                fs = ?idx.fs_kind,
+                index = idx.index,
+                "no clean MBR partition-type mapping for source FS; defaulting to 0x07 (IFS)"
+            );
+            0x07
+        }
+    }
 }
 
 pub fn verify_backup(path: &Path, quick: bool) -> Result<()> {

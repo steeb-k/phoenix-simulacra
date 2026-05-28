@@ -321,58 +321,120 @@ impl PartitionReader {
             // of 8, so the returned bitmap is always byte-aligned and can be
             // copied with byte-level slicing.
             let starting_lcn = header.starting_lcn as u64;
+            // CAREFUL: `BitmapSize` from VOLUME_BITMAP_BUFFER is the
+            // *entire volume's* cluster count, NOT the count covered by
+            // this single response. Per MSDN:
+            //
+            //   "BitmapSize: The size of the bitmap, in clusters. [...]
+            //   The Buffer member contains as much of the bitmap as can
+            //   fit in the output buffer."
+            //
+            // So on a 952 GiB volume, every response says
+            // `bitmap_size = 249_764_864` regardless of how few bytes
+            // the driver actually wrote into Buffer. Using that value
+            // to advance `next_lcn` would mark the loop "done" after
+            // one iteration even when only the first 4 MiB chunk got
+            // populated — which is exactly the 128 GiB capture cap we
+            // hit in production. The right value for "did we make
+            // forward progress in this response?" is the *payload
+            // length*, since each byte covers 8 clusters.
             let bitmap_size_clusters = header.bitmap_size as u64;
-            let returned_bitmap_bytes = ((bitmap_size_clusters + 7) / 8) as usize;
             let payload = &buf[header_size..returned as usize];
-            let actual_bytes = returned_bitmap_bytes.min(payload.len());
+            let payload_clusters = (payload.len() as u64).saturating_mul(8);
 
             let dst_start = (starting_lcn / 8) as usize;
             if dst_start < full_bitmap.len() {
-                let dst_end = (dst_start + actual_bytes).min(full_bitmap.len());
+                let dst_end = (dst_start + payload.len()).min(full_bitmap.len());
                 if dst_end > dst_start {
                     full_bitmap[dst_start..dst_end]
                         .copy_from_slice(&payload[..dst_end - dst_start]);
                 }
             }
 
-            // Trust the IOCTL's signal: a non-zero return means "this is the
-            // last response, you have everything". Don't second-guess by
-            // comparing against our boot-sector-derived `total_clusters` —
-            // NTFS reserves the trailing sector for the backup boot sector
-            // and reports `total_clusters - 1` here, so a `next >= total`
-            // test would terminate one cluster early and leave the loop
-            // asking for an LCN past the FS's real range. The driver would
-            // (correctly) reject that with ERROR_INVALID_PARAMETER (87) and
-            // we'd discard the entire good bitmap we just built.
-            if ok != 0 {
-                break;
-            }
+            tracing::debug!(
+                iteration = iterations,
+                starting_lcn,
+                payload_bytes = payload.len(),
+                payload_clusters,
+                driver_bitmap_size_clusters = bitmap_size_clusters,
+                ok = ok != 0,
+                err = err,
+                "FSCTL_GET_VOLUME_BITMAP chunk"
+            );
 
-            // ERROR_MORE_DATA: advance. Make sure we're actually making
-            // progress so a buggy driver can't stall us forever even before
-            // the iteration cap fires.
-            let next = starting_lcn + bitmap_size_clusters;
+            // Advance by *clusters covered in this response*, not by the
+            // driver's total-volume size hint. See the comment on
+            // `bitmap_size_clusters` above for the gory detail.
+            let next = starting_lcn + payload_clusters;
             if next <= next_lcn as u64 {
+                // No forward progress.
+                //
+                // If `ok != 0` (success), treat as "I'm done": there's
+                // legitimately no more bitmap to send. This is the
+                // small-volume single-call path *and* the
+                // driver-says-done-on-final-chunk path.
+                //
+                // If `ok == 0 && err == ERROR_MORE_DATA` we got
+                // promised "more data" but the driver didn't actually
+                // advance — that's a buggy driver and we have to bail
+                // rather than spin forever.
+                if ok != 0 {
+                    break;
+                }
                 tracing::warn!(
                     next,
                     next_lcn,
+                    payload_clusters,
                     bitmap_size_clusters,
-                    "FSCTL_GET_VOLUME_BITMAP: no forward progress; aborting"
+                    "FSCTL_GET_VOLUME_BITMAP: ERROR_MORE_DATA without forward progress; aborting"
                 );
                 return None;
             }
-            // Proactive end-of-volume short-circuit. If this response
-            // already reaches the FS's trailing-reserve boundary, don't
-            // issue another query — drivers that send ERROR_MORE_DATA on
-            // their final chunk will (correctly) reject a follow-up call
-            // at an LCN past their range with ERROR_INVALID_PARAMETER, and
-            // we'd otherwise discard a perfectly good bitmap to chase a
-            // single nonexistent cluster.
-            if next + FS_TRAILING_RESERVE >= total_clusters {
+            // Per MSDN, the driver's view of "end of bitmap" is at
+            // `starting_lcn + bitmap_size_clusters` (the BitmapSize field
+            // is the count of clusters from StartingLcn to the end of the
+            // volume, not the chunk size). Use the *minimum* of that and
+            // the caller's total_clusters as the termination target — they
+            // should be equal modulo NTFS's backup-boot-sector reservation,
+            // and taking the min keeps us conservative if either side is
+            // off by a cluster.
+            let driver_end = starting_lcn.saturating_add(bitmap_size_clusters);
+            let coverage_target = total_clusters.min(driver_end);
+            if next + FS_TRAILING_RESERVE >= coverage_target {
                 break;
+            }
+            // Driver said success but didn't actually reach the end of
+            // the volume. Log it and keep iterating — the loop will
+            // either get more data on the next call, or terminate via
+            // the ERROR_INVALID_PARAMETER end-of-volume safety net.
+            if ok != 0 {
+                tracing::debug!(
+                    starting_lcn,
+                    payload_clusters,
+                    next,
+                    coverage_target,
+                    "FSCTL_GET_VOLUME_BITMAP returned success but only covered part of the \
+                     volume; continuing to paginate (driver-reported completion is unreliable \
+                     on this handle, typically a VSS shadow or locked NTFS volume)"
+                );
             }
             next_lcn = next as i64;
         }
+
+        // Quick sanity log at INFO level so an operator scanning a log
+        // file can immediately tell whether the bitmap was fully read
+        // or truncated. Pre-fix runs would terminate after iteration 1
+        // and capture only the first 32 Mi clusters (~128 GiB) of a
+        // larger volume; with the fix we expect iterations to scale
+        // with total_clusters / (CHUNK_MAX_clusters).
+        let last_covered_lcn = next_lcn as u64;
+        tracing::info!(
+            iterations,
+            total_clusters,
+            last_covered_lcn,
+            full_bitmap_bytes = full_bitmap.len(),
+            "FSCTL_GET_VOLUME_BITMAP loop done"
+        );
 
         Some(full_bitmap)
     }

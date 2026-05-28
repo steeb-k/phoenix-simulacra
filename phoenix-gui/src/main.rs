@@ -7,6 +7,7 @@ mod job;
 mod sidebar;
 mod theme;
 mod util;
+mod version;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -47,10 +48,16 @@ const INPUT_MARGIN_RESTORE: f32 = 16.0;
 /// `input_height` (roughly 16pt text + 2×8px TextEdit margin).
 const ACTION_BUTTON_HEIGHT: f32 = 36.0;
 
-/// Decode the embedded application icon for the window / taskbar.
+/// Decode the embedded application icon for the OS window chrome (title
+/// bar / taskbar / Alt-Tab thumbnail). This is intentionally a *separate*
+/// asset from the in-app UI icons (phosphor glyphs rendered via
+/// `egui_phosphor`) — the OS-level icon is a full-color raster that needs
+/// to look right at 16x16/32x32/256x256 against the taskbar/title bar,
+/// while the in-app icons are vector glyphs tinted by the active theme.
 fn app_icon() -> egui::IconData {
-    let bytes = include_bytes!("../../carbon-phoenix-icon.ico");
-    let image = image::load_from_memory(bytes).expect("failed to decode carbon-phoenix-icon.ico");
+    let bytes = include_bytes!("../../carbon-phoenix_appIcon.ico");
+    let image =
+        image::load_from_memory(bytes).expect("failed to decode carbon-phoenix_appIcon.ico");
     let image = image.into_rgba8();
     let (width, height) = image.dimensions();
     egui::IconData {
@@ -89,12 +96,24 @@ fn main() -> eframe::Result<()> {
 /// Sets up tracing to BOTH stderr (for users who launch from a terminal) and
 /// a rolling log file in `%LOCALAPPDATA%\CarbonPhoenix\logs\` so users who
 /// double-click the .exe can still hand us a log when something goes wrong.
+///
+/// The default filter is deliberately *verbose* — `info` for every Phoenix
+/// crate — so a fresh log file is immediately useful even if the user never
+/// touches `RUST_LOG`. A previous filter of
+/// `"phoenix_core=info,phoenix_gui=info,warn"` made successful backups look
+/// silent (no log writes between startup and shutdown) which led us down
+/// multiple "the binary must be stale" rabbit holes. Anything truly noisy
+/// (per-chunk debug) is gated behind explicit `debug!`/`trace!` levels.
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "phoenix_core=info,phoenix_gui=info,warn".into());
+        .unwrap_or_else(|_| {
+            "phoenix_core=info,phoenix_gui=info,phoenix_capture=info,\
+             phoenix_restore=info,phoenix_vss=info,phoenix_build=info,warn"
+                .into()
+        });
 
     let log_dir = std::env::var("LOCALAPPDATA")
         .map(|p| std::path::PathBuf::from(p).join("CarbonPhoenix").join("logs"))
@@ -123,6 +142,13 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .with(stderr_layer)
         .with(file_layer)
         .init();
+
+    // The build banner must come first so every log file (and every
+    // user-pasted snippet) starts with "this is binary X, built at Y,
+    // commit Z". Before this, diagnosing "did my fix even land in the
+    // binary the user is running?" required cross-referencing exe
+    // mtimes and was easy to get wrong when multiple builds existed.
+    phoenix_core::build_info::log_startup_banner(&crate::version::BUILD_INFO);
 
     if guard.is_some() {
         tracing::info!(log_dir = %log_dir.display(), "log file initialized");

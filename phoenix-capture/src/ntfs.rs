@@ -132,12 +132,28 @@ fn cluster_used(bitmap: &[u8], cluster: usize) -> bool {
     (bitmap[byte] >> bit) & 1 == 1
 }
 
+/// Compute the volume's total cluster count from a parsed NTFS BPB.
+///
+/// `bs.total_sectors` is recorded in units of `bs.bytes_per_sector` (per the
+/// NTFS spec), NOT in 512-byte LBAs. Earlier versions of this code multiplied
+/// by the hardcoded `SECTOR_SIZE = 512` constant, which silently undercounted
+/// 4Kn (4096-byte-logical-sector) volumes by 8x — a 1 TB drive came out as
+/// ~125 GB, leaving most of the user's data uncaptured. Always compute via
+/// `bytes_per_sector` from the BPB so the math is correct for both 512e (512)
+/// and 4Kn (4096) media.
+fn total_clusters_for(bs: &NtfsBootSector, cluster_size: u64) -> u64 {
+    let volume_bytes = bs
+        .total_sectors
+        .saturating_mul(bs.bytes_per_sector as u64);
+    (volume_bytes + cluster_size - 1) / cluster_size
+}
+
 pub fn estimate_used_bytes(reader: &mut PartitionReader) -> Result<u64> {
     let mut boot = vec![0u8; 512];
     reader.read_at(0, &mut boot)?;
     let bs = parse_boot_sector(&boot)?;
     let cluster_size = bs.bytes_per_sector as u64 * bs.sectors_per_cluster as u64;
-    let total_clusters = (bs.total_sectors * SECTOR_SIZE + cluster_size - 1) / cluster_size;
+    let total_clusters = total_clusters_for(&bs, cluster_size);
     let bitmap = read_bitmap(reader, &bs, cluster_size, total_clusters)?;
     let used_clusters = (0..total_clusters)
         .filter(|c| cluster_used(&bitmap, *c as usize))
@@ -208,15 +224,24 @@ pub fn restore_ntfs(
 /// the boot sector so a damaged primary can be reconstructed from the
 /// tail (Windows verifies both at mount). Resizing therefore needs two
 /// writes: the patched primary at LBA 0, and a copy at the *new* last
-/// LBA. The old backup boot sector is either past the new boundary
-/// (shrink) or doesn't yet exist (grow); either way we replace it.
+/// LBA — but only on **shrink**.
 ///
-/// What this *doesn't* fix: `$Bitmap`, `$MFT`, and friends still
-/// describe the source volume's cluster layout. For grows, Windows
-/// treats clusters past the original boundary as untracked free space
-/// and `chkdsk /F` rebuilds `$Bitmap`. For shrinks, the trailing bits
-/// past the new `total_clusters` are leftover allocation state that
-/// `chkdsk /F` reconciles. The pre-flight extent-overflow check in
+/// Grow handling moved out of here. Setting `total_sectors` to the new
+/// (larger) value here makes the volume come up RAW: Windows refuses
+/// to mount NTFS when `$Bitmap` doesn't cover the cluster range
+/// advertised by the boot sector, and our on-disk `$Bitmap` is sized
+/// for the source. The previous "let chkdsk reconcile" comment was
+/// optimistic — modern Windows declines to mount it at all, so chkdsk
+/// never gets a chance. The fix is to leave the boot sector at its
+/// source size (so the volume mounts at source size, as a normal
+/// NTFS volume with the partition advertising more space than the FS
+/// uses), then issue `FSCTL_EXTEND_VOLUME` against the mounted volume
+/// after the partition table is in place. See
+/// `phoenix_restore::grow::extend_ntfs_volume`.
+///
+/// What this *still* doesn't fix on shrinks: the trailing bits past the
+/// new `total_clusters` are leftover allocation state that `chkdsk /F`
+/// reconciles. The pre-flight extent-overflow check in
 /// `RestorePlan::validate_extents_fit` guarantees no captured data
 /// lives past the new boundary, so chkdsk's job is purely metadata
 /// reconciliation, not data recovery.
@@ -257,14 +282,29 @@ fn patch_ntfs_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> R
         return Ok(());
     }
 
+    // Grow case: leave the boot sector pointing at the source size and
+    // let the post-restore `FSCTL_EXTEND_VOLUME` step (see
+    // `phoenix_restore::grow::extend_ntfs_volume`) ask NTFS to grow
+    // itself once it's mounted. Patching `total_sectors` here would
+    // make the volume come up RAW because `$Bitmap` is still sized
+    // for the source.
+    if new_total_field > cur_total_field {
+        tracing::info!(
+            cur_total_sectors = cur_total_field,
+            requested_total_sectors = new_total_field,
+            new_size_bytes = new_size,
+            bytes_per_sector,
+            "NTFS grow: leaving boot sector at source size; volume will be extended via \
+             FSCTL_EXTEND_VOLUME after the partition table is written"
+        );
+        return Ok(());
+    }
+
     sector[40..48].copy_from_slice(&new_total_field.to_le_bytes());
 
-    // Primary boot sector at LBA 0, duplicate at the new last LBA.
-    // We deliberately overwrite the existing backup-boot-sector area
-    // even though it might not be at the new position yet: the source's
-    // `total_sectors` tail data was at the old end (now possibly past
-    // the new end on shrink), so leaving it there would be both
-    // misleading and outside the new partition's bounds.
+    // Shrink case only: write the patched primary at LBA 0 and a
+    // duplicate at the new last LBA. The source's tail backup sector
+    // sits past the new end of the partition and is discarded.
     writer.write_at(0, &sector)?;
     writer.write_at(new_size - bytes_per_sector, &sector)?;
 
@@ -273,7 +313,7 @@ fn patch_ntfs_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> R
         new_total_sectors = new_total_field,
         new_size_bytes = new_size,
         bytes_per_sector,
-        "patched NTFS boot sector (primary + backup) to match resized partition"
+        "patched NTFS boot sector (primary + backup) to match shrunk partition"
     );
     Ok(())
 }
@@ -294,7 +334,16 @@ pub fn ntfs_plan(reader: &mut PartitionReader) -> Result<(Vec<Extent>, Option<St
     reader.read_at(0, &mut boot)?;
     let bs = parse_boot_sector(&boot)?;
     let cluster_size = bs.bytes_per_sector as u64 * bs.sectors_per_cluster as u64;
-    let total_clusters = (bs.total_sectors * SECTOR_SIZE + cluster_size - 1) / cluster_size;
+    let total_clusters = total_clusters_for(&bs, cluster_size);
+    tracing::debug!(
+        target: "phoenix_capture::ntfs",
+        bytes_per_sector = bs.bytes_per_sector,
+        sectors_per_cluster = bs.sectors_per_cluster,
+        total_sectors = bs.total_sectors,
+        cluster_size = cluster_size,
+        total_clusters = total_clusters,
+        "ntfs_plan computed volume geometry"
+    );
     let bitmap = read_bitmap(reader, &bs, cluster_size, total_clusters)?;
     let bitmap_hash = Some(hash::hash_hex(&bitmap));
 

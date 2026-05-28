@@ -1,5 +1,6 @@
 //! Carbon Phoenix core library: `.phnx` format, manifest, hashing, disk enumeration.
 
+pub mod build_info;
 pub mod container;
 pub mod disk;
 pub mod error;

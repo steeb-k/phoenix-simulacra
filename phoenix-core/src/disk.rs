@@ -83,6 +83,15 @@ pub struct PartitionInfo {
     pub index: u32,
     pub name: String,
     pub type_guid: [u8; 16],
+    /// GPT `Attributes` field (bit-packed flags: bit 0 =
+    /// PlatformRequired, bit 60 = ReadOnly, bit 62 = Hidden, bit 63 =
+    /// NoDriveLetter; the rest are partition-type specific).
+    /// Zero for MBR partitions and for older code paths that haven't
+    /// been migrated to read this. The restore path uses this when
+    /// rewriting partition tables during partial restores so it
+    /// doesn't accidentally strip "no auto-mount" / "hidden" flags
+    /// off a Recovery partition we're meant to leave alone.
+    pub gpt_attributes: u64,
     pub offset_bytes: u64,
     pub size_bytes: u64,
     pub fs_kind: FilesystemKind,
@@ -203,6 +212,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         index: i as u32,
                         name: e.name,
                         type_guid: e.type_guid,
+                        gpt_attributes: e.attributes,
                         offset_bytes: e.starting_offset,
                         size_bytes: e.length,
                         fs_kind,
@@ -240,6 +250,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         index: i as u32,
                         name: format!("Partition{i}"),
                         type_guid: [0u8; 16],
+                        gpt_attributes: 0,
                         offset_bytes: e.starting_offset,
                         size_bytes: e.length,
                         fs_kind,
@@ -371,6 +382,7 @@ fn bus_type_label(bus_type: i32, removable: u8) -> String {
 struct GptEntry {
     name: String,
     type_guid: [u8; 16],
+    attributes: u64,
     starting_offset: u64,
     length: u64,
 }
@@ -457,6 +469,7 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
             entries.push(GptEntry {
                 name,
                 type_guid,
+                attributes: gpt.Attributes,
                 starting_offset: part.StartingOffset as u64,
                 length: part.PartitionLength as u64,
             });
@@ -808,7 +821,13 @@ pub fn query_partition_usage(volume_path: &str) -> Option<PartitionUsage> {
     })
 }
 
-fn find_volume_for_partition(
+/// Find the `\\.\X:` volume device path whose extent exactly covers
+/// the partition at `(disk_index, offset, length)`. Used at enumeration
+/// time to attach drive letters to partitions, and at restore time to
+/// hand the post-restore extender (`phoenix_restore::grow`) a handle
+/// it can call `FSCTL_EXTEND_VOLUME` against. Returns `None` if no
+/// mounted volume matches (unmounted partitions, EFI/MSR, etc.).
+pub fn find_volume_for_partition(
     disk_index: u32,
     offset: u64,
     length: u64,

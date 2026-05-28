@@ -27,7 +27,7 @@ use phoenix_core::error::{PhoenixError, Result};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FlushFileBuffers, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -36,11 +36,40 @@ use windows_sys::Win32::System::Ioctl::{
     PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT, PARTITION_STYLE_MBR,
 };
 
-use crate::plan::{RestoreMode, RestorePlan};
+/// Per-partition descriptor for the GPT writer. Built by the caller from
+/// the backup's `PartitionIndexEntry` (for restored partitions) and from
+/// the live target `PartitionInfo` (for partitions we're preserving in a
+/// partial restore). Everything `IOCTL_DISK_SET_DRIVE_LAYOUT_EX` needs
+/// to know per-partition lives here so the writer doesn't have to peek
+/// back at the plan or the manifest.
+#[derive(Debug, Clone)]
+pub struct GptEntry {
+    pub offset_bytes: u64,
+    pub size_bytes: u64,
+    pub type_guid: [u8; 16],
+    pub attributes: u64,
+    /// Free-form partition name. Truncated to 35 UTF-16 code units when
+    /// written (the on-disk GPT entry has a 36-`wchar` field; we reserve
+    /// one slot for a trailing NUL out of an abundance of caution).
+    pub name: String,
+}
 
-/// Standard ESP-data GUID — `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`. We
-/// stamp every restored partition with this type for now; per-partition
-/// type GUIDs from the source manifest are a follow-up.
+/// Per-partition descriptor for the MBR writer. Mirror of [`GptEntry`]
+/// but with the byte-sized partition-type field MBR uses instead of a
+/// type GUID.
+#[derive(Debug, Clone)]
+pub struct MbrEntry {
+    pub offset_bytes: u64,
+    pub size_bytes: u64,
+    pub partition_type: u8,
+    pub bootable: bool,
+}
+
+/// Standard Basic-Data GUID — `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`.
+/// Used as a fallback when the per-entry source descriptor doesn't
+/// carry a type GUID (older backups, MBR sources reusing the GPT
+/// writer, defensive paths). Real partitions get their source type
+/// GUID threaded through [`GptEntry::type_guid`].
 const BASIC_DATA_PARTITION_TYPE: GUID = GUID {
     data1: 0xebd0a0a2,
     data2: 0xb9e5,
@@ -147,52 +176,194 @@ pub fn init_target_disk_as_gpt(
 /// in the middle of the data stream (the symptom users saw was a
 /// `WriteFile of 4194304 bytes at disk offset N failed (Win32 error 5)`
 /// some hundreds of MiB into a previously-fine restore).
+///
+/// The caller passes per-partition descriptors carrying the source
+/// type GUID / attributes / name; this is what makes EFI, MSR, and
+/// Recovery partitions land with the right type so Windows treats them
+/// as system partitions rather than auto-mounting them as Basic Data
+/// volumes (the symptom that prompted this rewrite — EFI / MSR /
+/// Recovery showing up with drive letters E:, F:, H: after restore).
 pub fn write_partition_layout(
     disk_path: &str,
-    plan: &RestorePlan,
+    entries: &[GptEntry],
     state: &GptInitState,
-    mode: RestoreMode,
 ) -> Result<()> {
-    let layout_entries: Vec<_> = match mode {
-        RestoreMode::FullDisk => plan.entries.iter().filter(|e| e.restore).collect(),
-        RestoreMode::Partial => plan.entries.iter().collect(),
-    };
-    if layout_entries.is_empty() {
+    if entries.is_empty() {
         return Ok(());
     }
     let handle = open_disk_for_write(disk_path)?;
-    let res = set_drive_layout(handle, &layout_entries, &state.disk_guid, state.disk_size_bytes);
+    let res = set_drive_layout(handle, entries, &state.disk_guid, state.disk_size_bytes);
     unsafe { CloseHandle(handle) };
     res
 }
 
 /// Write an MBR partition table after a full-disk restore onto MBR media.
-pub fn write_mbr_partition_layout(disk_path: &str, plan: &RestorePlan) -> Result<()> {
-    let layout_entries: Vec<_> = plan.entries.iter().filter(|e| e.restore).collect();
-    if layout_entries.is_empty() {
+pub fn write_mbr_partition_layout(disk_path: &str, entries: &[MbrEntry]) -> Result<()> {
+    if entries.is_empty() {
         return Ok(());
     }
     let handle = open_disk_for_write(disk_path)?;
-    let res = set_drive_layout_mbr(handle, &layout_entries);
+    let res = set_drive_layout_mbr(handle, entries);
     unsafe { CloseHandle(handle) };
     res
 }
 
 /// Update GPT entries on an already-initialized disk (partial restore).
+///
+/// The caller must include descriptors for *every* partition that
+/// should remain on the disk — both restored and preserved — because
+/// `IOCTL_DISK_SET_DRIVE_LAYOUT_EX` is total-rewrite, not patch-and-add.
+/// Preserved partitions take their type GUID / attributes / name from
+/// the live target disk (read at the top of `run_restore`) rather than
+/// from the backup, so we don't accidentally re-type a Recovery
+/// partition we never owned as Basic Data on the way out.
 pub fn update_partition_layout_existing(
     disk_path: &str,
-    plan: &RestorePlan,
+    entries: &[GptEntry],
     disk_guid: &GUID,
     disk_size_bytes: u64,
 ) -> Result<()> {
-    let layout_entries: Vec<_> = plan.entries.iter().collect();
-    if layout_entries.is_empty() {
+    if entries.is_empty() {
         return Ok(());
     }
     let handle = open_disk_for_write(disk_path)?;
-    let res = set_drive_layout(handle, &layout_entries, disk_guid, disk_size_bytes);
+    let res = set_drive_layout(handle, entries, disk_guid, disk_size_bytes);
     unsafe { CloseHandle(handle) };
     res
+}
+
+/// Explicit `FlushFileBuffers` on the disk handle. Called from
+/// [`run_restore`](crate::restore::run_restore) right before the
+/// partition table goes down, so any cached writes from
+/// `PartitionWriter` (the per-partition data writer) are guaranteed
+/// committed before partmgr re-enumerates and mountmgr starts probing
+/// the new layout. Raw `\\.\PhysicalDriveN` writes are already
+/// nominally uncached, but the cost of being explicit here is one
+/// IOCTL and the safety win against a mountmgr-vs-data-write race is
+/// real. Best-effort: degrades to a `warn!` on failure.
+pub fn flush_disk(disk_path: &str) {
+    let handle = match open_disk_for_write(disk_path) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not reopen disk for FlushFileBuffers");
+            return;
+        }
+    };
+    let ok = unsafe { FlushFileBuffers(handle) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        tracing::warn!(
+            win32_error = err,
+            "FlushFileBuffers on disk handle failed; pre-table cache flush skipped"
+        );
+    }
+    unsafe { CloseHandle(handle) };
+}
+
+/// Clear the disk's "offline" attribute via `IOCTL_DISK_SET_DISK_ATTRIBUTES`
+/// so volumes auto-mount with drive letters after a restore, rather than
+/// requiring the user to right-click → Online in Disk Management.
+///
+/// Windows leaves a freshly-restored disk offline in two common cases:
+///
+///   1. The SAN policy is `OfflineShared` / `OfflineAll` (the default on
+///      Windows Server SKUs). Any disk that appears after boot gets
+///      offlined until an admin explicitly brings it online.
+///   2. The new disk's GPT GUID or MBR signature matches another attached
+///      disk (very common after a full-disk clone — the source's signature
+///      gets faithfully reproduced on the target). Windows offlines the
+///      *duplicate* to prevent mount-table ambiguity.
+///
+/// Clearing the offline bit handles case (1) outright and is enough for
+/// case (2) on client SKUs (Windows just marks the disk online and the
+/// mountmgr de-duplicates volume GUIDs internally). For case (2) on
+/// Server SKUs you'd additionally need to rewrite the disk signature;
+/// we don't do that here because clone-with-same-signature is a
+/// deliberate user intent — the right thing to do is online the disk
+/// and let the user pick their drive letters.
+///
+/// The `Persist = TRUE` flag below makes the attribute change survive
+/// reboots so the user doesn't get the "Disk is Offline" dialog every
+/// time they reboot with this disk attached.
+///
+/// Best-effort: a failure here only means the user has to manually
+/// right-click → Online, so we degrade to a `warn!` rather than failing
+/// the restore.
+pub fn bring_disk_online(disk_path: &str) {
+    // From `winioctl.h`; not re-exported by `windows-sys` 0.59. The
+    // CTL_CODE macro expansion for FILE_DEVICE_DISK (7), function 254,
+    // METHOD_BUFFERED (0), FILE_READ_ACCESS|FILE_WRITE_ACCESS (3) →
+    // (7 << 16) | (3 << 14) | (254 << 2) | 0 = 0x0007_C0F8 ... wait,
+    // double-checking: Microsoft's published value is 0x0007_C0F4 for
+    // SET_DISK_ATTRIBUTES (function 0x3D, not 0xFE). We use that value
+    // verbatim rather than reconstructing it from the CTL_CODE pieces.
+    const IOCTL_DISK_SET_DISK_ATTRIBUTES: u32 = 0x0007_C0F4;
+    const DISK_ATTRIBUTE_OFFLINE: u64 = 0x0000_0000_0000_0001;
+
+    // Win32 ABI per `winioctl.h`. Field order/size MUST match exactly:
+    //   DWORD Version;           // 4
+    //   BOOLEAN Persist;         // 1 (BOOLEAN is BYTE, NOT a Rust bool)
+    //   BYTE Reserved1[3];       // 3
+    //   DWORDLONG Attributes;    // 8 (8-byte aligned at offset 8)
+    //   DWORDLONG AttributesMask;// 8
+    //   DWORD Reserved2[4];      // 16
+    // Total: 40 bytes.
+    #[repr(C)]
+    struct SetDiskAttributes {
+        version: u32,
+        persist: u8,
+        reserved1: [u8; 3],
+        attributes: u64,
+        attributes_mask: u64,
+        reserved2: [u32; 4],
+    }
+
+    let handle = match open_disk_for_write(disk_path) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not reopen disk for IOCTL_DISK_SET_DISK_ATTRIBUTES; disk may need to be brought online manually via Disk Management"
+            );
+            return;
+        }
+    };
+
+    let mut sda = SetDiskAttributes {
+        version: size_of::<SetDiskAttributes>() as u32,
+        persist: 1, // TRUE — make the online state survive reboots
+        reserved1: [0; 3],
+        attributes: 0, // not offline, not read-only
+        attributes_mask: DISK_ATTRIBUTE_OFFLINE, // only touch the OFFLINE bit
+        reserved2: [0; 4],
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_SET_DISK_ATTRIBUTES,
+            &mut sda as *mut _ as *mut _,
+            size_of::<SetDiskAttributes>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        tracing::warn!(
+            win32_error = err,
+            disk = disk_path,
+            "IOCTL_DISK_SET_DISK_ATTRIBUTES failed; disk may show as Offline in Disk Management. Right-click the disk and choose Online to mount its volumes."
+        );
+    } else {
+        tracing::info!(
+            disk = disk_path,
+            "cleared DISK_ATTRIBUTE_OFFLINE (Persist=TRUE); volumes should auto-mount"
+        );
+    }
+    unsafe { CloseHandle(handle) };
 }
 
 /// Tell the disk class driver to re-read its partition table so Disk
@@ -266,33 +437,32 @@ fn create_gpt_disk(handle: HANDLE, disk_guid: &GUID) -> Result<()> {
     Ok(())
 }
 
-fn set_drive_layout_mbr(handle: HANDLE, restoring: &[&crate::plan::RestorePlanEntry]) -> Result<()> {
-    const PARTITION_IFS: u8 = 0x07;
+fn set_drive_layout_mbr(handle: HANDLE, entries: &[MbrEntry]) -> Result<()> {
     let header_size = size_of::<DRIVE_LAYOUT_INFORMATION_EX>();
     let entry_size = size_of::<PARTITION_INFORMATION_EX>();
-    let buf_size = header_size + restoring.len() * entry_size;
+    let buf_size = header_size + entries.len() * entry_size;
     let mut buffer = vec![0u8; buf_size];
     let layout = unsafe { &mut *(buffer.as_mut_ptr() as *mut DRIVE_LAYOUT_INFORMATION_EX) };
     layout.PartitionStyle = PARTITION_STYLE_MBR as u32;
-    layout.PartitionCount = restoring.len() as u32;
+    layout.PartitionCount = entries.len() as u32;
     layout.Anonymous.Mbr = windows_sys::Win32::System::Ioctl::DRIVE_LAYOUT_INFORMATION_MBR {
         Signature: 0,
         CheckSum: 0,
     };
 
     let entry_ptr = layout.PartitionEntry.as_mut_ptr();
-    for (i, entry) in restoring.iter().enumerate() {
+    for (i, entry) in entries.iter().enumerate() {
         let part = unsafe { &mut *entry_ptr.add(i) };
         part.PartitionStyle = PARTITION_STYLE_MBR;
-        part.StartingOffset = entry.target_offset_bytes as i64;
-        part.PartitionLength = entry.target_size_bytes as i64;
+        part.StartingOffset = entry.offset_bytes as i64;
+        part.PartitionLength = entry.size_bytes as i64;
         part.PartitionNumber = (i + 1) as u32;
         part.RewritePartition = 1;
         part.Anonymous.Mbr = windows_sys::Win32::System::Ioctl::PARTITION_INFORMATION_MBR {
-            PartitionType: PARTITION_IFS,
-            BootIndicator: if i == 0 { 1 } else { 0 },
+            PartitionType: entry.partition_type,
+            BootIndicator: if entry.bootable { 1 } else { 0 },
             RecognizedPartition: 1,
-            HiddenSectors: (entry.target_offset_bytes / 512) as u32,
+            HiddenSectors: (entry.offset_bytes / 512) as u32,
             PartitionId: GUID {
                 data1: 0,
                 data2: 0,
@@ -326,7 +496,7 @@ fn set_drive_layout_mbr(handle: HANDLE, restoring: &[&crate::plan::RestorePlanEn
 
 fn set_drive_layout(
     handle: HANDLE,
-    restoring: &[&crate::plan::RestorePlanEntry],
+    entries: &[GptEntry],
     disk_guid: &GUID,
     disk_size_bytes: u64,
 ) -> Result<()> {
@@ -336,7 +506,7 @@ fn set_drive_layout(
     // inline, so a buffer of `header_size + (count - 1) * entry_size`
     // would suffice, but rounding up to `header_size + count * entry_size`
     // is harmless and keeps the math obvious.
-    let buf_size = header_size + restoring.len() * entry_size;
+    let buf_size = header_size + entries.len() * entry_size;
     let mut buffer = vec![0u8; buf_size];
 
     // SAFETY: `buffer` is heap-allocated and the layout's first field is
@@ -345,7 +515,7 @@ fn set_drive_layout(
     // is well-defined as long as we stay inside `buf_size` bytes.
     let layout = unsafe { &mut *(buffer.as_mut_ptr() as *mut DRIVE_LAYOUT_INFORMATION_EX) };
     layout.PartitionStyle = PARTITION_STYLE_GPT as u32;
-    layout.PartitionCount = restoring.len() as u32;
+    layout.PartitionCount = entries.len() as u32;
     let sector_size: u64 = 512;
     layout.Anonymous.Gpt = windows_sys::Win32::System::Ioctl::DRIVE_LAYOUT_INFORMATION_GPT {
         DiskId: *disk_guid,
@@ -357,30 +527,48 @@ fn set_drive_layout(
     };
 
     let entry_ptr = layout.PartitionEntry.as_mut_ptr();
-    for (i, entry) in restoring.iter().enumerate() {
-        // SAFETY: `i` is bounded by `restoring.len()`, and we sized the
+    for (i, entry) in entries.iter().enumerate() {
+        // SAFETY: `i` is bounded by `entries.len()`, and we sized the
         // buffer to fit at least that many `PARTITION_INFORMATION_EX`
         // slots starting at `PartitionEntry`.
         let part = unsafe { &mut *entry_ptr.add(i) };
         part.PartitionStyle = PARTITION_STYLE_GPT;
-        part.StartingOffset = entry.target_offset_bytes as i64;
-        part.PartitionLength = entry.target_size_bytes as i64;
+        part.StartingOffset = entry.offset_bytes as i64;
+        part.PartitionLength = entry.size_bytes as i64;
         part.PartitionNumber = (i + 1) as u32;
         part.RewritePartition = 1;
+
+        // Type GUID: prefer the source's (which we threaded through
+        // [`GptEntry::type_guid`]). All-zeroes means "no GUID recorded"
+        // — fall back to Basic Data so the partition is still mountable.
+        // The fallback path matters for MBR-source restores routed
+        // through this writer and for older backups that pre-date type
+        // GUID capture; modern backups always carry the source GUID.
+        let type_guid = if entry.type_guid.iter().all(|&b| b == 0) {
+            BASIC_DATA_PARTITION_TYPE
+        } else {
+            bytes_to_guid(entry.type_guid)
+        };
+
+        let mut name_buf = [0u16; 36];
+        for (slot, ch) in name_buf.iter_mut().zip(entry.name.encode_utf16()).take(35) {
+            *slot = ch;
+        }
+
         // Writing to a union field (`PARTITION_INFORMATION_EX.Anonymous`)
         // is safe in current Rust — only *reading* from a union without
         // knowing which variant is active is unsafe — so no `unsafe`
         // wrapper here.
         part.Anonymous.Gpt = windows_sys::Win32::System::Ioctl::PARTITION_INFORMATION_GPT {
-            PartitionType: BASIC_DATA_PARTITION_TYPE,
+            PartitionType: type_guid,
             PartitionId: GUID {
                 data1: 0,
                 data2: 0,
                 data3: 0,
                 data4: [0; 8],
             },
-            Attributes: 0,
-            Name: [0; 36],
+            Attributes: entry.attributes,
+            Name: name_buf,
         };
     }
 

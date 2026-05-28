@@ -1,4 +1,11 @@
+// Pulled in via `include!` rather than `mod` so we can share the helper
+// between `phoenix-gui/build.rs` and `phoenix-cli/build.rs` without
+// promoting it into a `build-dependencies` crate (which would noticeably
+// slow clean builds). See the file's own doc comment for the rationale.
+include!("../windows/build_info.rs");
+
 fn main() {
+    emit_build_info();
     embed_windows_resources();
 }
 
@@ -9,7 +16,7 @@ fn embed_windows_resources() {
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let manifest = root.join("windows").join("admin.manifest");
-    let icon = root.join("carbon-phoenix-icon.ico");
+    let icon = root.join("carbon-phoenix_appIcon.ico");
 
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-changed={}", icon.display());
@@ -19,7 +26,7 @@ fn embed_windows_resources() {
         .expect("admin.manifest path must be valid UTF-8");
     let icon_str = icon
         .to_str()
-        .expect("carbon-phoenix-icon.ico path must be valid UTF-8");
+        .expect("carbon-phoenix_appIcon.ico path must be valid UTF-8");
 
     winres::WindowsResource::new()
         .set_manifest_file(manifest_str)

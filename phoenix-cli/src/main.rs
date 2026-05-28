@@ -1,3 +1,5 @@
+mod version;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -73,12 +75,20 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Match the GUI's default filter so a user running the CLI also sees
+    // capture/restore progress events without having to set `RUST_LOG`.
+    // The catch-all `warn` keeps third-party libs quiet.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "phoenix_core=info,phoenix_capture=info,phoenix_restore=info,\
+                 phoenix_vss=info,phoenix_build=info,warn"
+                    .into()
+            }),
         )
         .init();
+
+    phoenix_core::build_info::log_startup_banner(&crate::version::BUILD_INFO);
 
     let cli = Cli::parse();
     match cli.command {
