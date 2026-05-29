@@ -25,37 +25,14 @@ pub struct RestoreOptions {
     pub progress: Option<ProgressHandle>,
 }
 
-/// Outcome of a successful restore. Distinguishes:
-///   * `partitions_restored` — total partitions written.
-///   * `partitions_resized` — partitions whose target size differed
-///     from the source. These needed boot-sector patching at minimum.
-///   * `partitions_metadata_rewritten` — partitions where the NTFS
-///     metadata rewriter ran (post-data-write `$Bitmap` truncation,
-///     `$LogFile` clean-shutdown stamp, MFT data-run translation, MFT
-///     mirror sync). Currently only NTFS shrinks; FAT/exFAT and NTFS
-///     grows still need user-side `chkdsk /F` to reconcile metadata.
-///
-/// The chkdsk hint is suppressed for partitions counted in
-/// `partitions_metadata_rewritten` because the rewriter has already
-/// done the reconciliation work that chkdsk would otherwise do at next
-/// mount. The hint still fires for resized partitions that didn't get
-/// our automatic cleanup (the `partitions_resized -
-/// partitions_metadata_rewritten` delta).
+/// Outcome of a successful restore.
 #[derive(Debug, Clone, Default)]
 pub struct RestoreSummary {
+    /// Partitions whose data was written to the target disk.
     pub partitions_restored: u32,
+    /// Partitions whose target size differed from the backup (grow,
+    /// shrink, or layout slack expansion on a larger disk).
     pub partitions_resized: u32,
-    pub partitions_metadata_rewritten: u32,
-}
-
-impl RestoreSummary {
-    /// Number of resized partitions whose post-resize metadata still
-    /// needs `chkdsk /F` to reconcile (i.e., we did not run our own
-    /// cleanup pass over them).
-    pub fn partitions_needing_chkdsk(&self) -> u32 {
-        self.partitions_resized
-            .saturating_sub(self.partitions_metadata_rewritten)
-    }
 }
 
 pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
@@ -234,16 +211,6 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                     bytes_done,
                     relocation.as_ref(),
                 )?;
-                // The NTFS metadata rewriter ran iff we passed it a
-                // map. With `build_relocation_map` now returning
-                // Some(empty_map) for shrinks that don't need
-                // physical relocation, this branch fires for every
-                // NTFS shrink — including the "data already fits"
-                // case, which still benefits from `$Bitmap` /
-                // `$LogFile` cleanup.
-                if relocation.is_some() {
-                    summary.partitions_metadata_rewritten += 1;
-                }
             }
             FilesystemKind::Fat | FilesystemKind::Exfat => {
                 bytes_done += restore_fat(

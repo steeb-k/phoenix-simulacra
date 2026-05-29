@@ -135,31 +135,7 @@ pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
             progress: Some(progress_worker),
             ..opts
         })
-        .map(|summary| {
-            // Three message states:
-            //   * No partitions resized → plain "Restore completed".
-            //   * Resized AND all got our metadata rewriter (NTFS
-            //     shrinks today) → still plain "Restore completed";
-            //     `$Bitmap` / `$LogFile` / mirror are already
-            //     reconciled, so chkdsk has nothing to do.
-            //   * Resized but at least one partition didn't get the
-            //     rewriter (NTFS grows, FAT/exFAT resizes) → the
-            //     hint, scoped to the partitions that still need it.
-            //     Boot-sector patching makes those volumes mountable
-            //     but their per-FS allocation metadata still
-            //     describes the source layout.
-            let needs_chkdsk = summary.partitions_needing_chkdsk();
-            if needs_chkdsk == 0 {
-                "Restore completed".to_string()
-            } else {
-                let plural = if needs_chkdsk == 1 { "" } else { "s" };
-                format!(
-                    "Restore completed. {needs_chkdsk} partition{plural} resized — run \
-                     `chkdsk /F X:` (replacing X: with each restored drive letter) so Windows \
-                     can reconcile filesystem metadata."
-                )
-            }
-        })
+        .map(|_summary| "Restore completed".to_string())
         .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
