@@ -5,6 +5,7 @@ mod restore_layout;
 mod restore_panel;
 mod job;
 mod sidebar;
+mod status_modal;
 mod theme;
 mod util;
 mod version;
@@ -24,6 +25,7 @@ use phoenix_restore::restore::RestoreOptions;
 
 use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob, JobKind};
 use crate::sidebar::Page;
+use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView};
 use crate::theme::Palette;
 use crate::util::format_bytes;
 
@@ -192,6 +194,10 @@ struct PhoenixApp {
     status: String,
     page: Page,
     job: Option<BackgroundJob>,
+    /// Finished-job snapshot that keeps the status modal up (final step list
+    /// + colored Close button) until the user dismisses it. `None` once
+    /// dismissed or while a job is still running.
+    completed: Option<CompletedJob>,
     palette: Palette,
     last_theme_refresh: Instant,
 }
@@ -221,6 +227,7 @@ impl PhoenixApp {
             status: "Ready".into(),
             page: Page::Backup,
             job: None,
+            completed: None,
             palette,
             last_theme_refresh: Instant::now(),
         };
@@ -331,6 +338,10 @@ impl PhoenixApp {
         };
         let job_kind = job.kind;
         if let Some(result) = job.poll() {
+            // Capture the final step list before dropping the job so the
+            // modal can keep showing it (with a Close button) after the
+            // worker thread is gone.
+            let final_snap = job.progress.snapshot();
             self.job = None;
             match result {
                 Ok(msg) => {
@@ -353,6 +364,7 @@ impl PhoenixApp {
                         }
                         self.total_backups = 0;
                         self.current_backup_index = 0;
+                        self.finish_modal(job_kind, &final_snap, JobOutcome::Success);
                     }
                 }
                 Err(e) => {
@@ -363,6 +375,11 @@ impl PhoenixApp {
                     // keeps the wording accurate even if the user has navigated
                     // to another page while the worker was winding down.
                     let cancelled = e.contains("cancelled by user");
+                    let outcome = if cancelled {
+                        JobOutcome::Warning
+                    } else {
+                        JobOutcome::Failure
+                    };
                     if cancelled {
                         self.status = job_kind.cancelled_message().to_string();
                         self.pending_backups.clear();
@@ -377,11 +394,30 @@ impl PhoenixApp {
                     }
                     self.total_backups = 0;
                     self.current_backup_index = 0;
+                    self.finish_modal(job_kind, &final_snap, outcome);
                 }
             }
         } else {
             ctx.request_repaint();
         }
+    }
+
+    /// Park the just-finished job's final step list in `self.completed` so the
+    /// modal stays up until the user clicks Close. The headline message reuses
+    /// the status text we just computed.
+    fn finish_modal(
+        &mut self,
+        kind: JobKind,
+        snap: &phoenix_core::ProgressSnapshot,
+        outcome: JobOutcome,
+    ) {
+        self.completed = Some(CompletedJob {
+            title: kind.noun().to_string(),
+            steps: snap.steps.clone(),
+            current_step: snap.current_step,
+            outcome,
+            message: self.status.clone(),
+        });
     }
 
     /// Request the active worker to wind down at the next chunk boundary
@@ -421,6 +457,9 @@ impl eframe::App for PhoenixApp {
         let busy = self.busy();
         sidebar::show(ctx, &mut self.page, &self.palette, busy);
 
+        // Slim bottom status line for idle/non-job messages (disk count,
+        // "Loaded backup…", load errors, "Ready"). While a job runs or its
+        // result modal is up, the blocking modal overlays this bar.
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
@@ -428,9 +467,6 @@ impl eframe::App for PhoenixApp {
                     .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
             )
             .show(ctx, |ui| {
-                if let Some(job) = &self.job {
-                    show_progress(ui, &job.progress, &self.palette);
-                }
                 ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
             });
 
@@ -452,6 +488,48 @@ impl eframe::App for PhoenixApp {
                     Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
                 }
             });
+
+        self.show_status_modal(ctx);
+    }
+}
+
+impl PhoenixApp {
+    /// Render the blocking status modal when a job is running or its result
+    /// is awaiting dismissal, then act on the user's Cancel/Close click.
+    fn show_status_modal(&mut self, ctx: &egui::Context) {
+        let mut action = ModalAction::None;
+        if let Some(completed) = &self.completed {
+            let view = ModalView {
+                title: &completed.title,
+                steps: &completed.steps,
+                current_step: completed.current_step,
+                detail: &completed.message,
+                fraction: 1.0,
+                current_bytes: 0,
+                total_bytes: 0,
+                outcome: Some(completed.outcome),
+            };
+            action = status_modal::show(ctx, &self.palette, &view);
+        } else if let Some(job) = &self.job {
+            let snap = job.progress.snapshot();
+            let view = ModalView {
+                title: job.kind.title(),
+                steps: &snap.steps,
+                current_step: snap.current_step,
+                detail: &snap.detail,
+                fraction: snap.fraction(),
+                current_bytes: snap.current,
+                total_bytes: snap.total,
+                outcome: None,
+            };
+            action = status_modal::show(ctx, &self.palette, &view);
+        }
+
+        match action {
+            ModalAction::Cancel => self.cancel_current_job(),
+            ModalAction::Close => self.completed = None,
+            ModalAction::None => {}
+        }
     }
 }
 
@@ -470,23 +548,23 @@ pub struct StartAction<'a> {
     pub disabled_hint: Option<&'a str>,
 }
 
-/// Render `starts` (one or more green Start-style buttons) followed by a
-/// single red Cancel button at the end of the row. Returns `(Some(start_idx), false)`
-/// when one of the start buttons was clicked, `(None, true)` when Cancel
-/// was clicked, or `(None, false)` otherwise.
+/// Render `starts` (one or more green Start-style buttons) in a row.
+/// Returns `Some(start_idx)` when one of them was clicked, `None` otherwise.
+///
+/// Cancellation lives in the blocking status modal now (its Cancel button
+/// calls [`PhoenixApp::cancel_current_job`]), so this row no longer renders
+/// a per-page Cancel control.
 ///
 /// All buttons land at `FORM_BUTTON_W` × `height`. Disabled colored
 /// buttons stay tinted (faded, via `Palette::dim`) instead of going
-/// fully grey so the user still recognizes which control is Go vs Stop.
+/// fully grey so the user still recognizes the Go control.
 fn action_row(
     ui: &mut egui::Ui,
     palette: &Palette,
     height: f32,
     starts: &[StartAction<'_>],
-    cancel_enabled: bool,
-) -> (Option<usize>, bool) {
+) -> Option<usize> {
     let mut clicked_start: Option<usize> = None;
-    let mut clicked_cancel = false;
     ui.horizontal(|ui| {
         for (idx, start) in starts.iter().enumerate() {
             let fill = if start.enabled {
@@ -513,28 +591,8 @@ fn action_row(
                 clicked_start = Some(idx);
             }
         }
-        let cancel_fill = if cancel_enabled {
-            palette.danger
-        } else {
-            palette.dim(palette.danger)
-        };
-        let cancel_resp = ui
-            .add_enabled_ui(cancel_enabled, |ui| {
-                ui.add_sized(
-                    [FORM_BUTTON_W, height],
-                    egui::Button::new(
-                        egui::RichText::new("Cancel").color(egui::Color32::WHITE),
-                    )
-                    .fill(cancel_fill),
-                )
-            })
-            .inner
-            .on_disabled_hover_text("No operation is currently running");
-        if cancel_resp.clicked() {
-            clicked_cancel = true;
-        }
     });
-    (clicked_start, clicked_cancel)
+    clicked_start
 }
 
 /// Bold "label + TextEdit + Browse…" row used by both the Verify and Restore
@@ -626,58 +684,6 @@ fn coming_soon(ui: &mut egui::Ui, palette: &Palette, blurb: &str) {
     });
 }
 
-fn show_progress(ui: &mut egui::Ui, progress: &ProgressHandle, palette: &Palette) {
-    let snap = progress.snapshot();
-    if !snap.active {
-        return;
-    }
-    ui.label(&snap.phase);
-    if !snap.detail.is_empty() {
-        ui.label(&snap.detail);
-    }
-    if snap.total > 0 {
-        let fraction = snap.fraction();
-        // Custom breathing fill: lerps the bar between a desaturated
-        // ~30%-accent + ~70%-input_bg blend and the full accent over a
-        // ~2s cycle. This swaps egui's built-in `.animate(true)` — which
-        // adds a hard-to-see grey "spinner arc" at the bar's leading edge
-        // and only pulses brightness by a barely-visible 30% — for a
-        // noticeably louder "this UI is alive" cue that doesn't need a
-        // spinner widget at all. We pulse via `ProgressBar::fill()` (a
-        // public builder method) instead of forking the widget.
-        let fill = if fraction >= 1.0 {
-            palette.accent
-        } else {
-            let t = ui.input(|i| i.time) as f32;
-            // 0..1 sinusoidal pulse with a ~2s period — matches the
-            // tempo of a calm human exhale-inhale, which avoids feeling
-            // anxious / busy.
-            let pulse = 0.5 + 0.5 * (t * std::f32::consts::PI).sin();
-            let dim_end = theme::tint(palette.accent, 0.7, palette.input_bg);
-            theme::tint(dim_end, pulse, palette.accent)
-        };
-
-        ui.add(
-            egui::ProgressBar::new(fraction)
-                .fill(fill)
-                .text(format!(
-                    "{} / {} ({:.1}%)",
-                    format_bytes(snap.current),
-                    format_bytes(snap.total),
-                    fraction * 100.0
-                )),
-        );
-        if fraction < 1.0 {
-            // egui's `.animate(true)` would call this for us. Now that
-            // we're driving the animation ourselves we have to ask for
-            // the next frame explicitly or the pulse would freeze.
-            ui.ctx().request_repaint();
-        }
-    } else {
-        ui.add(egui::Spinner::new());
-    }
-}
-
 /// Large phosphor refresh control for re-enumerating disks.
 fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
     let size = Vec2::splat(REFRESH_BTN_SIZE);
@@ -747,8 +753,6 @@ impl PhoenixApp {
 
         let input_height = name_response.rect.height() + INPUT_MARGIN_RESTORE;
 
-        // Action row sits OUTSIDE the disabled wrap so the Cancel button
-        // can stay live while the form is greyed out.
         let starts = [StartAction {
             label: "Start backup",
             enabled: !busy && !name_missing,
@@ -758,13 +762,8 @@ impl PhoenixApp {
                 "Enter a backup name first"
             }),
         }];
-        let (start_clicked, cancel_clicked) =
-            action_row(ui, &self.palette, input_height, &starts, busy);
-        if start_clicked == Some(0) {
+        if action_row(ui, &self.palette, input_height, &starts) == Some(0) {
             self.start_backup();
-        }
-        if cancel_clicked {
-            self.cancel_current_job();
         }
     }
 
@@ -1032,13 +1031,8 @@ impl PhoenixApp {
                 "Choose a backup file first"
             }),
         }];
-        let (start_clicked, cancel_clicked) =
-            action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts, busy);
-        if start_clicked == Some(0) {
+        if action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts) == Some(0) {
             self.start_restore();
-        }
-        if cancel_clicked {
-            self.cancel_current_job();
         }
     }
 
@@ -1249,15 +1243,10 @@ impl PhoenixApp {
                 disabled_hint: Some(disabled_hint),
             },
         ];
-        let (start_clicked, cancel_clicked) =
-            action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts, busy);
-        match start_clicked {
+        match action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts) {
             Some(0) => self.start_verify(true),
             Some(1) => self.start_verify(false),
             _ => {}
-        }
-        if cancel_clicked {
-            self.cancel_current_job();
         }
     }
 

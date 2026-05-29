@@ -73,9 +73,80 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // skip the whole step.
     let mode = opts.plan.mode();
     let source_was_gpt = reader.manifest.disk.style.eq_ignore_ascii_case("gpt");
+
+    // --- Build the ordered step plan up front so the GUI modal can render
+    // upcoming steps grayed out. Steps are condition-aware: disk init only
+    // runs for a full-disk restore, the layout write only when we (re)stamp
+    // the partition table, and "Resizing partitions" only when some NTFS
+    // volume is being grown. The `*_step` indices captured here are reused
+    // by the `set_step` calls below as the worker advances. ---
+    let restoring: Vec<_> = opts.plan.entries.iter().filter(|e| e.restore).collect();
+    let restore_count = restoring.len();
+    let any_grow = restoring.iter().any(|entry| {
+        let Some(src) = entry.source_partition_index else {
+            return false;
+        };
+        reader
+            .index
+            .iter()
+            .find(|e| e.index == src)
+            .map(|idx| {
+                matches!(idx.fs_kind, FilesystemKind::Ntfs)
+                    && entry.target_size_bytes > idx.original_size
+            })
+            .unwrap_or(false)
+    });
+    let needs_init = mode == RestoreMode::FullDisk;
+    let writes_layout = mode == RestoreMode::FullDisk
+        || (mode == RestoreMode::Partial && disk.is_gpt && disk.disk_guid.is_some());
+
+    let mut steps: Vec<String> = Vec::new();
+    steps.push("Preparing restore".to_string());
+    let init_step = if needs_init {
+        steps.push("Initializing target disk".to_string());
+        Some(steps.len() - 1)
+    } else {
+        None
+    };
+    let restore_step_base = steps.len();
+    for (i, entry) in restoring.iter().enumerate() {
+        let name = entry
+            .source_partition_index
+            .and_then(|src| reader.index.iter().find(|e| e.index == src))
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "partition".to_string());
+        steps.push(format!(
+            "Restoring partition {} of {} — {}",
+            i + 1,
+            restore_count,
+            name
+        ));
+    }
+    let layout_step = if writes_layout {
+        steps.push("Writing partition layout".to_string());
+        Some(steps.len() - 1)
+    } else {
+        None
+    };
+    let resize_step = if any_grow {
+        steps.push("Resizing partitions".to_string());
+        Some(steps.len() - 1)
+    } else {
+        None
+    };
+    steps.push("Bringing disk online".to_string());
+    let online_step = steps.len() - 1;
+
+    if let Some(ref p) = opts.progress {
+        p.set_steps(steps);
+        p.set_step(0);
+    }
+
     let gpt_state: Option<GptInitState> = if mode == RestoreMode::FullDisk && source_was_gpt {
         if let Some(ref p) = opts.progress {
-            p.set_phase("Initializing target disk as GPT");
+            if let Some(step) = init_step {
+                p.set_step(step);
+            }
         }
         let source_disk_guid = parse_disk_guid(reader.manifest.disk.disk_guid.as_deref());
         Some(init_target_disk_as_gpt(
@@ -86,7 +157,9 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     } else {
         if mode == RestoreMode::FullDisk && !source_was_gpt {
             if let Some(ref p) = opts.progress {
-                p.set_phase("Initializing target disk as MBR");
+                if let Some(step) = init_step {
+                    p.set_step(step);
+                }
             }
             let sig = (reader.header.disk_signature & 0xFFFF_FFFF) as u32;
             init_target_disk_as_mbr(&disk.path, sig)?;
@@ -94,7 +167,6 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         None
     };
 
-    let restoring: Vec<_> = opts.plan.entries.iter().filter(|e| e.restore).collect();
     // Sum the per-partition `used_bytes` from the manifest so the GUI's
     // progress bar — which renders `current` and `total` through
     // `format_bytes` — shows real-world scale ("1.6 GB / 21 GB") instead
@@ -119,6 +191,9 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
 
     let mut bytes_done = 0u64;
     let mut summary = RestoreSummary::default();
+    // Sequence among restoring entries only, used to index into the
+    // per-partition steps declared in the plan above.
+    let mut restore_seq = 0usize;
 
     for entry in &opts.plan.entries {
         if !entry.restore {
@@ -161,11 +236,10 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         }
 
         if let Some(ref p) = opts.progress {
-            p.set_phase(format!(
-                "Restoring partition {} ({})",
-                src_index, idx_entry.name
-            ));
+            p.set_step(restore_step_base + restore_seq);
+            p.set_detail(String::new());
         }
+        restore_seq += 1;
 
         info!(
             "Restoring partition {} ({}) to offset {}",
@@ -252,17 +326,21 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     flush_disk(&disk.path);
     if let Some(state) = gpt_state {
         if let Some(ref p) = opts.progress {
-            p.set_phase("Writing partition layout");
+            if let Some(step) = layout_step {
+                p.set_step(step);
+            }
         }
         let gpt_entries = build_gpt_layout_entries(&opts.plan, &reader, &disk, mode);
         write_partition_layout(&disk.path, &gpt_entries, &state)?;
         if let Some(ref p) = opts.progress {
-            p.set_phase("Notifying Windows of the new partition layout");
+            p.set_detail("Notifying Windows of the new partition layout".to_string());
         }
         notify_disk_updated(&disk.path);
     } else if mode == RestoreMode::FullDisk && !source_was_gpt {
         if let Some(ref p) = opts.progress {
-            p.set_phase("Writing MBR partition layout");
+            if let Some(step) = layout_step {
+                p.set_step(step);
+            }
         }
         let mbr_entries = build_mbr_layout_entries(&opts.plan, &reader);
         write_mbr_partition_layout(&disk.path, &mbr_entries)?;
@@ -270,7 +348,9 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     } else if mode == RestoreMode::Partial && disk.is_gpt {
         if let Some(guid_bytes) = disk.disk_guid {
             if let Some(ref p) = opts.progress {
-                p.set_phase("Updating partition layout");
+                if let Some(step) = layout_step {
+                    p.set_step(step);
+                }
             }
             let disk_guid = bytes_to_guid(guid_bytes);
             let gpt_entries = build_gpt_layout_entries(&opts.plan, &reader, &disk, mode);
@@ -318,7 +398,10 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             continue;
         }
         if let Some(ref p) = opts.progress {
-            p.set_phase(format!(
+            if let Some(step) = resize_step {
+                p.set_step(step);
+            }
+            p.set_detail(format!(
                 "Extending NTFS volume for partition {}",
                 src_index
             ));
@@ -345,7 +428,8 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // duplicate-signature handling). Best-effort: a warn is logged on
     // failure, but the restored data is already valid on disk.
     if let Some(ref p) = opts.progress {
-        p.set_phase("Bringing disk online");
+        p.set_step(online_step);
+        p.set_detail(String::new());
     }
     bring_disk_online(&disk.path);
 

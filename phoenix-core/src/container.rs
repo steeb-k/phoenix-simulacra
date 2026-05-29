@@ -590,7 +590,9 @@ impl PhnxReader {
     ) -> Result<()> {
         if quick {
             if let Some(ref p) = progress {
+                p.set_steps(vec!["Metadata check".to_string()]);
                 p.begin(1, "Verify");
+                p.set_step(0);
                 p.set(1, "Metadata check");
                 p.end();
             }
@@ -604,21 +606,30 @@ impl PhnxReader {
             .map(|p| p.chunks.len() as u64)
             .sum();
 
+        // Declare one step per partition up front so the GUI modal can show
+        // upcoming partitions grayed out.
+        let indices: Vec<u32> = self.index.iter().map(|e| e.index).collect();
         if let Some(ref p) = progress {
+            let steps: Vec<String> = indices
+                .iter()
+                .map(|idx| {
+                    let name = self
+                        .index
+                        .iter()
+                        .find(|e| e.index == *idx)
+                        .map(|e| e.name.as_str())
+                        .unwrap_or("partition");
+                    format!("Verifying {name}")
+                })
+                .collect();
+            p.set_steps(steps);
             p.begin(total_chunks.max(1), "Verify");
         }
 
         let mut done = 0u64;
-        let indices: Vec<u32> = self.index.iter().map(|e| e.index).collect();
-        for idx in indices {
+        for (step, idx) in indices.into_iter().enumerate() {
             if let Some(ref p) = progress {
-                let name = self
-                    .index
-                    .iter()
-                    .find(|e| e.index == idx)
-                    .map(|e| e.name.as_str())
-                    .unwrap_or("partition");
-                p.set_phase(format!("Verifying {name}"));
+                p.set_step(step);
             }
             done += self.verify_partition_with_progress(idx, progress.as_ref(), done)?;
         }

@@ -28,6 +28,26 @@ impl JobKind {
             JobKind::Verify => "Verify cancelled",
         }
     }
+
+    /// Present-tense headline shown at the top of the status modal while the
+    /// job is running.
+    pub fn title(self) -> &'static str {
+        match self {
+            JobKind::Backup => "Backing up",
+            JobKind::Restore => "Restoring",
+            JobKind::Verify => "Verifying backup",
+        }
+    }
+
+    /// Neutral noun headline shown at the top of the status modal after the
+    /// job has finished (paired with the colored Close button).
+    pub fn noun(self) -> &'static str {
+        match self {
+            JobKind::Backup => "Backup",
+            JobKind::Restore => "Restore",
+            JobKind::Verify => "Verify",
+        }
+    }
 }
 
 pub struct BackgroundJob {

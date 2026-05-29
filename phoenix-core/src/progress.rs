@@ -9,6 +9,13 @@ pub struct ProgressSnapshot {
     pub detail: String,
     pub current: u64,
     pub total: u64,
+    /// Full, ordered list of step labels for the whole operation, declared
+    /// up front by the worker so the GUI can render upcoming steps (grayed
+    /// out) ahead of time. Empty when the operation doesn't publish a plan
+    /// (the GUI then falls back to the live `phase` string alone).
+    pub steps: Vec<String>,
+    /// Index into `steps` of the currently-active step.
+    pub current_step: usize,
 }
 
 impl ProgressSnapshot {
@@ -47,6 +54,25 @@ impl ProgressHandle {
 
     pub fn set_phase(&self, phase: impl Into<String>) {
         self.inner.lock().expect("progress lock").phase = phase.into();
+    }
+
+    /// Declare the full ordered list of step labels for the operation. The
+    /// worker calls this once up front (before `begin`) so the GUI can show
+    /// upcoming steps grayed out. Resets `current_step` to 0.
+    pub fn set_steps(&self, steps: Vec<String>) {
+        let mut s = self.inner.lock().expect("progress lock");
+        s.steps = steps;
+        s.current_step = 0;
+    }
+
+    /// Mark `idx` as the active step and mirror its label into `phase` so
+    /// code (and log output) that still keys off `phase` keeps working.
+    pub fn set_step(&self, idx: usize) {
+        let mut s = self.inner.lock().expect("progress lock");
+        s.current_step = idx;
+        if let Some(label) = s.steps.get(idx).cloned() {
+            s.phase = label;
+        }
     }
 
     pub fn set_detail(&self, detail: impl Into<String>) {

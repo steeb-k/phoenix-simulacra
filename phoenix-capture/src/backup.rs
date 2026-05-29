@@ -119,14 +119,31 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             CaptureMode::Raw => p.size_bytes,
         })
         .sum();
+    let partition_count = selected.len();
+
+    // Declare the full ordered step plan up front so the GUI can render
+    // upcoming steps grayed out: prepare → one step per partition →
+    // finalize. The per-partition `set_step` calls below walk this list.
     if let Some(ref progress) = opts.progress {
+        let mut steps = Vec::with_capacity(partition_count + 2);
+        steps.push("Preparing volumes".to_string());
+        for (idx, part) in selected.iter().enumerate() {
+            steps.push(format!(
+                "Backing up partition {} of {} — {}",
+                idx + 1,
+                partition_count,
+                part.name
+            ));
+        }
+        steps.push("Finalizing backup file".to_string());
+        progress.set_steps(steps);
         progress.begin(total_bytes.max(1), "Backup");
+        progress.set_step(0);
     }
 
     let mut writer =
         PhnxWriter::create_with_progress(&opts.output, header, opts.progress.clone())?;
     let mut partition_manifests = Vec::new();
-    let partition_count = selected.len();
     // Owns every shadow we create across all selected partitions; its Drop
     // tears them down even if we error or panic out of this loop.
     let mut vss = phoenix_vss::VssSession::new();
@@ -145,7 +162,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     // acquired and closes every handle we already opened — no cleanup
     // bookkeeping needed at the call sites.
     if let Some(ref progress) = opts.progress {
-        progress.set_phase("Preparing volumes");
+        progress.set_step(0);
     }
     let mut prepared: Vec<PreparedPartition<'_>> = Vec::with_capacity(partition_count);
     for (idx, part) in selected.iter().enumerate() {
@@ -205,7 +222,9 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 .unwrap_or(read_path.as_str())
                 .to_string();
             if let Some(ref progress) = opts.progress {
-                progress.set_phase(format!(
+                // Sub-message under the "Preparing volumes" step — keep the
+                // step itself fixed and surface the per-volume lock as detail.
+                progress.set_detail(format!(
                     "Locking {} for exclusive backup access ({}/{})",
                     label,
                     idx + 1,
@@ -254,13 +273,10 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             if progress.is_cancelled() {
                 return Err(phoenix_core::error::PhoenixError::Cancelled);
             }
-            progress.set_phase(format!(
-                "Partition {} — {} ({}/{})",
-                part.index,
-                part.name,
-                part_idx + 1,
-                partition_count
-            ));
+            // Step 0 is "Preparing volumes", so partition `part_idx` maps to
+            // step `part_idx + 1` in the plan declared above.
+            progress.set_step(part_idx + 1);
+            progress.set_detail(String::new());
         }
 
         info!("Backing up partition {} ({})", part.index, part.name);
@@ -345,7 +361,9 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     };
 
     if let Some(ref progress) = opts.progress {
-        progress.set_phase("Finalizing backup file");
+        // Last step in the plan: "Finalizing backup file".
+        progress.set_step(partition_count + 1);
+        progress.set_detail(String::new());
     }
     writer.finalize(&manifest)?;
     if let Some(ref progress) = opts.progress {

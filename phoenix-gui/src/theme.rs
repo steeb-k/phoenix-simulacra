@@ -31,6 +31,10 @@ pub struct Palette {
     /// Fill for "stop" action buttons (Cancel backup/restore/verify).
     /// Material red 800 — same readability story as `success`.
     pub danger: Color32,
+    /// Fill for the modal's "Close" button after a job ends with a
+    /// warning/cancelled outcome. Amber (Material amber 800) — readable
+    /// against white button text and clearly distinct from success/danger.
+    pub warning: Color32,
     pub light_mode: bool,
 }
 
@@ -66,6 +70,7 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
             input_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
             danger: Color32::from_rgb(0xC6, 0x28, 0x28),
+            warning: Color32::from_rgb(0xFF, 0x8F, 0x00),
             light_mode: true,
         }
     } else {
@@ -80,6 +85,7 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
             input_bg: Color32::from_rgb(0x3C, 0x3C, 0x3C),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
             danger: Color32::from_rgb(0xC6, 0x28, 0x28),
+            warning: Color32::from_rgb(0xFF, 0x8F, 0x00),
             light_mode: false,
         }
     }
