@@ -164,9 +164,9 @@ pub fn draw_disk_info_card(
 ) {
     let painter = ui.painter_at(rect);
     let bg = if selected {
-        blend(palette.sidebar_hover_bg, palette.accent, 0.18)
+        blend(palette.content_card_bg, palette.accent, 0.18)
     } else {
-        palette.sidebar_hover_bg
+        palette.content_card_bg
     };
     painter.rect_filled(rect, Rounding::same(SEGMENT_ROUNDING), bg);
     if selected {
@@ -279,9 +279,9 @@ pub fn draw_partition_segment_visual_styled(
 ) {
     let painter = ui.painter_at(rect);
     let bg = if hovered || selected {
-        blend(palette.sidebar_hover_bg, palette.accent, 0.18)
+        blend(palette.content_card_bg, palette.accent, 0.18)
     } else {
-        palette.sidebar_hover_bg
+        palette.content_card_bg
     };
     painter.rect_filled(rect, Rounding::same(SEGMENT_ROUNDING), bg);
 

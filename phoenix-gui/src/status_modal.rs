@@ -57,6 +57,7 @@ pub struct ModalView<'a> {
 }
 
 const MODAL_WIDTH: f32 = 460.0;
+const CANCEL_BUTTON_ID: &str = "status_modal_cancel";
 
 pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> ModalAction {
     // --- Backdrop: a full-screen, input-swallowing dim layer above the panels
@@ -236,7 +237,15 @@ fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> Mo
         let resp = match view.outcome {
             // Running: a plain, theme-colored button — cancelling is no longer
             // styled as a "danger" action.
-            None => ui.add_sized([160.0, 38.0], egui::Button::new("Cancel")),
+            None => {
+                let resp = ui
+                    .push_id(egui::Id::new(CANCEL_BUTTON_ID), |ui| {
+                        ui.add_sized([160.0, 38.0], egui::Button::new("Cancel"))
+                    })
+                    .inner;
+                resp.request_focus();
+                resp
+            }
             // Finished: a Close button tinted by the outcome (blue success,
             // amber warning/cancelled, red failure).
             Some(outcome) => ui.add_sized(

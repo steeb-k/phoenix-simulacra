@@ -268,6 +268,12 @@ impl PhoenixApp {
         self.job.as_ref().is_some_and(|j| j.is_running()) || !self.pending_backups.is_empty()
     }
 
+    /// True while the blocking status modal is on screen (running job or
+    /// finished result awaiting Close).
+    fn modal_open(&self) -> bool {
+        self.job.is_some() || self.completed.is_some()
+    }
+
     fn clear_restore_ui_state(&mut self) {
         self.restore_loaded_path.clear();
         self.restore_backup_load_after = None;
@@ -440,13 +446,25 @@ impl PhoenixApp {
 
     fn maybe_refresh_theme(&mut self, ctx: &egui::Context) {
         if self.last_theme_refresh.elapsed() >= THEME_REFRESH_INTERVAL {
+            let modal_was_open = self.modal_open();
             self.palette = theme::refresh(ctx);
             self.last_theme_refresh = Instant::now();
+            if modal_was_open {
+                ctx.memory_mut(|mem| {
+                    if let Some(id) = mem.focused() {
+                        mem.surrender_focus(id);
+                    }
+                });
+            }
         }
     }
 }
 
 impl eframe::App for PhoenixApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job(ctx);
         self.maybe_refresh_theme(ctx);
@@ -455,7 +473,8 @@ impl eframe::App for PhoenixApp {
         }
 
         let busy = self.busy();
-        sidebar::show(ctx, &mut self.page, &self.palette, busy);
+        let modal_open = self.modal_open();
+        sidebar::show(ctx, &mut self.page, &self.palette, modal_open);
 
         // Slim bottom status line for idle/non-job messages (disk count,
         // "Loaded backup…", load errors, "Ready"). While a job runs or its
@@ -471,22 +490,25 @@ impl eframe::App for PhoenixApp {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(24.0, 20.0)))
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(24.0, 20.0)),
+            )
             .show(ctx, |ui| {
-                // Pages handle `busy` themselves now so the Cancel button
-                // on each action row can stay live while the rest of the
-                // form is greyed out. `add_enabled_ui` is a one-way ratchet
-                // — `(true, ...)` inside `(false, ...)` does NOT re-enable
-                // — so a single whole-page disable would block Cancel too.
-                match self.page {
-                    Page::Backup => self.ui_backup(ui, busy),
-                    Page::Clone => disabled_when(ui, busy, |ui| self.ui_clone(ui)),
-                    Page::Restore => self.ui_restore(ui, busy),
-                    Page::Verify => self.ui_verify(ui, busy),
-                    Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
-                    Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
-                    Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
-                }
+                // Pages handle `busy` themselves so Start stays gated while
+                // a job runs; `modal_open` disables the whole panel so nothing
+                // behind the status modal receives clicks or scroll.
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    match self.page {
+                        Page::Backup => self.ui_backup(ui, busy),
+                        Page::Clone => disabled_when(ui, busy, |ui| self.ui_clone(ui)),
+                        Page::Restore => self.ui_restore(ui, busy),
+                        Page::Verify => self.ui_verify(ui, busy),
+                        Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
+                        Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
+                        Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
+                    }
+                });
             });
 
         self.show_status_modal(ctx);
@@ -777,15 +799,10 @@ impl PhoenixApp {
         let name_response = ui
             .scope(|ui| {
                 if name_missing {
-                    // `extreme_bg_color` is what TextEdit uses as its field
-                    // fill. Hint text is drawn with `weak_text_color()`,
-                    // which blends `text_color()` toward `weak_bg_fill` —
-                    // so we also steer that weak_bg_fill to the error tint
-                    // so the placeholder lands on a readable pinkish color
-                    // instead of disappearing into the red.
-                    ui.visuals_mut().extreme_bg_color = self.palette.error_bg;
-                    ui.visuals_mut().widgets.noninteractive.weak_bg_fill =
-                        self.palette.error_bg;
+                    let error_stroke = egui::Stroke::new(1.5, self.palette.danger);
+                    ui.visuals_mut().widgets.inactive.bg_stroke = error_stroke;
+                    ui.visuals_mut().widgets.hovered.bg_stroke = error_stroke;
+                    ui.visuals_mut().widgets.active.bg_stroke = error_stroke;
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.backup_name)
@@ -797,6 +814,14 @@ impl PhoenixApp {
                 )
             })
             .inner;
+
+        if name_missing {
+            ui.label(
+                egui::RichText::new("Required")
+                    .color(self.palette.danger)
+                    .size(12.0),
+            );
+        }
 
         // Single source of truth for the visible outer height of an input
         // on this page. Reused for the Browse button so every form widget
@@ -988,6 +1013,7 @@ impl PhoenixApp {
             });
         }
 
+        self.completed = None;
         self.total_backups = queue.len();
         self.current_backup_index = 1;
         // pop() draws from the back, so reverse to preserve disk-index order.
@@ -1198,6 +1224,7 @@ impl PhoenixApp {
         // CREATE_DISK + SET_DRIVE_LAYOUT_EX) before the first
         // `set_phase` call inside the worker thread takes over the
         // status text.
+        self.completed = None;
         self.status = "Restoring, please wait…".into();
         self.job = Some(spawn_restore(RestoreOptions {
             backup_path,
@@ -1256,6 +1283,7 @@ impl PhoenixApp {
             return;
         };
         self.restore_backup_path = path.display().to_string();
+        self.completed = None;
         self.status = if quick {
             "Quick verify in progress…".into()
         } else {
@@ -1337,9 +1365,18 @@ impl PhoenixApp {
 
         ui.add_space(8.0);
         if ui.button("Refresh theme from Windows").clicked() {
+            let modal_was_open = self.modal_open();
+            let ctx = ui.ctx().clone();
             self.palette = theme::refresh(ui.ctx());
             self.last_theme_refresh = Instant::now();
             self.status = "Theme refreshed from Windows settings".into();
+            if modal_was_open {
+                ctx.memory_mut(|mem| {
+                    if let Some(id) = mem.focused() {
+                        mem.surrender_focus(id);
+                    }
+                });
+            }
         }
     }
 }

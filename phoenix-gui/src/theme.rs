@@ -24,6 +24,9 @@ pub struct Palette {
     /// uses a recessed (slightly darker) tone; dark mode uses a raised
     /// (slightly lighter) tone — both subtle by design.
     pub input_bg: Color32,
+    /// Subtle fill for disk-map cards and segment wells on the main content
+    /// pane (distinct from sidebar hover tints).
+    pub content_card_bg: Color32,
     /// Fill for "go" action buttons (Start backup, Run restore, Quick/Full
     /// verify, …). Picked from Material green 800 for high contrast against
     /// white button text in both light and dark themes.
@@ -68,6 +71,7 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
             icon_color: Color32::from_rgb(0x30, 0x30, 0x30),
             error_bg: Color32::from_rgb(0xFF, 0xD6, 0xD6),
             input_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+            content_card_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
             danger: Color32::from_rgb(0xC6, 0x28, 0x28),
             warning: Color32::from_rgb(0xFF, 0x8F, 0x00),
@@ -83,6 +87,7 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
             icon_color: Color32::from_rgb(0xE6, 0xE6, 0xE6),
             error_bg: Color32::from_rgb(0x5A, 0x2A, 0x2A),
             input_bg: Color32::from_rgb(0x3C, 0x3C, 0x3C),
+            content_card_bg: Color32::from_rgb(0x33, 0x33, 0x33),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
             danger: Color32::from_rgb(0xC6, 0x28, 0x28),
             warning: Color32::from_rgb(0xFF, 0x8F, 0x00),
@@ -118,8 +123,17 @@ pub fn apply(ctx: &egui::Context, accent: Color32, light_mode: bool) {
     } else {
         Color32::from_rgb(0x2A, 0x2A, 0x2A)
     };
-    visuals.widgets.hovered.bg_fill = pal.sidebar_hover_bg;
-    visuals.widgets.active.bg_fill = pal.sidebar_selected_bg;
+    let panel_fill = visuals.panel_fill;
+    visuals.widgets.hovered.bg_fill = if light_mode {
+        tint(panel_fill, 0.06, Color32::BLACK)
+    } else {
+        tint(panel_fill, 0.08, Color32::WHITE)
+    };
+    visuals.widgets.active.bg_fill = if light_mode {
+        tint(accent, 0.12, panel_fill)
+    } else {
+        tint(accent, 0.18, panel_fill)
+    };
     visuals.widgets.active.bg_stroke = Stroke::new(2.0, pal.icon_color);
     // Slight panel-vs-input contrast so TextEdit and friends visibly read
     // as "fields" instead of blending into the page. Per-widget overrides

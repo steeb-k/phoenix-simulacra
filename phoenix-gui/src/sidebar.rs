@@ -93,7 +93,7 @@ pub fn min_content_height() -> f32 {
 
 /// Render the left sidebar. `current` is updated when the user clicks a nav
 /// item. While `busy` is true, items remain visible but click-through is
-/// disabled so an in-flight backup/restore can't be interrupted by navigation.
+/// disabled while the status modal is up so navigation can't interrupt a job.
 ///
 /// Layout is three vertically-stacked regions:
 ///   * fixed top — brand/logo;
