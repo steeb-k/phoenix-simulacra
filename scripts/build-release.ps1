@@ -10,7 +10,14 @@ $targets = @(
 )
 
 foreach ($t in $targets) {
-    rustup target add $t 2>$null | Out-Null
+    # rustup logs info to stderr; with $ErrorActionPreference Stop that becomes a terminating error.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    rustup target add $t 2>&1 | Out-Null
+    $ErrorActionPreference = $prev
+    if ($LASTEXITCODE -ne 0) {
+        throw "rustup target add $t failed with exit code $LASTEXITCODE"
+    }
 }
 
 foreach ($t in $targets) {
