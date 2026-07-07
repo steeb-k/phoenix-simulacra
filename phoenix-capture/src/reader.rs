@@ -162,7 +162,14 @@ impl PartitionReader {
             )
         };
         if ok == 0 {
-            return Err(PhoenixError::Disk("read failed".into()));
+            let err = unsafe { GetLastError() };
+            // Win32 87 (ERROR_INVALID_PARAMETER) here almost always means a
+            // non-sector-aligned offset or length on a raw volume/disk handle.
+            return Err(PhoenixError::Disk(format!(
+                "ReadFile of {to_read} bytes at offset {abs_pos} failed (Win32 error {err}; \
+                 volume length {})",
+                self.length
+            )));
         }
         Ok(read as usize)
     }

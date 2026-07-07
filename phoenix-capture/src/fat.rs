@@ -74,8 +74,14 @@ pub fn fat_plan(
         parse_fat_boot(&boot, exfat)?;
 
     let fat_len = ((total_clusters + 2) * fat_bits as u64).div_ceil(8);
-    let mut fat_table = vec![0u8; fat_len as usize];
-    if fat_len > 0 {
+    // Raw volume/disk handles reject a ReadFile whose length isn't a multiple
+    // of the sector size, and `fat_len` is only 4-byte-aligned. Read a
+    // 512-rounded-up span into a padded buffer, then use just the FAT bytes.
+    // (This is why FAT/exFAT capture failed with "read failed" while NTFS,
+    // which reads its bitmap via FSCTL, did not.)
+    let read_len = fat_len.div_ceil(SECTOR) * SECTOR;
+    let mut fat_table = vec![0u8; read_len as usize];
+    if read_len > 0 {
         // exFAT's FAT lives at the FatOffset sector, not the cluster heap;
         // for FAT12/16/32 `data_start` returned by `parse_fat_boot` IS the
         // post-FAT cluster region, but the FAT itself starts at
@@ -94,6 +100,9 @@ pub fn fat_plan(
         };
         reader.read_at(fat_byte_offset, &mut fat_table)?;
     }
+    // Discard the sector-alignment padding so only real FAT bytes are hashed
+    // and indexed.
+    fat_table.truncate(fat_len as usize);
 
     let bitmap_hash = Some(hash::hash_hex(&fat_table));
     let extents = fat_used_extents(
