@@ -78,6 +78,29 @@ pub struct StreamHeader {
     pub bytes_per_cluster: u32,
 }
 
+/// Zip a partition's on-disk chunk-index table with its manifest chunk
+/// records, refusing to proceed if the two disagree in length.
+///
+/// Callers (verify and restore) previously used `chunks.iter().zip(records)`,
+/// which silently truncates to the shorter of the two — so a backup with a
+/// missing or extra chunk record would verify/restore as if nothing were
+/// wrong. This helper turns that class of corruption into a hard error.
+pub fn paired_chunks<'a>(
+    chunks: &'a [ChunkIndex],
+    records: &'a [crate::manifest::ChunkRecord],
+    partition_index: u32,
+) -> Result<std::iter::Zip<std::slice::Iter<'a, ChunkIndex>, std::slice::Iter<'a, crate::manifest::ChunkRecord>>>
+{
+    if chunks.len() != records.len() {
+        return Err(PhoenixError::ChunkCountMismatch {
+            partition_index,
+            stream_chunks: chunks.len(),
+            manifest_chunks: records.len(),
+        });
+    }
+    Ok(chunks.iter().zip(records.iter()))
+}
+
 impl Header {
     pub fn write<W: Write>(&self, w: &mut W) -> Result<()> {
         let mut buf = [0u8; HEADER_SIZE];
@@ -566,7 +589,7 @@ impl PhnxReader {
             .map(|p| p.chunks.clone())
             .ok_or_else(|| PhoenixError::Manifest("partition manifest missing".into()))?;
 
-        for (chunk, record) in stream.chunks.iter().zip(chunk_records.iter()) {
+        for (chunk, record) in paired_chunks(&stream.chunks, &chunk_records, partition_index)? {
             let data = self.read_chunk(chunk)?;
             let computed = hash::hash_hex(&data);
             if computed != record.blake3 {
@@ -662,7 +685,7 @@ impl PhnxReader {
             .map(|p| p.chunks.clone())
             .ok_or_else(|| PhoenixError::Manifest("partition manifest missing".into()))?;
 
-        for (chunk, record) in stream.chunks.iter().zip(chunk_records.iter()) {
+        for (chunk, record) in paired_chunks(&stream.chunks, &chunk_records, partition_index)? {
             if let Some(p) = progress {
                 if p.is_cancelled() {
                     return Err(PhoenixError::Cancelled);
@@ -715,5 +738,51 @@ mod tests {
         let c = compress_chunk(&data).unwrap();
         let d = decompress_chunk(&c, 1000).unwrap();
         assert_eq!(d, data);
+    }
+
+    fn dummy_chunk(i: u32) -> ChunkIndex {
+        ChunkIndex {
+            file_offset: 0,
+            compressed_len: 0,
+            uncompressed_len: 0,
+            extent_index: 0,
+            chunk_index: i,
+        }
+    }
+
+    fn dummy_record(i: u32) -> crate::manifest::ChunkRecord {
+        crate::manifest::ChunkRecord {
+            chunk_index: i,
+            extent_index: 0,
+            uncompressed_len: 0,
+            blake3: String::new(),
+        }
+    }
+
+    #[test]
+    fn paired_chunks_matches_equal_lengths() {
+        let chunks = vec![dummy_chunk(0), dummy_chunk(1)];
+        let records = vec![dummy_record(0), dummy_record(1)];
+        let paired: Vec<_> = paired_chunks(&chunks, &records, 3).unwrap().collect();
+        assert_eq!(paired.len(), 2);
+    }
+
+    #[test]
+    fn paired_chunks_rejects_length_mismatch() {
+        let chunks = vec![dummy_chunk(0), dummy_chunk(1), dummy_chunk(2)];
+        let records = vec![dummy_record(0), dummy_record(1)];
+        let err = paired_chunks(&chunks, &records, 3).unwrap_err();
+        match err {
+            PhoenixError::ChunkCountMismatch {
+                partition_index,
+                stream_chunks,
+                manifest_chunks,
+            } => {
+                assert_eq!(partition_index, 3);
+                assert_eq!(stream_chunks, 3);
+                assert_eq!(manifest_chunks, 2);
+            }
+            other => panic!("expected ChunkCountMismatch, got {other:?}"),
+        }
     }
 }

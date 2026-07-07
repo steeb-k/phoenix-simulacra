@@ -15,6 +15,16 @@ pub enum PhoenixError {
         partition_index: u32,
         chunk_index: u32,
     },
+    #[error(
+        "chunk-count mismatch in partition {partition_index}: the stored data stream has \
+         {stream_chunks} chunk(s) but the manifest records {manifest_chunks}. The backup is \
+         corrupt or truncated."
+    )]
+    ChunkCountMismatch {
+        partition_index: u32,
+        stream_chunks: usize,
+        manifest_chunks: usize,
+    },
     #[error("manifest error: {0}")]
     Manifest(String),
     #[error("disk error: {0}")]

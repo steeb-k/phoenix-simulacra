@@ -81,7 +81,11 @@ pub fn restore_raw(
 
     let sector_size = entry.sector_size as u64;
     let mut bytes_for_partition = 0u64;
-    for (chunk, record) in stream.chunks.iter().zip(chunk_records.iter()) {
+    for (chunk, record) in phoenix_core::container::paired_chunks(
+        &stream.chunks,
+        &chunk_records,
+        entry.index,
+    )? {
         if let Some(p) = progress {
             if p.is_cancelled() {
                 return Err(PhoenixError::Cancelled);
@@ -97,7 +101,17 @@ pub fn restore_raw(
                 });
             }
         }
-        let extent = &stream.extents[chunk.extent_index as usize];
+        let extent = stream
+            .extents
+            .get(chunk.extent_index as usize)
+            .ok_or_else(|| {
+                PhoenixError::InvalidFormat(format!(
+                    "chunk references extent index {} but partition {} only has {} extent(s)",
+                    chunk.extent_index,
+                    entry.index,
+                    stream.extents.len()
+                ))
+            })?;
         let src_offset =
             extent.start_sector * sector_size + (chunk.chunk_index as u64) * CHUNK_SIZE as u64;
 
