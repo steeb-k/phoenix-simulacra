@@ -7,10 +7,10 @@ use phoenix_core::relocation::RelocationMap;
 use phoenix_core::ProgressHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 
-use crate::reader::PartitionReader;
+use crate::reader::BlockSource;
 
 pub fn capture_raw(
-    reader: &mut PartitionReader,
+    reader: &mut impl BlockSource,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
 ) -> Result<()> {
     stream.set_extent(0);

@@ -4,7 +4,7 @@ use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
 use phoenix_core::ProgressHandle;
 
-use crate::reader::PartitionReader;
+use crate::reader::BlockSource;
 
 const SECTOR: u64 = 512;
 
@@ -31,7 +31,7 @@ enum FatType {
 /// out of bounds. Mirror NTFS's `ntfs_plan` + `capture_ntfs` shape so the
 /// manifest's extent table is the authoritative one.
 pub fn capture_fat(
-    reader: &mut PartitionReader,
+    reader: &mut impl BlockSource,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
     extents: &[Extent],
     bitmap_hash: Option<String>,
@@ -65,7 +65,7 @@ pub fn capture_fat(
 /// covering the whole partition" hack that desynced from the per-chunk
 /// `extent_index` values).
 pub fn fat_plan(
-    reader: &mut PartitionReader,
+    reader: &mut impl BlockSource,
     exfat: bool,
 ) -> Result<(Vec<Extent>, Option<String>, u32)> {
     let mut boot = vec![0u8; 512];
@@ -285,7 +285,7 @@ fn fat_cluster_value(fat: &[u8], cluster: u64, fat_type: FatType) -> u32 {
 /// the same `capture_fat` body since the divergence (boot-sector layout,
 /// cluster sizing) is fully handled by `fat_plan` upstream.
 pub fn capture_exfat(
-    reader: &mut PartitionReader,
+    reader: &mut impl BlockSource,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
     extents: &[Extent],
     bitmap_hash: Option<String>,
@@ -293,7 +293,7 @@ pub fn capture_exfat(
     capture_fat(reader, stream, extents, bitmap_hash)
 }
 
-pub fn estimate_fat_used(reader: &mut PartitionReader, exfat: bool) -> Result<u64> {
+pub fn estimate_fat_used(reader: &mut impl BlockSource, exfat: bool) -> Result<u64> {
     let (extents, _hash, _bpc) = fat_plan(reader, exfat)?;
     Ok(extents.iter().map(|e| e.sector_count * SECTOR).sum())
 }

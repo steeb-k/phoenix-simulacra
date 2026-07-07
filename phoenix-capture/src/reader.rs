@@ -7,6 +7,63 @@ use phoenix_core::error::{PhoenixError, Result};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
+/// A random-access byte source for a partition's raw contents. The capture
+/// and extent-planning code depends only on this small surface, so it can
+/// run against a real `\\.\PhysicalDriveN` handle ([`PartitionReader`]) in
+/// production and against an in-memory or file-backed image in unit tests.
+///
+/// The FSCTL-only volume bitmap is expressed as a defaulted method that
+/// returns `None` for non-volume sources; NTFS planning then falls back to
+/// treating every cluster as used, which is exactly the behavior we want
+/// for a file-backed image that has no live volume to query.
+pub trait BlockSource {
+    fn read_at(&mut self, position: u64, buf: &mut [u8]) -> Result<usize>;
+    fn length(&self) -> u64;
+    fn try_volume_bitmap(&mut self, _total_clusters: u64) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl BlockSource for PartitionReader {
+    fn read_at(&mut self, position: u64, buf: &mut [u8]) -> Result<usize> {
+        PartitionReader::read_at(self, position, buf)
+    }
+    fn length(&self) -> u64 {
+        PartitionReader::length(self)
+    }
+    fn try_volume_bitmap(&mut self, total_clusters: u64) -> Option<Vec<u8>> {
+        PartitionReader::try_volume_bitmap(self, total_clusters)
+    }
+}
+
+/// In-memory [`BlockSource`] for tests: wraps an owned byte image that
+/// stands in for a partition's raw contents. `try_volume_bitmap` uses the
+/// default (`None`), so NTFS planning falls back to all-used.
+pub struct MemoryBlockSource {
+    data: Vec<u8>,
+}
+
+impl MemoryBlockSource {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+}
+
+impl BlockSource for MemoryBlockSource {
+    fn read_at(&mut self, position: u64, buf: &mut [u8]) -> Result<usize> {
+        if position >= self.data.len() as u64 {
+            return Ok(0);
+        }
+        let start = position as usize;
+        let n = buf.len().min(self.data.len() - start);
+        buf[..n].copy_from_slice(&self.data[start..start + n]);
+        Ok(n)
+    }
+    fn length(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
 pub struct PartitionReader {
     handle: HANDLE,
     offset: u64,

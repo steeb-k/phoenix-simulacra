@@ -6,7 +6,7 @@ use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
 use phoenix_core::ProgressHandle;
 
-use crate::reader::PartitionReader;
+use crate::reader::BlockSource;
 
 const SECTOR_SIZE: u64 = 512;
 
@@ -31,7 +31,7 @@ struct NtfsBootSector {
 /// manifest, so `set_extent(ext_idx)` is unambiguous and there's no risk of
 /// two-bitmap-reads-can-disagree drift.
 pub fn capture_ntfs(
-    reader: &mut PartitionReader,
+    reader: &mut impl BlockSource,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
     extents: &[Extent],
     bitmap_hash: Option<String>,
@@ -80,7 +80,7 @@ fn parse_boot_sector(boot: &[u8]) -> Result<NtfsBootSector> {
 }
 
 fn read_bitmap(
-    reader: &mut PartitionReader,
+    reader: &mut impl BlockSource,
     bs: &NtfsBootSector,
     cluster_size: u64,
     total_clusters: u64,
@@ -148,7 +148,7 @@ fn total_clusters_for(bs: &NtfsBootSector, cluster_size: u64) -> u64 {
     (volume_bytes + cluster_size - 1) / cluster_size
 }
 
-pub fn estimate_used_bytes(reader: &mut PartitionReader) -> Result<u64> {
+pub fn estimate_used_bytes(reader: &mut impl BlockSource) -> Result<u64> {
     let mut boot = vec![0u8; 512];
     reader.read_at(0, &mut boot)?;
     let bs = parse_boot_sector(&boot)?;
@@ -329,7 +329,7 @@ fn patch_ntfs_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> R
 /// [`capture_ntfs`] (for the data stream); reading the bitmap a second time
 /// would risk re-tripping the same IOCTL failure and re-introduce the
 /// previously-flagged two-reads-can-disagree race.
-pub fn ntfs_plan(reader: &mut PartitionReader) -> Result<(Vec<Extent>, Option<String>)> {
+pub fn ntfs_plan(reader: &mut impl BlockSource) -> Result<(Vec<Extent>, Option<String>)> {
     let mut boot = vec![0u8; 512];
     reader.read_at(0, &mut boot)?;
     let bs = parse_boot_sector(&boot)?;

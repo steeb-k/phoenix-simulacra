@@ -8,4 +8,4 @@ pub mod raw;
 pub mod reader;
 
 pub use backup::run_backup;
-pub use reader::PartitionReader;
+pub use reader::{BlockSource, MemoryBlockSource, PartitionReader};
