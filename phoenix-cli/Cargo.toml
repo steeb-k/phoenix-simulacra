@@ -16,6 +16,7 @@ phoenix-capture.workspace = true
 phoenix-vss.workspace = true
 phoenix-restore.workspace = true
 phoenix-clone.workspace = true
+phoenix-mount.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -198,6 +198,9 @@ struct PhoenixApp {
     clone_target_index: Option<u32>,
     clone_expand: bool,
     clone_verify: bool,
+    /// Mount page: chosen .phnx and the currently-attached read-only mounts.
+    mount_backup_path: String,
+    mounts: Vec<phoenix_mount::MountSession>,
     status: String,
     page: Page,
     job: Option<BackgroundJob>,
@@ -235,6 +238,8 @@ impl PhoenixApp {
             clone_target_index: None,
             clone_expand: false,
             clone_verify: true,
+            mount_backup_path: String::new(),
+            mounts: Vec::new(),
             status: "Ready".into(),
             page: Page::Backup,
             job: None,
@@ -1443,14 +1448,76 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "Mount",
-            "Browse partitions inside a .phnx backup as if they were drives.",
+            "Attach a backup read-only so its files are browsable in Explorer.",
         );
-        let palette = self.palette;
-        coming_soon(
-            ui,
-            &palette,
-            "Backup mounting is on the roadmap — files inside backups will be browsable soon.",
-        );
+
+        ui.add_enabled_ui(self.job.is_none(), |ui| {
+            let _ = backup_path_picker(
+                ui,
+                "Backup file",
+                "Path to .phnx file",
+                &mut self.mount_backup_path,
+                None,
+            );
+        });
+
+        let path_filled = !self.mount_backup_path.trim().is_empty();
+        ui.add_space(4.0);
+        ui.add_enabled_ui(path_filled, |ui| {
+            if ui.button("Mount read-only").clicked() {
+                self.start_mount();
+            }
+        });
+
+        if !self.mounts.is_empty() {
+            ui.add_space(12.0);
+            ui.heading("Active mounts");
+            let mut unmount_idx: Option<usize> = None;
+            for (i, m) in self.mounts.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        m.backup_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "backup".into()),
+                    );
+                    ui.label(format!("({:.1} GB)", m.disk_size as f64 / 1e9));
+                    if ui.button("Open in Explorer").clicked() {
+                        let _ = std::process::Command::new("explorer.exe").spawn();
+                    }
+                    if ui.button("Unmount").clicked() {
+                        unmount_idx = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = unmount_idx {
+                self.mounts.remove(i); // Drop detaches + cleans the temp image
+                self.status = "Unmounted".into();
+            }
+        }
+    }
+
+    fn start_mount(&mut self) {
+        let path = std::path::PathBuf::from(self.mount_backup_path.trim());
+        let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
+        self.status = "Materializing and attaching… (this can take a moment)".into();
+        // Mounting materializes + attaches; MountSession holds a raw disk
+        // handle and isn't Send, so we do it inline. Materialization time
+        // scales with the backup's used size.
+        match phoenix_mount::MountSession::mount(&path, &scratch) {
+            Ok(session) => {
+                self.status = format!(
+                    "Mounted {} — browse it in Explorer",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
+                self.mounts.push(session);
+            }
+            Err(e) => {
+                self.status = format!("Mount failed: {e}");
+            }
+        }
     }
 
     fn ui_history(&mut self, ui: &mut egui::Ui) {

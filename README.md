@@ -9,10 +9,20 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
 - GPT/MBR disk enumeration
 - Selective partition backup and restore
 - Used-block imaging (smaller than full disk images)
-- BLAKE3 per-chunk integrity + verify command
-- Verify-on-restore (default)
+- Restore with partition resizing (NTFS grow + shrink-with-relocation, FAT/exFAT grow)
+- **Disk-to-disk cloning** (`clone`), including live system disks via VSS, with resize
+- **Read-only mounting** (`mount`) — browse a backup's files in Explorer; the image
+  is materialized to a sparse VHD (footprint ≈ used size) and attached read-only
+- Bulletproof verification: format v2 checksums every metadata structure (footer CRC,
+  total-length/truncation check, index-table hash, per-entry CRC); `verify --quick`
+  runs a structural + sampled check, `verify` hashes every chunk
+- Verify-on-restore (default) and optional read-back verification on clone
 - VSS support for live Windows backups (`--vss` / GUI checkbox)
 - CLI and egui GUI (WinPE-friendly, no WebView2)
+
+A future `winfsp` build option will serve mount reads on demand straight from the
+`.phnx` (zero temp space) when WinFsp is installed; the default build materializes to
+a sparse VHD and needs no external SDK.
 
 ## Build
 

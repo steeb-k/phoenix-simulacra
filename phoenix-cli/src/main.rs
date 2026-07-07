@@ -81,6 +81,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Mount a backup read-only so its files are browsable in Explorer. Runs
+    /// in the foreground; press Enter to unmount.
+    Mount { backup: PathBuf },
     /// Dump every partition's stream header (extents + chunks) for forensic
     /// inspection. Useful when a manifest's extent table is suspected of
     /// containing garbage values (e.g. start_sectors near `u64::MAX`) — the
@@ -171,8 +174,28 @@ fn main() -> anyhow::Result<()> {
             no_vss,
             yes,
         } => cmd_clone(source_disk, target_disk, expand, verify, !no_vss, yes)?,
+        Commands::Mount { backup } => cmd_mount(&backup)?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
     }
+    Ok(())
+}
+
+fn cmd_mount(backup: &std::path::Path) -> anyhow::Result<()> {
+    let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
+    println!(
+        "Materializing and attaching {} (read-only)…",
+        backup.display()
+    );
+    let session = phoenix_mount::MountSession::mount(backup, &scratch)?;
+    println!(
+        "Mounted a {:.1} GB virtual disk. Open Explorer to browse the volume(s).",
+        session.disk_size as f64 / 1e9
+    );
+    println!("Press Enter to unmount.");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    drop(session);
+    println!("Unmounted.");
     Ok(())
 }
 

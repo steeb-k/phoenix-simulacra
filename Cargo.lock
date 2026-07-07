@@ -2227,6 +2227,7 @@ dependencies = [
  "phoenix-capture",
  "phoenix-clone",
  "phoenix-core",
+ "phoenix-mount",
  "phoenix-restore",
  "phoenix-vss",
  "serde",
@@ -2278,6 +2279,7 @@ dependencies = [
  "phoenix-capture",
  "phoenix-clone",
  "phoenix-core",
+ "phoenix-mount",
  "phoenix-restore",
  "phoenix-vss",
  "rfd",
@@ -2286,6 +2288,17 @@ dependencies = [
  "tracing-subscriber",
  "winreg",
  "winres",
+]
+
+[[package]]
+name = "phoenix-mount"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "phoenix-core",
+ "tracing",
+ "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2312,6 +2325,7 @@ dependencies = [
  "phoenix-capture",
  "phoenix-clone",
  "phoenix-core",
+ "phoenix-mount",
  "phoenix-restore",
  "uuid",
 ]
