@@ -75,7 +75,12 @@ impl ClonePlan {
             .collect();
         tail.sort_by_key(|&i| plan.entries[i].target_offset_bytes);
 
-        let mut cursor = align_down(target.size_bytes, align);
+        // The last ~33 sectors of a GPT disk hold the backup GPT header + entry
+        // array, so a partition can't extend all the way to the disk end or
+        // IOCTL_DISK_SET_DRIVE_LAYOUT_EX rejects the layout (Win32 87). Leave one
+        // alignment unit (>= the 16.5 KiB the backup GPT needs) free at the tail.
+        let usable_end = align_down(target.size_bytes, align).saturating_sub(align);
+        let mut cursor = usable_end;
         for &i in tail.iter().rev() {
             let size = plan.entries[i].target_size_bytes;
             if size > cursor {
@@ -87,7 +92,7 @@ impl ClonePlan {
         let primary_new_end = tail
             .first()
             .map(|&i| plan.entries[i].target_offset_bytes)
-            .unwrap_or_else(|| align_down(target.size_bytes, align));
+            .unwrap_or(usable_end);
         let start = plan.entries[primary].target_offset_bytes;
         if primary_new_end > start {
             plan.entries[primary].target_size_bytes = align_down(primary_new_end - start, align);
@@ -168,6 +173,73 @@ fn align_down(value: u64, align: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::disk::{CaptureMode, PartitionInfo, PartitionUsage};
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn ntfs_part(index: u32, offset: u64, size: u64, used: u64) -> PartitionInfo {
+        PartitionInfo {
+            index,
+            name: format!("P{index}"),
+            type_guid: [0; 16],
+            gpt_attributes: 0,
+            offset_bytes: offset,
+            size_bytes: size,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            volume_path: None,
+            drive_letter: None,
+            volume_label: None,
+            usage: Some(PartitionUsage {
+                total_bytes: size,
+                free_bytes: size - used,
+            }),
+            sector_size: 512,
+        }
+    }
+
+    fn disk(index: u32, size: u64, parts: Vec<PartitionInfo>) -> DiskInfo {
+        DiskInfo {
+            index,
+            path: format!("\\\\.\\PhysicalDrive{index}"),
+            size_bytes: size,
+            is_gpt: true,
+            disk_guid: Some([0; 16]),
+            disk_signature: index as u64,
+            sector_size: 512,
+            model: None,
+            partitions: parts,
+        }
+    }
+
+    #[test]
+    fn expand_leaves_room_for_backup_gpt() {
+        // 256 MiB NTFS at 1 MiB on a 256 MiB source -> expand onto a 768 MiB
+        // target. The grown partition must NOT reach the disk end (the last
+        // ~33 sectors are reserved for the backup GPT; a partition there makes
+        // SET_DRIVE_LAYOUT_EX fail with Win32 87).
+        let src = disk(0, 256 * MIB, vec![ntfs_part(0, MIB, 255 * MIB, 50 * MIB)]);
+        let tgt = disk(1, 768 * MIB, vec![]);
+        let plan = ClonePlan::expand_to_fill(&src, &tgt);
+
+        let max_end = plan
+            .entries
+            .iter()
+            .map(|e| e.target_offset_bytes + e.target_size_bytes)
+            .max()
+            .unwrap();
+        assert!(
+            max_end <= tgt.size_bytes - MIB,
+            "grown partition ends at {max_end}, leaving no room for the backup GPT on a \
+             {}-byte disk",
+            tgt.size_bytes
+        );
+        // And the layout must be internally valid.
+        plan.validate(&src, &tgt)
+            .expect("expanded plan should validate");
+        // It actually grew (target size > source size).
+        assert!(plan.entries[0].target_size_bytes > 255 * MIB);
+    }
 
     #[test]
     fn overlap_math_matches_windows() {

@@ -395,8 +395,14 @@ fn expand_ntfs_slack_inner(
         .collect();
     tail.sort_by_key(|&i| entries[i].target_offset_bytes);
 
-    // Pack tail partitions against the end of the disk.
-    let mut cursor = align_down(target_disk_size, align);
+    // The last ~33 sectors of a GPT disk are reserved for the backup GPT, so a
+    // partition can't reach the very end or IOCTL_DISK_SET_DRIVE_LAYOUT_EX fails
+    // with Win32 87. Leave one alignment unit (>= the backup GPT's 16.5 KiB)
+    // free at the tail.
+    let usable_end = align_down(target_disk_size, align).saturating_sub(align);
+
+    // Pack tail partitions against the (usable) end of the disk.
+    let mut cursor = usable_end;
     for &i in tail.iter().rev() {
         let size = entries[i].target_size_bytes;
         if size > cursor {
@@ -407,11 +413,12 @@ fn expand_ntfs_slack_inner(
         cursor = entries[i].target_offset_bytes;
     }
 
-    // Main NTFS fills the gap from its start to the first tail partition (or disk end).
+    // Main NTFS fills the gap from its start to the first tail partition (or the
+    // usable disk end).
     let ntfs_end = if let Some(&first_tail) = tail.first() {
         entries[first_tail].target_offset_bytes
     } else {
-        align_down(target_disk_size, align)
+        usable_end
     };
 
     if ntfs_end > ntfs_start {
