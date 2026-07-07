@@ -38,17 +38,25 @@ Single-file container for disk/partition backups. All multi-byte integers are **
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Partition index (source order) |
-| 4 | 36 | Partition type GUID (GPT) or type byte + padding |
-| 40 | 72 | Partition name (UTF-16LE, truncated) |
+| 4 | 16 | Partition type GUID (GPT) or type byte + padding |
+| 20 | 72 | Partition name (UTF-16LE, up to 36 code units, NUL-terminated) |
+| 92 | 20 | Reserved |
 | 112 | 8 | Original size in bytes |
 | 120 | 1 | Filesystem kind (see enum) |
 | 121 | 1 | Capture mode (0=raw, 1=used-blocks) |
 | 122 | 2 | Reserved |
 | 124 | 8 | Stream offset in file |
 | 132 | 8 | Stream length |
-| 140 | 4 | Sector size (usually 512) |
+| 140 | 4 | Extent addressing unit ("sector size"), always **512** |
 | 144 | 8 | Used bytes (logical data size) |
 | 152 | 8 | Reserved |
+
+The field at offset 140 is a fixed 512-byte **extent addressing unit**, not
+the source disk's physical sector size. Every extent `start_sector` /
+`sector_count` in the streams is expressed in these 512-byte units and
+restore multiplies by this value to recover byte offsets, so it is 512 even
+for backups taken from 4Kn disks. The disk's real logical sector size is
+recorded in the manifest's `disk.sector_size`.
 
 ### FilesystemKind (u8)
 
@@ -58,6 +66,7 @@ Single-file container for disk/partition backups. All multi-byte integers are **
 - `3` exFAT
 - `4` EFI System
 - `5` MSR
+- `6` BitLocker (captured raw)
 
 ## Partition Stream
 
@@ -131,7 +140,7 @@ Stored at `footer.manifest_offset`, length `footer.manifest_length`.
 | 16 | 32 | BLAKE3 hash of manifest bytes |
 | 48 | 8 | Index table offset |
 | 56 | 4 | Index entry count |
-| 60 | 4 | Footer magic `PHNXEND` |
+| 60 | 4 | Footer magic `END\0` (bytes `45 4E 44 00`) |
 | 64 | 8 | Reserved |
 
 ## Integrity
