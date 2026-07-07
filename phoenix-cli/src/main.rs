@@ -38,6 +38,9 @@ enum Commands {
     /// Verify backup integrity
     Verify {
         backup: PathBuf,
+        /// Quick check: structural integrity + open-time checks (footer CRC,
+        /// total-length/truncation, manifest & index hashes) + a sampled chunk
+        /// hash. Omit for a full check that hashes every chunk.
         #[arg(long)]
         quick: bool,
     },
@@ -108,7 +111,13 @@ fn main() -> anyhow::Result<()> {
         Commands::List { backup } => cmd_list_backup(&backup)?,
         Commands::Verify { backup, quick } => {
             verify_backup(&backup, quick)?;
-            info!("Verification OK");
+            if quick {
+                info!(
+                    "Quick verification OK (structure + open-time integrity + sampled chunk hashes)"
+                );
+            } else {
+                info!("Full verification OK (every chunk hashed)");
+            }
         }
         Commands::Plan {
             backup,

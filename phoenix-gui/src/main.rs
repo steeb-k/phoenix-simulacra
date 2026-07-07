@@ -1236,7 +1236,8 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "Verify Backup",
-            "Run a quick header check or a full BLAKE3 verification across the archive.",
+            "Quick: structure + integrity checks and a sampled chunk hash. Full: BLAKE3 of every \
+             chunk.",
         );
 
         ui.add_enabled_ui(!busy, |ui| {

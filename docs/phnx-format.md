@@ -1,6 +1,12 @@
-# Carbon Phoenix `.phnx` Backup Format (v1)
+# Carbon Phoenix `.phnx` Backup Format (v2)
 
 Single-file container for disk/partition backups. All multi-byte integers are **little-endian**.
+
+The current writer emits **version 2**. Version 1 files still open (see the
+[v1 appendix](#appendix-v1-differences)); the reader accepts versions 1–2.
+v2 adds full metadata integrity: a footer CRC, a stored total-file-length
+(truncation detection), a BLAKE3 over the partition index table, and a per-entry
+CRC — so a "quick" verify is meaningful and truncation is always caught.
 
 ## File Layout
 
@@ -24,7 +30,7 @@ Single-file container for disk/partition backups. All multi-byte integers are **
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `PHNX` |
-| 4 | 2 | Format version (1) |
+| 4 | 2 | Format version (2; reader accepts 1–2) |
 | 6 | 2 | Flags (bit0: GPT, bit1: incremental-capable) |
 | 8 | 8 | Backup timestamp (Unix seconds) |
 | 16 | 16 | Backup UUID |
@@ -131,7 +137,7 @@ Stored at `footer.manifest_offset`, length `footer.manifest_length`.
 }
 ```
 
-## Footer (72 bytes)
+## Footer (v2, 112 bytes)
 
 | Offset | Size | Field |
 |--------|------|-------|
@@ -140,14 +146,47 @@ Stored at `footer.manifest_offset`, length `footer.manifest_length`.
 | 16 | 32 | BLAKE3 hash of manifest bytes |
 | 48 | 8 | Index table offset |
 | 56 | 4 | Index entry count |
-| 60 | 4 | Footer magic `END\0` (bytes `45 4E 44 00`) |
-| 64 | 8 | Reserved |
+| 60 | 4 | Format version (u32, = 2) |
+| 64 | 8 | **Total file length** (bytes; the file must be exactly this long) |
+| 72 | 32 | **BLAKE3 of the partition index-entry region** |
+| 104 | 4 | **Footer CRC32** (IEEE, over footer bytes 0–103) |
+| 108 | 4 | Footer magic `END2` (bytes `45 4E 44 32`) |
 
-## Integrity
+## Integrity (v2)
 
-1. **Per-chunk BLAKE3** of uncompressed plaintext (stored in manifest).
-2. **Manifest root**: BLAKE3 of entire manifest JSON (stored in footer).
-3. **Header CRC32**: IEEE CRC over header with CRC field zeroed.
+Every metadata structure is covered by a checksum, and the reader validates
+them before trusting any offset:
+
+| Structure | Protected by | Checked at |
+|-----------|--------------|-----------|
+| Header | Header CRC32 | open |
+| Footer | Footer CRC32 | open |
+| Whole file length | `total_file_length` in footer | open (truncation/padding) |
+| Partition index table | BLAKE3 in footer | open |
+| Each index entry | CRC32 at entry offset 152 | open |
+| Manifest JSON | BLAKE3 in footer | open |
+| Per chunk (plaintext) | BLAKE3 in manifest | full/sampled verify |
+| Stream extent & chunk tables | structural coverage math (`verify_structure`) | verify |
+
+### Verify tiers
+
+- **Open** always checks the header/footer CRCs, the total length, the manifest
+  hash, the index-table hash, and every index-entry CRC.
+- **Quick** (`verify --quick`) additionally runs `verify_structure` (chunk-count
+  equality, chunk byte-ranges in bounds, per-extent coverage, no extent overlap)
+  and decompresses + BLAKE3-checks a deterministic sample of chunks.
+- **Full** (`verify`) runs the structure check and then BLAKE3-checks every chunk.
+
+## Appendix: v1 differences
+
+Version 1 files use a **72-byte footer** with magic `END\0` (bytes
+`45 4E 44 00`) and fields: manifest offset (0), manifest length (8), manifest
+BLAKE3 (16), index offset (48), index count (56), magic (60), reserved (64).
+They carry no total-length, index-table hash, footer CRC, or per-entry CRC, so
+for v1 the open-time checks are limited to the header CRC and manifest hash, and
+`verify_structure` reports table checksums as unavailable. v1 index entries have
+zero in the CRC slot (offset 152). Everything else (header, index-entry layout,
+stream format, manifest) is identical across v1 and v2.
 
 ## Incremental (future)
 

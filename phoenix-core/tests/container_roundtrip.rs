@@ -53,7 +53,11 @@ fn phnx_write_read_manifest() {
             0,
         )
         .unwrap();
-    stream.write_chunk(b"hello backup world!!!").unwrap();
+    // The single extent covers 8 sectors = 4096 bytes, so the captured chunk
+    // must be exactly 4096 bytes for the structure check's per-extent coverage
+    // to balance.
+    let payload = vec![0x5Au8; 4096];
+    stream.write_chunk(&payload).unwrap();
     let (chunks, _) = stream.finish().unwrap();
     assert_eq!(chunks.len(), 1);
 
@@ -74,12 +78,12 @@ fn phnx_write_read_manifest() {
             fs: "unknown".into(),
             capture_mode: "raw".into(),
             original_size: 4096,
-            used_bytes: 23,
+            used_bytes: 4096,
             chunks: vec![ChunkRecord {
                 chunk_index: 0,
                 extent_index: 0,
-                uncompressed_len: 23,
-                blake3: phoenix_core::hash::hash_hex(b"hello backup world!!!"),
+                uncompressed_len: 4096,
+                blake3: phoenix_core::hash::hash_hex(&payload),
             }],
             bitmap_hash: None,
         }],

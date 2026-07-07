@@ -27,6 +27,13 @@ pub enum PhoenixError {
     },
     #[error("manifest error: {0}")]
     Manifest(String),
+    #[error(
+        "backup file is truncated or padded: footer records a total length of {expected} bytes \
+         but the file on disk is {actual} bytes"
+    )]
+    Truncated { expected: u64, actual: u64 },
+    #[error("backup structure is corrupt: {what}")]
+    TableCorrupt { what: String },
     #[error("disk error: {0}")]
     Disk(String),
     #[error("partition {partition_index} does not fit target size {target_size} (needs {required} bytes)")]
