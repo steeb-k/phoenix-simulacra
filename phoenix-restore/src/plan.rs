@@ -124,6 +124,18 @@ impl RestorePlan {
         Ok(())
     }
 
+    /// Verify the target layout is physically sane before any writes: no
+    /// two partitions overlap and none runs past the end of the target
+    /// disk. Guards against a hand-edited `plan.toml` and against a bug in
+    /// the auto-layout (`expand_ntfs_slack`) producing an overlapping plan.
+    /// `disk_size` is the target disk's total byte size.
+    pub fn validate_layout(&self, disk_size: u64) -> Result<()> {
+        if let Some(problem) = layout_problem(&self.entries, disk_size) {
+            return Err(PhoenixError::Plan(problem));
+        }
+        Ok(())
+    }
+
     pub fn validate_extents_fit(
         &self,
         reader: &mut phoenix_core::container::PhnxReader,
@@ -198,6 +210,46 @@ impl RestorePlan {
     }
 }
 
+/// Return a human-readable description of the first layout violation
+/// (overlap or past-end-of-disk) among the space-occupying entries, or
+/// `None` if the layout is sound. Entries with zero size are ignored (they
+/// don't occupy the disk). Used both by `RestorePlan::validate_layout` and
+/// by `expand_ntfs_slack` to reject its own bad output.
+fn layout_problem(entries: &[RestorePlanEntry], disk_size: u64) -> Option<String> {
+    let mut spans: Vec<(u64, u64, u32)> = entries
+        .iter()
+        .filter(|e| e.target_size_bytes > 0)
+        .map(|e| {
+            (
+                e.target_offset_bytes,
+                e.target_offset_bytes.saturating_add(e.target_size_bytes),
+                e.target_partition_index,
+            )
+        })
+        .collect();
+    spans.sort_by_key(|s| s.0);
+
+    for w in spans.windows(2) {
+        let (a_start, a_end, a_idx) = w[0];
+        let (b_start, _b_end, b_idx) = w[1];
+        if a_end > b_start {
+            return Some(format!(
+                "partition {a_idx} (bytes {a_start}..{a_end}) overlaps partition {b_idx} \
+                 starting at byte {b_start}"
+            ));
+        }
+    }
+    if let Some(&(start, end, idx)) = spans.last() {
+        if disk_size > 0 && end > disk_size {
+            return Some(format!(
+                "partition {idx} (bytes {start}..{end}) extends past the target disk end \
+                 ({disk_size} bytes)"
+            ));
+        }
+    }
+    None
+}
+
 pub fn alignment_bytes(reader: &PhnxReader) -> u64 {
     if reader.header.flags & 1 != 0 {
         1024 * 1024
@@ -264,6 +316,36 @@ pub fn build_full_disk_plan(
 /// sat after NTFS in the backup layout (e.g. Windows RE) are moved to the tail
 /// so NTFS can expand without overlapping them.
 fn expand_ntfs_slack(
+    entries: &mut [RestorePlanEntry],
+    reader: &PhnxReader,
+    target_disk_size: u64,
+    align: u64,
+) {
+    // Snapshot the pre-expansion offsets/sizes so we can revert if the
+    // repack produces an overlapping or out-of-bounds layout (pathological
+    // multi-NTFS / trailing-partition arrangements). A non-expanded plan is
+    // always valid; a corrupt one would fail the restore, so falling back
+    // is strictly safer.
+    let snapshot: Vec<(u64, u64)> = entries
+        .iter()
+        .map(|e| (e.target_offset_bytes, e.target_size_bytes))
+        .collect();
+
+    expand_ntfs_slack_inner(entries, reader, target_disk_size, align);
+
+    if let Some(problem) = layout_problem(entries, target_disk_size) {
+        tracing::warn!(
+            problem = %problem,
+            "NTFS slack expansion produced an invalid layout; reverting to the un-expanded plan"
+        );
+        for (e, (off, size)) in entries.iter_mut().zip(snapshot) {
+            e.target_offset_bytes = off;
+            e.target_size_bytes = size;
+        }
+    }
+}
+
+fn expand_ntfs_slack_inner(
     entries: &mut [RestorePlanEntry],
     reader: &PhnxReader,
     target_disk_size: u64,
@@ -401,4 +483,48 @@ pub fn partition_allows_resize(fs: FilesystemKind) -> bool {
         fs,
         FilesystemKind::Ntfs | FilesystemKind::Fat | FilesystemKind::Exfat
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(idx: u32, offset: u64, size: u64) -> RestorePlanEntry {
+        RestorePlanEntry {
+            source_partition_index: Some(idx),
+            target_partition_index: idx,
+            restore: true,
+            target_offset_bytes: offset,
+            target_size_bytes: size,
+        }
+    }
+
+    #[test]
+    fn valid_layout_passes() {
+        let entries = vec![entry(0, 1024, 1000), entry(1, 2024, 1000), entry(2, 3024, 500)];
+        assert!(layout_problem(&entries, 10_000).is_none());
+    }
+
+    #[test]
+    fn overlapping_layout_is_rejected() {
+        // Entry 1 starts at 1500, inside entry 0's 1024..2024 span.
+        let entries = vec![entry(0, 1024, 1000), entry(1, 1500, 1000)];
+        let problem = layout_problem(&entries, 10_000).expect("overlap must be caught");
+        assert!(problem.contains("overlap"), "got: {problem}");
+    }
+
+    #[test]
+    fn past_disk_end_is_rejected() {
+        let entries = vec![entry(0, 1024, 1000), entry(1, 9500, 1000)];
+        let problem = layout_problem(&entries, 10_000).expect("out-of-bounds must be caught");
+        assert!(problem.contains("past the target disk end"), "got: {problem}");
+    }
+
+    #[test]
+    fn zero_size_entries_are_ignored() {
+        // A zero-size (unmapped) slot at the same offset must not count as
+        // an overlap.
+        let entries = vec![entry(0, 1024, 1000), entry(1, 1024, 0)];
+        assert!(layout_problem(&entries, 10_000).is_none());
+    }
 }

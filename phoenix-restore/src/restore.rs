@@ -52,6 +52,10 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         .find(|d| d.index == opts.plan.target_disk_index)
         .ok_or_else(|| phoenix_core::error::PhoenixError::Disk("target disk not found".into()))?;
 
+    // Reject an overlapping or oversized layout before touching the disk.
+    // This catches a hand-edited plan.toml as well as any auto-layout bug.
+    opts.plan.validate_layout(disk.size_bytes)?;
+
     info!(
         "Restoring to disk {} ({}); source style={}, target was {}",
         disk.index,
