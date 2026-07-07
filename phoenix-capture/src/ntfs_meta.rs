@@ -40,6 +40,30 @@ const MFT_RECORD_BITMAP: u64 = 6;
 const ATTR_DATA: u32 = 0x80;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
+// Bounds-checked little-endian reads over untrusted on-disk bytes. Every
+// MFT record and run list we parse here comes from the source volume (or a
+// possibly-corrupt backup of it), so a malformed structure must surface as
+// a recoverable `Err`, never a panic that aborts the whole restore.
+#[inline]
+fn le_u16(buf: &[u8], off: usize) -> Result<u16> {
+    buf.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or_else(|| oob(2, off, buf.len()))
+}
+
+#[inline]
+fn le_u32(buf: &[u8], off: usize) -> Result<u32> {
+    buf.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or_else(|| oob(4, off, buf.len()))
+}
+
+fn oob(width: usize, off: usize, len: usize) -> PhoenixError {
+    PhoenixError::InvalidFormat(format!(
+        "NTFS metadata: {width}-byte read at offset {off} exceeds buffer length {len}"
+    ))
+}
+
 /// Parsed view of the NTFS boot sector. Field semantics match the
 /// canonical layout (offset 11 BytesPerSector, offset 13
 /// SectorsPerCluster, offset 48 MftLcn, offset 56 MftMirrLcn, offset
@@ -144,14 +168,30 @@ fn apply_fixups_for_read(record: &mut [u8], bytes_per_sector: u64) -> Result<()>
 }
 
 fn apply_fixups_for_write(record: &mut [u8], bytes_per_sector: u64) -> Result<()> {
-    let usa_offset = u16::from_le_bytes([record[4], record[5]]) as usize;
-    let usa_size_words = u16::from_le_bytes([record[6], record[7]]) as usize;
-    let usn = u16::from_le_bytes([record[usa_offset], record[usa_offset + 1]]).wrapping_add(1);
+    if record.len() < 8 {
+        return Err(PhoenixError::InvalidFormat(
+            "MFT record too short for a USA header".into(),
+        ));
+    }
+    let usa_offset = le_u16(record, 4)? as usize;
+    let usa_size_words = le_u16(record, 6)? as usize;
+    if usa_size_words < 2 || usa_offset + usa_size_words * 2 > record.len() {
+        return Err(PhoenixError::InvalidFormat(
+            "MFT record has invalid USA offset/size".into(),
+        ));
+    }
+    let usn = le_u16(record, usa_offset)?.wrapping_add(1);
     record[usa_offset] = (usn & 0xFF) as u8;
     record[usa_offset + 1] = (usn >> 8) as u8;
     let bps = bytes_per_sector as usize;
     for i in 1..usa_size_words {
         let sector_end = i * bps;
+        if sector_end < 2 || sector_end > record.len() {
+            return Err(PhoenixError::InvalidFormat(format!(
+                "MFT record sector boundary {sector_end} outside record length {}",
+                record.len()
+            )));
+        }
         let fixup_offset = usa_offset + i * 2;
         record[fixup_offset] = record[sector_end - 2];
         record[fixup_offset + 1] = record[sector_end - 1];
@@ -182,9 +222,17 @@ fn parse_run_list(bytes: &[u8]) -> Result<(Vec<DataRun>, usize)> {
         }
         let length_bytes = (header & 0x0F) as usize;
         let lcn_bytes = ((header >> 4) & 0x0F) as usize;
-        if length_bytes == 0 || pos + length_bytes + lcn_bytes > bytes.len() {
-            return Err(PhoenixError::Other(format!(
-                "truncated run list: header={header:02X}, pos={pos}, available={}",
+        // The header nibbles can encode up to 15 bytes, but a run's length
+        // and LCN delta each fit in 8 bytes; a value above 8 is corruption
+        // and, left unchecked, would shift a u64/i64 past its width and
+        // panic. Reject it as invalid input instead.
+        if length_bytes == 0
+            || length_bytes > 8
+            || lcn_bytes > 8
+            || pos + length_bytes + lcn_bytes > bytes.len()
+        {
+            return Err(PhoenixError::InvalidFormat(format!(
+                "invalid run-list entry: header={header:02X}, pos={pos}, available={}",
                 bytes.len()
             )));
         }
@@ -200,9 +248,14 @@ fn parse_run_list(bytes: &[u8]) -> Result<(Vec<DataRun>, usize)> {
             for i in 0..lcn_bytes {
                 delta |= (bytes[pos + i] as i64) << (i * 8);
             }
-            let sign_bit = 1i64 << (lcn_bytes * 8 - 1);
-            if delta & sign_bit != 0 {
-                delta |= -1i64 << (lcn_bytes * 8);
+            // Sign-extend the little-endian delta. At the full 8-byte width
+            // the i64 is already complete, and `-1i64 << 64` would overflow
+            // the shift, so only extend for widths under 8.
+            if lcn_bytes < 8 {
+                let sign_bit = 1i64 << (lcn_bytes * 8 - 1);
+                if delta & sign_bit != 0 {
+                    delta |= -1i64 << (lcn_bytes * 8);
+                }
             }
             pos += lcn_bytes;
             prev_lcn = prev_lcn.wrapping_add(delta);
@@ -312,35 +365,33 @@ fn relocate_runs(runs: &[DataRun], map: &RelocationMap) -> Vec<DataRun> {
 /// list, and re-encode in place. Returns `true` if anything changed,
 /// `Err` if a re-encoded run list no longer fits in its budget.
 fn rewrite_record_runs(record: &mut [u8], map: &RelocationMap, record_idx: u64) -> Result<bool> {
-    let attrs_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
-    let used_size = u32::from_le_bytes([record[24], record[25], record[26], record[27]]) as usize;
+    let attrs_offset = le_u16(record, 20)? as usize;
+    let used_size = le_u32(record, 24)? as usize;
     let mut changed = false;
     let mut pos = attrs_offset;
     while pos + 16 <= record.len() {
-        let attr_type = u32::from_le_bytes([
-            record[pos],
-            record[pos + 1],
-            record[pos + 2],
-            record[pos + 3],
-        ]);
+        let attr_type = le_u32(record, pos)?;
         if attr_type == ATTR_END {
             break;
         }
-        let attr_len = u32::from_le_bytes([
-            record[pos + 4],
-            record[pos + 5],
-            record[pos + 6],
-            record[pos + 7],
-        ]) as usize;
+        let attr_len = le_u32(record, pos + 4)? as usize;
         if attr_len == 0 || pos + attr_len > record.len() || pos + attr_len > used_size {
-            return Err(PhoenixError::Other(format!(
+            return Err(PhoenixError::InvalidFormat(format!(
                 "MFT record {record_idx}: attribute at offset {pos} has bad length {attr_len}"
             )));
         }
         let non_resident = record[pos + 8] != 0;
         if non_resident {
-            let run_list_offset =
-                u16::from_le_bytes([record[pos + 32], record[pos + 33]]) as usize;
+            // The run-list offset lives at attribute-relative offset 32; it
+            // must sit inside this attribute (which is already known to be
+            // within the record).
+            if pos + 34 > pos + attr_len {
+                return Err(PhoenixError::InvalidFormat(format!(
+                    "MFT record {record_idx}: non-resident attribute too short to hold a \
+                     run-list offset"
+                )));
+            }
+            let run_list_offset = le_u16(record, pos + 32)? as usize;
             let run_list_abs = pos + run_list_offset;
             if run_list_abs >= pos + attr_len {
                 return Err(PhoenixError::Other(format!(
@@ -382,24 +433,21 @@ fn rewrite_record_runs(record: &mut [u8], map: &RelocationMap, record_idx: u64) 
 }
 
 fn find_unnamed_data_runs(record: &[u8]) -> Result<Vec<DataRun>> {
-    let attrs_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
+    let attrs_offset = le_u16(record, 20)? as usize;
     let mut pos = attrs_offset;
     while pos + 16 <= record.len() {
-        let attr_type = u32::from_le_bytes([
-            record[pos],
-            record[pos + 1],
-            record[pos + 2],
-            record[pos + 3],
-        ]);
+        let attr_type = le_u32(record, pos)?;
         if attr_type == ATTR_END {
             break;
         }
-        let attr_len = u32::from_le_bytes([
-            record[pos + 4],
-            record[pos + 5],
-            record[pos + 6],
-            record[pos + 7],
-        ]) as usize;
+        let attr_len = le_u32(record, pos + 4)? as usize;
+        // A zero (or overshooting) attribute length would never advance
+        // `pos`, spinning forever; treat it as corruption.
+        if attr_len == 0 || pos + attr_len > record.len() {
+            return Err(PhoenixError::InvalidFormat(format!(
+                "MFT record: attribute at offset {pos} has bad length {attr_len}"
+            )));
+        }
         if attr_type == ATTR_DATA {
             let name_len = record[pos + 9] as usize;
             if name_len == 0 {
@@ -409,9 +457,19 @@ fn find_unnamed_data_runs(record: &[u8]) -> Result<Vec<DataRun>> {
                         "$DATA attribute is resident; cannot extract run list".into(),
                     ));
                 }
-                let run_list_offset =
-                    u16::from_le_bytes([record[pos + 32], record[pos + 33]]) as usize;
-                let run_bytes = &record[pos + run_list_offset..pos + attr_len];
+                if pos + 34 > pos + attr_len {
+                    return Err(PhoenixError::InvalidFormat(
+                        "non-resident $DATA attribute too short to hold a run-list offset".into(),
+                    ));
+                }
+                let run_list_offset = le_u16(record, pos + 32)? as usize;
+                let run_list_abs = pos + run_list_offset;
+                if run_list_abs > pos + attr_len {
+                    return Err(PhoenixError::InvalidFormat(
+                        "$DATA run-list offset points past the attribute end".into(),
+                    ));
+                }
+                let run_bytes = &record[run_list_abs..pos + attr_len];
                 let (runs, _) = parse_run_list(run_bytes)?;
                 return Ok(runs);
             }
@@ -704,6 +762,41 @@ pub fn rewrite_metadata_after_relocation(
 mod tests {
     use super::*;
     use phoenix_core::relocation::RelocationEntry;
+
+    /// The parsers all consume untrusted on-disk bytes; none of them may
+    /// panic on malformed input. Feed truncations and random garbage and
+    /// require an `Err` (or `Ok`), never an unwind.
+    #[test]
+    fn parsers_never_panic_on_garbage() {
+        let empty_map = RelocationMap {
+            sector_size: 512,
+            cluster_size: 4096,
+            safe_max_cluster: 0,
+            new_total_clusters: 0,
+            entries: Vec::new(),
+        };
+        // Deterministic pseudo-random bytes (no rng dependency).
+        let mut seed: u32 = 0x1234_5678;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        for len in 0..300usize {
+            let mut buf: Vec<u8> = (0..len).map(|_| next()).collect();
+            // A record that starts with "FILE" exercises deeper paths.
+            if len >= 4 {
+                buf[0..4].copy_from_slice(b"FILE");
+            }
+            let _ = parse_run_list(&buf);
+            let _ = find_unnamed_data_runs(&buf);
+            let mut rec = buf.clone();
+            let _ = rewrite_record_runs(&mut rec, &empty_map, 0);
+            let mut rec2 = buf.clone();
+            let _ = apply_fixups_for_read(&mut rec2, 512);
+            let mut rec3 = buf.clone();
+            let _ = apply_fixups_for_write(&mut rec3, 512);
+        }
+    }
 
     #[test]
     fn parse_then_encode_roundtrips_simple_run_list() {
