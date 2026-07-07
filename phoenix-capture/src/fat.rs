@@ -10,6 +10,7 @@ const SECTOR: u64 = 512;
 
 #[derive(Clone, Copy, PartialEq)]
 enum FatType {
+    Fat12,
     Fat16,
     Fat32,
     Exfat,
@@ -145,29 +146,53 @@ fn parse_fat_boot(boot: &[u8], exfat: bool) -> Result<(FatType, u64, u64, u64, u
     }
     let bytes_per_sector = u16::from_le_bytes([boot[11], boot[12]]) as u64;
     let sectors_per_cluster = boot[13] as u64;
+    if bytes_per_sector == 0 || sectors_per_cluster == 0 {
+        return Err(PhoenixError::Other(
+            "FAT boot sector reports zero bytes-per-sector or sectors-per-cluster".into(),
+        ));
+    }
     let cluster_size = bytes_per_sector * sectors_per_cluster;
     let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u64;
     let fat_count = boot[16] as u64;
-    let fat_size_sectors = u16::from_le_bytes([boot[22], boot[23]]) as u64;
-    let total_sectors = if boot[19] != 0 {
+    let root_entry_count = u16::from_le_bytes([boot[17], boot[18]]) as u64;
+
+    // FATSz and total-sector counts each have a 16-bit and a 32-bit field;
+    // the 16-bit form wins when non-zero (FAT12/16), otherwise the 32-bit
+    // form is authoritative (FAT32 / oversized FAT16).
+    let fat_size_16 = u16::from_le_bytes([boot[22], boot[23]]) as u64;
+    let fat_size_32 = u32::from_le_bytes(boot[36..40].try_into().unwrap()) as u64;
+    let fat_size = if fat_size_16 != 0 { fat_size_16 } else { fat_size_32 };
+    let total_sectors = if boot[19] != 0 || boot[20] != 0 {
         u16::from_le_bytes([boot[19], boot[20]]) as u64
     } else {
         u32::from_le_bytes(boot[32..36].try_into().unwrap()) as u64
     };
-    let fat_type = if fat_size_sectors == 0 {
-        let fat_size32 = u32::from_le_bytes(boot[36..40].try_into().unwrap()) as u64;
-        let root_clusters = u32::from_le_bytes(boot[44..48].try_into().unwrap()) as u64;
-        let data_start =
-            (reserved + fat_count * fat_size32) * bytes_per_sector;
-        let cluster_count = root_clusters;
-        (FatType::Fat32, cluster_size, data_start, cluster_count, 32)
+
+    // Root-directory sectors: 0 for FAT32 (root is a normal cluster chain),
+    // otherwise `ceil(root_entry_count * 32 / bytes_per_sector)`. The data
+    // region (cluster 2) begins after reserved + all FATs + the root dir —
+    // the previous code omitted the root-dir region, which offset every
+    // FAT12/16 extent's byte position by the root-directory size.
+    let root_dir_sectors =
+        (root_entry_count * 32).div_ceil(bytes_per_sector);
+    let data_start_sector = reserved + fat_count * fat_size + root_dir_sectors;
+    let data_sectors = total_sectors.saturating_sub(data_start_sector);
+    let cluster_count = data_sectors / sectors_per_cluster;
+
+    // FAT type is determined SOLELY by the count of data clusters (per the
+    // Microsoft FAT spec), never by which size field is populated. The old
+    // code keyed on `fat_size_16 == 0` and always produced FAT16, so FAT12
+    // was mis-decoded as FAT16 (2-byte entries) and FAT32's cluster count
+    // was read from `BPB_RootClus` (~2), capturing almost no data.
+    let (fat_type, fat_bits) = if cluster_count < 4085 {
+        (FatType::Fat12, 12u32)
+    } else if cluster_count < 65525 {
+        (FatType::Fat16, 16)
     } else {
-        let data_start = (reserved + fat_count * fat_size_sectors) * bytes_per_sector;
-        let cluster_count = (total_sectors - reserved - fat_count * fat_size_sectors)
-            / sectors_per_cluster;
-        (FatType::Fat16, cluster_size, data_start, cluster_count, 16)
+        (FatType::Fat32, 32)
     };
-    Ok(fat_type)
+    let data_start = data_start_sector * bytes_per_sector;
+    Ok((fat_type, cluster_size, data_start, cluster_count, fat_bits))
 }
 
 fn fat_used_extents(
@@ -180,7 +205,13 @@ fn fat_used_extents(
     let mut used = Vec::new();
     for c in 2..=total_clusters + 1 {
         let entry = fat_cluster_value(fat, c, fat_type);
-        if entry != 0 && entry != 0x0FFF_FFFF && entry != 0xFFFF {
+        // Any non-zero FAT entry means the cluster is allocated: mid-chain
+        // links, end-of-chain markers (0xFF8..0xFFF etc.), and bad-cluster
+        // markers all count as used. Only 0 (free) is skipped. The previous
+        // check excluded the single EOC value 0xFFFF / 0x0FFF_FFFF, which
+        // dropped the *final* cluster of every file (and missed the other
+        // EOC values 0xFF8..0xFFE entirely) from the captured image.
+        if entry != 0 {
             used.push(c);
         }
     }
@@ -217,6 +248,22 @@ fn fat_used_extents(
 
 fn fat_cluster_value(fat: &[u8], cluster: u64, fat_type: FatType) -> u32 {
     match fat_type {
+        FatType::Fat12 => {
+            // Each entry is 12 bits, packed two-per-three-bytes. Entry N
+            // begins at byte offset `N + N/2` (= floor(1.5 * N)); even
+            // clusters take the low 12 bits of the little-endian u16 there,
+            // odd clusters take the high 12 bits.
+            let off = (cluster + cluster / 2) as usize;
+            if off + 2 > fat.len() {
+                return 0;
+            }
+            let raw = u16::from_le_bytes([fat[off], fat[off + 1]]);
+            if cluster & 1 == 1 {
+                (raw >> 4) as u32
+            } else {
+                (raw & 0x0FFF) as u32
+            }
+        }
         FatType::Fat16 => {
             let off = (cluster * 2) as usize;
             if off + 2 > fat.len() {
@@ -519,4 +566,145 @@ fn patch_exfat_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> 
          resized partition"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic FAT12/16/32 boot sector from a geometry spec so we
+    /// can assert `parse_fat_boot` derives the right type and cluster count.
+    #[allow(clippy::too_many_arguments)]
+    fn make_boot(
+        bytes_per_sector: u16,
+        sectors_per_cluster: u8,
+        reserved: u16,
+        fat_count: u8,
+        root_entry_count: u16,
+        fat_size_16: u16,
+        total_sectors_16: u16,
+        fat_size_32: u32,
+        total_sectors_32: u32,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
+        b[13] = sectors_per_cluster;
+        b[14..16].copy_from_slice(&reserved.to_le_bytes());
+        b[16] = fat_count;
+        b[17..19].copy_from_slice(&root_entry_count.to_le_bytes());
+        b[19..21].copy_from_slice(&total_sectors_16.to_le_bytes());
+        b[22..24].copy_from_slice(&fat_size_16.to_le_bytes());
+        b[32..36].copy_from_slice(&total_sectors_32.to_le_bytes());
+        b[36..40].copy_from_slice(&fat_size_32.to_le_bytes());
+        // BPB_RootClus (offset 44) is 2 on a real FAT32 volume — the value
+        // the old buggy code mistook for the cluster count. Set it so the
+        // regression test proves we no longer read it.
+        b[44..48].copy_from_slice(&2u32.to_le_bytes());
+        b[510] = 0x55;
+        b[511] = 0xAA;
+        b
+    }
+
+    #[test]
+    fn parse_fat16_geometry() {
+        // 5000 data clusters → FAT16 range [4085, 65525).
+        let boot = make_boot(512, 4, 4, 2, 512, 20, 20076, 0, 0);
+        let (ft, cluster_size, data_start, count, bits) =
+            parse_fat_boot(&boot, false).unwrap();
+        assert!(ft == FatType::Fat16);
+        assert_eq!(bits, 16);
+        assert_eq!(cluster_size, 2048);
+        assert_eq!(count, 5000);
+        // data_start = (reserved 4 + 2*fat 20 + root_dir 32) * 512.
+        assert_eq!(data_start, (4 + 40 + 32) * 512);
+    }
+
+    #[test]
+    fn parse_fat12_geometry() {
+        // 2000 data clusters → FAT12 range (< 4085); must NOT be read as FAT16.
+        let boot = make_boot(512, 1, 1, 2, 224, 6, 2027, 0, 0);
+        let (ft, _cs, _ds, count, bits) = parse_fat_boot(&boot, false).unwrap();
+        assert!(ft == FatType::Fat12);
+        assert_eq!(bits, 12);
+        assert_eq!(count, 2000);
+    }
+
+    #[test]
+    fn parse_fat32_cluster_count_not_rootclus() {
+        // 70000 data clusters → FAT32. The old code returned ~2 here
+        // (BPB_RootClus), which is the whole "captures almost no data" bug.
+        let boot = make_boot(512, 8, 32, 2, 0, 0, 0, 547, 561126);
+        let (ft, _cs, _ds, count, bits) = parse_fat_boot(&boot, false).unwrap();
+        assert!(ft == FatType::Fat32);
+        assert_eq!(bits, 32);
+        assert_eq!(count, 70000);
+    }
+
+    fn set_fat16(fat: &mut [u8], cluster: u64, value: u16) {
+        let off = (cluster * 2) as usize;
+        fat[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn set_fat12(fat: &mut [u8], cluster: u64, value: u16) {
+        let off = (cluster + cluster / 2) as usize;
+        let v = value & 0x0FFF;
+        if cluster & 1 == 1 {
+            fat[off] = (fat[off] & 0x0F) | ((v << 4) as u8 & 0xF0);
+            fat[off + 1] = (v >> 4) as u8;
+        } else {
+            fat[off] = (v & 0xFF) as u8;
+            fat[off + 1] = (fat[off + 1] & 0xF0) | ((v >> 8) as u8 & 0x0F);
+        }
+    }
+
+    #[test]
+    fn fat12_packed_reads_roundtrip() {
+        let mut fat = vec![0u8; 64];
+        set_fat12(&mut fat, 2, 0x123); // even
+        set_fat12(&mut fat, 3, 0xFFF); // odd, EOC
+        set_fat12(&mut fat, 4, 0xABC); // even
+        assert_eq!(fat_cluster_value(&fat, 2, FatType::Fat12), 0x123);
+        assert_eq!(fat_cluster_value(&fat, 3, FatType::Fat12), 0xFFF);
+        assert_eq!(fat_cluster_value(&fat, 4, FatType::Fat12), 0xABC);
+    }
+
+    #[test]
+    fn eoc_terminated_clusters_are_captured() {
+        // Chain 2->3->4(EOC) plus a lone cluster 6(EOC); cluster 5 is free.
+        // The final cluster of each file (the EOC-marked one) must appear
+        // in the extents — this is the "FAT file tails dropped" regression.
+        let cluster_size = 2048u64;
+        let data_start = 76 * 512u64;
+        let total_clusters = 6u64;
+        let mut fat = vec![0u8; (total_clusters as usize + 2) * 2 + 16];
+        set_fat16(&mut fat, 2, 3);
+        set_fat16(&mut fat, 3, 4);
+        set_fat16(&mut fat, 4, 0xFFFF); // EOC
+        set_fat16(&mut fat, 6, 0xFFFF); // EOC (single-cluster file)
+
+        let extents =
+            fat_used_extents(&fat, FatType::Fat16, cluster_size, data_start, total_clusters);
+        assert_eq!(extents.len(), 2, "expected two coalesced runs");
+        // Run 1: clusters 2,3,4 (3 clusters) at data_start.
+        assert_eq!(extents[0].start_sector, data_start / 512);
+        assert_eq!(extents[0].sector_count, 3 * cluster_size / 512);
+        // Run 2: cluster 6 only.
+        assert_eq!(extents[1].start_sector, (data_start + 4 * cluster_size) / 512);
+        assert_eq!(extents[1].sector_count, cluster_size / 512);
+    }
+
+    #[test]
+    fn bad_and_reserved_markers_count_as_used() {
+        // Bad-cluster (0xFFF7) and reserved (0xFFF0) markers are non-zero,
+        // so they must be captured; only 0 (free) is skipped.
+        let cluster_size = 512u64;
+        let total_clusters = 3u64;
+        let mut fat = vec![0u8; (total_clusters as usize + 2) * 2 + 8];
+        set_fat16(&mut fat, 2, 0xFFF7); // bad
+        set_fat16(&mut fat, 3, 0); // free
+        set_fat16(&mut fat, 4, 0xFFF0); // reserved
+        let extents = fat_used_extents(&fat, FatType::Fat16, cluster_size, 0, total_clusters);
+        // Clusters 2 and 4 used, 3 free → two separate runs.
+        assert_eq!(extents.len(), 2);
+    }
 }
