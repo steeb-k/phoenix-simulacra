@@ -54,20 +54,81 @@ pub struct BackgroundJob {
     pub kind: JobKind,
     pub progress: ProgressHandle,
     rx: mpsc::Receiver<JobResult>,
+    /// Kept so we can `join()` the worker and recover its panic payload if
+    /// the channel disconnects without a result (worker panicked before
+    /// sending). Without this, a panicking worker would leave the modal
+    /// spinning forever with no completion.
+    handle: Option<thread::JoinHandle<()>>,
+    /// Terminal result, cached the first time `poll` observes it. Once set,
+    /// the channel is never read again — this is what makes `poll` and
+    /// `is_running` safe to call any number of times per frame (the old
+    /// design had both methods `try_recv`, so whichever ran second could
+    /// swallow the one-shot completion message and hang the UI).
+    finished: Option<JobResult>,
 }
 
 impl BackgroundJob {
-    pub fn poll(&self) -> Option<JobResult> {
-        self.rx.try_recv().ok()
+    /// Advance the job: if the worker has produced a result (or died),
+    /// cache and return it. Idempotent and cheap to call every frame.
+    pub fn poll(&mut self) -> Option<JobResult> {
+        if self.finished.is_none() {
+            match self.rx.try_recv() {
+                Ok(result) => self.finished = Some(result),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The sender was dropped without a message: the worker
+                    // thread panicked. Join it to surface the panic text.
+                    let msg = match self.handle.take().map(|h| h.join()) {
+                        Some(Err(payload)) => panic_message(&payload),
+                        _ => "worker thread ended without producing a result".to_string(),
+                    };
+                    error!(target: "phoenix_gui::job", "{msg}");
+                    self.finished = Some(Err(format!("Internal error: {msg}")));
+                }
+            }
+        }
+        self.finished.clone()
     }
 
+    /// Pure read of the cached state — never touches the channel, so it
+    /// can't race `poll`. Reflects the result observed by the most recent
+    /// `poll` call (which the UI runs once per frame).
     pub fn is_running(&self) -> bool {
-        self.poll().is_none()
+        self.finished.is_none()
+    }
+}
+
+/// Extract a readable message from a thread panic payload.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        format!("worker thread panicked: {s}")
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        format!("worker thread panicked: {s}")
+    } else {
+        "worker thread panicked (non-string payload)".to_string()
+    }
+}
+
+/// Spawn `f` on a worker thread, wiring up the result channel and join
+/// handle. `f` returns the job's terminal [`JobResult`].
+fn make_job<F>(kind: JobKind, progress: ProgressHandle, f: F) -> BackgroundJob
+where
+    F: FnOnce() -> JobResult + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    BackgroundJob {
+        kind,
+        progress,
+        rx,
+        handle: Some(handle),
+        finished: None,
     }
 }
 
 pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
-    let (tx, rx) = mpsc::channel();
     let progress = opts.progress.clone().unwrap_or_default();
     let progress_worker = progress.clone();
 
@@ -76,7 +137,7 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
     let disk_index = opts.disk_index;
     let partitions = opts.partition_indices.clone();
     let use_vss = opts.use_vss;
-    thread::spawn(move || {
+    make_job(JobKind::Backup, progress, move || {
         // Anchor-point logs: every backup run leaves a clear START / END
         // pair in the log so an operator scrolling a multi-run log can
         // locate "the run that produced C-Backup-N.phnx" by output path
@@ -132,57 +193,76 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
             }
         }
 
-        let result = result
+        result
             .map(|()| format!("Backup completed: {output_display}"))
-            .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
-
-    BackgroundJob {
-        kind: JobKind::Backup,
-        progress,
-        rx,
-    }
+            .map_err(|e| e.to_string())
+    })
 }
 
 pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
-    let (tx, rx) = mpsc::channel();
     let progress = opts.progress.clone().unwrap_or_default();
     let progress_worker = progress.clone();
 
-    thread::spawn(move || {
-        let result = run_restore(RestoreOptions {
+    make_job(JobKind::Restore, progress, move || {
+        run_restore(RestoreOptions {
             progress: Some(progress_worker),
             ..opts
         })
         .map(|_summary| "Restore completed".to_string())
-        .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
-
-    BackgroundJob {
-        kind: JobKind::Restore,
-        progress,
-        rx,
-    }
+        .map_err(|e| e.to_string())
+    })
 }
 
 pub fn spawn_verify(path: PathBuf, quick: bool) -> BackgroundJob {
-    let (tx, rx) = mpsc::channel();
     let progress = ProgressHandle::new();
     let progress_worker = progress.clone();
 
-    thread::spawn(move || {
+    make_job(JobKind::Verify, progress, move || {
         let label = if quick { "Quick verify OK" } else { "Full verify OK" };
-        let result = verify_backup_with_progress(&path, quick, Some(progress_worker))
+        verify_backup_with_progress(&path, quick, Some(progress_worker))
             .map(|()| label.to_string())
-            .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
+            .map_err(|e| e.to_string())
+    })
+}
 
-    BackgroundJob {
-        kind: JobKind::Verify,
-        progress,
-        rx,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panicking_worker_surfaces_error_instead_of_hanging() {
+        let mut job = make_job(JobKind::Verify, ProgressHandle::new(), || {
+            panic!("boom in worker");
+        });
+        // Spin briefly until the panic propagates to a cached terminal Err.
+        let mut result = None;
+        for _ in 0..2000 {
+            if let Some(r) = job.poll() {
+                result = Some(r);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let r = result.expect("panicking worker must produce a terminal result");
+        assert!(r.is_err(), "expected an error result, got {r:?}");
+        assert!(!job.is_running(), "job must not report running after finishing");
+    }
+
+    #[test]
+    fn successful_worker_result_is_cached_and_idempotent() {
+        let mut job = make_job(JobKind::Verify, ProgressHandle::new(), || {
+            Ok("done".to_string())
+        });
+        let mut first = None;
+        for _ in 0..2000 {
+            if let Some(r) = job.poll() {
+                first = Some(r);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(first, Some(Ok("done".to_string())));
+        // Polling again returns the same cached value, never Empty/None.
+        assert_eq!(job.poll(), Some(Ok("done".to_string())));
     }
 }

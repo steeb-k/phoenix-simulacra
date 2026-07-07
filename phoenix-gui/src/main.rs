@@ -339,7 +339,7 @@ impl PhoenixApp {
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.job else {
+        let Some(job) = self.job.as_mut() else {
             return;
         };
         let job_kind = job.kind;
