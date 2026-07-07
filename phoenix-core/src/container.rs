@@ -319,8 +319,12 @@ impl PhnxWriter {
         bytes_per_cluster: u32,
     ) -> Result<PartitionStreamWriter<'_>> {
         let stream_offset = self.current_offset;
-        // Reserve space: we'll patch stream_length later
-        let header_size = 8 + extents.len() * 16;
+        // Map header is 12 bytes (extent count + chunk count + bytes/cluster,
+        // three u32s) followed by the extent table (16 bytes per extent). This
+        // MUST match the 12-byte header the reader assumes; a previous value of
+        // 8 placed `data_start` inside the extent table, so the first chunk
+        // overwrote the high 32 bits of the last extent's sector_count.
+        let header_size = 12 + extents.len() * 16;
         self.file.seek(SeekFrom::Start(stream_offset))?;
         self.file.write_u32::<LittleEndian>(extents.len() as u32)?;
         self.file.write_u32::<LittleEndian>(0)?; // chunk count placeholder
@@ -738,6 +742,77 @@ mod tests {
         let c = compress_chunk(&data).unwrap();
         let d = decompress_chunk(&c, 1000).unwrap();
         assert_eq!(d, data);
+    }
+
+    #[test]
+    fn stream_extents_survive_roundtrip() {
+        // Regression: the map header is 12 bytes, so the first chunk must not
+        // overlap the extent table. Previously data_start was computed 4 bytes
+        // early and the first chunk clobbered the high 32 bits of the LAST
+        // extent's sector_count.
+        use crate::manifest::{BackupManifest, DiskManifest, PartitionManifest};
+        let path = std::env::temp_dir().join(format!("extents_{}.phnx", Uuid::new_v4()));
+        let header = Header {
+            version: FORMAT_VERSION,
+            flags: 0,
+            timestamp: 1,
+            backup_id: Uuid::new_v4(),
+            disk_signature: 1,
+            partition_count: 1,
+        };
+        let extents = vec![
+            Extent { start_sector: 0, sector_count: 8 },
+            Extent { start_sector: 100, sector_count: 50 },
+        ];
+        let mut writer = PhnxWriter::create(&path, header).unwrap();
+        let mut stream = writer
+            .begin_partition_stream(
+                0,
+                [0; 16],
+                "T".into(),
+                4096,
+                FilesystemKind::Ntfs,
+                CaptureMode::UsedBlocks,
+                EXTENT_LBA_BYTES,
+                0,
+                &extents,
+                4096,
+            )
+            .unwrap();
+        stream.set_extent(0);
+        stream.write_chunk(&[0xCD; 4096]).unwrap();
+        stream.set_extent(1);
+        stream.write_chunk(&[0xEF; 4096]).unwrap();
+        let (chunks, _) = stream.finish().unwrap();
+        let manifest = BackupManifest {
+            format_version: 1,
+            backup_id: writer.header.backup_id,
+            parent_backup_id: None,
+            hostname: "T".into(),
+            disk: DiskManifest { style: "gpt".into(), disk_guid: None, sector_size: 512 },
+            partitions: vec![PartitionManifest {
+                index: 0,
+                name: "T".into(),
+                type_guid: None,
+                fs: "ntfs".into(),
+                capture_mode: "used-blocks".into(),
+                original_size: 4096,
+                used_bytes: 8192,
+                chunks,
+                bitmap_hash: None,
+            }],
+        };
+        writer.finalize(&manifest).unwrap();
+
+        let mut reader = PhnxReader::open(&path).unwrap();
+        let entry = reader.index[0].clone();
+        let sh = reader.read_stream_header(&entry).unwrap();
+        assert_eq!(sh.extents.len(), 2);
+        assert_eq!(sh.extents[0].start_sector, 0);
+        assert_eq!(sh.extents[0].sector_count, 8);
+        assert_eq!(sh.extents[1].start_sector, 100);
+        assert_eq!(sh.extents[1].sector_count, 50, "last extent sector_count clobbered");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn dummy_chunk(i: u32) -> ChunkIndex {
