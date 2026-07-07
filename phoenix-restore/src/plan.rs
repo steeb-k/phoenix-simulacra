@@ -286,6 +286,34 @@ pub fn default_plan_from_backup(
     build_full_disk_plan(backup_path, reader, target_disk_index, target_disk_size)
 }
 
+/// Pack partitions of the given `sizes` sequentially onto a `disk_size`-byte
+/// GPT disk: each start is aligned, and the final partition is clamped so the
+/// layout leaves room for the backup GPT (33 LBAs at the disk end). A `.phnx`
+/// records partition sizes but not their source disk offsets, so re-packing
+/// from the front can drift the last partition past the disk end when the
+/// source had inter-partition gaps (e.g. an MSR partition) — the clamp keeps
+/// the reconstructed layout valid. Returns `(offset, size)` per input size.
+fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> {
+    const GPT_TRAILING_BYTES: u64 = 33 * 512;
+    let usable_end = disk_size.saturating_sub(GPT_TRAILING_BYTES);
+    let mut offset = align;
+    let mut out = Vec::with_capacity(sizes.len());
+    let count = sizes.len();
+    for (i, &orig) in sizes.iter().enumerate() {
+        let off = align_up(offset, align);
+        let mut size = orig;
+        if i + 1 == count && off.saturating_add(size) > usable_end {
+            // Clamp only the last partition. `validate_against_backup` still
+            // enforces that the used data fits and surfaces PartitionTooSmall
+            // if a genuinely full partition can't.
+            size = align_down(usable_end.saturating_sub(off), 4096);
+        }
+        out.push((off, size));
+        offset = off + size;
+    }
+    out
+}
+
 pub fn build_full_disk_plan(
     backup_path: &str,
     reader: &PhnxReader,
@@ -293,19 +321,27 @@ pub fn build_full_disk_plan(
     target_disk_size: u64,
 ) -> RestorePlan {
     let align = alignment_bytes(reader);
-    let mut offset = align;
-    let mut entries: Vec<RestorePlanEntry> = Vec::new();
-
-    for e in &reader.index {
-        entries.push(RestorePlanEntry {
+    // The final 33 LBAs of a GPT disk hold the backup GPT header + entry array;
+    // no partition may end past there or IOCTL_DISK_SET_DRIVE_LAYOUT_EX rejects
+    // the layout. A `.phnx` records partition sizes but not their source disk
+    // offsets, so re-packing from the front can drift the last partition past
+    // the disk end when the source had inter-partition gaps (e.g. an MSR
+    // partition). Aligning each start and clamping the final partition keeps
+    // the reconstructed layout valid.
+    let sizes: Vec<u64> = reader.index.iter().map(|e| e.original_size).collect();
+    let placed = pack_full_disk(&sizes, target_disk_size, align);
+    let mut entries: Vec<RestorePlanEntry> = reader
+        .index
+        .iter()
+        .zip(placed)
+        .map(|(e, (off, size))| RestorePlanEntry {
             source_partition_index: Some(e.index),
             target_partition_index: e.index,
             restore: true,
-            target_offset_bytes: offset,
-            target_size_bytes: e.original_size,
-        });
-        offset += e.original_size;
-    }
+            target_offset_bytes: off,
+            target_size_bytes: size,
+        })
+        .collect();
 
     expand_ntfs_slack(&mut entries, reader, target_disk_size, align);
 
@@ -541,6 +577,39 @@ mod tests {
             problem.contains("past the target disk end"),
             "got: {problem}"
         );
+    }
+
+    #[test]
+    fn full_disk_pack_leaves_room_for_backup_gpt() {
+        // Reproduces the FAT/exFAT failure: a 16 MiB MSR-like partition plus a
+        // data partition sized to reach the source's usable end. Re-packed onto
+        // a same-size disk it would overshoot; pack_full_disk must clamp it.
+        let disk = 512 * 1024 * 1024u64;
+        let align = 1024 * 1024u64;
+        let msr = 16 * 1024 * 1024u64;
+        // Data sized so msr + data + 1 MiB lead > disk (forces a clamp).
+        let data = disk - align - msr + 2 * 1024 * 1024;
+        let placed = pack_full_disk(&[msr, data], disk, align);
+        let last = placed.last().unwrap();
+        let end = last.0 + last.1;
+        assert!(
+            end <= disk - 33 * 512,
+            "last partition ends at {end}, past the GPT usable end on a {disk}-byte disk"
+        );
+        // Offsets are aligned.
+        for (off, _) in &placed {
+            assert_eq!(off % align, 0, "offset {off} not aligned");
+        }
+    }
+
+    #[test]
+    fn full_disk_pack_no_clamp_when_it_fits() {
+        // A single partition that already fits is left untouched.
+        let disk = 512 * 1024 * 1024u64;
+        let align = 1024 * 1024u64;
+        let size = disk - align - 33 * 512; // ends exactly at usable end
+        let placed = pack_full_disk(&[size], disk, align);
+        assert_eq!(placed[0], (align, size));
     }
 
     #[test]
