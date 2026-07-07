@@ -240,8 +240,7 @@ pub fn draw_partition_map(
 
     let mut x = rect.left();
     for (seg, w) in segments.iter().zip(widths.iter()) {
-        let seg_rect =
-            Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(*w, rect.height()));
+        let seg_rect = Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(*w, rect.height()));
         match seg {
             SegmentKind::Partition(p) => {
                 if !on_partition(ui, disk.index, p, seg_rect) {
@@ -307,8 +306,7 @@ pub fn draw_partition_segment_visual_styled(
     };
     let usage_w = (rect.width() * usage_frac).max(0.0);
     if usage_w > 0.5 {
-        let usage_rect =
-            Rect::from_min_size(rect.left_top(), Vec2::new(usage_w, FILL_BAR_HEIGHT));
+        let usage_rect = Rect::from_min_size(rect.left_top(), Vec2::new(usage_w, FILL_BAR_HEIGHT));
         painter.rect_filled(
             usage_rect,
             Rounding {
@@ -567,27 +565,33 @@ pub fn draw_backup_disk_row(
         egui::pos2(map_left, row_rect.top()),
         row_rect.right_bottom(),
     );
-    draw_partition_map(ui, map_rect, disk, palette, |ui, disk_index, p, seg_rect| {
-        let id = ui.id().with(("partition", disk.index, p.index));
-        let response = ui.interact(seg_rect, id, PARTITION_SENSE);
-        let selected = selections.contains(&(disk_index, p.index));
-        draw_partition_segment_visual_styled(
-            ui,
-            seg_rect,
-            p,
-            palette,
-            response.hovered(),
-            selected,
-            None,
-        );
-        if response.clicked() {
-            let key = (disk_index, p.index);
-            if selected {
-                selections.remove(&key);
-            } else {
-                selections.insert(key);
+    draw_partition_map(
+        ui,
+        map_rect,
+        disk,
+        palette,
+        |ui, disk_index, p, seg_rect| {
+            let id = ui.id().with(("partition", disk.index, p.index));
+            let response = ui.interact(seg_rect, id, PARTITION_SENSE);
+            let selected = selections.contains(&(disk_index, p.index));
+            draw_partition_segment_visual_styled(
+                ui,
+                seg_rect,
+                p,
+                palette,
+                response.hovered(),
+                selected,
+                None,
+            );
+            if response.clicked() {
+                let key = (disk_index, p.index);
+                if selected {
+                    selections.remove(&key);
+                } else {
+                    selections.insert(key);
+                }
             }
-        }
-        true
-    });
+            true
+        },
+    );
 }

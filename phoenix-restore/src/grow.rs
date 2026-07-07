@@ -101,24 +101,21 @@ pub fn extend_ntfs_volume(
         ));
     }
 
-    let volume_path = match poll_for_volume(
-        disk_index,
-        partition_offset_bytes,
-        partition_size_bytes,
-    ) {
-        Some(path) => path,
-        None => {
-            warn!(
-                disk_index,
-                partition_offset_bytes,
-                partition_size_bytes,
-                wait_secs = MOUNT_WAIT.as_secs(),
-                "extend_ntfs_volume: volume did not mount within timeout; leaving NTFS at \
+    let volume_path =
+        match poll_for_volume(disk_index, partition_offset_bytes, partition_size_bytes) {
+            Some(path) => path,
+            None => {
+                warn!(
+                    disk_index,
+                    partition_offset_bytes,
+                    partition_size_bytes,
+                    wait_secs = MOUNT_WAIT.as_secs(),
+                    "extend_ntfs_volume: volume did not mount within timeout; leaving NTFS at \
                  source size (user can extend manually via Disk Management)"
-            );
-            return Ok(());
-        }
-    };
+                );
+                return Ok(());
+            }
+        };
 
     let new_sectors: i64 = (partition_size_bytes / bytes_per_sector)
         .try_into()

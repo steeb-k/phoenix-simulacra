@@ -6,8 +6,8 @@ use phoenix_capture::raw::{restore_raw, PartitionWriter};
 use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
 use phoenix_core::disk::{enumerate_disks, DiskInfo, FilesystemKind};
 use phoenix_core::error::Result;
-use phoenix_core::ProgressHandle;
 use phoenix_core::manifest::fs_kind_from_string;
+use phoenix_core::ProgressHandle;
 use tracing::{info, warn};
 
 use crate::grow::extend_ntfs_volume;
@@ -37,8 +37,7 @@ pub struct RestoreSummary {
 
 pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     let mut reader = PhnxReader::open(&opts.backup_path)?;
-    opts.plan
-        .validate_against_backup(&reader.manifest)?;
+    opts.plan.validate_against_backup(&reader.manifest)?;
     // Pre-flight: refuse a shrink whose source has data physically
     // beyond the new partition's end *before* we touch the target disk.
     // This has to come before `init_target_disk_as_gpt` — a half-
@@ -61,7 +60,11 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         disk.index,
         disk.path,
         reader.manifest.disk.style,
-        if disk.is_gpt { "GPT" } else { "MBR/uninitialized" }
+        if disk.is_gpt {
+            "GPT"
+        } else {
+            "MBR/uninitialized"
+        }
     );
 
     // PHASE 1 — initialize the target as GPT *without* any partition
@@ -180,11 +183,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         .iter()
         .filter_map(|entry| {
             let src = entry.source_partition_index?;
-            reader
-                .manifest
-                .partitions
-                .iter()
-                .find(|p| p.index == src)
+            reader.manifest.partitions.iter().find(|p| p.index == src)
         })
         .map(|p| p.used_bytes)
         .sum();
@@ -405,10 +404,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             if let Some(step) = resize_step {
                 p.set_step(step);
             }
-            p.set_detail(format!(
-                "Extending NTFS volume for partition {}",
-                src_index
-            ));
+            p.set_detail(format!("Extending NTFS volume for partition {}", src_index));
         }
         if let Err(e) = extend_ntfs_volume(
             disk.index,
@@ -637,10 +633,7 @@ fn build_mbr_layout_entries(plan: &RestorePlan, reader: &PhnxReader) -> Vec<MbrL
 /// a warning — MSR on MBR isn't a real thing, BitLocker volumes
 /// preserve as 0x07 on round-trip, and Unknown means we couldn't
 /// classify but the user asked us to restore it anyway.
-fn mbr_partition_type_for(
-    idx_entry: Option<&PartitionIndexEntry>,
-    size_bytes: u64,
-) -> u8 {
+fn mbr_partition_type_for(idx_entry: Option<&PartitionIndexEntry>, size_bytes: u64) -> u8 {
     let Some(idx) = idx_entry else {
         warn!("MBR restore entry has no source partition; defaulting type to 0x07 (IFS)");
         return 0x07;

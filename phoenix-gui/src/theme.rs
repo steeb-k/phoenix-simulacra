@@ -169,12 +169,7 @@ pub fn draw_focus_outline(ui: &Ui, response: &Response, palette: &Palette) {
 /// sRGB lerp matches what people expect a paint program would do.
 pub fn tint(a: Color32, t: f32, b: Color32) -> Color32 {
     let mix = |x: u8, y: u8| ((x as f32) * (1.0 - t) + (y as f32) * t) as u8;
-    Color32::from_rgba_unmultiplied(
-        mix(a.r(), b.r()),
-        mix(a.g(), b.g()),
-        mix(a.b(), b.b()),
-        255,
-    )
+    Color32::from_rgba_unmultiplied(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), 255)
 }
 
 fn with_alpha(c: Color32, a: u8) -> Color32 {
@@ -211,8 +206,8 @@ fn read_apps_use_light_theme() -> bool {
     use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(personalize) = hkcu
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+    let Ok(personalize) =
+        hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
     else {
         return false;
     };

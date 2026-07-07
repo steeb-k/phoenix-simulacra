@@ -1,8 +1,6 @@
 use phoenix_core::container::{Extent, Header, PhnxReader, PhnxWriter, FORMAT_VERSION};
 use phoenix_core::disk::{CaptureMode, FilesystemKind};
-use phoenix_core::manifest::{
-    BackupManifest, ChunkRecord, DiskManifest, PartitionManifest,
-};
+use phoenix_core::manifest::{BackupManifest, ChunkRecord, DiskManifest, PartitionManifest};
 use std::io::{Read, Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
 use uuid::Uuid;

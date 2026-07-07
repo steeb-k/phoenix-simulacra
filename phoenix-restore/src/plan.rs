@@ -31,7 +31,9 @@ fn default_true() -> bool {
 }
 
 /// TOML plans may use `source_partition_index = 2` (legacy integer) or omit it.
-fn deserialize_source_partition<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+fn deserialize_source_partition<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -61,8 +63,7 @@ impl RestorePlan {
     }
 
     pub fn to_toml(&self) -> Result<String> {
-        toml::to_string_pretty(self)
-            .map_err(|e| PhoenixError::Plan(format!("serialize plan: {e}")))
+        toml::to_string_pretty(self).map_err(|e| PhoenixError::Plan(format!("serialize plan: {e}")))
     }
 
     pub fn mode(&self) -> RestoreMode {
@@ -152,7 +153,9 @@ impl RestorePlan {
                 .iter()
                 .find(|e| e.index == src)
                 .cloned()
-                .ok_or_else(|| PhoenixError::Plan(format!("partition {src} not in backup index")))?;
+                .ok_or_else(|| {
+                    PhoenixError::Plan(format!("partition {src} not in backup index"))
+                })?;
             if entry.target_size_bytes >= idx_entry.original_size {
                 continue;
             }
@@ -194,7 +197,9 @@ impl RestorePlan {
                 let sample = offending
                     .iter()
                     .take(3)
-                    .map(|(i, s, c, l)| format!("extent[{i}]: start={s}, count={c}, last_sector={l}"))
+                    .map(|(i, s, c, l)| {
+                        format!("extent[{i}]: start={s}, count={c}, last_sector={l}")
+                    })
                     .collect::<Vec<_>>()
                     .join("; ");
                 return Err(PhoenixError::Plan(format!(
@@ -410,7 +415,8 @@ fn expand_ntfs_slack_inner(
     };
 
     if ntfs_end > ntfs_start {
-        entries[primary_ntfs].target_size_bytes = align_down(ntfs_end.saturating_sub(ntfs_start), align);
+        entries[primary_ntfs].target_size_bytes =
+            align_down(ntfs_end.saturating_sub(ntfs_start), align);
     }
 
     // Additional NTFS volumes (rare) share any space after the tail pack.
@@ -431,7 +437,10 @@ fn expand_ntfs_slack_inner(
     if trailing < align {
         return;
     }
-    let total_extra_orig: u64 = extra_ntfs.iter().map(|&i| entries[i].target_size_bytes).sum();
+    let total_extra_orig: u64 = extra_ntfs
+        .iter()
+        .map(|&i| entries[i].target_size_bytes)
+        .sum();
     let mut remaining = trailing;
     for (pos, &idx) in extra_ntfs.iter().enumerate() {
         let share = if pos + 1 == extra_ntfs.len() {
@@ -501,7 +510,11 @@ mod tests {
 
     #[test]
     fn valid_layout_passes() {
-        let entries = vec![entry(0, 1024, 1000), entry(1, 2024, 1000), entry(2, 3024, 500)];
+        let entries = vec![
+            entry(0, 1024, 1000),
+            entry(1, 2024, 1000),
+            entry(2, 3024, 500),
+        ];
         assert!(layout_problem(&entries, 10_000).is_none());
     }
 
@@ -517,7 +530,10 @@ mod tests {
     fn past_disk_end_is_rejected() {
         let entries = vec![entry(0, 1024, 1000), entry(1, 9500, 1000)];
         let problem = layout_problem(&entries, 10_000).expect("out-of-bounds must be caught");
-        assert!(problem.contains("past the target disk end"), "got: {problem}");
+        assert!(
+            problem.contains("past the target disk end"),
+            "got: {problem}"
+        );
     }
 
     #[test]

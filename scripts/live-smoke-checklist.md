@@ -1,0 +1,49 @@
+# Tier-3 Live Smoke Checklist
+
+These checks exercise behavior that can't be automated safely on a build
+machine: backing up and cloning the **running** Windows system disk via VSS,
+and booting a cloned disk. Run them manually before a release, on real hardware
+or a spare disk you can afford to overwrite.
+
+> ⚠️ Every step here writes to real disks. Double-check disk numbers with
+> `Get-Disk` before each destructive operation.
+
+## 1. Live system-disk backup (VSS)
+
+- [ ] From an elevated prompt, list disks: `carbon-phoenix list-disks`.
+- [ ] Back up the live OS disk with VSS:
+      `carbon-phoenix backup --disk 0 --partitions <sys parts> -o C:\temp\live.phnx --vss`
+- [ ] Verify the backup: `carbon-phoenix verify C:\temp\live.phnx` (full).
+- [ ] Confirm `verify --quick` also passes and is fast.
+
+## 2. Restore to a spare disk and boot
+
+- [ ] Attach a spare disk (>= source used size).
+- [ ] `carbon-phoenix plan C:\temp\live.phnx --disk <spare> -o plan.toml`
+- [ ] Review `plan.toml` sizes/offsets, then `carbon-phoenix restore C:\temp\live.phnx --plan plan.toml`.
+- [ ] Move the spare disk to a test machine (or set as boot device) and confirm Windows boots.
+- [ ] If boot fails, note whether Startup Repair / `bcdedit` fixes it (expected for dissimilar hardware).
+
+## 3. Live system-disk clone (VSS)
+
+- [ ] `carbon-phoenix clone --source-disk 0 --target-disk <spare> --verify`
+- [ ] Confirm the destructive-action confirmation prompt appears and requires typed confirmation.
+- [ ] After completion, `chkdsk <letter>: /scan` on each restored volume is clean.
+- [ ] Boot the cloned disk; confirm Windows starts and data is intact.
+
+## 4. Resize restores
+
+- [ ] Restore an NTFS partition to a **larger** target; confirm the volume grew and mounts.
+- [ ] Restore an NTFS partition to a **smaller** target (data must fit); confirm `chkdsk /F` is clean.
+
+## 5. Mount
+
+- [ ] `carbon-phoenix mount C:\temp\live.phnx` (with WinFsp installed).
+- [ ] Browse the mounted volume(s) in Explorer; open a few files; compare hashes to source.
+- [ ] Unmount (Ctrl-C) and confirm the drive letters disappear cleanly.
+- [ ] With WinFsp NOT installed, confirm the CLI/GUI shows a clear "install WinFsp" message.
+
+## 6. 4Kn / USB media (if available)
+
+- [ ] Back up and restore a partition on a 4Kn (4096-byte sector) disk; confirm success (no ERROR_INVALID_PARAMETER).
+- [ ] Repeat on a USB-attached disk.

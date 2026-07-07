@@ -126,12 +126,8 @@ impl RestoreLayoutState {
         self.assignments.clear();
         let reader_path = self.backup_path.clone();
         if let Ok(reader) = PhnxReader::open(Path::new(&reader_path)) {
-            let plan = build_full_disk_plan(
-                &self.backup_path,
-                &reader,
-                target.index,
-                target.size_bytes,
-            );
+            let plan =
+                build_full_disk_plan(&self.backup_path, &reader, target.index, target.size_bytes);
             for (slot, entry) in plan.entries.iter().enumerate() {
                 if let Some(src) = entry.source_partition_index {
                     self.assignments.insert(
@@ -154,7 +150,12 @@ impl RestoreLayoutState {
         self.assignments.clear();
     }
 
-    pub fn try_map_source_to_target(&mut self, source_index: u32, target: &DiskInfo, target_part: u32) {
+    pub fn try_map_source_to_target(
+        &mut self,
+        source_index: u32,
+        target: &DiskInfo,
+        target_part: u32,
+    ) {
         let Some(slot) = target.partitions.iter().find(|p| p.index == target_part) else {
             return;
         };

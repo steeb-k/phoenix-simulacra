@@ -9,13 +9,13 @@ use tracing::{debug, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetDiskFreeSpaceExW, GetVolumeInformationW, ReadFile, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+    FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Ioctl::{
-    DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
-    IOCTL_STORAGE_QUERY_PROPERTY, PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT,
-    PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
-    StorageDeviceProperty,
+    PropertyStandardQuery, StorageDeviceProperty, DRIVE_LAYOUT_INFORMATION_EX,
+    IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
+    PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT, STORAGE_DEVICE_DESCRIPTOR,
+    STORAGE_PROPERTY_QUERY,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -179,10 +179,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
     let model = query_disk_model(handle);
 
     let (is_gpt, disk_guid, disk_signature, partitions) = match layout {
-        LayoutInfo::Gpt {
-            disk_guid,
-            entries,
-        } => {
+        LayoutInfo::Gpt { disk_guid, entries } => {
             let sig = u64::from_le_bytes(disk_guid[0..8].try_into().unwrap());
             let parts = entries
                 .into_iter()
@@ -198,20 +195,10 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                     } else {
                         CaptureMode::UsedBlocks
                     };
-                    let volume_path = find_volume_for_partition(
-                        index,
-                        e.starting_offset,
-                        e.length,
-                    );
-                    let drive_letter = volume_path
-                        .as_deref()
-                        .and_then(parse_drive_letter);
-                    let volume_label = volume_path
-                        .as_deref()
-                        .and_then(query_volume_label);
-                    let usage = volume_path
-                        .as_deref()
-                        .and_then(query_partition_usage);
+                    let volume_path = find_volume_for_partition(index, e.starting_offset, e.length);
+                    let drive_letter = volume_path.as_deref().and_then(parse_drive_letter);
+                    let volume_label = volume_path.as_deref().and_then(query_volume_label);
+                    let usage = volume_path.as_deref().and_then(query_partition_usage);
                     PartitionInfo {
                         index: i as u32,
                         name: e.name,
@@ -237,20 +224,10 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                 .enumerate()
                 .map(|(i, e)| {
                     let fs_kind = FilesystemKind::Unknown;
-                    let volume_path = find_volume_for_partition(
-                        index,
-                        e.starting_offset,
-                        e.length,
-                    );
-                    let drive_letter = volume_path
-                        .as_deref()
-                        .and_then(parse_drive_letter);
-                    let volume_label = volume_path
-                        .as_deref()
-                        .and_then(query_volume_label);
-                    let usage = volume_path
-                        .as_deref()
-                        .and_then(query_partition_usage);
+                    let volume_path = find_volume_for_partition(index, e.starting_offset, e.length);
+                    let drive_letter = volume_path.as_deref().and_then(parse_drive_letter);
+                    let volume_label = volume_path.as_deref().and_then(query_volume_label);
+                    let usage = volume_path.as_deref().and_then(query_partition_usage);
                     PartitionInfo {
                         index: i as u32,
                         name: format!("Partition{i}"),
@@ -320,7 +297,10 @@ fn query_disk_model(handle: HANDLE) -> Option<String> {
         )
     };
     if ok == 0 || (returned as usize) < size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-        debug!(last_error = unsafe { GetLastError() }, "IOCTL_STORAGE_QUERY_PROPERTY failed; model unknown");
+        debug!(
+            last_error = unsafe { GetLastError() },
+            "IOCTL_STORAGE_QUERY_PROPERTY failed; model unknown"
+        );
         return None;
     }
 
@@ -466,13 +446,16 @@ fn get_disk_length(handle: HANDLE) -> Result<u64> {
         )
     };
     if ok == 0 {
-        return Err(PhoenixError::Disk("IOCTL_DISK_GET_LENGTH_INFO failed".into()));
+        return Err(PhoenixError::Disk(
+            "IOCTL_DISK_GET_LENGTH_INFO failed".into(),
+        ));
     }
     Ok(info.length as u64)
 }
 
 fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
-    let buf_size = size_of::<DRIVE_LAYOUT_INFORMATION_EX>() + 128 * size_of::<PARTITION_INFORMATION_EX>();
+    let buf_size =
+        size_of::<DRIVE_LAYOUT_INFORMATION_EX>() + 128 * size_of::<PARTITION_INFORMATION_EX>();
     let mut buffer = vec![0u8; buf_size];
     let mut returned = 0u32;
     let ok = unsafe {
@@ -488,7 +471,9 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
         )
     };
     if ok == 0 {
-        return Err(PhoenixError::Disk("IOCTL_DISK_GET_DRIVE_LAYOUT_EX failed".into()));
+        return Err(PhoenixError::Disk(
+            "IOCTL_DISK_GET_DRIVE_LAYOUT_EX failed".into(),
+        ));
     }
 
     let layout = unsafe { &*(buffer.as_ptr() as *const DRIVE_LAYOUT_INFORMATION_EX) };
@@ -501,12 +486,7 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
         for i in 0..layout.PartitionCount {
             let part = unsafe { &*entry_ptr.add(i as usize) };
             let gpt = unsafe { part.Anonymous.Gpt };
-            let name_wide: Vec<u16> = gpt
-                .Name
-                .iter()
-                .take_while(|&&c| c != 0)
-                .copied()
-                .collect();
+            let name_wide: Vec<u16> = gpt.Name.iter().take_while(|&&c| c != 0).copied().collect();
             let name = String::from_utf16_lossy(&name_wide);
             let type_guid: [u8; 16] = unsafe { std::mem::transmute(gpt.PartitionType) };
             entries.push(GptEntry {
@@ -535,10 +515,7 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
             });
         }
         let signature = unsafe { layout.Anonymous.Mbr }.Signature;
-        Ok(LayoutInfo::Mbr {
-            signature,
-            entries,
-        })
+        Ok(LayoutInfo::Mbr { signature, entries })
     }
 }
 
@@ -614,7 +591,10 @@ fn detect_volume_fs_via_get_volume_information(volume_path: &str) -> Option<File
         );
         return None;
     }
-    let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
     let fs = String::from_utf16_lossy(&fs_name[..len]).to_uppercase();
     debug!(
         volume = root.as_str(),
@@ -736,7 +716,8 @@ fn classify_boot_sector(buf: &[u8]) -> Option<FilesystemKind> {
     }
     // FAT12/FAT16 store theirs at offset 54..62.
     let fat1216_label = &buf[54..62];
-    if fat1216_label == b"FAT12   " || fat1216_label == b"FAT16   " || fat1216_label == b"FAT     " {
+    if fat1216_label == b"FAT12   " || fat1216_label == b"FAT16   " || fat1216_label == b"FAT     "
+    {
         return Some(FilesystemKind::Fat);
     }
     None
@@ -748,9 +729,9 @@ pub fn refine_partition_fs(part: &mut PartitionInfo) {
         if detected != FilesystemKind::Unknown {
             part.fs_kind = detected;
             part.capture_mode = match detected {
-                FilesystemKind::Efi
-                | FilesystemKind::Msr
-                | FilesystemKind::Bitlocker => CaptureMode::Raw,
+                FilesystemKind::Efi | FilesystemKind::Msr | FilesystemKind::Bitlocker => {
+                    CaptureMode::Raw
+                }
                 _ => CaptureMode::UsedBlocks,
             };
         }
@@ -870,11 +851,7 @@ pub fn query_partition_usage(volume_path: &str) -> Option<PartitionUsage> {
 /// hand the post-restore extender (`phoenix_restore::grow`) a handle
 /// it can call `FSCTL_EXTEND_VOLUME` against. Returns `None` if no
 /// mounted volume matches (unmounted partitions, EFI/MSR, etc.).
-pub fn find_volume_for_partition(
-    disk_index: u32,
-    offset: u64,
-    length: u64,
-) -> Option<String> {
+pub fn find_volume_for_partition(disk_index: u32, offset: u64, length: u64) -> Option<String> {
     for letter in b'C'..=b'Z' {
         // Open the volume *device* (`\\.\C:`), not the directory `C:\`. The
         // latter requires `FILE_FLAG_BACKUP_SEMANTICS` to open at all, and

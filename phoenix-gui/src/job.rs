@@ -218,7 +218,11 @@ pub fn spawn_verify(path: PathBuf, quick: bool) -> BackgroundJob {
     let progress_worker = progress.clone();
 
     make_job(JobKind::Verify, progress, move || {
-        let label = if quick { "Quick verify OK" } else { "Full verify OK" };
+        let label = if quick {
+            "Quick verify OK"
+        } else {
+            "Full verify OK"
+        };
         verify_backup_with_progress(&path, quick, Some(progress_worker))
             .map(|()| label.to_string())
             .map_err(|e| e.to_string())
@@ -245,7 +249,10 @@ mod tests {
         }
         let r = result.expect("panicking worker must produce a terminal result");
         assert!(r.is_err(), "expected an error result, got {r:?}");
-        assert!(!job.is_running(), "job must not report running after finishing");
+        assert!(
+            !job.is_running(),
+            "job must not report running after finishing"
+        );
     }
 
     #[test]

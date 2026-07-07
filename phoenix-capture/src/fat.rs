@@ -84,8 +84,7 @@ pub fn fat_plan(
         // parser to keep the parser's tuple shape compatible.
         let fat_byte_offset = match fat_type {
             FatType::Exfat => {
-                u32::from_le_bytes(boot[80..84].try_into().unwrap()) as u64
-                    * (1u64 << boot[108])
+                u32::from_le_bytes(boot[80..84].try_into().unwrap()) as u64 * (1u64 << boot[108])
             }
             _ => {
                 let bytes_per_sector = u16::from_le_bytes([boot[11], boot[12]]) as u64;
@@ -97,7 +96,13 @@ pub fn fat_plan(
     }
 
     let bitmap_hash = Some(hash::hash_hex(&fat_table));
-    let extents = fat_used_extents(&fat_table, fat_type, cluster_size, data_start, total_clusters);
+    let extents = fat_used_extents(
+        &fat_table,
+        fat_type,
+        cluster_size,
+        data_start,
+        total_clusters,
+    );
     let bytes_per_cluster: u32 = cluster_size.try_into().unwrap_or(u32::MAX);
     Ok((extents, bitmap_hash, bytes_per_cluster))
 }
@@ -126,8 +131,7 @@ fn parse_fat_boot(boot: &[u8], exfat: bool) -> Result<(FatType, u64, u64, u64, u
         // `boot[116..120]` read landed in a Reserved area that the spec
         // says MUST be zero, so cluster_count came back as 0 and the
         // capture path silently degenerated to a tiny placeholder extent.
-        let cluster_count =
-            u32::from_le_bytes(boot[92..96].try_into().unwrap()) as u64;
+        let cluster_count = u32::from_le_bytes(boot[92..96].try_into().unwrap()) as u64;
         // `data_start` is the byte offset where cluster #2 lives —
         // i.e. `ClusterHeapOffset (in sectors) * bytes_per_sector`.
         // The previous formula (`fat_offset + cluster_count * cluster_size`)
@@ -135,8 +139,7 @@ fn parse_fat_boot(boot: &[u8], exfat: bool) -> Result<(FatType, u64, u64, u64, u
         // physical meaning as a "data start". The 4 TB exFAT case with
         // those bugs made byte_start values reach trillions of bytes
         // beyond the partition end.
-        let cluster_heap_offset =
-            u32::from_le_bytes(boot[88..92].try_into().unwrap()) as u64;
+        let cluster_heap_offset = u32::from_le_bytes(boot[88..92].try_into().unwrap()) as u64;
         let data_start = cluster_heap_offset * bytes_per_sector;
         return Ok((FatType::Exfat, cluster_size, data_start, cluster_count, 32));
     }
@@ -161,7 +164,11 @@ fn parse_fat_boot(boot: &[u8], exfat: bool) -> Result<(FatType, u64, u64, u64, u
     // form is authoritative (FAT32 / oversized FAT16).
     let fat_size_16 = u16::from_le_bytes([boot[22], boot[23]]) as u64;
     let fat_size_32 = u32::from_le_bytes(boot[36..40].try_into().unwrap()) as u64;
-    let fat_size = if fat_size_16 != 0 { fat_size_16 } else { fat_size_32 };
+    let fat_size = if fat_size_16 != 0 {
+        fat_size_16
+    } else {
+        fat_size_32
+    };
     let total_sectors = if boot[19] != 0 || boot[20] != 0 {
         u16::from_le_bytes([boot[19], boot[20]]) as u64
     } else {
@@ -173,8 +180,7 @@ fn parse_fat_boot(boot: &[u8], exfat: bool) -> Result<(FatType, u64, u64, u64, u
     // region (cluster 2) begins after reserved + all FATs + the root dir —
     // the previous code omitted the root-dir region, which offset every
     // FAT12/16 extent's byte position by the root-directory size.
-    let root_dir_sectors =
-        (root_entry_count * 32).div_ceil(bytes_per_sector);
+    let root_dir_sectors = (root_entry_count * 32).div_ceil(bytes_per_sector);
     let data_start_sector = reserved + fat_count * fat_size + root_dir_sectors;
     let data_sectors = total_sectors.saturating_sub(data_start_sector);
     let cluster_count = data_sectors / sectors_per_cluster;
@@ -326,7 +332,8 @@ pub fn restore_fat(
     // only). Pre-flight in `validate_extents_fit` still refuses any
     // FAT/exFAT shrink whose used data lives past the boundary, so this
     // None is correct: by the time we get here, the source already fits.
-    let written = crate::raw::restore_raw(reader, entry, writer, verify, progress, bytes_done, None)?;
+    let written =
+        crate::raw::restore_raw(reader, entry, writer, verify, progress, bytes_done, None)?;
     match fs {
         FilesystemKind::Fat => patch_fat_size(writer, target_size)?,
         FilesystemKind::Exfat => patch_exfat_size(writer, target_size)?,
@@ -384,7 +391,8 @@ fn patch_fat_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> Re
     }
     let new_total_u32: u32 = new_total_sectors_u64.try_into().map_err(|_| {
         PhoenixError::Other(
-            "FAT cannot address volumes larger than 2^32 sectors; pick a smaller target size".into(),
+            "FAT cannot address volumes larger than 2^32 sectors; pick a smaller target size"
+                .into(),
         )
     })?;
 
@@ -398,7 +406,11 @@ fn patch_fat_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> Re
 
     let cur_total16 = u16::from_le_bytes([sector[19], sector[20]]) as u32;
     let cur_total32 = u32::from_le_bytes(sector[32..36].try_into().unwrap());
-    let cur_effective = if cur_total16 != 0 { cur_total16 } else { cur_total32 };
+    let cur_effective = if cur_total16 != 0 {
+        cur_total16
+    } else {
+        cur_total32
+    };
     if cur_effective == new_total_u32 {
         return Ok(());
     }
@@ -482,8 +494,7 @@ fn patch_exfat_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> 
             "exFAT boot sector reports invalid SectorsPerClusterShift {sectors_per_cluster_shift}"
         )));
     }
-    let cluster_heap_offset =
-        u32::from_le_bytes(region[88..92].try_into().unwrap()) as u64;
+    let cluster_heap_offset = u32::from_le_bytes(region[88..92].try_into().unwrap()) as u64;
 
     let new_volume_sectors = new_size / bytes_per_sector;
     if new_volume_sectors <= cluster_heap_offset {
@@ -609,8 +620,7 @@ mod tests {
     fn parse_fat16_geometry() {
         // 5000 data clusters → FAT16 range [4085, 65525).
         let boot = make_boot(512, 4, 4, 2, 512, 20, 20076, 0, 0);
-        let (ft, cluster_size, data_start, count, bits) =
-            parse_fat_boot(&boot, false).unwrap();
+        let (ft, cluster_size, data_start, count, bits) = parse_fat_boot(&boot, false).unwrap();
         assert!(ft == FatType::Fat16);
         assert_eq!(bits, 16);
         assert_eq!(cluster_size, 2048);
@@ -682,14 +692,22 @@ mod tests {
         set_fat16(&mut fat, 4, 0xFFFF); // EOC
         set_fat16(&mut fat, 6, 0xFFFF); // EOC (single-cluster file)
 
-        let extents =
-            fat_used_extents(&fat, FatType::Fat16, cluster_size, data_start, total_clusters);
+        let extents = fat_used_extents(
+            &fat,
+            FatType::Fat16,
+            cluster_size,
+            data_start,
+            total_clusters,
+        );
         assert_eq!(extents.len(), 2, "expected two coalesced runs");
         // Run 1: clusters 2,3,4 (3 clusters) at data_start.
         assert_eq!(extents[0].start_sector, data_start / 512);
         assert_eq!(extents[0].sector_count, 3 * cluster_size / 512);
         // Run 2: cluster 6 only.
-        assert_eq!(extents[1].start_sector, (data_start + 4 * cluster_size) / 512);
+        assert_eq!(
+            extents[1].start_sector,
+            (data_start + 4 * cluster_size) / 512
+        );
         assert_eq!(extents[1].sector_count, cluster_size / 512);
     }
 

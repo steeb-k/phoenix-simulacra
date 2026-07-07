@@ -142,9 +142,7 @@ fn cluster_used(bitmap: &[u8], cluster: usize) -> bool {
 /// `bytes_per_sector` from the BPB so the math is correct for both 512e (512)
 /// and 4Kn (4096) media.
 fn total_clusters_for(bs: &NtfsBootSector, cluster_size: u64) -> u64 {
-    let volume_bytes = bs
-        .total_sectors
-        .saturating_mul(bs.bytes_per_sector as u64);
+    let volume_bytes = bs.total_sectors.saturating_mul(bs.bytes_per_sector as u64);
     (volume_bytes + cluster_size - 1) / cluster_size
 }
 
@@ -193,8 +191,9 @@ pub fn restore_ntfs(
             required: entry.used_bytes,
         });
     }
-    let written =
-        crate::raw::restore_raw(reader, entry, writer, verify, progress, bytes_done, relocation)?;
+    let written = crate::raw::restore_raw(
+        reader, entry, writer, verify, progress, bytes_done, relocation,
+    )?;
     if let Some(map) = relocation {
         // Rewrite MFT data runs, $Bitmap, $LogFile, and the MFT mirror
         // so the on-disk metadata points at the relocated cluster

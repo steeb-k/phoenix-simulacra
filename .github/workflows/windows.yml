@@ -20,8 +20,10 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             msvc_arch: amd64
+            run_tests: true
           - target: aarch64-pc-windows-msvc
             msvc_arch: arm64
+            run_tests: false
 
     steps:
       - uses: actions/checkout@v4
@@ -34,11 +36,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: cargo fmt --check
+        if: matrix.run_tests
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        if: matrix.run_tests
+        run: cargo clippy --workspace --target ${{ matrix.target }} -- -D warnings
+
       - name: cargo build --release
         run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      # Tier-1 unit tests: pure logic, no admin, no devices. Engine crates
+      # only. (phoenix-gui's test binary inherits a requireAdministrator
+      # manifest and phoenix-systests tests are #[ignore]d — both run in the
+      # elevated system-tests job.)
+      - name: cargo test (unit tier)
+        if: matrix.run_tests
+        run: >
+          cargo test --target ${{ matrix.target }}
+          -p phoenix-core -p phoenix-capture -p phoenix-restore -p phoenix-vss
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -47,3 +68,25 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/carbon-phoenix.exe
             target/${{ matrix.target }}/release/carbon-phoenix-gui.exe
+
+  # Tier-2 system tests: real VHDX attach via diskpart + raw disk I/O. GitHub's
+  # windows-latest runners execute with an elevated admin token, so diskpart
+  # and physical-disk handles work without an interactive UAC prompt. Kept as
+  # continue-on-error until proven stable in CI; the local elevated box
+  # (scripts/run-system-tests.ps1) is the authoritative gate.
+  system-tests:
+    name: system-tests (x64, elevated)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (system tier, single-threaded)
+        run: cargo test -p phoenix-systests -- --ignored --test-threads=1
+      - name: cargo test (gui, elevated)
+        run: cargo test -p phoenix-gui

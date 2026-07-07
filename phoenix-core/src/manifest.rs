@@ -49,8 +49,7 @@ pub struct ChunkRecord {
 
 impl BackupManifest {
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|e| PhoenixError::Manifest(e.to_string()))
+        serde_json::to_vec_pretty(self).map_err(|e| PhoenixError::Manifest(e.to_string()))
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self> {

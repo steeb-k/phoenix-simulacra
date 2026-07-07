@@ -28,7 +28,7 @@ fn fat16_geometry() -> Fat16 {
     let reserved = 1usize;
     let fat_count = 1usize;
     let cluster_count = 5000usize; // in [4085, 65525) -> FAT16
-    // 2 bytes per FAT16 entry, entries for clusters 0..=cluster_count+1.
+                                   // 2 bytes per FAT16 entry, entries for clusters 0..=cluster_count+1.
     let fat_bytes = (cluster_count + 2) * 2;
     let fat_size = fat_bytes.div_ceil(SECTOR);
     let root_entry_count = 16usize;
@@ -46,7 +46,11 @@ fn fat16_geometry() -> Fat16 {
     }
 }
 
-fn build_fat16_image(g: &Fat16, allocate: &[(u16, Option<u16>)], payloads: &[(u16, &[u8])]) -> Vec<u8> {
+fn build_fat16_image(
+    g: &Fat16,
+    allocate: &[(u16, Option<u16>)],
+    payloads: &[(u16, &[u8])],
+) -> Vec<u8> {
     let mut img = vec![0u8; g.total_sectors * SECTOR];
 
     // --- Boot sector (BPB) ---
@@ -88,12 +92,7 @@ fn fat16_capture_reproduces_used_clusters() {
 
     // Chain A: single cluster 2, EOC. Cluster 3 is left FREE (the gap that
     // splits the used region into two runs). Chain B: 4 -> 5 -> 6, EOC at 6.
-    let allocate = [
-        (2u16, None),
-        (4u16, Some(5)),
-        (5u16, Some(6)),
-        (6u16, None),
-    ];
+    let allocate = [(2u16, None), (4u16, Some(5)), (5u16, Some(6)), (6u16, None)];
     let mut cluster2 = vec![0xAAu8; SECTOR];
     cluster2[..8].copy_from_slice(b"CLUSTER2");
     let mut cluster4 = vec![0xBBu8; SECTOR];
@@ -135,7 +134,8 @@ fn fat16_capture_reproduces_used_clusters() {
             bytes_per_cluster,
         )
         .unwrap();
-    let (used_bytes, _) = capture_fat(&mut src, &mut stream, &extents, bitmap_hash.clone()).unwrap();
+    let (used_bytes, _) =
+        capture_fat(&mut src, &mut stream, &extents, bitmap_hash.clone()).unwrap();
     assert_eq!(used_bytes, 4 * SECTOR as u64);
     let (chunks, _) = stream.finish().unwrap();
 

@@ -100,30 +100,36 @@ fn draw_source_row(
         row_rect.right_bottom(),
     );
 
-    let dragging_source = ui.ctx().data_mut(|d| {
-        d.get_temp::<u32>(egui::Id::new("restore_drag_source"))
-    });
+    let dragging_source = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<u32>(egui::Id::new("restore_drag_source")));
 
-    draw_partition_map(ui, map_rect, &disk, palette, |ui, _disk_idx, p, seg_rect| {
-        let id = ui.id().with(("restore_src", p.index));
-        let response = ui.interact(seg_rect, id, Sense::click_and_drag());
-        if response.drag_started() {
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(egui::Id::new("restore_drag_source"), p.index);
-            });
-        }
-        let selected = dragging_source == Some(p.index);
-        draw_partition_segment_visual_styled(
-            ui,
-            seg_rect,
-            p,
-            palette,
-            response.hovered(),
-            selected,
-            None,
-        );
-        true
-    });
+    draw_partition_map(
+        ui,
+        map_rect,
+        &disk,
+        palette,
+        |ui, _disk_idx, p, seg_rect| {
+            let id = ui.id().with(("restore_src", p.index));
+            let response = ui.interact(seg_rect, id, Sense::click_and_drag());
+            if response.drag_started() {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("restore_drag_source"), p.index);
+                });
+            }
+            let selected = dragging_source == Some(p.index);
+            draw_partition_segment_visual_styled(
+                ui,
+                seg_rect,
+                p,
+                palette,
+                response.hovered(),
+                selected,
+                None,
+            );
+            true
+        },
+    );
 }
 
 fn draw_full_disk_checkbox(
@@ -187,7 +193,10 @@ fn draw_target_row(
     let _ = checkbox_rect;
 
     let info_rect = Rect::from_min_size(
-        egui::pos2(row_rect.left() + CHECKBOX_COLUMN_WIDTH + CHECKBOX_GAP, row_rect.top()),
+        egui::pos2(
+            row_rect.left() + CHECKBOX_COLUMN_WIDTH + CHECKBOX_GAP,
+            row_rect.top(),
+        ),
         Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT),
     );
     draw_disk_info_card(ui, info_rect, target, palette, false);
@@ -197,9 +206,9 @@ fn draw_target_row(
         row_rect.right_bottom(),
     );
 
-    let dragging_source = ui.ctx().data_mut(|d| {
-        d.get_temp::<u32>(egui::Id::new("restore_drag_source"))
-    });
+    let dragging_source = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<u32>(egui::Id::new("restore_drag_source")));
 
     draw_partition_map(ui, map_rect, view, palette, |ui, _, p, seg_rect| {
         let part = p.index;
@@ -266,7 +275,10 @@ fn draw_target_row(
                 layout.begin_resize(part, false);
             }
             if l.dragged() || r.dragged() {
-                if let Some(pos) = l.interact_pointer_pos().or_else(|| r.interact_pointer_pos()) {
+                if let Some(pos) = l
+                    .interact_pointer_pos()
+                    .or_else(|| r.interact_pointer_pos())
+                {
                     let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
                     layout.update_drag(view, off);
                     changed = true;

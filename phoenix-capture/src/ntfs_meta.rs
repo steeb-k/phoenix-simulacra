@@ -345,7 +345,9 @@ fn relocate_runs(runs: &[DataRun], map: &RelocationMap) -> Vec<DataRun> {
             let dst = map.translate_cluster(cur_src).unwrap_or(cur_src);
             let mut span = 1u64;
             while cur_src + span < end_src {
-                let next_dst = map.translate_cluster(cur_src + span).unwrap_or(cur_src + span);
+                let next_dst = map
+                    .translate_cluster(cur_src + span)
+                    .unwrap_or(cur_src + span);
                 if next_dst != dst + span {
                     break;
                 }

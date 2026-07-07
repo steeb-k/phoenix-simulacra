@@ -64,7 +64,11 @@ impl BuildInfo {
             name = self.binary_name,
             ver = self.version,
             hash = self.git_hash,
-            dirty = if self.git_dirty == "dirty" { "-dirty" } else { "" },
+            dirty = if self.git_dirty == "dirty" {
+                "-dirty"
+            } else {
+                ""
+            },
             profile = self.profile,
         )
     }

@@ -34,9 +34,7 @@ enum Commands {
         vss: bool,
     },
     /// List contents of a .phnx backup
-    List {
-        backup: PathBuf,
-    },
+    List { backup: PathBuf },
     /// Verify backup integrity
     Verify {
         backup: PathBuf,
@@ -117,7 +115,11 @@ fn main() -> anyhow::Result<()> {
             disk,
             output,
         } => cmd_plan(&backup, disk, &output)?,
-        Commands::Restore { backup, plan, verify } => {
+        Commands::Restore {
+            backup,
+            plan,
+            verify,
+        } => {
             let plan = RestorePlan::from_toml(&plan)?;
             let summary = run_restore(RestoreOptions {
                 backup_path: backup,
@@ -142,7 +144,8 @@ fn cmd_list_disks() -> anyhow::Result<()> {
         for part in &mut disk.partitions {
             phoenix_core::disk::refine_partition_fs(part);
         }
-        println!("Disk {}: {} ({:.2} GB, {})", 
+        println!(
+            "Disk {}: {} ({:.2} GB, {})",
             disk.index,
             disk.path,
             disk.size_bytes as f64 / 1e9,
@@ -234,10 +237,7 @@ fn cmd_inspect(path: &PathBuf, full: bool) -> anyhow::Result<()> {
     let entries: Vec<_> = reader.index.clone();
     for entry in &entries {
         println!();
-        println!(
-            "Partition {} — \"{}\"",
-            entry.index, entry.name,
-        );
+        println!("Partition {} — \"{}\"", entry.index, entry.name,);
         println!(
             "  fs={:?}  capture={:?}  sector_size={}  original={} bytes  used={} bytes",
             entry.fs_kind,

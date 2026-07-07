@@ -1,0 +1,22 @@
+[package]
+name = "phoenix-systests"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+publish = false
+
+# This crate is a test harness only: it has no product code, just the VHD
+# fixtures and integration tests that require an elevated shell. The tests
+# are all `#[ignore]`d so a plain `cargo test` skips them; run them with
+# `cargo test -p phoenix-systests -- --ignored --test-threads=1` as admin.
+
+[dependencies]
+phoenix-core = { workspace = true }
+phoenix-capture = { workspace = true }
+phoenix-restore = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]

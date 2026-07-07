@@ -1,9 +1,9 @@
 mod disk_map;
 mod disk_panel;
 mod fonts;
+mod job;
 mod restore_layout;
 mod restore_panel;
-mod job;
 mod sidebar;
 mod status_modal;
 mod theme;
@@ -110,15 +110,18 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            "phoenix_core=info,phoenix_gui=info,phoenix_capture=info,\
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        "phoenix_core=info,phoenix_gui=info,phoenix_capture=info,\
              phoenix_restore=info,phoenix_vss=info,phoenix_build=info,warn"
-                .into()
-        });
+            .into()
+    });
 
     let log_dir = std::env::var("LOCALAPPDATA")
-        .map(|p| std::path::PathBuf::from(p).join("CarbonPhoenix").join("logs"))
+        .map(|p| {
+            std::path::PathBuf::from(p)
+                .join("CarbonPhoenix")
+                .join("logs")
+        })
         .unwrap_or_else(|_| std::env::temp_dir().join("CarbonPhoenix").join("logs"));
 
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -127,8 +130,7 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     let (file_layer, guard) = match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
-            let appender =
-                tracing_appender::rolling::daily(&log_dir, "carbon-phoenix.log");
+            let appender = tracing_appender::rolling::daily(&log_dir, "carbon-phoenix.log");
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let layer = tracing_subscriber::fmt::layer()
                 .with_writer(writer)
@@ -304,8 +306,9 @@ impl PhoenixApp {
         }
         match PhnxReader::open(path) {
             Ok(reader) => {
-                self.restore_layout =
-                    Some(restore_layout::RestoreLayoutState::from_backup(path_str, &reader));
+                self.restore_layout = Some(restore_layout::RestoreLayoutState::from_backup(
+                    path_str, &reader,
+                ));
                 self.restore_loaded_path = path_str.to_string();
                 let n = reader.index.len();
                 self.status = format!("Loaded backup — {n} partition(s)");
@@ -319,8 +322,7 @@ impl PhoenixApp {
     }
 
     fn schedule_restore_backup_load(&mut self) {
-        self.restore_backup_load_after =
-            Some(Instant::now() + RESTORE_BACKUP_LOAD_DEBOUNCE);
+        self.restore_backup_load_after = Some(Instant::now() + RESTORE_BACKUP_LOAD_DEBOUNCE);
     }
 
     fn poll_restore_backup_load(&mut self) {
@@ -512,16 +514,14 @@ impl eframe::App for PhoenixApp {
                 // Pages handle `busy` themselves so Start stays gated while
                 // a job runs; `modal_open` disables the whole panel so nothing
                 // behind the status modal receives clicks or scroll.
-                ui.add_enabled_ui(!modal_open, |ui| {
-                    match self.page {
-                        Page::Backup => self.ui_backup(ui, busy),
-                        Page::Clone => disabled_when(ui, busy, |ui| self.ui_clone(ui)),
-                        Page::Restore => self.ui_restore(ui, busy),
-                        Page::Verify => self.ui_verify(ui, busy),
-                        Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
-                        Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
-                        Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
-                    }
+                ui.add_enabled_ui(!modal_open, |ui| match self.page {
+                    Page::Backup => self.ui_backup(ui, busy),
+                    Page::Clone => disabled_when(ui, busy, |ui| self.ui_clone(ui)),
+                    Page::Restore => self.ui_restore(ui, busy),
+                    Page::Verify => self.ui_verify(ui, busy),
+                    Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
+                    Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
+                    Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
                 });
             });
 
@@ -679,9 +679,7 @@ fn backup_path_picker(
         if ui
             .add_sized(
                 [FORM_BUTTON_W, visible_h],
-                egui::Button::new(
-                    egui::RichText::new("Browse…").font(fonts::regular(16.0)),
-                ),
+                egui::Button::new(egui::RichText::new("Browse…").font(fonts::regular(16.0))),
             )
             .clicked()
         {
@@ -782,9 +780,7 @@ impl PhoenixApp {
         // to match its height. `ui.add_enabled_ui` returns `InnerResponse`,
         // so we just bubble the inner closure value back up.
         let name_response = ui
-            .add_enabled_ui(!busy, |ui| {
-                self.ui_backup_form(ui, name_missing)
-            })
+            .add_enabled_ui(!busy, |ui| self.ui_backup_form(ui, name_missing))
             .inner;
 
         let input_height = name_response.rect.height() + INPUT_MARGIN_RESTORE;
@@ -924,9 +920,7 @@ impl PhoenixApp {
             if ui
                 .add_sized(
                     [FORM_BUTTON_W, input_height],
-                    egui::Button::new(
-                        egui::RichText::new("Browse…").font(fonts::regular(16.0)),
-                    ),
+                    egui::Button::new(egui::RichText::new("Browse…").font(fonts::regular(16.0))),
                 )
                 .clicked()
             {
@@ -994,17 +988,11 @@ impl PhoenixApp {
             return;
         }
         if !folder.exists() {
-            self.status = format!(
-                "Backup folder does not exist: {}",
-                folder.display()
-            );
+            self.status = format!("Backup folder does not exist: {}", folder.display());
             return;
         }
         if !folder.is_dir() {
-            self.status = format!(
-                "Backup destination is not a folder: {}",
-                folder.display()
-            );
+            self.status = format!("Backup destination is not a folder: {}", folder.display());
             return;
         }
 
@@ -1107,11 +1095,7 @@ impl PhoenixApp {
                     // so the dropdown's `selected_text` always reflects
                     // a real entry rather than stranding the user on a
                     // ghost index.
-                    if !self
-                        .disks
-                        .iter()
-                        .any(|d| d.index == self.target_disk_index)
-                    {
+                    if !self.disks.iter().any(|d| d.index == self.target_disk_index) {
                         if let Some(first) = self.disks.first() {
                             self.target_disk_index = first.index;
                         }
@@ -1187,13 +1171,8 @@ impl PhoenixApp {
             .cloned()
         {
             if let Some(layout) = self.restore_layout.as_mut() {
-                let panel_out = restore_panel::show(
-                    ui,
-                    layout,
-                    &target,
-                    &self.palette,
-                    ui.available_width(),
-                );
+                let panel_out =
+                    restore_panel::show(ui, layout, &target, &self.palette, ui.available_width());
                 if panel_out.plan_entries_updated {
                     // layout drives plan at run time
                 }
@@ -1216,7 +1195,11 @@ impl PhoenixApp {
             self.status = "No restore layout — load a backup first".into();
             return;
         };
-        let Some(target) = self.disks.iter().find(|d| d.index == self.target_disk_index) else {
+        let Some(target) = self
+            .disks
+            .iter()
+            .find(|d| d.index == self.target_disk_index)
+        else {
             self.status = "Target disk not found".into();
             return;
         };
@@ -1364,17 +1347,18 @@ impl PhoenixApp {
             let (r, g, b, _) = self.palette.accent.to_tuple();
             let swatch_size = egui::vec2(20.0, 20.0);
             let (rect, _) = ui.allocate_exact_size(swatch_size, egui::Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                egui::Rounding::same(4.0),
-                self.palette.accent,
-            );
+            ui.painter()
+                .rect_filled(rect, egui::Rounding::same(4.0), self.palette.accent);
             ui.monospace(format!("#{:02X}{:02X}{:02X}", r, g, b));
         });
 
         ui.horizontal(|ui| {
             ui.label("Theme:");
-            ui.label(if self.palette.light_mode { "Light" } else { "Dark" });
+            ui.label(if self.palette.light_mode {
+                "Light"
+            } else {
+                "Dark"
+            });
         });
 
         ui.add_space(8.0);
@@ -1411,7 +1395,12 @@ fn default_backup_folder() -> String {
 fn format_disk_choice(disk: &DiskInfo) -> String {
     match disk.model.as_deref() {
         Some(model) if !model.is_empty() => {
-            format!("Disk {} - {} - {}", disk.index, format_bytes(disk.size_bytes), model)
+            format!(
+                "Disk {} - {} - {}",
+                disk.index,
+                format_bytes(disk.size_bytes),
+                model
+            )
         }
         _ => format!("Disk {} - {}", disk.index, format_bytes(disk.size_bytes)),
     }

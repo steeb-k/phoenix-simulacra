@@ -96,8 +96,12 @@ pub fn paired_chunks<'a>(
     chunks: &'a [ChunkIndex],
     records: &'a [crate::manifest::ChunkRecord],
     partition_index: u32,
-) -> Result<std::iter::Zip<std::slice::Iter<'a, ChunkIndex>, std::slice::Iter<'a, crate::manifest::ChunkRecord>>>
-{
+) -> Result<
+    std::iter::Zip<
+        std::slice::Iter<'a, ChunkIndex>,
+        std::slice::Iter<'a, crate::manifest::ChunkRecord>,
+    >,
+> {
     if chunks.len() != records.len() {
         return Err(PhoenixError::ChunkCountMismatch {
             partition_index,
@@ -429,9 +433,7 @@ impl PartitionStreamWriter<'_> {
         let hash_hex = hash::hash_hex(plaintext);
         let compressed = compress_chunk(plaintext)?;
         let file_offset = self.current_data_offset;
-        self.writer
-            .file
-            .seek(SeekFrom::Start(file_offset))?;
+        self.writer.file.seek(SeekFrom::Start(file_offset))?;
         self.writer.file.write_all(&compressed)?;
         self.current_data_offset += compressed.len() as u64;
 
@@ -463,27 +465,23 @@ impl PartitionStreamWriter<'_> {
         // Write chunk index table after compressed data
         let index_table_offset = self.current_data_offset;
         for c in &self.chunk_indices {
-            self.writer
-                .file
-                .write_u64::<LittleEndian>(c.file_offset)?;
+            self.writer.file.write_u64::<LittleEndian>(c.file_offset)?;
             self.writer
                 .file
                 .write_u32::<LittleEndian>(c.compressed_len)?;
             self.writer
                 .file
                 .write_u32::<LittleEndian>(c.uncompressed_len)?;
-            self.writer
-                .file
-                .write_u32::<LittleEndian>(c.extent_index)?;
-            self.writer
-                .file
-                .write_u32::<LittleEndian>(c.chunk_index)?;
+            self.writer.file.write_u32::<LittleEndian>(c.extent_index)?;
+            self.writer.file.write_u32::<LittleEndian>(c.chunk_index)?;
         }
-        let total_stream_len = index_table_offset + self.chunk_indices.len() as u64 * 24
-            - self.stream_offset;
+        let total_stream_len =
+            index_table_offset + self.chunk_indices.len() as u64 * 24 - self.stream_offset;
 
         // Patch chunk count in stream header
-        self.writer.file.seek(SeekFrom::Start(self.stream_offset + 4))?;
+        self.writer
+            .file
+            .seek(SeekFrom::Start(self.stream_offset + 4))?;
         self.writer.file.write_u32::<LittleEndian>(chunk_count)?;
 
         let idx = self.writer.index_entries.len() - 1;
@@ -545,8 +543,7 @@ impl PhnxReader {
             });
         }
         let map_header_size = 12 + map_count as u64 * 16;
-        let data_region_end =
-            entry.stream_offset + entry.stream_length - chunk_count as u64 * 24;
+        let data_region_end = entry.stream_offset + entry.stream_length - chunk_count as u64 * 24;
         let mut chunks = Vec::new();
         self.file.seek(SeekFrom::Start(data_region_end))?;
         for _ in 0..chunk_count {
@@ -573,11 +570,7 @@ impl PhnxReader {
         decompress_chunk(&compressed, chunk.uncompressed_len as usize)
     }
 
-    pub fn verify_partition(
-        &mut self,
-        partition_index: u32,
-        quick: bool,
-    ) -> Result<()> {
+    pub fn verify_partition(&mut self, partition_index: u32, quick: bool) -> Result<()> {
         let entry = self
             .index
             .iter()

@@ -84,9 +84,8 @@ const MIN_VISIBLE_TOP_ITEMS: f32 = 1.5;
 /// can't collapse below "logo + 1.5-item scroll hint + History/Options".
 pub fn min_content_height() -> f32 {
     let brand = BRAND_TOP_PAD + LOGO_SIZE + BRAND_IMAGE_TRAILER + BRAND_BOTTOM_PAD;
-    let bottom = BOTTOM_NAV_TOP_PAD
-        + (BOTTOM_ITEMS.len() as f32) * ROW_HEIGHT
-        + BOTTOM_NAV_BOTTOM_PAD;
+    let bottom =
+        BOTTOM_NAV_TOP_PAD + (BOTTOM_ITEMS.len() as f32) * ROW_HEIGHT + BOTTOM_NAV_BOTTOM_PAD;
     let middle = ROW_HEIGHT * MIN_VISIBLE_TOP_ITEMS;
     brand + bottom + middle
 }
@@ -116,14 +115,12 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                 egui::TopBottomPanel::top("sidebar_brand")
                     .resizable(false)
                     .show_separator_line(false)
-                    .frame(
-                        egui::Frame::none().inner_margin(Margin {
-                            left: 0.0,
-                            right: 0.0,
-                            top: BRAND_TOP_PAD,
-                            bottom: BRAND_BOTTOM_PAD,
-                        }),
-                    )
+                    .frame(egui::Frame::none().inner_margin(Margin {
+                        left: 0.0,
+                        right: 0.0,
+                        top: BRAND_TOP_PAD,
+                        bottom: BRAND_BOTTOM_PAD,
+                    }))
                     .show_inside(ui, |ui| {
                         draw_brand(ui);
                     });
@@ -135,14 +132,12 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                 egui::TopBottomPanel::bottom("sidebar_bottom_nav")
                     .resizable(false)
                     .show_separator_line(false)
-                    .frame(
-                        egui::Frame::none().inner_margin(Margin {
-                            left: 0.0,
-                            right: 0.0,
-                            top: BOTTOM_NAV_TOP_PAD,
-                            bottom: BOTTOM_NAV_BOTTOM_PAD,
-                        }),
-                    )
+                    .frame(egui::Frame::none().inner_margin(Margin {
+                        left: 0.0,
+                        right: 0.0,
+                        top: BOTTOM_NAV_TOP_PAD,
+                        bottom: BOTTOM_NAV_BOTTOM_PAD,
+                    }))
                     .show_inside(ui, |ui| {
                         for item in BOTTOM_ITEMS {
                             nav_row(ui, item, current, palette);

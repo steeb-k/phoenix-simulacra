@@ -29,12 +29,12 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     CREATE_DISK, CREATE_DISK_GPT, CREATE_DISK_MBR, DRIVE_LAYOUT_INFORMATION_EX,
     IOCTL_DISK_CREATE_DISK, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, IOCTL_DISK_UPDATE_PROPERTIES,
     PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT, PARTITION_STYLE_MBR,
 };
+use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Per-partition descriptor for the GPT writer. Built by the caller from
 /// the backup's `PartitionIndexEntry` (for restored partitions) and from
@@ -333,7 +333,7 @@ pub fn bring_disk_online(disk_path: &str) {
         version: size_of::<SetDiskAttributes>() as u32,
         persist: 1, // TRUE — make the online state survive reboots
         reserved1: [0; 3],
-        attributes: 0, // not offline, not read-only
+        attributes: 0,                           // not offline, not read-only
         attributes_mask: DISK_ATTRIBUTE_OFFLINE, // only touch the OFFLINE bit
         reserved2: [0; 4],
     };
@@ -520,9 +520,9 @@ fn set_drive_layout(
     layout.Anonymous.Gpt = windows_sys::Win32::System::Ioctl::DRIVE_LAYOUT_INFORMATION_GPT {
         DiskId: *disk_guid,
         StartingUsableOffset: (GPT_LEADING_RESERVED_SECTORS * sector_size) as i64,
-        UsableLength: disk_size_bytes
-            .saturating_sub((GPT_LEADING_RESERVED_SECTORS + GPT_TRAILING_RESERVED_SECTORS) * sector_size)
-            as i64,
+        UsableLength: disk_size_bytes.saturating_sub(
+            (GPT_LEADING_RESERVED_SECTORS + GPT_TRAILING_RESERVED_SECTORS) * sector_size,
+        ) as i64,
         MaxPartitionCount: GPT_MAX_PARTITION_ENTRIES,
     };
 

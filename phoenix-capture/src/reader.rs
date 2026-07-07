@@ -76,7 +76,11 @@ pub struct PartitionReader {
 }
 
 impl PartitionReader {
-    pub fn open_disk_partition(disk_path: &str, offset_bytes: u64, length_bytes: u64) -> Result<Self> {
+    pub fn open_disk_partition(
+        disk_path: &str,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<Self> {
         let handle = open_disk_readonly(disk_path)?;
         Ok(Self {
             handle,

@@ -1,5 +1,6 @@
 use chrono::Utc;
 use phoenix_core::container::{Extent, Header, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION};
+use phoenix_core::disk::guid_to_string;
 use phoenix_core::disk::{
     enumerate_disks, refine_partition_fs, CaptureMode, FilesystemKind, PartitionInfo,
 };
@@ -7,7 +8,6 @@ use phoenix_core::error::Result;
 use phoenix_core::manifest::{
     capture_mode_to_string, fs_kind_to_string, BackupManifest, DiskManifest, PartitionManifest,
 };
-use phoenix_core::disk::guid_to_string;
 use phoenix_core::ProgressHandle;
 use tracing::info;
 use uuid::Uuid;
@@ -141,8 +141,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         progress.set_step(0);
     }
 
-    let mut writer =
-        PhnxWriter::create_with_progress(&opts.output, header, opts.progress.clone())?;
+    let mut writer = PhnxWriter::create_with_progress(&opts.output, header, opts.progress.clone())?;
     let mut partition_manifests = Vec::new();
     // Owns every shadow we create across all selected partitions; its Drop
     // tears them down even if we error or panic out of this loop.
@@ -314,19 +313,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 // are the manifest's extent table, and the streamer just
                 // walks them. Eliminates the previous extent-table-vs-
                 // chunk-index mismatch that broke FAT/exFAT restores.
-                capture_fat(
-                    reader,
-                    &mut stream,
-                    &prep.extents,
-                    prep.bitmap_hash.clone(),
-                )?
+                capture_fat(reader, &mut stream, &prep.extents, prep.bitmap_hash.clone())?
             }
-            (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => capture_exfat(
-                reader,
-                &mut stream,
-                &prep.extents,
-                prep.bitmap_hash.clone(),
-            )?,
+            (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => {
+                capture_exfat(reader, &mut stream, &prep.extents, prep.bitmap_hash.clone())?
+            }
             _ => {
                 capture_raw(reader, &mut stream)?;
                 (reader.length(), None)
@@ -391,7 +382,13 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 fn plan_capture(
     part: &PartitionInfo,
     reader: &mut PartitionReader,
-) -> Result<(Vec<Extent>, u32, CaptureMode, FilesystemKind, Option<String>)> {
+) -> Result<(
+    Vec<Extent>,
+    u32,
+    CaptureMode,
+    FilesystemKind,
+    Option<String>,
+)> {
     let fs = part.fs_kind;
     let mode = part.capture_mode;
     match (fs, mode) {

@@ -7,6 +7,7 @@ members = [
     "phoenix-restore",
     "phoenix-cli",
     "phoenix-gui",
+    "phoenix-systests",
 ]
 
 [workspace.package]

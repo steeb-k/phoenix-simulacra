@@ -79,11 +79,9 @@ pub fn restore_raw(
 
     let sector_size = entry.sector_size as u64;
     let mut bytes_for_partition = 0u64;
-    for (chunk, record) in phoenix_core::container::paired_chunks(
-        &stream.chunks,
-        &chunk_records,
-        entry.index,
-    )? {
+    for (chunk, record) in
+        phoenix_core::container::paired_chunks(&stream.chunks, &chunk_records, entry.index)?
+    {
         if let Some(p) = progress {
             if p.is_cancelled() {
                 return Err(PhoenixError::Cancelled);
@@ -143,11 +141,7 @@ pub fn restore_raw(
         if let Some(p) = progress {
             p.set(
                 bytes_done,
-                format!(
-                    "Chunk {} / {}",
-                    record.chunk_index + 1,
-                    chunk_records.len()
-                ),
+                format!("Chunk {} / {}", record.chunk_index + 1, chunk_records.len()),
             );
         }
     }
