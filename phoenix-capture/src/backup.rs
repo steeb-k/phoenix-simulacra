@@ -1,5 +1,5 @@
 use chrono::Utc;
-use phoenix_core::container::{Extent, Header, PhnxWriter, FORMAT_VERSION};
+use phoenix_core::container::{Extent, Header, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION};
 use phoenix_core::disk::{
     enumerate_disks, refine_partition_fs, CaptureMode, FilesystemKind, PartitionInfo,
 };
@@ -288,7 +288,15 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             part.size_bytes,
             fs_kind,
             capture_mode,
-            disk.sector_size,
+            // The index entry's `sector_size` is the extent addressing unit,
+            // which is a fixed 512-byte LBA for every filesystem planner
+            // (`ntfs_plan`, `fat_plan`, `raw_extent_for_partition` all emit
+            // 512-byte-sector extents). It is NOT the disk's physical sector
+            // size — restore multiplies `extent.start_sector` by this value,
+            // so on a 4Kn disk passing 4096 here would inflate every offset
+            // 8x. The real physical sector size is recorded in the manifest's
+            // disk block and used only for I/O alignment.
+            EXTENT_LBA_BYTES,
             0,
             &prep.extents,
             prep.bytes_per_cluster,

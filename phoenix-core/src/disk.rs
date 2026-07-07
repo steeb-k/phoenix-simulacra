@@ -100,6 +100,10 @@ pub struct PartitionInfo {
     pub drive_letter: Option<char>,
     pub volume_label: Option<String>,
     pub usage: Option<PartitionUsage>,
+    /// Logical sector size of the containing disk (512 or 4096). Copied from
+    /// the parent [`DiskInfo`] so capture/restore code that only holds a
+    /// `PartitionInfo` can align its I/O without re-querying the device.
+    pub sector_size: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +174,7 @@ pub fn open_volume_readonly(path: &str) -> Result<HANDLE> {
 fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
     let size_bytes = get_disk_length(handle)?;
     let layout = get_drive_layout(handle)?;
-    let sector_size = 512u32;
+    let sector_size = get_sector_size(handle);
     // Failure here is non-fatal: the disk still enumerates without a model.
     let model = query_disk_model(handle);
 
@@ -221,6 +225,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         drive_letter,
                         volume_label,
                         usage,
+                        sector_size,
                     }
                 })
                 .collect();
@@ -259,6 +264,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         drive_letter,
                         volume_label,
                         usage,
+                        sector_size,
                     }
                 })
                 .collect();
@@ -401,6 +407,43 @@ enum LayoutInfo {
         signature: u32,
         entries: Vec<MbrEntry>,
     },
+}
+
+/// Query the disk's logical (addressable) sector size via
+/// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`. Falls back to 512 on failure so a
+/// device that refuses the IOCTL still enumerates. 4Kn disks report 4096
+/// here; that value drives I/O alignment in the capture/restore paths (the
+/// on-disk extent unit itself stays a fixed 512-byte LBA — see the format
+/// spec — so this only affects read/write alignment, not extent math).
+fn get_sector_size(handle: HANDLE) -> u32 {
+    // Value of CTL_CODE(IOCTL_DISK_BASE, 0x0028, METHOD_BUFFERED, FILE_ANY_ACCESS).
+    const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
+    // DISK_GEOMETRY_EX begins with DISK_GEOMETRY; BytesPerSector is the last
+    // u32 of that leading struct, at offset 20. A 32-byte buffer covers it.
+    let mut buf = [0u8; 32];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+            ptr::null(),
+            0,
+            buf.as_mut_ptr() as *mut _,
+            buf.len() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 || returned < 24 {
+        return 512;
+    }
+    let bytes_per_sector = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+    // Sanity-clamp: sector sizes are powers of two between 512 and 4096 on
+    // all supported media. Anything else is treated as the 512 default.
+    match bytes_per_sector {
+        512 | 1024 | 2048 | 4096 => bytes_per_sector,
+        _ => 512,
+    }
 }
 
 fn get_disk_length(handle: HANDLE) -> Result<u64> {

@@ -68,6 +68,7 @@ pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
                 total_bytes: e.original_size,
                 free_bytes: e.original_size.saturating_sub(e.used_bytes),
             }),
+            sector_size: 512,
         });
         offset += e.original_size;
     }
@@ -226,6 +227,7 @@ impl RestoreLayoutState {
                     drive_letter: src.drive_letter,
                     volume_label: src.volume_label.clone(),
                     usage: src.usage.clone(),
+                    sector_size: src.sector_size,
                 })
             })
             .collect();

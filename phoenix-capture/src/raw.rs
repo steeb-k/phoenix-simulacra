@@ -13,8 +13,6 @@ pub fn capture_raw(
     reader: &mut PartitionReader,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
 ) -> Result<()> {
-    let sector_size = 512u64;
-    let total_sectors = (reader.length() + sector_size - 1) / sector_size;
     stream.set_extent(0);
 
     let mut pos = 0u64;
@@ -159,10 +157,16 @@ pub fn restore_raw(
 pub struct PartitionWriter {
     handle: windows_sys::Win32::Foundation::HANDLE,
     base_offset: u64,
+    /// Logical sector size of the target disk (512 or 4096). Raw-disk
+    /// handles reject `ReadFile`/`WriteFile` calls whose offset or length
+    /// isn't a multiple of this, so `write_at` transparently read-modify-
+    /// writes an aligned span when a caller (e.g. a 512-byte boot-sector
+    /// patch on a 4Kn disk) hands us a sub-sector-aligned write.
+    sector_size: u64,
 }
 
 impl PartitionWriter {
-    pub fn open_disk(disk_path: &str, partition_offset: u64) -> Result<Self> {
+    pub fn open_disk(disk_path: &str, partition_offset: u64, sector_size: u32) -> Result<Self> {
         let wide: Vec<u16> = std::ffi::OsStr::new(disk_path)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -174,7 +178,7 @@ impl PartitionWriter {
                 windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
                     | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
                 std::ptr::null(),
-                windows_sys::Win32::Storage::FileSystem::                OPEN_EXISTING,
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
                 0,
                 std::ptr::null_mut(),
             )
@@ -187,6 +191,7 @@ impl PartitionWriter {
         Ok(Self {
             handle,
             base_offset: partition_offset,
+            sector_size: (sector_size as u64).max(512),
         })
     }
 
@@ -198,7 +203,32 @@ impl PartitionWriter {
     /// must be sector-aligned: the handle is opened against a raw disk
     /// device, which only accepts sector-multiples for `ReadFile`.
     pub fn read_at(&mut self, relative_offset: u64, data: &mut [u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let abs = self.base_offset + relative_offset;
+        let ss = self.sector_size;
+        if abs % ss == 0 && (data.len() as u64) % ss == 0 {
+            return self.read_raw(abs, data);
+        }
+        // Sub-sector-aligned read (e.g. a 512-byte boot-sector read-back on
+        // a 4Kn disk): read the enclosing aligned span and copy out the
+        // requested slice. Mirrors the alignment bounce in `write_at`.
+        let aligned_start = abs - (abs % ss);
+        let aligned_end = (abs + data.len() as u64).div_ceil(ss) * ss;
+        let span = (aligned_end - aligned_start) as usize;
+        let mut buf = vec![0u8; span];
+        self.read_raw(aligned_start, &mut buf)?;
+        let inner = (abs - aligned_start) as usize;
+        data.copy_from_slice(&buf[inner..inner + data.len()]);
+        Ok(())
+    }
+
+    /// Absolute-offset raw read. Both `abs` and `data.len()` must be
+    /// sector-aligned (the caller guarantees this — `read_at` is only
+    /// invoked by the boot-sector patchers with sector-sized buffers, and
+    /// the RMW path in `write_at` computes an aligned span).
+    fn read_raw(&mut self, abs: u64, data: &mut [u8]) -> Result<()> {
         unsafe {
             let mut dist = 0i64;
             if windows_sys::Win32::Storage::FileSystem::SetFilePointerEx(
@@ -269,7 +299,37 @@ impl PartitionWriter {
     ///   * 33 (ERROR_LOCK_VIOLATION)        — disk's mounted volumes are
     ///        active; need an FSCTL_LOCK_VOLUME / FSCTL_DISMOUNT first.
     pub fn write_at(&mut self, relative_offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let abs = self.base_offset + relative_offset;
+        let ss = self.sector_size;
+        // Fast path: already sector-aligned in both offset and length. This
+        // is every streamed data chunk (chunk offsets and lengths are
+        // multiples of CHUNK_SIZE, itself a multiple of any sector size).
+        if abs % ss == 0 && (data.len() as u64) % ss == 0 {
+            return self.write_raw(abs, data);
+        }
+        // Slow path: a misaligned write (e.g. a 512-byte boot-sector patch
+        // landing on a 4Kn disk). Grow the write to the enclosing aligned
+        // span, read the existing sectors, splice our bytes in, and write
+        // the whole span back. Without this, WriteFile returns Win32 error
+        // 87 (ERROR_INVALID_PARAMETER) on raw-disk handles.
+        let aligned_start = abs - (abs % ss);
+        let aligned_end = (abs + data.len() as u64).div_ceil(ss) * ss;
+        let span = (aligned_end - aligned_start) as usize;
+        let mut buf = vec![0u8; span];
+        self.read_raw(aligned_start, &mut buf)?;
+        let inner = (abs - aligned_start) as usize;
+        buf[inner..inner + data.len()].copy_from_slice(data);
+        self.write_raw(aligned_start, &buf)
+    }
+
+    /// Absolute-offset raw write. `abs` and `data.len()` must be
+    /// sector-aligned; callers reach this only via `write_at`, which
+    /// guarantees alignment (directly on the fast path, or by bouncing
+    /// through an aligned span on the slow path).
+    fn write_raw(&mut self, abs: u64, data: &[u8]) -> Result<()> {
         unsafe {
             let mut dist = 0i64;
             if windows_sys::Win32::Storage::FileSystem::SetFilePointerEx(
@@ -312,7 +372,15 @@ impl PartitionWriter {
 
 impl Drop for PartitionWriter {
     fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        // Best-effort flush before closing so a caller that forgot an
+        // explicit flush() (or bailed on an error path) still commits any
+        // buffered writes. Raw-disk handles are effectively unbuffered, so
+        // this is belt-and-suspenders; ignore the result since Drop can't
+        // surface an error and CloseHandle itself flushes on close.
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(self.handle);
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
     }
 }
 

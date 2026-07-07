@@ -18,6 +18,13 @@ pub const HEADER_SIZE: usize = 64;
 pub const INDEX_ENTRY_SIZE: usize = 160;
 pub const FOOTER_SIZE: usize = 72;
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Byte size of one extent-addressing unit ("sector") in the `.phnx`
+/// format. This is a fixed format invariant, independent of the source
+/// disk's physical sector size: all extent `start_sector`/`sector_count`
+/// values and every `PartitionIndexEntry::sector_size` are expressed in
+/// these 512-byte units. Restore code multiplies extent sectors by this to
+/// recover byte offsets.
+pub const EXTENT_LBA_BYTES: u32 = 512;
 /// Reserved bytes after header for partition index entries (max 128 partitions).
 pub const INDEX_TABLE_RESERVE: u64 = 128 * INDEX_ENTRY_SIZE as u64;
 

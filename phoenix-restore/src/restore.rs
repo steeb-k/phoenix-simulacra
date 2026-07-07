@@ -228,7 +228,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
 
         let fs = fs_kind_from_string(&part_manifest.fs);
         let mut writer =
-            PartitionWriter::open_disk(&disk.path, entry.target_offset_bytes)?;
+            PartitionWriter::open_disk(&disk.path, entry.target_offset_bytes, disk.sector_size)?;
 
         summary.partitions_restored += 1;
         if entry.target_size_bytes != idx_entry.original_size {
