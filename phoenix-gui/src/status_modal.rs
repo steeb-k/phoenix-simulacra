@@ -58,11 +58,13 @@ pub struct ModalView<'a> {
 
 const MODAL_WIDTH: f32 = 460.0;
 const CANCEL_BUTTON_ID: &str = "status_modal_cancel";
+const CLOSE_BUTTON_ID: &str = "status_modal_close";
 
 pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> ModalAction {
-    // --- Backdrop: a full-screen, input-swallowing dim layer above the panels
-    // but below the dialog. Painted as a foreground Area; the dialog Window
-    // (also foreground, created afterwards) renders on top of it. ---
+    // --- Backdrop: full-screen dim layer above panels, below the dialog.
+    // Keep it on Foreground; the dialog Window uses Tooltip so hit-testing
+    // always prefers the Close/Cancel button (same Order::Foreground let the
+    // backdrop steal clicks after sleep/focus changes on some backends). ---
     let screen = ctx.screen_rect();
     egui::Area::new(egui::Id::new("status_modal_backdrop"))
         .order(Order::Foreground)
@@ -77,13 +79,21 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
 
     let mut action = ModalAction::None;
 
+    if view.outcome.is_some() {
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape) {
+                action = ModalAction::Close;
+            }
+        });
+    }
+
     let frame = egui::Frame::window(&ctx.style())
         .fill(palette.sidebar_bg)
         .inner_margin(egui::Margin::same(22.0))
         .rounding(egui::Rounding::same(10.0));
 
     egui::Window::new("status_modal")
-        .order(Order::Foreground)
+        .order(Order::Tooltip)
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
@@ -117,6 +127,12 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
             ui.add_space(18.0);
             action = show_button(ui, palette, view);
         });
+
+    if view.outcome.is_some() {
+        // Keep repainting while the result modal is up so a wake-from-sleep
+        // does not leave a stale, input-deaf frame until the user moves the mouse.
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
 
     action
 }
@@ -248,11 +264,19 @@ fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> Mo
             }
             // Finished: a Close button tinted by the outcome (blue success,
             // amber warning/cancelled, red failure).
-            Some(outcome) => ui.add_sized(
-                [160.0, 38.0],
-                egui::Button::new(RichText::new("Close").color(Color32::WHITE))
-                    .fill(outcome_color(palette, outcome)),
-            ),
+            Some(outcome) => {
+                let resp = ui
+                    .push_id(egui::Id::new(CLOSE_BUTTON_ID), |ui| {
+                        ui.add_sized(
+                            [160.0, 38.0],
+                            egui::Button::new(RichText::new("Close").color(Color32::WHITE))
+                                .fill(outcome_color(palette, outcome)),
+                        )
+                    })
+                    .inner;
+                resp.request_focus();
+                resp
+            }
         };
         if resp.clicked() {
             action = match view.outcome {

@@ -446,10 +446,13 @@ impl PhoenixApp {
 
     fn maybe_refresh_theme(&mut self, ctx: &egui::Context) {
         if self.last_theme_refresh.elapsed() >= THEME_REFRESH_INTERVAL {
-            let modal_was_open = self.modal_open();
+            let running_job_modal = self.job.is_some();
             self.palette = theme::refresh(ctx);
             self.last_theme_refresh = Instant::now();
-            if modal_was_open {
+            // Only surrender keyboard focus while a job is actively running.
+            // Doing so on the finished "Close" modal can interfere with
+            // dismissing it after sleep/focus changes.
+            if running_job_modal {
                 ctx.memory_mut(|mem| {
                     if let Some(id) = mem.focused() {
                         mem.surrender_focus(id);
@@ -472,6 +475,15 @@ impl eframe::App for PhoenixApp {
             self.poll_restore_backup_load();
         }
 
+        let focus_regained = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        });
+        if focus_regained && self.completed.is_some() {
+            ctx.request_repaint();
+        }
+
         let busy = self.busy();
         let modal_open = self.modal_open();
         sidebar::show(ctx, &mut self.page, &self.palette, modal_open);
@@ -486,7 +498,9 @@ impl eframe::App for PhoenixApp {
                     .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
             )
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
+                });
             });
 
         egui::CentralPanel::default()
@@ -1365,12 +1379,12 @@ impl PhoenixApp {
 
         ui.add_space(8.0);
         if ui.button("Refresh theme from Windows").clicked() {
-            let modal_was_open = self.modal_open();
+            let running_job_modal = self.job.is_some();
             let ctx = ui.ctx().clone();
             self.palette = theme::refresh(ui.ctx());
             self.last_theme_refresh = Instant::now();
             self.status = "Theme refreshed from Windows settings".into();
-            if modal_was_open {
+            if running_job_modal {
                 ctx.memory_mut(|mem| {
                     if let Some(id) = mem.focused() {
                         mem.surrender_focus(id);
