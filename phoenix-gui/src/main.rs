@@ -686,7 +686,7 @@ fn backup_path_picker(
             if let Some(picked) = pick_backup_open_path(path) {
                 *path = picked.display().to_string();
                 browsed = true;
-                if let Some(cb) = on_path_changed.as_deref_mut() {
+                if let Some(cb) = on_path_changed {
                     cb();
                 }
             }

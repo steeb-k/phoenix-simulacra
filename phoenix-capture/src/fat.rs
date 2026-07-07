@@ -73,7 +73,7 @@ pub fn fat_plan(
     let (fat_type, cluster_size, data_start, total_clusters, fat_bits) =
         parse_fat_boot(&boot, exfat)?;
 
-    let fat_len = ((total_clusters + 2) * fat_bits as u64 + 7) / 8;
+    let fat_len = ((total_clusters + 2) * fat_bits as u64).div_ceil(8);
     let mut fat_table = vec![0u8; fat_len as usize];
     if fat_len > 0 {
         // exFAT's FAT lives at the FatOffset sector, not the cluster heap;

@@ -202,7 +202,7 @@ impl PartitionWriter {
         }
         let abs = self.base_offset + relative_offset;
         let ss = self.sector_size;
-        if abs % ss == 0 && (data.len() as u64) % ss == 0 {
+        if abs.is_multiple_of(ss) && (data.len() as u64).is_multiple_of(ss) {
             return self.read_raw(abs, data);
         }
         // Sub-sector-aligned read (e.g. a 512-byte boot-sector read-back on
@@ -301,7 +301,7 @@ impl PartitionWriter {
         // Fast path: already sector-aligned in both offset and length. This
         // is every streamed data chunk (chunk offsets and lengths are
         // multiples of CHUNK_SIZE, itself a multiple of any sector size).
-        if abs % ss == 0 && (data.len() as u64) % ss == 0 {
+        if abs.is_multiple_of(ss) && (data.len() as u64).is_multiple_of(ss) {
             return self.write_raw(abs, data);
         }
         // Slow path: a misaligned write (e.g. a 512-byte boot-sector patch
@@ -379,7 +379,7 @@ impl Drop for PartitionWriter {
 }
 
 pub fn raw_extent_for_partition(size_bytes: u64, sector_size: u32) -> Vec<Extent> {
-    let sectors = (size_bytes + sector_size as u64 - 1) / sector_size as u64;
+    let sectors = size_bytes.div_ceil(sector_size as u64);
     vec![Extent {
         start_sector: 0,
         sector_count: sectors,

@@ -38,6 +38,12 @@ pub struct IncrementalHasher {
     inner: Hasher,
 }
 
+impl Default for IncrementalHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IncrementalHasher {
     pub fn new() -> Self {
         Self {

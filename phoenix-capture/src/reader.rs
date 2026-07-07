@@ -283,7 +283,7 @@ impl PartitionReader {
         const FS_TRAILING_RESERVE: u64 = 8;
 
         let header_size = mem::size_of::<VolumeBitmapHeader>();
-        let bitmap_bytes = ((total_clusters + 7) / 8) as usize;
+        let bitmap_bytes = total_clusters.div_ceil(8) as usize;
         let mut full_bitmap = vec![0u8; bitmap_bytes];
         let mut next_lcn: i64 = 0;
         // Termination is driven by the IOCTL itself: we keep going while it
@@ -316,7 +316,7 @@ impl PartitionReader {
             // driver.
             const CHUNK_MAX: usize = 4 * 1024 * 1024;
             let remaining_clusters = total_clusters.saturating_sub(next_lcn as u64);
-            let needed_bytes = ((remaining_clusters + 7) / 8) as usize + header_size + 16;
+            let needed_bytes = remaining_clusters.div_ceil(8) as usize + header_size + 16;
             let buf_size = needed_bytes.min(CHUNK_MAX).max(header_size + 4096);
             let mut buf = vec![0u8; buf_size];
 

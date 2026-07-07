@@ -93,7 +93,7 @@ fn read_bitmap(
     // as used and silently turns a "used blocks" backup into a full raw clone
     // of the partition.
     if let Some(bm) = reader.try_volume_bitmap(total_clusters) {
-        let bitmap_bytes = ((total_clusters + 7) / 8) as usize;
+        let bitmap_bytes = total_clusters.div_ceil(8) as usize;
         if bm.len() >= bitmap_bytes {
             tracing::info!(
                 total_clusters,
@@ -118,7 +118,7 @@ fn read_bitmap(
         total_clusters,
         "FSCTL_GET_VOLUME_BITMAP unavailable; falling back to full-partition capture"
     );
-    let bitmap_bytes = ((total_clusters + 7) / 8) as usize;
+    let bitmap_bytes = total_clusters.div_ceil(8) as usize;
     let _ = (bs, cluster_size);
     Ok(vec![0xFFu8; bitmap_bytes])
 }
@@ -143,7 +143,7 @@ fn cluster_used(bitmap: &[u8], cluster: usize) -> bool {
 /// and 4Kn (4096) media.
 fn total_clusters_for(bs: &NtfsBootSector, cluster_size: u64) -> u64 {
     let volume_bytes = bs.total_sectors.saturating_mul(bs.bytes_per_sector as u64);
-    (volume_bytes + cluster_size - 1) / cluster_size
+    volume_bytes.div_ceil(cluster_size)
 }
 
 pub fn estimate_used_bytes(reader: &mut impl BlockSource) -> Result<u64> {

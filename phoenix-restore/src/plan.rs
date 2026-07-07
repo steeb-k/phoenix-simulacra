@@ -267,7 +267,7 @@ pub fn align_up(value: u64, align: u64) -> u64 {
     if align == 0 {
         return value;
     }
-    ((value + align - 1) / align) * align
+    value.div_ceil(align) * align
 }
 
 pub fn align_down(value: u64, align: u64) -> u64 {

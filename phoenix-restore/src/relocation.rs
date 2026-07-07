@@ -62,7 +62,7 @@ pub fn build_relocation_map(
     let safe_max_cluster = new_total_clusters - 1;
 
     let sectors_per_cluster = cluster_size / sector_size;
-    if sectors_per_cluster == 0 || cluster_size % sector_size != 0 {
+    if sectors_per_cluster == 0 || !cluster_size.is_multiple_of(sector_size) {
         return Err(PhoenixError::Other(format!(
             "cluster_size ({cluster_size}) is not a multiple of sector_size ({sector_size})"
         )));
@@ -81,7 +81,7 @@ pub fn build_relocation_map(
         }
         let start_cluster = start_byte / cluster_size;
         let end_byte = start_byte.saturating_add(len_bytes);
-        let end_cluster = (end_byte + cluster_size - 1) / cluster_size;
+        let end_cluster = end_byte.div_ceil(cluster_size);
         let cluster_count = end_cluster.saturating_sub(start_cluster);
         if cluster_count > 0 {
             cluster_extents.push((start_cluster, cluster_count));

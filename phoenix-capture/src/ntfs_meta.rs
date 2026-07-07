@@ -599,11 +599,11 @@ fn rewrite_bitmap(
     }
 
     let new_total = map.new_total_clusters;
-    let usable_bytes = ((new_total + 7) / 8) as usize;
+    let usable_bytes = new_total.div_ceil(8) as usize;
     for byte_idx in usable_bytes..bitmap.len() {
         bitmap[byte_idx] = 0;
     }
-    if new_total % 8 != 0 && (new_total as usize) / 8 < bitmap.len() {
+    if !new_total.is_multiple_of(8) && (new_total as usize) / 8 < bitmap.len() {
         let boundary_byte = (new_total as usize) / 8;
         let bits_to_keep = (new_total % 8) as u8;
         let mask = (1u8 << bits_to_keep) - 1;

@@ -227,7 +227,7 @@ impl RestoreLayoutState {
                     volume_path: None,
                     drive_letter: src.drive_letter,
                     volume_label: src.volume_label.clone(),
-                    usage: src.usage.clone(),
+                    usage: src.usage,
                     sector_size: src.sector_size,
                 })
             })
@@ -406,7 +406,7 @@ pub fn partition_title(p: &PartitionInfo) -> String {
     match (&p.drive_letter, p.volume_label.as_deref()) {
         (Some(c), Some(label)) if !label.is_empty() => format!("{c}: {label}"),
         (Some(c), _) => format!("{c}:"),
-        (None, Some(label)) if !label.is_empty() => format!("{label}"),
+        (None, Some(label)) if !label.is_empty() => label.to_string(),
         _ => format!("Part {}", p.index),
     }
 }
