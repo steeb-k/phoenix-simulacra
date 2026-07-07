@@ -230,35 +230,67 @@ fn fat_used_extents(
             used.push(c);
         }
     }
-    if used.is_empty() {
+
+    // Collect byte ranges to capture. The reserved region [0, data_start) --
+    // boot sector, the FAT copies, and (for FAT12/16) the root directory -- is
+    // filesystem metadata and must ALWAYS be captured; without it a restored
+    // volume has no boot sector and mounts as RAW. NTFS gets this for free
+    // because its bitmap marks the metadata clusters used, but FAT's data-only
+    // cluster scan does not, so we add the reserved region explicitly.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    if data_start > 0 {
+        ranges.push((0, data_start));
+    }
+    if !used.is_empty() {
+        let mut start = used[0];
+        let mut prev = used[0];
+        let mut push_run = |ranges: &mut Vec<(u64, u64)>, start: u64, prev: u64| {
+            let byte_start = data_start + (start - 2) * cluster_size;
+            let byte_end = data_start + (prev - 2 + 1) * cluster_size;
+            ranges.push((byte_start, byte_end));
+        };
+        for &c in used.iter().skip(1) {
+            if c == prev + 1 {
+                prev = c;
+            } else {
+                push_run(&mut ranges, start, prev);
+                start = c;
+                prev = c;
+            }
+        }
+        push_run(&mut ranges, start, prev);
+    }
+
+    // Coalesce adjacent/overlapping ranges (the reserved region and the first
+    // data cluster are adjacent when cluster 2 is allocated).
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+
+    if merged.is_empty() {
+        // A degenerate volume with no reserved region and no data: capture a
+        // minimal extent so the stream isn't empty.
         return vec![Extent {
             start_sector: 0,
             sector_count: (cluster_size / SECTOR).max(8),
         }];
     }
 
-    let mut extents = Vec::new();
-    let mut start = used[0];
-    let mut prev = used[0];
-    for &c in used.iter().skip(1) {
-        if c == prev + 1 {
-            prev = c;
-        } else {
-            let byte_start = data_start + (start - 2) * cluster_size;
-            extents.push(Extent {
-                start_sector: byte_start / SECTOR,
-                sector_count: ((prev - start + 1) * cluster_size) / SECTOR,
-            });
-            start = c;
-            prev = c;
-        }
-    }
-    let byte_start = data_start + (start - 2) * cluster_size;
-    extents.push(Extent {
-        start_sector: byte_start / SECTOR,
-        sector_count: ((prev - start + 1) * cluster_size) / SECTOR,
-    });
-    extents
+    merged
+        .into_iter()
+        .map(|(s, e)| Extent {
+            start_sector: s / SECTOR,
+            sector_count: (e - s) / SECTOR,
+        })
+        .collect()
 }
 
 fn fat_cluster_value(fat: &[u8], cluster: u64, fat_type: FatType) -> u32 {
@@ -722,10 +754,18 @@ mod tests {
             data_start,
             total_clusters,
         );
+        // The reserved region [0, data_start) is always captured, and it
+        // coalesces with the adjacent cluster-2 run. So: run 1 = reserved +
+        // clusters 2,3,4; run 2 = cluster 6 (after the cluster-5 free gap).
         assert_eq!(extents.len(), 2, "expected two coalesced runs");
-        // Run 1: clusters 2,3,4 (3 clusters) at data_start.
-        assert_eq!(extents[0].start_sector, data_start / 512);
-        assert_eq!(extents[0].sector_count, 3 * cluster_size / 512);
+        assert_eq!(
+            extents[0].start_sector, 0,
+            "reserved region must be captured"
+        );
+        assert_eq!(
+            extents[0].sector_count,
+            (data_start + 3 * cluster_size) / 512
+        );
         // Run 2: cluster 6 only.
         assert_eq!(
             extents[1].start_sector,

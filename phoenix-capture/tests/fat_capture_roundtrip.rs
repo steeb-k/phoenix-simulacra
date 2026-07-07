@@ -104,10 +104,15 @@ fn fat16_capture_reproduces_used_clusters() {
     // --- Plan extents from the FAT, then capture into a .phnx ---
     let mut src = MemoryBlockSource::new(img.clone());
     let (extents, bitmap_hash, bytes_per_cluster) = fat_plan(&mut src, false).unwrap();
-    // Two runs: {cluster 2} and {clusters 3,4,5}.
-    assert_eq!(extents.len(), 2, "expected two coalesced used-cluster runs");
-    let used_clusters: u64 = extents.iter().map(|e| e.sector_count).sum();
-    assert_eq!(used_clusters, 4, "4 clusters allocated (1 + 3)");
+    // Two runs: [reserved region + cluster 2] (coalesced) and [clusters 4,5,6],
+    // with the cluster-3 free gap between them. The reserved region (boot sector
+    // + FATs + root dir) is always captured, so run 1 starts at sector 0.
+    assert_eq!(extents.len(), 2, "expected two coalesced runs");
+    assert_eq!(
+        extents[0].start_sector, 0,
+        "reserved region must be captured"
+    );
+    let captured_sectors: u64 = extents.iter().map(|e| e.sector_count).sum();
 
     let path = std::env::temp_dir().join(format!("fat16_{}.phnx", Uuid::new_v4()));
     let backup_id = Uuid::new_v4();
@@ -136,7 +141,7 @@ fn fat16_capture_reproduces_used_clusters() {
         .unwrap();
     let (used_bytes, _) =
         capture_fat(&mut src, &mut stream, &extents, bitmap_hash.clone()).unwrap();
-    assert_eq!(used_bytes, 4 * SECTOR as u64);
+    assert_eq!(used_bytes, captured_sectors * SECTOR as u64);
     let (chunks, _) = stream.finish().unwrap();
 
     let manifest = BackupManifest {
