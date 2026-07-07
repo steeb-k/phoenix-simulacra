@@ -192,7 +192,14 @@ pub fn restore_ntfs(
         });
     }
     let written = crate::raw::restore_raw(
-        reader, entry, writer, verify, progress, bytes_done, relocation,
+        reader,
+        entry,
+        writer,
+        verify,
+        progress,
+        bytes_done,
+        relocation,
+        target_size,
     )?;
     finalize_ntfs_partition(writer, target_size, relocation)?;
     Ok(written)

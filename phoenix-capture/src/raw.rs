@@ -9,6 +9,18 @@ use windows_sys::Win32::Foundation::GetLastError;
 
 use crate::reader::BlockSource;
 
+/// How many bytes of a write at partition-relative `offset` of `len` bytes may
+/// actually be written without reaching `max_bytes`. `None` = write nothing
+/// (fully out of bounds); `Some(n)` = write the first `n` bytes.
+fn clamp_write(offset: u64, len: usize, max_bytes: u64) -> Option<usize> {
+    if offset >= max_bytes {
+        return None;
+    }
+    let room = (max_bytes - offset) as usize;
+    let n = room.min(len);
+    (n > 0).then_some(n)
+}
+
 pub fn capture_raw(
     reader: &mut impl BlockSource,
     stream: &mut phoenix_core::container::PartitionStreamWriter<'_>,
@@ -67,6 +79,12 @@ pub fn restore_raw(
     progress: Option<&ProgressHandle>,
     mut bytes_done: u64,
     relocation: Option<&RelocationMap>,
+    // Never write at or past this partition-relative byte (the target
+    // partition size). Data beyond it is dropped: for a raw-captured volume
+    // restored into a smaller partition this trims trailing free space that
+    // the boot-sector patch is about to declare out of bounds, and it's a
+    // hard guard against a stream overrunning into the neighboring partition.
+    max_bytes: u64,
 ) -> Result<u64> {
     let stream = reader.read_stream_header(entry)?;
     let chunk_records: Vec<phoenix_core::manifest::ChunkRecord> = reader
@@ -113,7 +131,9 @@ pub fn restore_raw(
 
         match relocation {
             None => {
-                writer.write_at(src_offset, &data)?;
+                if let Some(clamped) = clamp_write(src_offset, data.len(), max_bytes) {
+                    writer.write_at(src_offset, &data[..clamped])?;
+                }
             }
             Some(map) => {
                 // A chunk that fully lives below the safe boundary OR
@@ -131,8 +151,10 @@ pub fn restore_raw(
                     )));
                 }
                 for seg in segments {
-                    let end = seg.source_offset + seg.len;
-                    writer.write_at(seg.dst_byte_offset, &data[seg.source_offset..end])?;
+                    if let Some(clamped) = clamp_write(seg.dst_byte_offset, seg.len, max_bytes) {
+                        let end = seg.source_offset + clamped;
+                        writer.write_at(seg.dst_byte_offset, &data[seg.source_offset..end])?;
+                    }
                 }
             }
         }
@@ -384,4 +406,23 @@ pub fn raw_extent_for_partition(size_bytes: u64, sector_size: u32) -> Vec<Extent
         start_sector: 0,
         sector_count: sectors,
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_write;
+
+    #[test]
+    fn clamp_write_bounds() {
+        // Fully within bounds: write everything.
+        assert_eq!(clamp_write(0, 100, 1000), Some(100));
+        // Straddles the boundary: write only up to max_bytes.
+        assert_eq!(clamp_write(900, 200, 1000), Some(100));
+        // Starts exactly at the boundary: write nothing.
+        assert_eq!(clamp_write(1000, 50, 1000), None);
+        // Starts past the boundary: write nothing.
+        assert_eq!(clamp_write(1200, 50, 1000), None);
+        // Ends exactly at the boundary: write everything.
+        assert_eq!(clamp_write(950, 50, 1000), Some(50));
+    }
 }

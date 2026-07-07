@@ -310,6 +310,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                     opts.progress.as_ref(),
                     bytes_done,
                     None,
+                    entry.target_size_bytes,
                 )?;
             }
         }

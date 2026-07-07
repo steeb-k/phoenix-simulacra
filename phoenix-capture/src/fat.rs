@@ -373,8 +373,16 @@ pub fn restore_fat(
     // only). Pre-flight in `validate_extents_fit` still refuses any
     // FAT/exFAT shrink whose used data lives past the boundary, so this
     // None is correct: by the time we get here, the source already fits.
-    let written =
-        crate::raw::restore_raw(reader, entry, writer, verify, progress, bytes_done, None)?;
+    let written = crate::raw::restore_raw(
+        reader,
+        entry,
+        writer,
+        verify,
+        progress,
+        bytes_done,
+        None,
+        target_size,
+    )?;
     finalize_fat_partition(writer, target_size, fs)?;
     Ok(written)
 }

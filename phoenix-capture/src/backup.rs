@@ -405,8 +405,20 @@ pub fn plan_capture(
             Ok((extents, bytes_per_cluster, mode, fs, bitmap_hash))
         }
         (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => {
-            let (extents, bitmap_hash, bytes_per_cluster) = fat_plan(reader, true)?;
-            Ok((extents, bytes_per_cluster, mode, fs, bitmap_hash))
+            // exFAT records contiguous files with the "NoFatChain" flag, so
+            // their clusters are NOT in the FAT — they're tracked only in the
+            // allocation bitmap. A FAT-based used-block scan therefore misses
+            // every contiguous file (the common case), which would silently
+            // drop data. Until we parse the exFAT allocation bitmap, capture
+            // exFAT volumes in full (raw) so restores are always correct.
+            // (FAT12/16/32 don't have this problem: every file is a FAT chain.)
+            Ok((
+                raw_extent_for_partition(part.size_bytes, 512),
+                0,
+                CaptureMode::Raw,
+                fs,
+                None,
+            ))
         }
         _ => Ok((
             raw_extent_for_partition(part.size_bytes, 512),
