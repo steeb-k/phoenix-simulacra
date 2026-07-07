@@ -295,18 +295,35 @@ pub fn default_plan_from_backup(
 /// the reconstructed layout valid. Returns `(offset, size)` per input size.
 fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> {
     const GPT_TRAILING_BYTES: u64 = 33 * 512;
+    /// Hard floor for partition starts: logical-sector alignment — the same
+    /// floor diskpart itself uses when it packs a partition tightly after the
+    /// MSR (observed start 16825856 = sector 32863, 512-aligned but not
+    /// 4 KiB-aligned). The 1 MiB `align` is a performance preference; this is
+    /// the correctness minimum.
+    const SECTOR_ALIGN: u64 = 512;
     let usable_end = disk_size.saturating_sub(GPT_TRAILING_BYTES);
     let mut offset = align;
     let mut out = Vec::with_capacity(sizes.len());
     let count = sizes.len();
     for (i, &orig) in sizes.iter().enumerate() {
-        let off = align_up(offset, align);
+        let mut off = align_up(offset, align);
         let mut size = orig;
         if i + 1 == count && off.saturating_add(size) > usable_end {
-            // Clamp only the last partition. `validate_against_backup` still
-            // enforces that the used data fits and surfaces PartitionTooSmall
-            // if a genuinely full partition can't.
-            size = align_down(usable_end.saturating_sub(off), 4096);
+            // The last partition doesn't fit at the preferred alignment. The
+            // source often packs it tighter (diskpart starts it right after
+            // the MSR, unaligned to MiB), so aligning UP drifted the layout by
+            // up to `align` bytes. Shrinking is fatal for fixed-geometry
+            // filesystems (FAT/exFAT restore can't relocate → the observed
+            // PartitionTooSmall at ~1 MiB short), so first try keeping the
+            // ORIGINAL size by relaxing the start to sector alignment; clamp
+            // only when it still can't fit. `validate_against_backup` then
+            // enforces that the used data fits.
+            let relaxed = align_up(offset, SECTOR_ALIGN);
+            if relaxed.saturating_add(size) <= usable_end {
+                off = relaxed;
+            } else {
+                size = align_down(usable_end.saturating_sub(off), SECTOR_ALIGN);
+            }
         }
         out.push((off, size));
         offset = off + size;
@@ -600,6 +617,31 @@ mod tests {
         for (off, _) in &placed {
             assert_eq!(off % align, 0, "offset {off} not aligned");
         }
+    }
+
+    #[test]
+    fn full_disk_pack_relaxes_alignment_before_shrinking() {
+        // The exact geometry from the failing exFAT roundtrip on a 512 MiB VHD:
+        // diskpart put the data partition immediately after the MSR (start
+        // 16825856 — NOT MiB-aligned) running to the usable end, so its
+        // original 520028160 bytes only fit if the re-pack keeps the tight
+        // start. Aligning up to 1 MiB drifted the start to 17825792 and the
+        // clamp shrank the partition by ~980 KiB → PartitionTooSmall for a
+        // fixed-geometry filesystem. The pack must keep the ORIGINAL size by
+        // relaxing the start to 4 KiB alignment instead.
+        let disk = 512 * 1024 * 1024u64;
+        let align = 1024 * 1024u64;
+        let msr = 15_777_280u64; // 1 MiB..16825856, as diskpart laid it out
+        let data = 520_028_160u64; // reaches exactly the GPT usable end
+        let placed = pack_full_disk(&[msr, data], disk, align);
+        let (off, size) = placed[1];
+        assert_eq!(size, data, "fixed-geometry partition must not be shrunk");
+        assert_eq!(off % 512, 0, "start must stay logical-sector-aligned");
+        assert!(
+            off + size <= disk - 33 * 512,
+            "must still leave room for the backup GPT (ends at {})",
+            off + size
+        );
     }
 
     #[test]
