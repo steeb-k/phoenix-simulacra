@@ -379,7 +379,8 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 /// `Option<String>` carries the bitmap hash for NTFS partitions and is
 /// `None` for FAT/exFAT/raw, where the per-FS hash (if any) is computed
 /// during the streaming step inside `capture_fat` / `capture_exfat`.
-fn plan_capture(
+#[allow(clippy::type_complexity)]
+pub fn plan_capture(
     part: &PartitionInfo,
     reader: &mut PartitionReader,
 ) -> Result<(

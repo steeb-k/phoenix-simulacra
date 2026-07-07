@@ -1,0 +1,460 @@
+//! Direct disk-to-disk cloning for Carbon Phoenix.
+//!
+//! Unlike backup+restore, cloning streams each source partition's used blocks
+//! straight to the target disk with no intermediate `.phnx` file and no
+//! compression. It reuses the same building blocks the backup/restore engines
+//! are built from — extent planning ([`phoenix_capture::plan_capture`]), the
+//! raw [`PartitionWriter`], the NTFS shrink relocation map + metadata rewriter,
+//! the FAT/exFAT boot patchers, and the GPT/MBR partition-table writers — so a
+//! clone gets the same resize support (grow + NTFS shrink relocation) and the
+//! same live-volume consistency (VSS) as a backup.
+
+use tracing::{info, warn};
+
+use phoenix_core::container::{Extent, CHUNK_SIZE, EXTENT_LBA_BYTES};
+use phoenix_core::disk::{
+    enumerate_disks, refine_partition_fs, CaptureMode, DiskInfo, FilesystemKind, PartitionInfo,
+};
+use phoenix_core::error::{PhoenixError, Result};
+use phoenix_core::relocation::RelocationMap;
+use phoenix_core::ProgressHandle;
+
+use phoenix_capture::{
+    finalize_fat_partition, finalize_ntfs_partition, plan_capture, PartitionReader, PartitionWriter,
+};
+use phoenix_restore::grow::extend_ntfs_volume;
+use phoenix_restore::partition_table::{
+    bring_disk_online, flush_disk, init_target_disk_as_gpt, init_target_disk_as_mbr,
+    notify_disk_updated, write_mbr_partition_layout, write_partition_layout, GptEntry, MbrEntry,
+};
+use phoenix_restore::relocation::build_relocation_map;
+
+pub mod plan;
+pub use plan::{CloneEntry, ClonePlan};
+
+/// Whether to read each written region back off the target and compare it to
+/// the source before moving on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneVerify {
+    /// Trust the write (fast).
+    None,
+    /// Re-read every written block from the target and byte-compare against the
+    /// source. Roughly doubles target I/O but proves the copy landed intact.
+    ReadBack,
+}
+
+pub struct CloneOptions {
+    pub source_disk_index: u32,
+    pub target_disk_index: u32,
+    pub plan: ClonePlan,
+    pub verify: CloneVerify,
+    /// Use a VSS snapshot for live, mounted source volumes so the clone is
+    /// crash-consistent even while Windows is running off the source disk.
+    pub use_vss: bool,
+    pub progress: Option<ProgressHandle>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CloneSummary {
+    pub partitions_cloned: u32,
+    pub partitions_resized: u32,
+    pub bytes_copied: u64,
+}
+
+/// Clone `source_disk_index` onto `target_disk_index` per the plan.
+pub fn run_clone(opts: CloneOptions) -> Result<CloneSummary> {
+    let mut disks = enumerate_disks()?;
+    for d in &mut disks {
+        for p in &mut d.partitions {
+            refine_partition_fs(p);
+        }
+    }
+
+    if opts.source_disk_index == opts.target_disk_index {
+        return Err(PhoenixError::Disk(
+            "source and target are the same disk".into(),
+        ));
+    }
+    let source = disks
+        .iter()
+        .find(|d| d.index == opts.source_disk_index)
+        .ok_or_else(|| PhoenixError::Disk("source disk not found".into()))?
+        .clone();
+    let target = disks
+        .iter()
+        .find(|d| d.index == opts.target_disk_index)
+        .ok_or_else(|| PhoenixError::Disk("target disk not found".into()))?
+        .clone();
+
+    // Guard against cloning a disk onto its own duplicate (USB enclosure that
+    // surfaces the same physical media twice, etc.).
+    if source.disk_signature != 0 && source.disk_signature == target.disk_signature {
+        warn!(
+            "source and target report the same disk signature ({:#x}); if these are the same \
+             physical disk the clone will corrupt it",
+            source.disk_signature
+        );
+    }
+
+    // Validate the plan against both disks before touching anything.
+    opts.plan.validate(&source, &target)?;
+
+    let summary = clone_inner(&source, &target, &opts)?;
+    Ok(summary)
+}
+
+fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Result<CloneSummary> {
+    let mut summary = CloneSummary::default();
+
+    // Total planned bytes for the progress meter (doubled when reading back).
+    let per_pass: u64 = opts
+        .plan
+        .entries
+        .iter()
+        .filter_map(|e| {
+            source
+                .partitions
+                .iter()
+                .find(|p| p.index == e.source_partition_index)
+        })
+        .map(planned_bytes)
+        .sum();
+    let total = if opts.verify == CloneVerify::ReadBack {
+        per_pass * 2
+    } else {
+        per_pass
+    };
+
+    if let Some(ref p) = opts.progress {
+        let mut steps = vec!["Preparing disks".to_string()];
+        for (i, e) in opts.plan.entries.iter().enumerate() {
+            let name = source
+                .partitions
+                .iter()
+                .find(|p| p.index == e.source_partition_index)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "partition".into());
+            steps.push(format!(
+                "Cloning partition {} of {} — {}",
+                i + 1,
+                opts.plan.entries.len(),
+                name
+            ));
+        }
+        steps.push("Writing partition table".to_string());
+        p.set_steps(steps);
+        p.begin(total.max(1), "Clone");
+        p.set_step(0);
+    }
+
+    // --- Initialize the target disk (GPT/MBR skeleton, no entries yet) ---
+    // Same rationale as restore: defer the partition entries until after the
+    // data is written so mountmgr can't lazy-mount empty volumes and bounce
+    // our raw writes with ERROR_ACCESS_DENIED.
+    let gpt_state = if source.is_gpt {
+        Some(init_target_disk_as_gpt(
+            &target.path,
+            target.size_bytes,
+            source.disk_guid,
+        )?)
+    } else {
+        init_target_disk_as_mbr(&target.path, source.disk_signature as u32)?;
+        None
+    };
+
+    let mut bytes_done = 0u64;
+    let mut grown_ntfs: Vec<(u64, u64)> = Vec::new(); // (target_offset, target_size)
+
+    for (i, entry) in opts.plan.entries.iter().enumerate() {
+        if let Some(ref p) = opts.progress {
+            if p.is_cancelled() {
+                return Err(PhoenixError::Cancelled);
+            }
+            p.set_step(i + 1);
+        }
+        let part = source
+            .partitions
+            .iter()
+            .find(|p| p.index == entry.source_partition_index)
+            .ok_or_else(|| PhoenixError::Disk("source partition vanished".into()))?;
+
+        bytes_done = clone_one_partition(source, target, part, entry, opts, bytes_done)?;
+
+        summary.partitions_cloned += 1;
+        if entry.target_size_bytes != part.size_bytes {
+            summary.partitions_resized += 1;
+        }
+        // A grown NTFS partition needs FSCTL_EXTEND_VOLUME after the table is
+        // in place and the volume mounts.
+        if part.fs_kind == FilesystemKind::Ntfs && entry.target_size_bytes > part.size_bytes {
+            grown_ntfs.push((entry.target_offset_bytes, entry.target_size_bytes));
+        }
+    }
+    summary.bytes_copied = per_pass;
+
+    // --- Plant the partition table on top of the freshly-written data ---
+    flush_disk(&target.path);
+    if let Some(ref p) = opts.progress {
+        p.set_step(opts.plan.entries.len() + 1);
+    }
+    if let Some(state) = gpt_state {
+        let entries = build_gpt_entries(source, &opts.plan);
+        write_partition_layout(&target.path, &entries, &state)?;
+    } else {
+        let entries = build_mbr_entries(source, &opts.plan);
+        write_mbr_partition_layout(&target.path, &entries)?;
+    }
+    notify_disk_updated(&target.path);
+    bring_disk_online(&target.path);
+
+    // --- Grow NTFS volumes that were cloned into a larger partition ---
+    for (offset, size) in grown_ntfs {
+        if let Err(e) = extend_ntfs_volume(target.index, offset, size, target.sector_size as u64) {
+            warn!(offset, size, error = %e, "extend_ntfs_volume after clone failed (non-fatal)");
+        }
+    }
+
+    if let Some(ref p) = opts.progress {
+        p.end();
+    }
+    Ok(summary)
+}
+
+/// Stream one partition's used blocks from source to target, applying shrink
+/// relocation and the FS-specific finalization. Returns the running byte total.
+fn clone_one_partition(
+    source: &DiskInfo,
+    target: &DiskInfo,
+    part: &PartitionInfo,
+    entry: &CloneEntry,
+    opts: &CloneOptions,
+    mut bytes_done: u64,
+) -> Result<u64> {
+    // --- Source prep: resolve read path (VSS shadow / live volume / raw
+    // disk), plan extents, lock if reading a live mounted volume. ---
+    let original_volume = part.volume_path.clone();
+    let mut vss = phoenix_vss::VssSession::new();
+    let read_path = if opts.use_vss {
+        if let Some(ref vol) = original_volume {
+            vss.snapshot_volume(vol)?
+        } else {
+            source.path.clone()
+        }
+    } else if let Some(ref vol) = original_volume {
+        vol.clone()
+    } else {
+        source.path.clone()
+    };
+    let is_live = original_volume
+        .as_deref()
+        .map(|orig| orig == read_path.as_str())
+        .unwrap_or(false);
+
+    let mut reader = if read_path.contains("PhysicalDrive") {
+        PartitionReader::open_disk_partition(&read_path, part.offset_bytes, part.size_bytes)?
+    } else {
+        PartitionReader::open_volume(&read_path)?
+    };
+
+    // Plan extents BEFORE locking (FSCTL_GET_VOLUME_BITMAP fails on a locked
+    // NTFS volume on some builds — same ordering constraint as backup).
+    let (extents, bytes_per_cluster, capture_mode, fs_kind, _bitmap_hash) =
+        plan_capture(part, &mut reader)?;
+
+    if is_live {
+        let label = original_volume.as_deref().unwrap_or(&read_path).to_string();
+        reader.lock_volume(&label)?;
+    }
+
+    // --- Shrink relocation (NTFS only) ---
+    let relocation: Option<RelocationMap> =
+        if fs_kind == FilesystemKind::Ntfs && entry.target_size_bytes < part.size_bytes {
+            build_relocation_map(
+                &extents,
+                EXTENT_LBA_BYTES as u64,
+                bytes_per_cluster as u64,
+                entry.target_size_bytes,
+            )?
+        } else {
+            None
+        };
+
+    // --- Open the target writer and stream ---
+    let mut writer =
+        PartitionWriter::open_disk(&target.path, entry.target_offset_bytes, target.sector_size)?;
+
+    let effective_extents = if capture_mode == CaptureMode::Raw {
+        // Raw capture streams the whole partition as one extent.
+        vec![Extent {
+            start_sector: 0,
+            sector_count: part.size_bytes.div_ceil(EXTENT_LBA_BYTES as u64),
+        }]
+    } else {
+        extents
+    };
+
+    bytes_done = stream_extents(
+        &mut reader,
+        &mut writer,
+        &effective_extents,
+        relocation.as_ref(),
+        opts,
+        bytes_done,
+    )?;
+
+    // --- FS-specific finalization (metadata rewrite / boot-sector patch) ---
+    match fs_kind {
+        FilesystemKind::Ntfs => {
+            finalize_ntfs_partition(&mut writer, entry.target_size_bytes, relocation.as_ref())?;
+        }
+        FilesystemKind::Fat | FilesystemKind::Exfat => {
+            finalize_fat_partition(&mut writer, entry.target_size_bytes, fs_kind)?;
+        }
+        _ => {}
+    }
+    writer.flush()?;
+    info!(
+        partition = part.index,
+        target_offset = entry.target_offset_bytes,
+        "cloned partition"
+    );
+    Ok(bytes_done)
+}
+
+/// Copy every byte of `extents` from source to target in CHUNK_SIZE blocks,
+/// translating destination offsets through the relocation map when shrinking,
+/// and optionally reading each block back to verify it.
+fn stream_extents(
+    reader: &mut PartitionReader,
+    writer: &mut PartitionWriter,
+    extents: &[Extent],
+    relocation: Option<&RelocationMap>,
+    opts: &CloneOptions,
+    mut bytes_done: u64,
+) -> Result<u64> {
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    for extent in extents {
+        let base = extent.start_sector * EXTENT_LBA_BYTES as u64;
+        let byte_len = extent.sector_count * EXTENT_LBA_BYTES as u64;
+        let mut pos = 0u64;
+        while pos < byte_len {
+            if let Some(ref p) = opts.progress {
+                if p.is_cancelled() {
+                    return Err(PhoenixError::Cancelled);
+                }
+            }
+            let to_read = (CHUNK_SIZE as u64).min(byte_len - pos) as usize;
+            let n = reader.read_at(base + pos, &mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            let data = &buf[..n];
+            let src_offset = base + pos;
+
+            match relocation {
+                None => {
+                    writer.write_at(src_offset, data)?;
+                    if opts.verify == CloneVerify::ReadBack {
+                        verify_readback(writer, src_offset, data)?;
+                        bytes_done += n as u64;
+                        bump(opts, bytes_done);
+                    }
+                }
+                Some(map) => {
+                    for seg in map.translate_write(src_offset, data.len()) {
+                        let end = seg.source_offset + seg.len;
+                        let chunk = &data[seg.source_offset..end];
+                        writer.write_at(seg.dst_byte_offset, chunk)?;
+                        if opts.verify == CloneVerify::ReadBack {
+                            verify_readback(writer, seg.dst_byte_offset, chunk)?;
+                        }
+                    }
+                    if opts.verify == CloneVerify::ReadBack {
+                        bytes_done += n as u64;
+                        bump(opts, bytes_done);
+                    }
+                }
+            }
+            bytes_done += n as u64;
+            bump(opts, bytes_done);
+            pos += n as u64;
+        }
+    }
+    Ok(bytes_done)
+}
+
+/// Re-read `len` bytes at `offset` from the target and compare to `expected`.
+fn verify_readback(writer: &mut PartitionWriter, offset: u64, expected: &[u8]) -> Result<()> {
+    let mut back = vec![0u8; expected.len()];
+    writer.read_at(offset, &mut back)?;
+    if blake3::hash(&back) != blake3::hash(expected) {
+        return Err(PhoenixError::Other(format!(
+            "clone read-back verification failed at target offset {offset}: the data written to \
+             the target does not match the source"
+        )));
+    }
+    Ok(())
+}
+
+fn bump(opts: &CloneOptions, bytes_done: u64) {
+    if let Some(ref p) = opts.progress {
+        p.set(bytes_done, String::new());
+    }
+}
+
+fn planned_bytes(p: &PartitionInfo) -> u64 {
+    match p.capture_mode {
+        CaptureMode::UsedBlocks => p
+            .usage
+            .map(|u| u.used_bytes())
+            .filter(|n| *n > 0)
+            .unwrap_or(p.size_bytes),
+        CaptureMode::Raw => p.size_bytes,
+    }
+}
+
+fn build_gpt_entries(source: &DiskInfo, plan: &ClonePlan) -> Vec<GptEntry> {
+    plan.entries
+        .iter()
+        .filter_map(|e| {
+            let src = source
+                .partitions
+                .iter()
+                .find(|p| p.index == e.source_partition_index)?;
+            Some(GptEntry {
+                offset_bytes: e.target_offset_bytes,
+                size_bytes: e.target_size_bytes,
+                type_guid: src.type_guid,
+                attributes: src.gpt_attributes,
+                name: src.name.clone(),
+            })
+        })
+        .collect()
+}
+
+fn build_mbr_entries(source: &DiskInfo, plan: &ClonePlan) -> Vec<MbrEntry> {
+    plan.entries
+        .iter()
+        .filter_map(|e| {
+            let src = source
+                .partitions
+                .iter()
+                .find(|p| p.index == e.source_partition_index)?;
+            Some(MbrEntry {
+                offset_bytes: e.target_offset_bytes,
+                size_bytes: e.target_size_bytes,
+                partition_type: mbr_type_for(src.fs_kind),
+                bootable: false,
+            })
+        })
+        .collect()
+}
+
+fn mbr_type_for(fs: FilesystemKind) -> u8 {
+    match fs {
+        FilesystemKind::Ntfs | FilesystemKind::Exfat => 0x07,
+        FilesystemKind::Fat => 0x0C, // FAT32 LBA; FAT16 volumes still mount.
+        FilesystemKind::Efi => 0xEF,
+        _ => 0x07,
+    }
+}

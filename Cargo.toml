@@ -5,6 +5,7 @@ members = [
     "phoenix-capture",
     "phoenix-vss",
     "phoenix-restore",
+    "phoenix-clone",
     "phoenix-cli",
     "phoenix-gui",
     "phoenix-systests",
@@ -21,6 +22,7 @@ phoenix-core = { path = "phoenix-core" }
 phoenix-capture = { path = "phoenix-capture" }
 phoenix-vss = { path = "phoenix-vss" }
 phoenix-restore = { path = "phoenix-restore" }
+phoenix-clone = { path = "phoenix-clone" }
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

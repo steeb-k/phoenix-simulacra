@@ -194,16 +194,26 @@ pub fn restore_ntfs(
     let written = crate::raw::restore_raw(
         reader, entry, writer, verify, progress, bytes_done, relocation,
     )?;
+    finalize_ntfs_partition(writer, target_size, relocation)?;
+    Ok(written)
+}
+
+/// Post-stream NTFS finalization shared by restore and clone: once the file
+/// data is on the target at its (possibly relocated) positions, rewrite the
+/// MFT run lists / `$Bitmap` / `$LogFile` / MFT mirror for a shrink and patch
+/// the boot sector's `total_sectors` to the new partition size. Source-
+/// agnostic — the bytes may have arrived from a `.phnx` (restore) or straight
+/// off another disk (clone).
+pub fn finalize_ntfs_partition(
+    writer: &mut crate::raw::PartitionWriter,
+    target_size: u64,
+    relocation: Option<&phoenix_core::relocation::RelocationMap>,
+) -> Result<()> {
     if let Some(map) = relocation {
-        // Rewrite MFT data runs, $Bitmap, $LogFile, and the MFT mirror
-        // so the on-disk metadata points at the relocated cluster
-        // positions. Without this, a shrink with relocation produces a
-        // mountable-but-corrupt volume: the data bytes are on disk but
-        // every file references its old (now garbage) clusters.
         crate::ntfs_meta::rewrite_metadata_after_relocation(writer, map)?;
     }
     patch_ntfs_size(writer, target_size)?;
-    Ok(written)
+    Ok(())
 }
 
 /// Patch the NTFS boot sector to match a resized target partition.

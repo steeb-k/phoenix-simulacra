@@ -60,6 +60,27 @@ enum Commands {
         #[arg(long, default_value_t = true)]
         verify: bool,
     },
+    /// Clone one disk directly onto another (no intermediate file)
+    Clone {
+        /// Source physical disk index (from `list-disks`)
+        #[arg(long)]
+        source_disk: u32,
+        /// Target physical disk index — WILL BE ERASED
+        #[arg(long)]
+        target_disk: u32,
+        /// Grow the last NTFS partition to fill a larger target
+        #[arg(long, default_value_t = false)]
+        expand: bool,
+        /// Read every written block back off the target and compare to source
+        #[arg(long, default_value_t = false)]
+        verify: bool,
+        /// Do NOT use a VSS snapshot for live source volumes
+        #[arg(long, default_value_t = false)]
+        no_vss: bool,
+        /// Skip the interactive "type the target disk number" confirmation
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
     /// Dump every partition's stream header (extents + chunks) for forensic
     /// inspection. Useful when a manifest's extent table is suspected of
     /// containing garbage values (e.g. start_sectors near `u64::MAX`) — the
@@ -142,8 +163,92 @@ fn main() -> anyhow::Result<()> {
                 "Restore complete"
             );
         }
+        Commands::Clone {
+            source_disk,
+            target_disk,
+            expand,
+            verify,
+            no_vss,
+            yes,
+        } => cmd_clone(source_disk, target_disk, expand, verify, !no_vss, yes)?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
     }
+    Ok(())
+}
+
+fn cmd_clone(
+    source_disk: u32,
+    target_disk: u32,
+    expand: bool,
+    verify: bool,
+    use_vss: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
+
+    let mut disks = enumerate_disks()?;
+    for d in &mut disks {
+        for p in &mut d.partitions {
+            phoenix_core::disk::refine_partition_fs(p);
+        }
+    }
+    let source = disks
+        .iter()
+        .find(|d| d.index == source_disk)
+        .ok_or_else(|| anyhow::anyhow!("source disk {source_disk} not found"))?
+        .clone();
+    let target = disks
+        .iter()
+        .find(|d| d.index == target_disk)
+        .ok_or_else(|| anyhow::anyhow!("target disk {target_disk} not found"))?
+        .clone();
+
+    let plan = if expand {
+        ClonePlan::expand_to_fill(&source, &target)
+    } else {
+        ClonePlan::identity(&source)
+    };
+    plan.validate(&source, &target)?;
+
+    println!(
+        "About to CLONE disk {} ({}, {:.1} GB) onto disk {} ({}, {:.1} GB).",
+        source.index,
+        source.model.as_deref().unwrap_or("disk"),
+        source.size_bytes as f64 / 1e9,
+        target.index,
+        target.model.as_deref().unwrap_or("disk"),
+        target.size_bytes as f64 / 1e9,
+    );
+    println!("ALL DATA ON DISK {target_disk} WILL BE PERMANENTLY ERASED.");
+
+    if !yes {
+        use std::io::Write;
+        print!("Type the target disk number ({target_disk}) to proceed: ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != target_disk.to_string() {
+            anyhow::bail!("confirmation did not match; aborting");
+        }
+    }
+
+    let summary = run_clone(CloneOptions {
+        source_disk_index: source_disk,
+        target_disk_index: target_disk,
+        plan,
+        verify: if verify {
+            CloneVerify::ReadBack
+        } else {
+            CloneVerify::None
+        },
+        use_vss,
+        progress: None,
+    })?;
+    info!(
+        partitions_cloned = summary.partitions_cloned,
+        partitions_resized = summary.partitions_resized,
+        "Clone complete"
+    );
     Ok(())
 }
 

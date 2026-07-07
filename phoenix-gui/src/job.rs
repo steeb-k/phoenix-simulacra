@@ -18,6 +18,7 @@ pub enum JobKind {
     Backup,
     Restore,
     Verify,
+    Clone,
 }
 
 impl JobKind {
@@ -26,6 +27,7 @@ impl JobKind {
             JobKind::Backup => "Backup cancelled",
             JobKind::Restore => "Restore cancelled",
             JobKind::Verify => "Verify cancelled",
+            JobKind::Clone => "Clone cancelled",
         }
     }
 
@@ -36,6 +38,7 @@ impl JobKind {
             JobKind::Backup => "Backing up",
             JobKind::Restore => "Restoring",
             JobKind::Verify => "Verifying backup",
+            JobKind::Clone => "Cloning disk",
         }
     }
 
@@ -46,6 +49,7 @@ impl JobKind {
             JobKind::Backup => "Backup",
             JobKind::Restore => "Restore",
             JobKind::Verify => "Verify",
+            JobKind::Clone => "Clone",
         }
     }
 }
@@ -226,6 +230,24 @@ pub fn spawn_verify(path: PathBuf, quick: bool) -> BackgroundJob {
         verify_backup_with_progress(&path, quick, Some(progress_worker))
             .map(|()| label.to_string())
             .map_err(|e| e.to_string())
+    })
+}
+
+pub fn spawn_clone(opts: phoenix_clone::CloneOptions) -> BackgroundJob {
+    let progress = opts.progress.clone().unwrap_or_default();
+    let progress_worker = progress.clone();
+    make_job(JobKind::Clone, progress, move || {
+        phoenix_clone::run_clone(phoenix_clone::CloneOptions {
+            progress: Some(progress_worker),
+            ..opts
+        })
+        .map(|s| {
+            format!(
+                "Clone complete: {} partition(s) copied, {} resized",
+                s.partitions_cloned, s.partitions_resized
+            )
+        })
+        .map_err(|e| e.to_string())
     })
 }
 

@@ -7,5 +7,8 @@ pub mod ntfs_meta;
 pub mod raw;
 pub mod reader;
 
-pub use backup::run_backup;
+pub use backup::{plan_capture, run_backup};
+pub use fat::finalize_fat_partition;
+pub use ntfs::finalize_ntfs_partition;
+pub use raw::PartitionWriter;
 pub use reader::{BlockSource, MemoryBlockSource, PartitionReader};

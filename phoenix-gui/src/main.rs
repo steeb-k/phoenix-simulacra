@@ -23,7 +23,7 @@ use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
 use phoenix_core::ProgressHandle;
 use phoenix_restore::restore::RestoreOptions;
 
-use crate::job::{spawn_backup, spawn_restore, spawn_verify, BackgroundJob, JobKind};
+use crate::job::{spawn_backup, spawn_clone, spawn_restore, spawn_verify, BackgroundJob, JobKind};
 use crate::sidebar::Page;
 use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView};
 use crate::theme::Palette;
@@ -193,6 +193,11 @@ struct PhoenixApp {
     restore_backup_load_now: bool,
     restore_layout: Option<restore_layout::RestoreLayoutState>,
     target_disk_index: u32,
+    /// Clone page state: chosen source/target disk indices and options.
+    clone_source_index: Option<u32>,
+    clone_target_index: Option<u32>,
+    clone_expand: bool,
+    clone_verify: bool,
     status: String,
     page: Page,
     job: Option<BackgroundJob>,
@@ -226,6 +231,10 @@ impl PhoenixApp {
             restore_backup_load_now: false,
             restore_layout: None,
             target_disk_index: 0,
+            clone_source_index: None,
+            clone_target_index: None,
+            clone_expand: false,
+            clone_verify: true,
             status: "Ready".into(),
             page: Page::Backup,
             job: None,
@@ -1297,12 +1306,136 @@ impl PhoenixApp {
             "Clone",
             "Copy one disk directly to another without going through a backup file.",
         );
-        let palette = self.palette;
-        coming_soon(
-            ui,
-            &palette,
-            "Disk-to-disk cloning will land in a future release.",
-        );
+
+        let busy = self.busy();
+        if self.disks.is_empty() {
+            ui.label("No disks detected. Run as Administrator, then refresh.");
+            if refresh_disks_button(ui, &self.palette).clicked() {
+                self.refresh_disks();
+            }
+            return;
+        }
+
+        // Build a stable list of (index, label) for the dropdowns.
+        let disk_labels: Vec<(u32, String)> = self
+            .disks
+            .iter()
+            .map(|d| {
+                (
+                    d.index,
+                    format!(
+                        "Disk {} — {} ({})",
+                        d.index,
+                        d.model.as_deref().unwrap_or("disk"),
+                        format_bytes(d.size_bytes)
+                    ),
+                )
+            })
+            .collect();
+
+        ui.add_enabled_ui(!busy, |ui| {
+            egui::Grid::new("clone_grid").num_columns(2).show(ui, |ui| {
+                ui.label("Source disk:");
+                let src_label = self
+                    .clone_source_index
+                    .and_then(|i| disk_labels.iter().find(|(d, _)| *d == i))
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| "Choose…".into());
+                egui::ComboBox::from_id_source("clone_src")
+                    .selected_text(src_label)
+                    .show_ui(ui, |ui| {
+                        for (idx, label) in &disk_labels {
+                            ui.selectable_value(&mut self.clone_source_index, Some(*idx), label);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Target disk:");
+                let tgt_label = self
+                    .clone_target_index
+                    .and_then(|i| disk_labels.iter().find(|(d, _)| *d == i))
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| "Choose…".into());
+                egui::ComboBox::from_id_source("clone_tgt")
+                    .selected_text(tgt_label)
+                    .show_ui(ui, |ui| {
+                        for (idx, label) in &disk_labels {
+                            // Never offer the source as a target.
+                            if Some(*idx) != self.clone_source_index {
+                                ui.selectable_value(
+                                    &mut self.clone_target_index,
+                                    Some(*idx),
+                                    label,
+                                );
+                            }
+                        }
+                    });
+                ui.end_row();
+            });
+
+            ui.checkbox(
+                &mut self.clone_expand,
+                "Expand the last NTFS partition to fill a larger target",
+            );
+            ui.checkbox(
+                &mut self.clone_verify,
+                "Verify every written block by reading it back (slower, safer)",
+            );
+        });
+
+        ui.add_space(8.0);
+        let ready = !busy
+            && self.clone_source_index.is_some()
+            && self.clone_target_index.is_some()
+            && self.clone_source_index != self.clone_target_index;
+
+        if let Some(tgt) = self.clone_target_index {
+            ui.colored_label(
+                self.palette.warning,
+                format!("⚠ Cloning will PERMANENTLY ERASE all data on disk {tgt}."),
+            );
+        }
+
+        ui.add_enabled_ui(ready, |ui| {
+            if ui.button("Clone disk").clicked() {
+                self.start_clone();
+            }
+        });
+    }
+
+    fn start_clone(&mut self) {
+        let (Some(src), Some(tgt)) = (self.clone_source_index, self.clone_target_index) else {
+            return;
+        };
+        let source = self.disks.iter().find(|d| d.index == src).cloned();
+        let target = self.disks.iter().find(|d| d.index == tgt).cloned();
+        let (Some(source), Some(target)) = (source, target) else {
+            self.status = "Selected disk no longer present; refresh".into();
+            return;
+        };
+        let plan = if self.clone_expand {
+            phoenix_clone::ClonePlan::expand_to_fill(&source, &target)
+        } else {
+            phoenix_clone::ClonePlan::identity(&source)
+        };
+        if let Err(e) = plan.validate(&source, &target) {
+            self.status = format!("Cannot clone: {e}");
+            return;
+        }
+        let verify = if self.clone_verify {
+            phoenix_clone::CloneVerify::ReadBack
+        } else {
+            phoenix_clone::CloneVerify::None
+        };
+        self.status = format!("Cloning disk {src} → disk {tgt}…");
+        self.job = Some(spawn_clone(phoenix_clone::CloneOptions {
+            source_disk_index: src,
+            target_disk_index: tgt,
+            plan,
+            verify,
+            use_vss: true,
+            progress: None,
+        }));
     }
 
     fn ui_mount(&mut self, ui: &mut egui::Ui) {

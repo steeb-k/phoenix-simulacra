@@ -2225,6 +2225,7 @@ dependencies = [
  "anyhow",
  "clap",
  "phoenix-capture",
+ "phoenix-clone",
  "phoenix-core",
  "phoenix-restore",
  "phoenix-vss",
@@ -2233,6 +2234,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winres",
+]
+
+[[package]]
+name = "phoenix-clone"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "phoenix-capture",
+ "phoenix-core",
+ "phoenix-restore",
+ "phoenix-vss",
+ "tracing",
 ]
 
 [[package]]
@@ -2263,6 +2276,7 @@ dependencies = [
  "egui_extras",
  "image",
  "phoenix-capture",
+ "phoenix-clone",
  "phoenix-core",
  "phoenix-restore",
  "phoenix-vss",
@@ -2296,6 +2310,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "phoenix-capture",
+ "phoenix-clone",
  "phoenix-core",
  "phoenix-restore",
  "uuid",

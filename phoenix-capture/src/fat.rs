@@ -334,6 +334,20 @@ pub fn restore_fat(
     // None is correct: by the time we get here, the source already fits.
     let written =
         crate::raw::restore_raw(reader, entry, writer, verify, progress, bytes_done, None)?;
+    finalize_fat_partition(writer, target_size, fs)?;
+    Ok(written)
+}
+
+/// Post-stream FAT/exFAT finalization shared by restore and clone: patch the
+/// boot-sector size fields (and, for exFAT, recompute the boot checksum) so a
+/// resized target mounts instead of coming up RAW. Source-agnostic — the bytes
+/// may have arrived from a `.phnx` (restore) or straight off another disk
+/// (clone).
+pub fn finalize_fat_partition(
+    writer: &mut crate::raw::PartitionWriter,
+    target_size: u64,
+    fs: FilesystemKind,
+) -> Result<()> {
     match fs {
         FilesystemKind::Fat => patch_fat_size(writer, target_size)?,
         FilesystemKind::Exfat => patch_exfat_size(writer, target_size)?,
@@ -343,7 +357,7 @@ pub fn restore_fat(
         // writes.
         _ => {}
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Patch the FAT12/FAT16/FAT32 boot sector to match a resized target

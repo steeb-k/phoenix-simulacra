@@ -15,6 +15,7 @@ publish = false
 phoenix-core = { workspace = true }
 phoenix-capture = { workspace = true }
 phoenix-restore = { workspace = true }
+phoenix-clone = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
