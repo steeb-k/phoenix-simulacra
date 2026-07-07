@@ -201,6 +201,11 @@ struct PhoenixApp {
     /// Mount page: chosen .phnx and the currently-attached read-only mounts.
     mount_backup_path: String,
     mounts: Vec<phoenix_mount::MountSession>,
+    /// Persisted user settings and job history (loaded at startup).
+    settings: phoenix_core::appdata::Settings,
+    history: phoenix_core::appdata::History,
+    /// Wall-clock start of the currently-running job, for the history record.
+    job_started: Option<Instant>,
     status: String,
     page: Page,
     job: Option<BackgroundJob>,
@@ -219,10 +224,17 @@ impl PhoenixApp {
 
         let palette = theme::refresh(&cc.egui_ctx);
 
+        let settings = phoenix_core::appdata::Settings::load();
+        let backup_folder = settings
+            .default_backup_dir
+            .clone()
+            .unwrap_or_else(default_backup_folder);
+        let clone_verify = settings.clone_readback_verify;
+
         let mut app = Self {
             disks: Vec::new(),
             selections: HashSet::new(),
-            backup_folder: default_backup_folder(),
+            backup_folder,
             backup_name: String::new(),
             use_vss: false,
             pending_backups: Vec::new(),
@@ -237,9 +249,12 @@ impl PhoenixApp {
             clone_source_index: None,
             clone_target_index: None,
             clone_expand: false,
-            clone_verify: true,
+            clone_verify,
             mount_backup_path: String::new(),
             mounts: Vec::new(),
+            settings,
+            history: phoenix_core::appdata::History::load(),
+            job_started: None,
             status: "Ready".into(),
             page: Page::Backup,
             job: None,
@@ -354,7 +369,37 @@ impl PhoenixApp {
         }
     }
 
+    /// Append a completed-job record to the persistent history (best-effort).
+    fn record_job(
+        &mut self,
+        kind: JobKind,
+        outcome: phoenix_core::appdata::JobOutcome,
+        snap: &phoenix_core::ProgressSnapshot,
+    ) {
+        use phoenix_core::appdata::{JobKindTag, JobRecord};
+        let tag = match kind {
+            JobKind::Backup => JobKindTag::Backup,
+            JobKind::Restore => JobKindTag::Restore,
+            JobKind::Verify => JobKindTag::Verify,
+            JobKind::Clone => JobKindTag::Clone,
+        };
+        let duration = self.job_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+        let rec = JobRecord::now(
+            tag,
+            duration,
+            String::new(),
+            self.status.clone(),
+            None,
+            outcome,
+            snap.total,
+        );
+        let _ = self.history.append(rec);
+    }
+
     fn poll_job(&mut self, ctx: &egui::Context) {
+        if self.job.is_some() && self.job_started.is_none() {
+            self.job_started = Some(Instant::now());
+        }
         let Some(job) = self.job.as_mut() else {
             return;
         };
@@ -386,6 +431,12 @@ impl PhoenixApp {
                         }
                         self.total_backups = 0;
                         self.current_backup_index = 0;
+                        self.record_job(
+                            job_kind,
+                            phoenix_core::appdata::JobOutcome::Success,
+                            &final_snap,
+                        );
+                        self.job_started = None;
                         self.finish_modal(job_kind, &final_snap, JobOutcome::Success);
                     }
                 }
@@ -416,6 +467,13 @@ impl PhoenixApp {
                     }
                     self.total_backups = 0;
                     self.current_backup_index = 0;
+                    let rec_outcome = if cancelled {
+                        phoenix_core::appdata::JobOutcome::Cancelled
+                    } else {
+                        phoenix_core::appdata::JobOutcome::Failed(e.clone())
+                    };
+                    self.record_job(job_kind, rec_outcome, &final_snap);
+                    self.job_started = None;
                     self.finish_modal(job_kind, &final_snap, outcome);
                 }
             }
@@ -596,6 +654,32 @@ pub struct StartAction<'a> {
     pub label: &'a str,
     pub enabled: bool,
     pub disabled_hint: Option<&'a str>,
+}
+
+/// Format a duration in seconds as a compact "N units ago" string for the
+/// history list.
+fn relative_time(secs_ago: i64) -> String {
+    let s = secs_ago.max(0);
+    if s < 60 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{} min ago", s / 60)
+    } else if s < 86_400 {
+        format!("{} hr ago", s / 3600)
+    } else {
+        format!("{} days ago", s / 86_400)
+    }
+}
+
+/// Truncate a string to `max` chars with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Render `starts` (one or more green Start-style buttons) in a row.
@@ -1525,14 +1609,54 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "History",
-            "Previous backups, restores, and verification runs from this machine.",
+            "Previous backups, restores, clones, and verification runs from this machine.",
         );
-        let palette = self.palette;
-        coming_soon(
-            ui,
-            &palette,
-            "Job history will be tracked once persistent settings land.",
-        );
+
+        if self.history.records.is_empty() {
+            ui.label("No jobs recorded yet.");
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("Clear history").clicked() {
+                self.history.records.clear();
+                let _ = self.history.save();
+            }
+        });
+        ui.add_space(6.0);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Newest first.
+            for rec in self.history.records.iter().rev() {
+                let (label, color) = match &rec.outcome {
+                    phoenix_core::appdata::JobOutcome::Success => ("OK", self.palette.success),
+                    phoenix_core::appdata::JobOutcome::Cancelled => {
+                        ("Cancelled", self.palette.warning)
+                    }
+                    phoenix_core::appdata::JobOutcome::Failed(_) => {
+                        ("Failed", egui::Color32::from_rgb(0xD3, 0x2F, 0x2F))
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, format!("[{label}]"));
+                    ui.label(format!("{:?}", rec.kind));
+                    ui.label(relative_time(now - rec.started_unix));
+                    ui.label(format!("{}s", rec.duration_secs));
+                    ui.label(format_bytes(rec.bytes_processed));
+                    if let phoenix_core::appdata::JobOutcome::Failed(msg) = &rec.outcome {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xD3, 0x2F, 0x2F),
+                            truncate(msg, 60),
+                        );
+                    }
+                });
+            }
+        });
     }
 
     fn ui_options(&mut self, ui: &mut egui::Ui) {
@@ -1543,6 +1667,68 @@ impl PhoenixApp {
             "Application preferences and live theme info.",
         );
 
+        // --- Persisted settings ---
+        let mut changed = false;
+        ui.heading("Preferences");
+        ui.horizontal(|ui| {
+            ui.label("Default backup folder:");
+            let mut dir = self.settings.default_backup_dir.clone().unwrap_or_default();
+            if ui.text_edit_singleline(&mut dir).changed() {
+                self.settings.default_backup_dir = if dir.trim().is_empty() {
+                    None
+                } else {
+                    Some(dir)
+                };
+                changed = true;
+            }
+            if ui.button("Browse…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.settings.default_backup_dir = Some(path.display().to_string());
+                    changed = true;
+                }
+            }
+        });
+        changed |= ui
+            .checkbox(
+                &mut self.settings.verify_after_backup,
+                "Verify each backup after it completes",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.default_verify_quick,
+                "Default the Verify page to Quick verify",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.clone_readback_verify,
+                "Default clone to read-back verification",
+            )
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Theme:");
+            use phoenix_core::appdata::ThemeChoice;
+            for (choice, label) in [
+                (ThemeChoice::System, "System"),
+                (ThemeChoice::Dark, "Dark"),
+                (ThemeChoice::Light, "Light"),
+            ] {
+                if ui
+                    .selectable_label(self.settings.theme == choice, label)
+                    .clicked()
+                {
+                    self.settings.theme = choice;
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            let _ = self.settings.save();
+        }
+
+        ui.add_space(12.0);
+        ui.heading("Theme (live)");
         ui.horizontal(|ui| {
             ui.label("Accent color:");
             let (r, g, b, _) = self.palette.accent.to_tuple();
