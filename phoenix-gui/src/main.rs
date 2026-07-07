@@ -671,6 +671,15 @@ fn relative_time(secs_ago: i64) -> String {
     }
 }
 
+/// Round `v` up to a multiple of `align` (0 = no rounding).
+fn align_up_local(v: u64, align: u64) -> u64 {
+    if align == 0 {
+        v
+    } else {
+        v.div_ceil(align) * align
+    }
+}
+
 /// Truncate a string to `max` chars with an ellipsis.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1273,6 +1282,60 @@ impl PhoenixApp {
                     restore_panel::show(ui, layout, &target, &self.palette, ui.available_width());
                 if panel_out.plan_entries_updated {
                     // layout drives plan at run time
+                }
+
+                // Numeric size entry — a precise alternative to edge-dragging.
+                // Only meaningful in partial mode (full-disk auto-sizes).
+                if !layout.full_disk && !layout.assignments.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Partition sizes").color(self.palette.subtle_text),
+                    );
+                    let align = layout.align_bytes;
+                    let mut rows: Vec<(u32, u64, u64, u64)> = layout
+                        .assignments
+                        .iter()
+                        .map(|(&slot, a)| (slot, a.size_bytes, a.source_used_bytes, a.offset_bytes))
+                        .collect();
+                    rows.sort_by_key(|r| r.3); // by target offset
+                    let mut size_error: Option<String> = None;
+                    const GIB: f64 = (1u64 << 30) as f64;
+                    egui::Grid::new("restore_size_editor")
+                        .num_columns(3)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for (slot, size, used, _off) in rows {
+                                let min = align_up_local(used, align);
+                                ui.label(
+                                    layout
+                                        .assignment_label(slot, &target)
+                                        .unwrap_or_else(|| format!("Partition {slot}")),
+                                );
+                                let mut gib = size as f64 / GIB;
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut gib)
+                                        .speed(0.05)
+                                        .suffix(" GiB")
+                                        .max_decimals(2),
+                                );
+                                if resp.changed() {
+                                    let new_bytes = (gib * GIB) as u64;
+                                    if let Err(e) =
+                                        layout.set_partition_size(slot, new_bytes, &target)
+                                    {
+                                        size_error = Some(e);
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("min {}", format_bytes(min)))
+                                        .color(self.palette.subtle_text),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                    if let Some(e) = size_error {
+                        ui.colored_label(self.palette.warning, e);
+                    }
                 }
             }
         } else if self.restore_layout.is_some() {

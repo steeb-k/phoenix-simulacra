@@ -400,6 +400,54 @@ impl RestoreLayoutState {
     pub fn end_drag(&mut self) {
         self.drag = None;
     }
+
+    /// Aligned minimum size a mapped partition can shrink to (its used data).
+    pub fn min_size_for(&self, target_part: u32) -> u64 {
+        self.assignments
+            .get(&target_part)
+            .map(|a| align_up(a.source_used_bytes, self.align_bytes))
+            .unwrap_or(0)
+    }
+
+    /// Set a mapped partition's size numerically (a right-edge resize keeping
+    /// the offset fixed). Applies the same constraints as the drag path and
+    /// returns a human-readable error if the size is invalid — this is what the
+    /// numeric size field on the Restore page calls, replacing pixel-precise
+    /// dragging as the primary way to resize.
+    pub fn set_partition_size(
+        &mut self,
+        target_part: u32,
+        new_size: u64,
+        layout_disk: &DiskInfo,
+    ) -> std::result::Result<(), String> {
+        let a = self
+            .assignments
+            .get(&target_part)
+            .cloned()
+            .ok_or_else(|| "partition is not mapped to the target".to_string())?;
+        let fs = self.target_partition_fs(layout_disk, target_part);
+        if !partition_allows_resize(fs) {
+            return Err("this filesystem can't be resized (only NTFS/FAT/exFAT)".into());
+        }
+        // Never below the used data; align like the drag path.
+        let new_size = align_up(new_size.max(a.source_used_bytes), self.align_bytes);
+        if a.offset_bytes.saturating_add(new_size) > layout_disk.size_bytes {
+            return Err("size runs past the end of the target disk".into());
+        }
+        if overlaps_assignments(
+            &self.assignments,
+            target_part,
+            a.offset_bytes,
+            new_size,
+            layout_disk.size_bytes,
+        ) {
+            return Err("size would overlap the next partition".into());
+        }
+        if let Some(slot) = self.assignments.get_mut(&target_part) {
+            slot.size_bytes = new_size;
+        }
+        Ok(())
+    }
 }
 
 pub fn partition_title(p: &PartitionInfo) -> String {
