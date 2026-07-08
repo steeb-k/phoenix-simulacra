@@ -47,7 +47,18 @@ pub fn capture_ntfs(
             let mut buf = vec![0u8; to_read];
             let n = reader.read_at(base_byte + pos, &mut buf)?;
             if n == 0 {
-                break;
+                // A used extent that reads 0 bytes means the used-block map
+                // points past what the reader can read — capturing this would
+                // silently drop real data. Refuse instead of producing an
+                // incomplete backup. The offsets pinpoint the cause (reader
+                // length too short vs. an out-of-range extent).
+                return Err(PhoenixError::Other(format!(
+                    "capture_ntfs: read 0 bytes for used extent {ext_idx} at partition offset {} \
+                     (extent spans {byte_len} bytes, {pos} captured so far; reader length {}). \
+                     Refusing to write an incomplete backup.",
+                    base_byte + pos,
+                    reader.length(),
+                )));
             }
             stream.write_chunk(&buf[..n])?;
             total_used += n as u64;
