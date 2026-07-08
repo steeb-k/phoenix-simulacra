@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use eframe::egui;
 use egui::{Align2, Color32, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
-use phoenix_core::disk::{DiskInfo, FilesystemKind, PartitionInfo};
+use phoenix_core::disk::{BitlockerState, DiskInfo, FilesystemKind, PartitionInfo};
 
 use crate::fonts;
 use crate::theme::Palette;
@@ -376,7 +376,11 @@ pub fn describe_filesystem(p: &PartitionInfo) -> String {
         FilesystemKind::Unknown => None,
     };
     if let Some(label) = known {
-        return label.to_string();
+        return match p.bitlocker {
+            BitlockerState::Unlocked => format!("{label} (BitLocker, unlocked)"),
+            BitlockerState::Locked => "BitLocker (locked)".to_string(),
+            BitlockerState::None => label.to_string(),
+        };
     }
     if p.volume_path.is_some() && p.usage.is_none() {
         return "Encrypted / locked".into();

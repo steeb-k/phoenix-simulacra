@@ -301,13 +301,23 @@ fn cmd_list_disks() -> anyhow::Result<()> {
             if disk.is_gpt { "GPT" } else { "MBR" }
         );
         for p in &disk.partitions {
+            let bitlocker = match p.bitlocker {
+                phoenix_core::disk::BitlockerState::None => String::new(),
+                phoenix_core::disk::BitlockerState::Unlocked => {
+                    ", bitlocker=UNLOCKED (normal plaintext backup)".to_string()
+                }
+                phoenix_core::disk::BitlockerState::Locked => {
+                    ", bitlocker=LOCKED (backup would be raw ciphertext)".to_string()
+                }
+            };
             println!(
-                "  [{}] {} — {} bytes, fs={:?}, mode={:?}{}",
+                "  [{}] {} — {} bytes, fs={:?}, mode={:?}{}{}",
                 p.index,
                 p.name,
                 p.size_bytes,
                 p.fs_kind,
                 p.capture_mode,
+                bitlocker,
                 p.volume_path
                     .as_ref()
                     .map(|v| format!(", vol={v}"))
@@ -331,13 +341,19 @@ fn cmd_list_backup(path: &PathBuf) -> anyhow::Result<()> {
             .partitions
             .iter()
             .find(|p| p.index == e.index);
+        let bitlocker = match pm.and_then(|p| p.bitlocker.as_deref()) {
+            Some("locked") => " [BitLocker ciphertext — needs original key to unlock]",
+            Some("unlocked") => " [was BitLocker; image is plaintext]",
+            _ => "",
+        };
         println!(
-            "  Partition [{}] {} — {} / {} bytes used, {} chunks",
+            "  Partition [{}] {} — {} / {} bytes used, {} chunks{}",
             e.index,
             e.name,
             e.original_size,
             e.used_bytes,
-            pm.map(|p| p.chunks.len()).unwrap_or(0)
+            pm.map(|p| p.chunks.len()).unwrap_or(0),
+            bitlocker
         );
     }
     Ok(())

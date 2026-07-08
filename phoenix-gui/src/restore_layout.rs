@@ -5,7 +5,7 @@ use std::path::Path;
 
 use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
 use phoenix_core::disk::{DiskInfo, FilesystemKind, PartitionInfo, PartitionUsage};
-use phoenix_core::manifest::fs_kind_from_string;
+use phoenix_core::manifest::{bitlocker_state_from_manifest, fs_kind_from_string};
 use phoenix_restore::plan::{
     align_up, alignment_bytes, build_full_disk_plan, build_partial_plan, partition_allows_resize,
     RestorePlan,
@@ -61,6 +61,14 @@ pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
             size_bytes: e.original_size,
             fs_kind: fs_kind_for_entry(reader, e),
             capture_mode: e.capture_mode,
+            bitlocker: bitlocker_state_from_manifest(
+                reader
+                    .manifest
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == e.index)
+                    .and_then(|p| p.bitlocker.as_deref()),
+            ),
             volume_path: None,
             drive_letter: None,
             volume_label: None,
@@ -224,6 +232,7 @@ impl RestoreLayoutState {
                     size_bytes: a.size_bytes,
                     fs_kind: src.fs_kind,
                     capture_mode: src.capture_mode,
+                    bitlocker: src.bitlocker,
                     volume_path: None,
                     drive_letter: src.drive_letter,
                     volume_label: src.volume_label.clone(),
