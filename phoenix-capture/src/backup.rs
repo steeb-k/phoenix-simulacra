@@ -419,10 +419,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 }
 
 /// Re-read a partition's source and confirm every recorded chunk still hashes
-/// to its captured value. Each chunk is located directly from its `(extent,
-/// chunk_index)` position (chunks are `CHUNK_SIZE`-aligned within an extent, or
-/// within the whole partition for raw capture), so this doesn't depend on the
-/// capture walk order.
+/// to its captured value. Chunk byte offsets are reconstructed by accumulating
+/// each chunk's `uncompressed_len` within its extent — NOT by assuming
+/// `CHUNK_SIZE` alignment, because capture advances by the actual bytes read
+/// and raw volume reads can be short (which shifts later chunks). Reads fill the
+/// exact recorded length so a short device read doesn't cause a false mismatch.
 fn verify_partition_against_source(
     reader: &mut impl BlockSource,
     extents: &[Extent],
@@ -430,6 +431,8 @@ fn verify_partition_against_source(
     expected: &[phoenix_core::manifest::ChunkRecord],
 ) -> Result<()> {
     let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut cur_extent: Option<u32> = None;
+    let mut offset = 0u64;
     for rec in expected {
         let len = rec.uncompressed_len as usize;
         if len == 0 || len > CHUNK_SIZE {
@@ -438,23 +441,36 @@ fn verify_partition_against_source(
                 rec.extent_index, rec.chunk_index
             )));
         }
-        let base = if capture_mode == CaptureMode::Raw {
-            0
-        } else {
-            let ext = extents.get(rec.extent_index as usize).ok_or_else(|| {
-                PhoenixError::Other(format!(
-                    "chunk references extent {} of {}",
-                    rec.extent_index,
-                    extents.len()
-                ))
-            })?;
-            ext.start_sector * EXTENT_LBA_BYTES as u64
-        };
-        let offset = base + rec.chunk_index as u64 * CHUNK_SIZE as u64;
-        let n = reader.read_at(offset, &mut buf[..len])?;
-        if n != len {
+        // Reset to the extent's base whenever we enter a new extent; within an
+        // extent, chunks are contiguous, so we accumulate their lengths.
+        if cur_extent != Some(rec.extent_index) {
+            cur_extent = Some(rec.extent_index);
+            offset = if capture_mode == CaptureMode::Raw {
+                0
+            } else {
+                let ext = extents.get(rec.extent_index as usize).ok_or_else(|| {
+                    PhoenixError::Other(format!(
+                        "chunk references extent {} of {}",
+                        rec.extent_index,
+                        extents.len()
+                    ))
+                })?;
+                ext.start_sector * EXTENT_LBA_BYTES as u64
+            };
+        }
+
+        // Read exactly `len` bytes (looping over short reads).
+        let mut got = 0usize;
+        while got < len {
+            let n = reader.read_at(offset + got as u64, &mut buf[got..len])?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        if got != len {
             return Err(PhoenixError::Other(format!(
-                "source read {n} bytes, expected {len} at offset {offset} (extent {}, chunk {})",
+                "source read {got} bytes, expected {len} at offset {offset} (extent {}, chunk {})",
                 rec.extent_index, rec.chunk_index
             )));
         }
@@ -465,6 +481,7 @@ fn verify_partition_against_source(
                 rec.extent_index, rec.chunk_index
             )));
         }
+        offset += len as u64;
     }
     Ok(())
 }
