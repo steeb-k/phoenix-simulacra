@@ -11,8 +11,9 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
 - Used-block imaging (smaller than full disk images)
 - Restore with partition resizing (NTFS grow + shrink-with-relocation, FAT/exFAT grow)
 - **Disk-to-disk cloning** (`clone`), including live system disks via VSS, with resize
-- **Read-only mounting** (`mount`) — browse a backup's files in Explorer; the image
-  is materialized to a sparse VHD (footprint ≈ used size) and attached read-only
+- **Read-only mounting** (`mount`) — browse a backup's files in Explorer with **zero
+  extra disk space**: a WinFsp filesystem serves a synthesized `backup.vhd` on demand
+  straight from the compressed `.phnx`, and Windows attaches it read-only
 - Bulletproof verification: format v2 checksums every metadata structure (footer CRC,
   total-length/truncation check, index-table hash, per-entry CRC); `verify --quick`
   runs a structural + sampled check, `verify` hashes every chunk
@@ -20,12 +21,12 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
 - VSS support for live Windows backups (`--vss` / GUI checkbox)
 - CLI and egui GUI (WinPE-friendly, no WebView2)
 
-> **Mount is not yet space-efficient.** The current mount materializes a full-size
-> temporary VHD (Windows rejects sparse fixed VHDs). The required implementation —
-> tracked as top priority — is a **WinFsp on-demand mount** that serves reads
-> straight from the `.phnx` with **zero extra disk space**; mounting must never
-> double a backup's footprint. Until that lands, mount is a stopgap suitable only
-> for small backups.
+> **Mounting requires WinFsp** and is enabled by the `winfsp` build feature (release
+> builds). It adds no meaningful disk footprint — reads are served on demand from the
+> compressed `.phnx`. Install WinFsp from [winfsp.dev](https://winfsp.dev) (release
+> builds bundle it). A build *without* the `winfsp` feature falls back to
+> materializing a full-size temp VHD — a dev-only stopgap, never used when the
+> feature is on.
 
 ## Build
 
