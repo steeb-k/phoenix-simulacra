@@ -90,7 +90,11 @@ fn compare_vhd_footer_with_windows() {
         .arg("/s")
         .arg({
             let s = dir.join(format!("dp2-{}.txt", uuid::Uuid::new_v4().simple()));
-            std::fs::write(&s, format!("select vdisk file=\"{vhd_str}\"\ndetach vdisk\n")).ok();
+            std::fs::write(
+                &s,
+                format!("select vdisk file=\"{vhd_str}\"\ndetach vdisk\n"),
+            )
+            .ok();
             s
         })
         .output();

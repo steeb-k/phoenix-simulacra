@@ -157,26 +157,14 @@ fn derive_guid(disk_guid: &[u8; 16], index: u32) -> [u8; 16] {
 }
 
 #[cfg(windows)]
-fn make_sparse(file: &std::fs::File) {
-    use std::os::windows::io::AsRawHandle;
-    // FSCTL_SET_SPARSE = 0x000900C4.
-    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
-    let handle = file.as_raw_handle();
-    let mut returned = 0u32;
-    unsafe {
-        windows_sys::Win32::System::IO::DeviceIoControl(
-            handle,
-            FSCTL_SET_SPARSE,
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            0,
-            &mut returned,
-            std::ptr::null_mut(),
-        );
-    }
-    // Best-effort: if the volume doesn't support sparse files the image still
-    // materializes correctly, just larger.
+fn make_sparse(_file: &std::fs::File) {
+    // NOTE: the Windows virtual-disk driver rejects a *fixed* VHD stored in a
+    // sparse file (OpenVirtualDisk returns 0xC03A001A even though the footer is
+    // byte-for-byte valid). So we no longer mark the image sparse. This means a
+    // fixed-VHD mount currently allocates the full disk size on disk; the
+    // space-efficient path is a dynamic VHD (BAT-backed), tracked as a
+    // follow-up. Small backups mount fine; very large ones should use the
+    // dynamic-VHD or WinFsp path once implemented.
 }
 
 #[cfg(not(windows))]
