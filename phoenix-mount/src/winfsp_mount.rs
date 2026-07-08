@@ -323,18 +323,23 @@ impl Drop for WinFspMount {
 fn ensure_winfsp() -> Result<()> {
     static INIT: Once = Once::new();
     static OK: AtomicBool = AtomicBool::new(false);
-    INIT.call_once(|| {
-        if let Ok(token) = winfsp::winfsp_init() {
+    static ERR: Mutex<Option<String>> = Mutex::new(None);
+    INIT.call_once(|| match winfsp::winfsp_init() {
+        Ok(token) => {
             std::mem::forget(token);
             OK.store(true, Ordering::SeqCst);
+        }
+        Err(e) => {
+            *ERR.lock().unwrap() = Some(format!("{e:?}"));
         }
     });
     if OK.load(Ordering::SeqCst) {
         Ok(())
     } else {
-        Err(PhoenixError::Other(
-            "WinFsp initialization failed — is WinFsp installed? (https://winfsp.dev)".into(),
-        ))
+        let detail = ERR.lock().unwrap().clone().unwrap_or_default();
+        Err(PhoenixError::Other(format!(
+            "WinFsp initialization failed ({detail}) — is WinFsp installed? (https://winfsp.dev)"
+        )))
     }
 }
 

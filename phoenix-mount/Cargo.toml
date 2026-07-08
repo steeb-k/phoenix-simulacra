@@ -9,7 +9,9 @@ authors = { workspace = true }
 phoenix-core = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
-winfsp = { version = "0.13", optional = true }
+# `system` makes winfsp_init locate winfsp-<arch>.dll via the registry
+# InstallDir (WinFsp's bin isn't on PATH) instead of a bare LoadLibrary.
+winfsp = { version = "0.13", optional = true, features = ["system"] }
 widestring = { version = "1", optional = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
