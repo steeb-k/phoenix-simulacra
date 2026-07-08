@@ -33,7 +33,13 @@ pub fn capture_raw(
         let to_read = CHUNK_SIZE.min((reader.length() - pos) as usize);
         let n = reader.read_at(pos, &mut chunk_buf[..to_read])?;
         if n == 0 {
-            break;
+            // A raw partition should be fully readable; a 0-byte read before the
+            // end means we'd drop the tail. Never silently produce a short image.
+            return Err(PhoenixError::Other(format!(
+                "capture_raw: read 0 bytes at offset {pos} (partition length {}). \
+                 Refusing to write an incomplete backup.",
+                reader.length(),
+            )));
         }
         stream.write_chunk(&chunk_buf[..n])?;
         pos += n as u64;

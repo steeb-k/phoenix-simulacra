@@ -47,7 +47,15 @@ pub fn capture_fat(
             let mut buf = vec![0u8; to_read];
             let n = reader.read_at(base + pos, &mut buf)?;
             if n == 0 {
-                break;
+                // A used FAT extent that reads 0 bytes means the used-block map
+                // points past the readable partition — never silently drop it.
+                return Err(PhoenixError::Other(format!(
+                    "capture_fat: read 0 bytes for used extent {ext_idx} at offset {} \
+                     (extent spans {byte_len} bytes, {pos} captured; reader length {}). \
+                     Refusing to write an incomplete backup.",
+                    base + pos,
+                    reader.length(),
+                )));
             }
             stream.write_chunk(&buf[..n])?;
             total_used += n as u64;
