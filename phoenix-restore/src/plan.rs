@@ -294,53 +294,70 @@ pub fn default_plan_from_backup(
 /// source had inter-partition gaps (e.g. an MSR partition) — the clamp keeps
 /// the reconstructed layout valid. Returns `(offset, size)` per input size.
 fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> {
+    // GPT reserves 34 LBAs at the front (protective MBR + primary header +
+    // entry array) and 33 at the back (backup entry array + header). No
+    // partition may start before the front reserve or end past the back one.
+    const GPT_LEADING_BYTES: u64 = 34 * 512;
     const GPT_TRAILING_BYTES: u64 = 33 * 512;
-    /// Hard floor for partition starts: logical-sector alignment — the same
-    /// floor diskpart itself uses when it packs a partition tightly after the
-    /// MSR (observed start 16825856 = sector 32863, 512-aligned but not
-    /// 4 KiB-aligned). The 1 MiB `align` is a performance preference; this is
-    /// the correctness minimum.
-    const SECTOR_ALIGN: u64 = 512;
     let usable_end = disk_size.saturating_sub(GPT_TRAILING_BYTES);
     let n = sizes.len();
     if n == 0 {
         return Vec::new();
     }
-
-    // Pack all but the last partition from the front, aligning each start.
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
-    let mut offset = align;
-    for &sz in &sizes[..n - 1] {
-        let off = align_up(offset, align);
-        out.push((off, sz));
-        offset = off + sz;
-    }
-    let earlier_end = out.last().map(|(o, s)| o + s).unwrap_or(align);
-
-    // Anchor the LAST partition's end at the disk's usable end, keeping its
-    // ORIGINAL size. A `.phnx` records partition sizes but not their source
-    // offsets, so packing purely from the front and aligning up drifts the
-    // tail past the disk end when the source packed it tight after an MSR.
-    // Anchoring reconstructs the last partition at its true end position with
-    // no shrink — which matters because a raw-captured (exFAT) or
-    // fixed-geometry (FAT) partition can't be shrunk, so a clamp would trip
-    // PartitionTooSmall. Anchoring works whenever the earlier partitions don't
-    // reach into it (they didn't on the source).
     let last = sizes[n - 1];
-    let anchored_start = align_down(usable_end.saturating_sub(last), SECTOR_ALIGN);
-    if last > 0 && anchored_start >= earlier_end {
-        out.push((anchored_start, last));
-    } else {
-        // Earlier partitions reach the anchor (or the single partition doesn't
-        // fit). Pack the last right after them at sector alignment, keeping the
-        // original size if it fits, clamping only if it truly can't.
-        let off = align_up(earlier_end, SECTOR_ALIGN);
-        let size = if off.saturating_add(last) <= usable_end {
-            last
+
+    // A `.phnx` records partition sizes but not their source disk offsets, so
+    // we reconstruct the layout by packing the earlier partitions from the
+    // front and anchoring the LAST partition's end at the disk's usable end —
+    // keeping every original size (no shrink), which is essential for
+    // raw-captured (exFAT) or fixed-geometry (FAT) partitions that can't be
+    // resized. The only free variable is how tightly to pack:
+    //
+    //   * 1 MiB alignment is the modern performance default (and what a fresh
+    //     diskpart layout uses when there's slack).
+    //   * When the partitions nearly fill the disk (the source packed them
+    //     right after the GPT header with no 1 MiB lead — observed: MSR + data
+    //     leaving only ~80 KiB free), 1 MiB alignment doesn't fit, so fall back
+    //     to 4 KiB alignment with a minimal GPT-boundary lead.
+    //
+    // Try each packing from most- to least-preferred; the first whose earlier
+    // partitions end before the anchored last partition wins.
+    let min_lead_4k = align_up(GPT_LEADING_BYTES, 4096);
+    for &(lead, a) in &[
+        (align.max(GPT_LEADING_BYTES), align),
+        (min_lead_4k, 4096u64),
+    ] {
+        let anchored_start = align_down(usable_end.saturating_sub(last), a);
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
+        let mut offset = lead;
+        for &sz in &sizes[..n - 1] {
+            let off = align_up(offset, a).max(lead);
+            out.push((off, sz));
+            offset = off + sz;
+        }
+        let earlier_end = out.last().map(|(o, s)| o + s).unwrap_or(lead);
+        if last > 0 && anchored_start >= earlier_end {
+            out.push((anchored_start, last));
+            return out;
+        }
+    }
+
+    // Tightest fallback: the partitions genuinely don't fit at full size. Pack
+    // sequentially at 4 KiB from the GPT boundary and clamp the last partition
+    // to leave room for the backup GPT. `validate_against_backup` then enforces
+    // that the used data still fits and surfaces PartitionTooSmall if not.
+    let a = 4096u64;
+    let mut out = Vec::with_capacity(n);
+    let mut offset = min_lead_4k;
+    for (i, &sz) in sizes.iter().enumerate() {
+        let off = align_up(offset, a).max(min_lead_4k);
+        let size = if i + 1 == n && off.saturating_add(sz) > usable_end {
+            align_down(usable_end.saturating_sub(off), a)
         } else {
-            align_down(usable_end.saturating_sub(off), SECTOR_ALIGN)
+            sz
         };
         out.push((off, size));
+        offset = off + size;
     }
     out
 }
@@ -641,9 +658,10 @@ mod tests {
             end <= disk - 33 * 512,
             "last partition ends at {end}, past the GPT usable end on a {disk}-byte disk"
         );
-        // Offsets are aligned.
+        // Starts stay at least logical-sector-aligned (the tight fallback relaxes
+        // the 1 MiB preference to 4 KiB when partitions nearly fill the disk).
         for (off, _) in &placed {
-            assert_eq!(off % align, 0, "offset {off} not aligned");
+            assert_eq!(off % 4096, 0, "offset {off} not 4 KiB-aligned");
         }
     }
 
@@ -657,10 +675,13 @@ mod tests {
         // clamp shrank the partition by ~980 KiB → PartitionTooSmall for a
         // fixed-geometry filesystem. The pack must keep the ORIGINAL size by
         // relaxing the start to 4 KiB alignment instead.
-        let disk = 512 * 1024 * 1024u64;
+        // Exact sizes captured from the failing hardware run (via the test's
+        // diagnostic print): MSR + exFAT sum to 536787968 on a 536870912-byte
+        // disk, leaving only ~80 KiB — no room for a 1 MiB lead.
+        let disk = 536_870_912u64;
         let align = 1024 * 1024u64;
-        let msr = 15_777_280u64; // 1 MiB..16825856, as diskpart laid it out
-        let data = 520_028_160u64; // reaches exactly the GPT usable end
+        let msr = 16_759_808u64;
+        let data = 520_028_160u64; // reaches ~the GPT usable end
         let placed = pack_full_disk(&[msr, data], disk, align);
         let (off, size) = placed[1];
         assert_eq!(size, data, "fixed-geometry partition must not be shrunk");
