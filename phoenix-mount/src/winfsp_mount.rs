@@ -13,7 +13,8 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Once};
 
 use widestring::U16CStr;
 use winfsp::filesystem::{
@@ -242,6 +243,7 @@ impl WinFspMount {
     /// Mount `backup` read-only with zero materialization. `scratch_dir` holds
     /// the transient WinFsp mount point (a directory, not a drive letter).
     pub fn mount(backup: &Path, scratch_dir: &Path) -> Result<Self> {
+        ensure_winfsp()?;
         let reader = PhnxReader::open(backup)?;
         let backup_id = reader.header.backup_id;
         let vhd = SyntheticVhd::build(reader)?;
@@ -311,6 +313,28 @@ impl Drop for WinFspMount {
         self.host.stop();
         self.host.unmount();
         let _ = std::fs::remove_dir_all(&self.mount_dir);
+    }
+}
+
+/// Initialize WinFsp once per process. `winfsp_init` loads winfsp-<arch>.dll
+/// from the WinFsp install directory (via the registry) so the delay-loaded
+/// symbols resolve; it must run before any other WinFsp call. The returned
+/// token is leaked so WinFsp stays initialized for the process lifetime.
+fn ensure_winfsp() -> Result<()> {
+    static INIT: Once = Once::new();
+    static OK: AtomicBool = AtomicBool::new(false);
+    INIT.call_once(|| {
+        if let Ok(token) = winfsp::winfsp_init() {
+            std::mem::forget(token);
+            OK.store(true, Ordering::SeqCst);
+        }
+    });
+    if OK.load(Ordering::SeqCst) {
+        Ok(())
+    } else {
+        Err(PhoenixError::Other(
+            "WinFsp initialization failed — is WinFsp installed? (https://winfsp.dev)".into(),
+        ))
     }
 }
 
