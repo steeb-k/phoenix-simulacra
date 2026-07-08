@@ -162,6 +162,7 @@ fn fat16_capture_reproduces_used_clusters() {
             capture_mode: "used-blocks".into(),
             original_size: (g.total_sectors * SECTOR) as u64,
             used_bytes,
+            bitlocker: None,
             chunks,
             bitmap_hash,
         }],

@@ -142,6 +142,7 @@ mod tests {
                 capture_mode: "used-blocks".into(),
                 original_size: ext_bytes as u64,
                 used_bytes: ext_bytes as u64,
+                bitlocker: None,
                 chunks,
                 bitmap_hash: None,
             }],

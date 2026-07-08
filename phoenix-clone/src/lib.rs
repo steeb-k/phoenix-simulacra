@@ -234,7 +234,13 @@ fn clone_one_partition(
     // disk), plan extents, lock if reading a live mounted volume. ---
     let original_volume = part.volume_path.clone();
     let mut vss = phoenix_vss::VssSession::new();
-    let read_path = if opts.use_vss {
+    // A locked BitLocker volume must be read through the PHYSICAL disk
+    // handle: fvevol rejects volume-device reads with FVE_E_LOCKED_VOLUME
+    // (0x80310000) until unlock, and there's no filesystem for VSS to
+    // snapshot. Same rule as the backup path in phoenix-capture.
+    let read_path = if part.bitlocker == phoenix_core::disk::BitlockerState::Locked {
+        source.path.clone()
+    } else if opts.use_vss {
         if let Some(ref vol) = original_volume {
             vss.snapshot_volume(vol)?
         } else {

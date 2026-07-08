@@ -230,6 +230,20 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             .unwrap();
 
         let fs = fs_kind_from_string(&part_manifest.fs);
+        if part_manifest.bitlocker.as_deref() == Some("locked") {
+            warn!(
+                partition = src_index,
+                "this partition was captured from a BitLocker-LOCKED volume: restoring raw \
+                 ciphertext. The restored volume will be encrypted and requires the original \
+                 BitLocker key/recovery password to unlock."
+            );
+            if let Some(ref p) = opts.progress {
+                p.set_detail(format!(
+                    "Partition {src_index} is BitLocker ciphertext — the restored volume will \
+                     need its original recovery key"
+                ));
+            }
+        }
         let mut writer =
             PartitionWriter::open_disk(&disk.path, entry.target_offset_bytes, disk.sector_size)?;
 
@@ -630,9 +644,9 @@ fn build_mbr_layout_entries(plan: &RestorePlan, reader: &PhnxReader) -> Vec<MbrL
 ///   * 0x0C  FAT32 LBA — what modern Windows formats default to
 ///   * 0xEF  EFI System Partition (rare on MBR; legal but unusual)
 ///
-/// Ambiguous source (MSR, BitLocker, Unknown) falls back to 0x07 with
-/// a warning — MSR on MBR isn't a real thing, BitLocker volumes
-/// preserve as 0x07 on round-trip, and Unknown means we couldn't
+/// BitLocker volumes map to 0x07 (they live in ordinary IFS partitions).
+/// Ambiguous source (MSR, Unknown) falls back to 0x07 with a warning —
+/// MSR on MBR isn't a real thing, and Unknown means we couldn't
 /// classify but the user asked us to restore it anyway.
 fn mbr_partition_type_for(idx_entry: Option<&PartitionIndexEntry>, size_bytes: u64) -> u8 {
     let Some(idx) = idx_entry else {
@@ -642,6 +656,10 @@ fn mbr_partition_type_for(idx_entry: Option<&PartitionIndexEntry>, size_bytes: u
     match idx.fs_kind {
         FilesystemKind::Ntfs => 0x07,
         FilesystemKind::Exfat => 0x07,
+        // A BitLocker data volume lives in an ordinary 0x07 (IFS) MBR
+        // partition — the FVE header replaces the filesystem boot sector,
+        // not the partition type — so a ciphertext round-trip preserves it.
+        FilesystemKind::Bitlocker => 0x07,
         FilesystemKind::Fat => {
             // Modern Windows always formats FAT32 with type 0x0C (LBA).
             // The 32 MiB threshold is the classic FAT16-vs-FAT32
@@ -655,7 +673,7 @@ fn mbr_partition_type_for(idx_entry: Option<&PartitionIndexEntry>, size_bytes: u
             }
         }
         FilesystemKind::Efi => 0xEF,
-        FilesystemKind::Msr | FilesystemKind::Bitlocker | FilesystemKind::Unknown => {
+        FilesystemKind::Msr | FilesystemKind::Unknown => {
             warn!(
                 fs = ?idx.fs_kind,
                 index = idx.index,

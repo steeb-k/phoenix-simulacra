@@ -1148,6 +1148,7 @@ mod tests {
                 capture_mode: "used-blocks".into(),
                 original_size: 4096,
                 used_bytes: 8192,
+                bitlocker: None,
                 chunks,
                 bitmap_hash: None,
             }],

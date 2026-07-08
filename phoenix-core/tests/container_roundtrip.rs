@@ -79,6 +79,7 @@ fn phnx_write_read_manifest() {
             capture_mode: "raw".into(),
             original_size: 4096,
             used_bytes: 4096,
+            bitlocker: None,
             chunks: vec![ChunkRecord {
                 chunk_index: 0,
                 extent_index: 0,

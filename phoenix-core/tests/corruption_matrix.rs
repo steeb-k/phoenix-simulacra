@@ -83,6 +83,7 @@ fn build_backup() -> std::path::PathBuf {
             capture_mode: "used-blocks".into(),
             original_size: (ext0_bytes + ext1_bytes) as u64,
             used_bytes: (ext0_bytes + ext1_bytes) as u64,
+            bitlocker: None,
             chunks,
             bitmap_hash: None,
         }],

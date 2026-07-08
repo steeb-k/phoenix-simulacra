@@ -50,6 +50,33 @@ impl FilesystemKind {
     }
 }
 
+/// Per-partition BitLocker status, derived by comparing the *on-disk*
+/// (physical) view of the boot sector with the *volume-device* view.
+///
+/// The two views differ exactly when BitLocker is unlocked: the physical
+/// sectors hold FVE ciphertext (`-FVE-FS-`), but the volume device — the
+/// handle capture actually reads through — presents the decrypted
+/// filesystem. That makes this classification impossible to get wrong
+/// relative to the bytes a backup would stream:
+///
+/// - [`BitlockerState::Unlocked`]: disk view says BitLocker, volume view
+///   reads a real filesystem → used-block capture streams **plaintext**;
+///   the resulting image is a normal, unencrypted, restorable backup.
+/// - [`BitlockerState::Locked`]: every readable view is ciphertext → the
+///   partition must be captured raw, and a restore reproduces the locked
+///   volume (the original BitLocker key is still required to unlock it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BitlockerState {
+    /// Not a BitLocker volume.
+    #[default]
+    None,
+    /// BitLocker volume whose decrypted view is readable; captured as a
+    /// normal used-block backup containing plaintext.
+    Unlocked,
+    /// BitLocker volume we can only read as ciphertext; captured raw.
+    Locked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CaptureMode {
@@ -96,6 +123,10 @@ pub struct PartitionInfo {
     pub size_bytes: u64,
     pub fs_kind: FilesystemKind,
     pub capture_mode: CaptureMode,
+    /// BitLocker lock state (see [`BitlockerState`]). Drives whether a
+    /// BitLocker partition gets a normal used-block (plaintext) capture or
+    /// a raw ciphertext capture, and is recorded in the backup manifest.
+    pub bitlocker: BitlockerState,
     pub volume_path: Option<String>,
     pub drive_letter: Option<char>,
     pub volume_label: Option<String>,
@@ -143,6 +174,14 @@ pub fn enumerate_disks() -> Result<Vec<DiskInfo>> {
     for disk in &mut disks {
         for part in &mut disk.partitions {
             refine_partition_fs(part);
+            // BitLocker lock-state detection needs the *physical* view of
+            // the partition's boot sector (the volume-device view above
+            // presents plaintext once BitLocker is unlocked), so it can't
+            // live inside refine_partition_fs — do it here where the disk
+            // path is in scope.
+            let on_disk =
+                classify_partition_on_disk(&disk.path, part.offset_bytes, disk.sector_size);
+            apply_bitlocker_state(part, on_disk);
         }
     }
     Ok(disks)
@@ -169,6 +208,42 @@ pub fn open_disk_readonly(path: &str) -> Result<HANDLE> {
 
 pub fn open_volume_readonly(path: &str) -> Result<HANDLE> {
     open_disk_readonly(path)
+}
+
+/// Force-dismount a mounted volume (`\\.\X:`) via `FSCTL_DISMOUNT_VOLUME`.
+/// The volume object is torn down **in place** (not ejected), so the next
+/// access re-mounts it fresh and re-reads the on-disk boot sector.
+///
+/// This is the media-agnostic way to make Windows re-recognize a volume whose
+/// sectors were rewritten underneath a live mount — notably a raw BitLocker
+/// ciphertext restore, where the `-FVE-FS-` header lands *after* Windows has
+/// already cached a non-BitLocker view of the freshly-created partition. It
+/// works on removable USB media, where `Set-Disk -IsOffline` and diskpart
+/// `offline disk` are rejected ("Removable media cannot be set to offline").
+pub fn dismount_volume(volume_path: &str) -> Result<()> {
+    const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
+    let handle = open_volume_readonly(volume_path)?;
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_DISMOUNT_VOLUME,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    let err = unsafe { GetLastError() };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return Err(PhoenixError::Disk(format!(
+            "FSCTL_DISMOUNT_VOLUME on {volume_path} failed (Win32 error {err})"
+        )));
+    }
+    Ok(())
 }
 
 fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
@@ -208,6 +283,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         size_bytes: e.length,
                         fs_kind,
                         capture_mode,
+                        bitlocker: BitlockerState::None,
                         volume_path,
                         drive_letter,
                         volume_label,
@@ -237,6 +313,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         size_bytes: e.length,
                         fs_kind,
                         capture_mode: CaptureMode::Raw,
+                        bitlocker: BitlockerState::None,
                         volume_path,
                         drive_letter,
                         volume_label,
@@ -747,6 +824,110 @@ pub fn refine_partition_fs(part: &mut PartitionInfo) {
     }
 }
 
+/// Classify the **on-disk (physical) view** of a partition's boot sector by
+/// reading through the disk device (`\\.\PhysicalDriveN`) at the partition
+/// offset. For a BitLocker volume this always sees the FVE ciphertext header
+/// (`-FVE-FS-`) regardless of lock state — unlike the volume-device view,
+/// which presents the decrypted filesystem once the volume is unlocked.
+/// Comparing the two views is what tells us a volume is BitLocker *and*
+/// unlocked (see [`apply_bitlocker_state`]).
+///
+/// Reads `max(512, sector_size)` bytes so the read stays sector-aligned on
+/// 4Kn media. Returns `None` on any open/seek/read failure or when no FS
+/// magic is recognized.
+pub fn classify_partition_on_disk(
+    disk_path: &str,
+    offset_bytes: u64,
+    sector_size: u32,
+) -> Option<FilesystemKind> {
+    use windows_sys::Win32::Storage::FileSystem::SetFilePointerEx;
+
+    let wide = to_wide(disk_path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0x8000_0000, // GENERIC_READ
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        debug!(
+            disk = disk_path,
+            err = unsafe { GetLastError() },
+            "classify_partition_on_disk: CreateFileW failed"
+        );
+        return None;
+    }
+
+    let read_len = (sector_size.max(512)) as usize;
+    let mut buf = vec![0u8; read_len];
+    let mut read = 0u32;
+    let ok = unsafe {
+        let mut new_pos = 0i64;
+        if SetFilePointerEx(handle, offset_bytes as i64, &mut new_pos, 0) == 0 {
+            CloseHandle(handle);
+            return None;
+        }
+        ReadFile(
+            handle,
+            buf.as_mut_ptr(),
+            read_len as u32,
+            &mut read,
+            ptr::null_mut(),
+        )
+    };
+    let read_err = unsafe { GetLastError() };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 || (read as usize) < 512 {
+        debug!(
+            disk = disk_path,
+            offset = offset_bytes,
+            read = read,
+            err = read_err,
+            "classify_partition_on_disk: read failed or short"
+        );
+        return None;
+    }
+    classify_boot_sector(&buf[..512])
+}
+
+/// Combine the volume-device view (already refined into `part.fs_kind`) with
+/// the on-disk physical view of the boot sector to resolve the partition's
+/// BitLocker state, adjusting `fs_kind`/`capture_mode` for the locked case.
+///
+/// Decision table (`on_disk` = physical view, `part.fs_kind` = volume view):
+///
+/// | on_disk       | volume view       | result                                   |
+/// |---------------|-------------------|------------------------------------------|
+/// | BitLocker     | NTFS/FAT/exFAT    | `Unlocked` — normal used-block capture   |
+/// | BitLocker     | anything else     | `Locked` — fs=Bitlocker, raw ciphertext  |
+/// | not BitLocker | Bitlocker         | `Locked` — volume handle reads FVE bytes |
+/// | not BitLocker | anything else     | `None`                                   |
+///
+/// The third row covers the "metadata-shadowed" volume view (the volume
+/// device itself presents `-FVE-FS-`): whatever handle capture opens will
+/// read ciphertext, so raw is the only capture that faithfully round-trips.
+pub fn apply_bitlocker_state(part: &mut PartitionInfo, on_disk: Option<FilesystemKind>) {
+    let disk_is_fve = on_disk == Some(FilesystemKind::Bitlocker);
+    let volume_is_plaintext = matches!(
+        part.fs_kind,
+        FilesystemKind::Ntfs | FilesystemKind::Fat | FilesystemKind::Exfat
+    );
+    if disk_is_fve && volume_is_plaintext {
+        part.bitlocker = BitlockerState::Unlocked;
+    } else if disk_is_fve || part.fs_kind == FilesystemKind::Bitlocker {
+        part.bitlocker = BitlockerState::Locked;
+        part.fs_kind = FilesystemKind::Bitlocker;
+        part.capture_mode = CaptureMode::Raw;
+    } else {
+        part.bitlocker = BitlockerState::None;
+    }
+}
+
 /// Extract the drive letter (e.g. `'C'`) from a `\\.\X:` style volume path.
 pub fn parse_drive_letter(volume_path: &str) -> Option<char> {
     // Accept formats produced by find_volume_for_partition (`\\.\X:`) and the
@@ -1008,6 +1189,83 @@ mod tests {
     fn classify_boot_sector_returns_none_for_garbage() {
         let buf = [0u8; 512];
         assert_eq!(classify_boot_sector(&buf), None);
+    }
+
+    fn part_with(fs_kind: FilesystemKind, capture_mode: CaptureMode) -> PartitionInfo {
+        PartitionInfo {
+            index: 0,
+            name: "test".into(),
+            type_guid: [0u8; 16],
+            gpt_attributes: 0,
+            offset_bytes: 1024 * 1024,
+            size_bytes: 64 * 1024 * 1024,
+            fs_kind,
+            capture_mode,
+            bitlocker: BitlockerState::None,
+            volume_path: Some(r"\\.\X:".into()),
+            drive_letter: Some('X'),
+            volume_label: None,
+            usage: None,
+            sector_size: 512,
+        }
+    }
+
+    #[test]
+    fn bitlocker_unlocked_keeps_used_block_capture() {
+        // Physical view = FVE ciphertext, volume view = plaintext NTFS:
+        // the unlocked case must stay a completely normal capture.
+        let mut p = part_with(FilesystemKind::Ntfs, CaptureMode::UsedBlocks);
+        apply_bitlocker_state(&mut p, Some(FilesystemKind::Bitlocker));
+        assert_eq!(p.bitlocker, BitlockerState::Unlocked);
+        assert_eq!(p.fs_kind, FilesystemKind::Ntfs);
+        assert_eq!(p.capture_mode, CaptureMode::UsedBlocks);
+    }
+
+    #[test]
+    fn bitlocker_unlocked_fat_and_exfat_also_normal() {
+        for fs in [FilesystemKind::Fat, FilesystemKind::Exfat] {
+            let mut p = part_with(fs, CaptureMode::UsedBlocks);
+            apply_bitlocker_state(&mut p, Some(FilesystemKind::Bitlocker));
+            assert_eq!(p.bitlocker, BitlockerState::Unlocked);
+            assert_eq!(p.fs_kind, fs);
+            assert_eq!(p.capture_mode, CaptureMode::UsedBlocks);
+        }
+    }
+
+    #[test]
+    fn bitlocker_locked_forces_raw() {
+        // Physical view = FVE, volume view unreadable/unknown: locked.
+        let mut p = part_with(FilesystemKind::Unknown, CaptureMode::Raw);
+        apply_bitlocker_state(&mut p, Some(FilesystemKind::Bitlocker));
+        assert_eq!(p.bitlocker, BitlockerState::Locked);
+        assert_eq!(p.fs_kind, FilesystemKind::Bitlocker);
+        assert_eq!(p.capture_mode, CaptureMode::Raw);
+    }
+
+    #[test]
+    fn bitlocker_locked_when_volume_view_is_fve() {
+        // Volume device itself presents -FVE-FS- (metadata-shadowed view),
+        // even if the physical read failed: capture reads ciphertext → raw.
+        let mut p = part_with(FilesystemKind::Bitlocker, CaptureMode::Raw);
+        apply_bitlocker_state(&mut p, None);
+        assert_eq!(p.bitlocker, BitlockerState::Locked);
+        assert_eq!(p.fs_kind, FilesystemKind::Bitlocker);
+        assert_eq!(p.capture_mode, CaptureMode::Raw);
+    }
+
+    #[test]
+    fn non_bitlocker_partitions_untouched() {
+        for (fs, mode) in [
+            (FilesystemKind::Ntfs, CaptureMode::UsedBlocks),
+            (FilesystemKind::Efi, CaptureMode::Raw),
+            (FilesystemKind::Unknown, CaptureMode::Raw),
+        ] {
+            let mut p = part_with(fs, mode);
+            apply_bitlocker_state(&mut p, Some(fs));
+            assert_eq!(p.bitlocker, BitlockerState::None);
+            assert_eq!(p.fs_kind, fs);
+            assert_eq!(p.capture_mode, mode);
+        }
     }
 
     #[test]

@@ -187,6 +187,7 @@ mod tests {
             size_bytes: size,
             fs_kind: FilesystemKind::Ntfs,
             capture_mode: CaptureMode::UsedBlocks,
+            bitlocker: phoenix_core::disk::BitlockerState::None,
             volume_path: None,
             drive_letter: None,
             volume_label: None,

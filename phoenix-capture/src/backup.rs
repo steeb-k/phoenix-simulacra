@@ -4,15 +4,17 @@ use phoenix_core::container::{
 };
 use phoenix_core::disk::guid_to_string;
 use phoenix_core::disk::{
-    enumerate_disks, refine_partition_fs, CaptureMode, FilesystemKind, PartitionInfo,
+    enumerate_disks, refine_partition_fs, BitlockerState, CaptureMode, FilesystemKind,
+    PartitionInfo,
 };
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
 use phoenix_core::manifest::{
-    capture_mode_to_string, fs_kind_to_string, BackupManifest, DiskManifest, PartitionManifest,
+    bitlocker_state_to_manifest, capture_mode_to_string, fs_kind_to_string, BackupManifest,
+    DiskManifest, PartitionManifest,
 };
 use phoenix_core::ProgressHandle;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::fat::{capture_exfat, capture_fat, fat_plan};
@@ -179,8 +181,32 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             }
         }
 
+        if part.bitlocker == BitlockerState::Locked {
+            warn!(
+                partition = part.index,
+                name = part.name.as_str(),
+                "partition is BitLocker-LOCKED: capturing raw ciphertext. The backup will \
+                 restore to an encrypted volume that still requires the original BitLocker \
+                 key/recovery password. Unlock the volume and re-run for a normal, \
+                 unencrypted (and typically much smaller) backup."
+            );
+        }
+
         let original_volume = part.volume_path.clone();
-        let read_path = if opts.use_vss {
+        // A locked BitLocker volume must be read through the PHYSICAL disk
+        // handle at the partition offset: fvevol rejects reads through the
+        // volume device with FVE_E_LOCKED_VOLUME (0x80310000) until the
+        // volume is unlocked (observed live in the T2 bitlocker systest).
+        // That also rules out VSS (no mounted filesystem to snapshot) and
+        // FSCTL_LOCK_VOLUME (nothing is mounted; and `is_live` below is
+        // false for the PhysicalDrive path). The ciphertext can't change
+        // underneath us unless someone unlocks and writes mid-backup — and
+        // verify-after-backup re-reads the source, so even that tampering
+        // window fails loudly instead of corrupting the image silently.
+        let locked_bitlocker = part.bitlocker == BitlockerState::Locked;
+        let read_path = if locked_bitlocker {
+            disk.path.clone()
+        } else if opts.use_vss {
             if let Some(ref vol) = original_volume {
                 vss.snapshot_volume(vol)?
             } else {
@@ -348,6 +374,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             capture_mode: capture_mode_to_string(capture_mode).to_string(),
             original_size: part.size_bytes,
             used_bytes,
+            bitlocker: bitlocker_state_to_manifest(part.bitlocker),
             chunks,
             bitmap_hash,
         });

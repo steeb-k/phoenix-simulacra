@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::disk::{CaptureMode, FilesystemKind};
+use crate::disk::{BitlockerState, CaptureMode, FilesystemKind};
 use crate::error::{PhoenixError, Result};
 use crate::hash;
 
@@ -34,6 +34,15 @@ pub struct PartitionManifest {
     pub capture_mode: String,
     pub original_size: u64,
     pub used_bytes: u64,
+    /// BitLocker state at capture time. `None`/absent → not a BitLocker
+    /// volume (also the value in every pre-BitLocker-support backup).
+    /// `"unlocked"` → the volume was BitLocker but unlocked, so the image
+    /// holds **plaintext** and restores as a normal, unencrypted volume.
+    /// `"locked"` → the image holds raw **ciphertext**; a restore
+    /// reproduces the locked volume, which still needs the original
+    /// BitLocker key/recovery password to unlock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitlocker: Option<String>,
     pub chunks: Vec<ChunkRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitmap_hash: Option<String>,
@@ -80,6 +89,25 @@ pub fn capture_mode_to_string(m: CaptureMode) -> &'static str {
     }
 }
 
+/// Manifest encoding of [`BitlockerState`]; `None` for non-BitLocker
+/// partitions so the field is omitted from the JSON entirely (keeping old
+/// and new manifests byte-compatible for the common case).
+pub fn bitlocker_state_to_manifest(s: BitlockerState) -> Option<String> {
+    match s {
+        BitlockerState::None => None,
+        BitlockerState::Unlocked => Some("unlocked".to_string()),
+        BitlockerState::Locked => Some("locked".to_string()),
+    }
+}
+
+pub fn bitlocker_state_from_manifest(s: Option<&str>) -> BitlockerState {
+    match s {
+        Some("unlocked") => BitlockerState::Unlocked,
+        Some("locked") => BitlockerState::Locked,
+        _ => BitlockerState::None,
+    }
+}
+
 pub fn fs_kind_from_string(s: &str) -> FilesystemKind {
     match s {
         "ntfs" => FilesystemKind::Ntfs,
@@ -89,5 +117,48 @@ pub fn fs_kind_from_string(s: &str) -> FilesystemKind {
         "msr" => FilesystemKind::Msr,
         "bitlocker" => FilesystemKind::Bitlocker,
         _ => FilesystemKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pre-BitLocker-support manifest (no `bitlocker` field) must still
+    /// deserialize, with the state defaulting to "not BitLocker".
+    #[test]
+    fn partition_manifest_without_bitlocker_field_deserializes() {
+        let json = r#"{
+            "index": 0,
+            "name": "Basic data partition",
+            "fs": "ntfs",
+            "capture_mode": "used-blocks",
+            "original_size": 1048576,
+            "used_bytes": 4096,
+            "chunks": []
+        }"#;
+        let pm: PartitionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(pm.bitlocker, None);
+        assert_eq!(
+            bitlocker_state_from_manifest(pm.bitlocker.as_deref()),
+            BitlockerState::None
+        );
+    }
+
+    #[test]
+    fn bitlocker_state_manifest_roundtrip() {
+        for state in [
+            BitlockerState::None,
+            BitlockerState::Unlocked,
+            BitlockerState::Locked,
+        ] {
+            let encoded = bitlocker_state_to_manifest(state);
+            assert_eq!(bitlocker_state_from_manifest(encoded.as_deref()), state);
+        }
+        // Unrecognized values from a future format degrade safely.
+        assert_eq!(
+            bitlocker_state_from_manifest(Some("suspended")),
+            BitlockerState::None
+        );
     }
 }
