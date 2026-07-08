@@ -171,6 +171,14 @@ fn main() -> anyhow::Result<()> {
                 partitions_resized = summary.partitions_resized,
                 "Restore complete"
             );
+            if summary.restored_locked_bitlocker {
+                println!(
+                    "\nNote: a restored partition is a BitLocker-encrypted (locked) volume. \
+                     It still requires the original BitLocker key/recovery password to unlock. \
+                     If Windows shows it as unrecognized or decrypted, reboot or reconnect the \
+                     disk and then unlock it."
+                );
+            }
         }
         Commands::Clone {
             source_disk,

@@ -97,12 +97,6 @@ spare fixed disk is available, extend `real_disk.rs` with a GPT variant
 - The T3 real-disk tier is inherently manual (it wipes a physical disk); keep it
   as a documented pre-release step.
 
-### P3 — Deeper structural validation in T3
-Restore/shrink verification on the real USB drive relies on the fixture BLAKE3
-digest + the volume mounting cleanly, because `chkdsk /scan` can't create a VSS
-snapshot on a small/full volume. Add an **offline `chkdsk /F`** pass (dismount →
-check) for a deeper structural check of shrunk/restored NTFS.
-
 ### P3 — Used-block exFAT capture
 exFAT is currently captured **raw** (the whole partition), because exFAT's
 `NoFatChain` contiguous files aren't discoverable from the FAT alone. This makes
@@ -136,16 +130,25 @@ hard to automate safely; **4Kn media** could be automated if a 4Kn test device
   loud warnings); unlocking first yields a normal plaintext backup. There is no
   prompt-to-unlock or re-encrypt-on-restore flow. Mounting a ciphertext image
   surfaces an encrypted volume that prompts for the recovery key.
-- **Restoring a locked BitLocker (ciphertext) image needs a re-scan to be
-  recognized.** The restore writes the `-FVE-FS-` sectors correctly, but
-  Windows caches the mounted-volume view of the freshly-created partition from
-  *before* those bytes landed, so `manage-bde`/Explorer show a stale
-  "decrypted / unknown" volume until the disk is re-read. A **reboot or
-  unplug/replug** (or offline→online on a fixed disk) refreshes it and the
-  volume then prompts for the BitLocker key as expected. The on-disk bytes are
-  correct the whole time — this is purely an OS cache-refresh quirk, most
-  visible on removable USB media where `FSCTL_DISMOUNT_VOLUME` alone doesn't
-  clear it. (A future nicety: have restore trigger a rescan itself.)
+- **Restoring a locked BitLocker (ciphertext) image may need a reboot/reconnect
+  to be recognized.** Restore writes the `-FVE-FS-` sectors correctly and now
+  does a best-effort post-restore rescan (dismounts the restored volume so
+  Windows re-reads it), and the CLI/summary flag the encrypted volume. On a
+  **fixed** disk this usually makes Windows recognize the locked volume
+  immediately; on **removable** USB media Windows can still serve a stale
+  "decrypted / unknown" view from its per-session FVE cache until a **reboot or
+  unplug/replug** (which we can't force from software). The on-disk bytes are
+  correct the whole time — this is purely an OS cache-refresh quirk.
+- **NTFS shrink leaves a one-time `chkdsk` reconciliation.** The shrink-
+  relocation path deliberately doesn't perfectly rewrite `$Bitmap`; it leaves
+  the trailing allocation slack past the new boundary for `chkdsk /F` to
+  reconcile on first mount (documented in `phoenix-capture/src/ntfs.rs`). No
+  data is at risk — `validate_extents_fit` guarantees nothing captured lives
+  past the boundary, so it's pure metadata cleanup, and a single `chkdsk /F`
+  leaves the volume clean (the T3 `real_mbr_restore_shrink` offline check
+  asserts exactly this: reconcile-once, then a second pass must be clean).
+  A perfect-`$Bitmap`-on-shrink rewrite (so no `chkdsk` is ever needed) is a
+  possible future P3 improvement.
 - **Restore to dissimilar hardware** may need Windows Startup Repair / `bcdedit`
   (expected; noted in the live checklist).
 

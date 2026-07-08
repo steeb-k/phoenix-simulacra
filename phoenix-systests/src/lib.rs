@@ -747,6 +747,74 @@ pub fn chkdsk_clean(letter: char) -> Result<()> {
     );
 }
 
+/// Run an **offline** `chkdsk /F /X` (force-dismount + full fix) on a drive
+/// letter and fail unless the volume ends up clean. Unlike [`chkdsk_clean`]
+/// (online `/scan`, which needs a VSS snapshot and is skipped on small/full
+/// volumes), this dismounts the volume and always runs a full structural
+/// check — the deeper post-restore / post-shrink NTFS validation that `/scan`
+/// can't do on the small T3 volumes.
+///
+/// chkdsk exit codes: `0` = no problems. `1` = errors found and fixed. `>=2` =
+/// could not complete the check.
+///
+/// A same-size restore should be `0` on the first pass. The **shrink**-
+/// relocation path, by design, leaves trailing `$Bitmap` allocation slack for
+/// `chkdsk` to reconcile (documented in `phoenix-capture/src/ntfs.rs` —
+/// `validate_extents_fit` guarantees no real data lives past the new boundary,
+/// so it's pure metadata cleanup). That surfaces here as `1` (errors fixed) on
+/// the first pass. To keep this a real gate rather than a rubber stamp, when
+/// the first pass reports `1` we run chkdsk **again** and require a clean `0`:
+/// the one-time reconciliation must fully resolve the volume, proving nothing
+/// deeper is wrong. `>=2`, or a second pass that still isn't clean, fails.
+///
+/// `/X` forces a dismount, so this never prompts or schedules a reboot-time
+/// check (these are data volumes, never the system volume). The volume
+/// remounts on next access.
+pub fn chkdsk_offline_fix(letter: char) -> Result<()> {
+    let run = |pass: u32| -> Result<i32> {
+        let out = Command::new("chkdsk")
+            .arg(format!("{letter}:"))
+            .arg("/F")
+            .arg("/X")
+            .output()
+            .with_context(|| format!("spawning offline chkdsk /F /X (pass {pass})"))?;
+        let code = out.status.code().unwrap_or(-1);
+        if code >= 2 {
+            bail!(
+                "offline chkdsk {letter}: /F /X could not complete (exit {code}, pass {pass}):\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        Ok(code)
+    };
+
+    match run(1)? {
+        0 => {
+            eprintln!("chkdsk {letter}: /F /X clean on first pass (offline structural check)");
+            Ok(())
+        }
+        _ => {
+            // First pass fixed something (expected for shrink-relocation's
+            // documented $Bitmap slack). Require the second pass to be clean.
+            eprintln!(
+                "chkdsk {letter}: /F /X reconciled metadata on first pass (expected for shrink); \
+                 re-running to require a clean volume"
+            );
+            match run(2)? {
+                0 => {
+                    eprintln!("chkdsk {letter}: /F /X clean on second pass (reconciliation stuck)");
+                    Ok(())
+                }
+                code => bail!(
+                    "offline chkdsk {letter}: still reported fixes on the SECOND pass (exit \
+                     {code}); a single reconciliation should have left the volume clean — the \
+                     restore/shrink produced a persistently inconsistent filesystem"
+                ),
+            }
+        }
+    }
+}
+
 /// Force a drive letter onto the largest partition of a disk and return it.
 /// After a restore the engine brings the disk online, but the mount manager
 /// assigns letters asynchronously and can be slow — especially for a freshly

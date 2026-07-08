@@ -33,6 +33,12 @@ pub struct RestoreSummary {
     /// Partitions whose target size differed from the backup (grow,
     /// shrink, or layout slack expansion on a larger disk).
     pub partitions_resized: u32,
+    /// True if at least one restored partition was a BitLocker **locked**
+    /// (ciphertext) image. The restored volume is encrypted and still needs
+    /// the original key/recovery password to unlock; callers should surface
+    /// this, and note that Windows may need a reboot or a disk reconnect
+    /// before it re-recognizes the volume (see the post-restore rescan).
+    pub restored_locked_bitlocker: bool,
 }
 
 pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
@@ -194,6 +200,12 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
 
     let mut bytes_done = 0u64;
     let mut summary = RestoreSummary::default();
+    // (target_offset, target_size) of every restored BitLocker-locked
+    // (ciphertext) partition, so we can nudge Windows to re-read the volume
+    // after bring-online (PHASE 6). Windows may have a stale, pre-restore
+    // view of a re-appearing FVE volume cached; a dismount lets it remount
+    // fresh and read the `-FVE-FS-` header we just wrote.
+    let mut locked_bitlocker_parts: Vec<(u64, u64)> = Vec::new();
     // Sequence among restoring entries only, used to index into the
     // per-partition steps declared in the plan above.
     let mut restore_seq = 0usize;
@@ -231,6 +243,8 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
 
         let fs = fs_kind_from_string(&part_manifest.fs);
         if part_manifest.bitlocker.as_deref() == Some("locked") {
+            summary.restored_locked_bitlocker = true;
+            locked_bitlocker_parts.push((entry.target_offset_bytes, entry.target_size_bytes));
             warn!(
                 partition = src_index,
                 "this partition was captured from a BitLocker-LOCKED volume: restoring raw \
@@ -448,15 +462,74 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     }
     bring_disk_online(&disk.path);
 
+    // PHASE 6 — if we restored any BitLocker-locked (ciphertext) partition,
+    // nudge Windows to re-read its volume. The ciphertext bytes were written
+    // before the volume mounted (the partition table is planted last), but
+    // Windows can still serve a stale, pre-restore view of a re-appearing FVE
+    // volume from its per-session cache, showing the volume as "decrypted /
+    // unknown" instead of prompting for the key. Dismounting lets it remount
+    // fresh. Best-effort and non-fatal — the on-disk ciphertext is already
+    // correct regardless; on removable media a reboot or reconnect may still
+    // be required, which we can't force from software.
+    if !locked_bitlocker_parts.is_empty() {
+        for (offset, length) in &locked_bitlocker_parts {
+            rescan_restored_volume(disk.index, *offset, *length);
+        }
+        warn!(
+            "restored an encrypted BitLocker volume; if Windows still shows it as \
+             unrecognized/decrypted, reboot or reconnect the disk, then unlock it with the \
+             original BitLocker key/recovery password"
+        );
+    }
+
     if let Some(ref p) = opts.progress {
         p.end();
     }
     info!(
         partitions_restored = summary.partitions_restored,
         partitions_resized = summary.partitions_resized,
+        restored_locked_bitlocker = summary.restored_locked_bitlocker,
         "Restore complete"
     );
     Ok(summary)
+}
+
+/// Best-effort: after bring-online, wait briefly for the mount manager to give
+/// the restored partition a volume path, then `FSCTL_DISMOUNT_VOLUME` it so it
+/// remounts fresh and re-reads its on-disk boot sector. Used only for restored
+/// BitLocker-locked (ciphertext) partitions, where Windows can otherwise serve
+/// a stale cached view of the re-appearing FVE volume. Silently gives up if no
+/// volume path appears in the poll window — the restored bytes are correct
+/// either way, and a reboot/reconnect remains the fallback.
+fn rescan_restored_volume(disk_index: u32, offset: u64, length: u64) {
+    use phoenix_core::disk::{dismount_volume, find_volume_for_partition};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(vol) = find_volume_for_partition(disk_index, offset, length) {
+            match dismount_volume(&vol) {
+                Ok(()) => info!(
+                    volume = vol.as_str(),
+                    "dismounted restored BitLocker volume so Windows re-reads it"
+                ),
+                Err(e) => warn!(
+                    volume = vol.as_str(),
+                    error = %e,
+                    "could not dismount restored BitLocker volume; a reboot/reconnect will refresh it"
+                ),
+            }
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            info!(
+                disk = disk_index,
+                offset,
+                "restored BitLocker volume did not get a drive path in time to rescan; \
+                 a reboot/reconnect will let Windows recognize it"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// Parse the `BackupManifest::disk.disk_guid` field (a 36-char dashed

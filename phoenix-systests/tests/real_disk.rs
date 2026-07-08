@@ -22,10 +22,11 @@ use phoenix_core::disk::{enumerate_disks, refine_partition_fs};
 use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    bitlocker_status, chkdsk_clean, disk_partition_boot_tags, enable_bitlocker_password,
-    fill_fixture, lock_bitlocker, partition_summary, require_admin, rescan_disk_volumes,
-    unlock_bitlocker_password, verify_fixture, wait_for_disk_volumes, wait_for_letter,
-    wait_for_letter_even_if_locked, wait_for_restored_letter, PartSpec, RealDisk, TestFs, TestVhd,
+    bitlocker_status, chkdsk_clean, chkdsk_offline_fix, disk_partition_boot_tags,
+    enable_bitlocker_password, fill_fixture, lock_bitlocker, partition_summary, require_admin,
+    rescan_disk_volumes, unlock_bitlocker_password, verify_fixture, wait_for_disk_volumes,
+    wait_for_letter, wait_for_letter_even_if_locked, wait_for_restored_letter, PartSpec, RealDisk,
+    TestFs, TestVhd,
 };
 
 const MB: u64 = 1024 * 1024;
@@ -176,6 +177,9 @@ fn real_mbr_multifs_roundtrip() {
     chkdsk_clean(letters[0]).expect("chkdsk on restored NTFS");
     verify_fixture(letters[0], &d_ntfs).expect("NTFS fixture preserved across restore");
     verify_fixture(letters[1], &d_fat).expect("FAT32 fixture preserved across restore");
+    // Deeper structural check: offline chkdsk /F on the restored NTFS (last —
+    // it force-dismounts the volume).
+    chkdsk_offline_fix(letters[0]).expect("offline chkdsk on restored NTFS");
 
     let _ = std::fs::remove_file(&backup);
     eprintln!("[T3] real_mbr_multifs_roundtrip PASSED");
@@ -269,6 +273,10 @@ fn real_mbr_restore_shrink() {
     chkdsk_clean(letters[0]).expect("chkdsk on shrunk NTFS");
     verify_fixture(letters[0], &d_ntfs).expect("NTFS fixture preserved across shrink");
     verify_fixture(letters[1], &d_fat).expect("FAT32 fixture preserved");
+    // Deeper structural check on the shrunk+relocated NTFS: an offline
+    // chkdsk /F (works where the online /scan can't snapshot). Do this last —
+    // it force-dismounts the volume.
+    chkdsk_offline_fix(letters[0]).expect("offline chkdsk on shrunk NTFS");
 
     let _ = std::fs::remove_file(&backup);
     eprintln!("[T3] real_mbr_restore_shrink PASSED");

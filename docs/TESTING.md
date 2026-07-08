@@ -127,8 +127,8 @@ Without `PHOENIX_T3_DISK` set, the tests skip cleanly (nothing is wiped).
 
 | Scenario | Covers |
 |----------|--------|
-| `real_mbr_multifs_roundtrip` | MBR NTFS + FAT32 image → full-disk restore, NTFS auto-grow, partition-table + data |
-| `real_mbr_restore_shrink` | NTFS relocation (shrink to 512 MB), chkdsk-clean |
+| `real_mbr_multifs_roundtrip` | MBR NTFS + FAT32 image → full-disk restore, NTFS auto-grow, partition-table + data, offline `chkdsk /F` on the restored NTFS |
+| `real_mbr_restore_shrink` | NTFS relocation (shrink to 512 MB), online `chkdsk /scan` + offline `chkdsk /F /X` structural check |
 | `real_mbr_exfat_roundtrip` | exFAT (raw capture) + NTFS round-trip |
 | `real_mbr_bitlocker_roundtrip` | BitLocker on real flash: unlocked → plaintext backup/restore; locked → ciphertext backup/restore, ciphertext proven by reading `-FVE-FS-` off the physical disk (the in-session OS unlock leg is best-effort — Windows won't re-recognize a restored removable BitLocker volume without a re-plug/reboot) |
 | `real_clone_to_vhd` | clone the real disk → a VHD, read-back verify |
