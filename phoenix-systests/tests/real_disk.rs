@@ -16,13 +16,14 @@
 //! layouts — which also fills a real coverage gap (the T2 VHD tests are all GPT).
 
 use phoenix_capture::backup::{run_backup, BackupOptions};
+use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
 use phoenix_core::container::PhnxReader;
-use phoenix_core::disk::enumerate_disks;
+use phoenix_core::disk::{enumerate_disks, refine_partition_fs};
 use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
     chkdsk_clean, fill_fixture, partition_summary, require_admin, verify_fixture,
-    wait_for_disk_volumes, wait_for_letter, PartSpec, RealDisk, TestFs,
+    wait_for_disk_volumes, wait_for_letter, PartSpec, RealDisk, TestFs, TestVhd,
 };
 
 const MB: u64 = 1024 * 1024;
@@ -269,4 +270,143 @@ fn real_mbr_restore_shrink() {
 
     let _ = std::fs::remove_file(&backup);
     eprintln!("[T3] real_mbr_restore_shrink PASSED");
+}
+
+#[test]
+#[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
+fn real_mbr_exfat_roundtrip() {
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    let idx = disk.index();
+
+    // exFAT (captured raw) + NTFS. exFAT first (kept at size), NTFS last (grows
+    // to fill on the full-disk restore).
+    disk.layout(
+        false,
+        &[
+            PartSpec {
+                size_mb: 512,
+                fs: TestFs::Exfat,
+                letter: 'R',
+                label: "T3EXFAT".into(),
+            },
+            PartSpec {
+                size_mb: 512,
+                fs: TestFs::Ntfs,
+                letter: 'S',
+                label: "T3NTFS".into(),
+            },
+        ],
+    )
+    .expect("MBR layout");
+    assert!(wait_for_letter('R', 20_000), "exFAT didn't mount");
+    assert!(wait_for_letter('S', 20_000), "NTFS didn't mount");
+    let d_exfat = fill_fixture('R', 0xCC01).expect("fill exfat");
+    let d_ntfs = fill_fixture('S', 0xCC02).expect("fill ntfs");
+
+    let backup = backup_all(idx);
+    let disk_size = disk_size_bytes(idx);
+
+    disk.clean().expect("clean");
+    let reader = PhnxReader::open(&backup).unwrap();
+    let plan = default_plan_from_backup(backup.to_str().unwrap(), &reader, idx, disk_size);
+    for e in &plan.entries {
+        eprintln!(
+            "[T3] exfat restore plan: src={:?} off={} size={}",
+            e.source_partition_index, e.target_offset_bytes, e.target_size_bytes
+        );
+    }
+    drop(reader);
+    run_restore(RestoreOptions {
+        backup_path: backup.clone(),
+        plan,
+        verify_on_restore: true,
+        progress: None,
+    })
+    .expect("run_restore");
+
+    let letters = wait_for_disk_volumes(idx, 2, 60_000).expect("restored volumes");
+    eprintln!("[T3] restored letters: {letters:?}");
+    // Offset order: [0] = exFAT, [1] = NTFS.
+    verify_fixture(letters[0], &d_exfat).expect("exFAT fixture preserved across restore");
+    chkdsk_clean(letters[1]).expect("chkdsk on restored NTFS");
+    verify_fixture(letters[1], &d_ntfs).expect("NTFS fixture preserved across restore");
+
+    let _ = std::fs::remove_file(&backup);
+    eprintln!("[T3] real_mbr_exfat_roundtrip PASSED");
+}
+
+#[test]
+#[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
+fn real_clone_to_vhd() {
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    let idx = disk.index();
+
+    // Source: the real USB disk, MBR NTFS + FAT32, filled.
+    disk.layout(
+        false,
+        &[
+            PartSpec {
+                size_mb: 1024,
+                fs: TestFs::Ntfs,
+                letter: 'R',
+                label: "T3NTFS".into(),
+            },
+            PartSpec {
+                size_mb: 512,
+                fs: TestFs::Fat32,
+                letter: 'S',
+                label: "T3FAT".into(),
+            },
+        ],
+    )
+    .expect("MBR layout");
+    assert!(wait_for_letter('R', 20_000), "NTFS didn't mount");
+    assert!(wait_for_letter('S', 20_000), "FAT didn't mount");
+    let d_ntfs = fill_fixture('R', 0xDD01).expect("fill ntfs");
+    let d_fat = fill_fixture('S', 0xDD02).expect("fill fat");
+
+    // Target: a VHD at least as large as the real disk (identity clone).
+    let target = TestVhd::create(31_000).expect("create target vhd");
+
+    // Enumerate both disks with filesystems refined (clone needs fs types).
+    let mut disks = enumerate_disks().unwrap();
+    for d in &mut disks {
+        for p in &mut d.partitions {
+            refine_partition_fs(p);
+        }
+    }
+    let src = disks.iter().find(|d| d.index == idx).unwrap().clone();
+    let tgt = disks
+        .iter()
+        .find(|d| d.index == target.disk_index())
+        .unwrap()
+        .clone();
+
+    let plan = ClonePlan::identity(&src);
+    plan.validate(&src, &tgt).expect("clone plan valid");
+    run_clone(CloneOptions {
+        source_disk_index: idx,
+        target_disk_index: target.disk_index(),
+        plan,
+        verify: CloneVerify::ReadBack,
+        use_vss: false,
+        progress: None,
+    })
+    .expect("run_clone real -> vhd");
+
+    // Verify the CLONED VHD's volumes carry the fixtures byte-for-byte.
+    let letters =
+        wait_for_disk_volumes(target.disk_index(), 2, 60_000).expect("cloned volumes got letters");
+    eprintln!("[T3] cloned VHD letters: {letters:?}");
+    chkdsk_clean(letters[0]).expect("chkdsk on cloned NTFS");
+    verify_fixture(letters[0], &d_ntfs).expect("NTFS fixture preserved by clone");
+    verify_fixture(letters[1], &d_fat).expect("FAT32 fixture preserved by clone");
+
+    eprintln!("[T3] real_clone_to_vhd PASSED");
 }
