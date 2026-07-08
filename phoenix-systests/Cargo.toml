@@ -23,6 +23,11 @@ blake3 = { workspace = true }
 
 [features]
 # Enables the WinFsp zero-space mount test (needs WinFsp + libclang to build).
-winfsp = ["phoenix-mount/winfsp"]
+winfsp = ["phoenix-mount/winfsp", "dep:winfsp"]
+
+[build-dependencies]
+# Used from build.rs to apply the winfsp-x64.dll delay-load link arg to the
+# test binaries (link args don't propagate from the winfsp-sys dependency).
+winfsp = { version = "0.13", optional = true }
 
 [dev-dependencies]

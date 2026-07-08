@@ -2413,6 +2413,7 @@ dependencies = [
  "phoenix-mount",
  "phoenix-restore",
  "uuid",
+ "winfsp",
 ]
 
 [[package]]
