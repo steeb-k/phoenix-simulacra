@@ -320,7 +320,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             }
             _ => {
                 capture_raw(reader, &mut stream)?;
-                (reader.length(), None)
+                // A partition's used bytes can't exceed its own size. A volume
+                // handle can report a length that disagrees with the GPT
+                // partition size (observed on exFAT); cap so downstream
+                // used_bytes-vs-target checks stay sane.
+                (reader.length().min(part.size_bytes), None)
             }
         };
 

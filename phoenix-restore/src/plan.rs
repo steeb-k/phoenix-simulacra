@@ -302,31 +302,45 @@ fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> 
     /// the correctness minimum.
     const SECTOR_ALIGN: u64 = 512;
     let usable_end = disk_size.saturating_sub(GPT_TRAILING_BYTES);
+    let n = sizes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Pack all but the last partition from the front, aligning each start.
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
     let mut offset = align;
-    let mut out = Vec::with_capacity(sizes.len());
-    let count = sizes.len();
-    for (i, &orig) in sizes.iter().enumerate() {
-        let mut off = align_up(offset, align);
-        let mut size = orig;
-        if i + 1 == count && off.saturating_add(size) > usable_end {
-            // The last partition doesn't fit at the preferred alignment. The
-            // source often packs it tighter (diskpart starts it right after
-            // the MSR, unaligned to MiB), so aligning UP drifted the layout by
-            // up to `align` bytes. Shrinking is fatal for fixed-geometry
-            // filesystems (FAT/exFAT restore can't relocate → the observed
-            // PartitionTooSmall at ~1 MiB short), so first try keeping the
-            // ORIGINAL size by relaxing the start to sector alignment; clamp
-            // only when it still can't fit. `validate_against_backup` then
-            // enforces that the used data fits.
-            let relaxed = align_up(offset, SECTOR_ALIGN);
-            if relaxed.saturating_add(size) <= usable_end {
-                off = relaxed;
-            } else {
-                size = align_down(usable_end.saturating_sub(off), SECTOR_ALIGN);
-            }
-        }
+    for &sz in &sizes[..n - 1] {
+        let off = align_up(offset, align);
+        out.push((off, sz));
+        offset = off + sz;
+    }
+    let earlier_end = out.last().map(|(o, s)| o + s).unwrap_or(align);
+
+    // Anchor the LAST partition's end at the disk's usable end, keeping its
+    // ORIGINAL size. A `.phnx` records partition sizes but not their source
+    // offsets, so packing purely from the front and aligning up drifts the
+    // tail past the disk end when the source packed it tight after an MSR.
+    // Anchoring reconstructs the last partition at its true end position with
+    // no shrink — which matters because a raw-captured (exFAT) or
+    // fixed-geometry (FAT) partition can't be shrunk, so a clamp would trip
+    // PartitionTooSmall. Anchoring works whenever the earlier partitions don't
+    // reach into it (they didn't on the source).
+    let last = sizes[n - 1];
+    let anchored_start = align_down(usable_end.saturating_sub(last), SECTOR_ALIGN);
+    if last > 0 && anchored_start >= earlier_end {
+        out.push((anchored_start, last));
+    } else {
+        // Earlier partitions reach the anchor (or the single partition doesn't
+        // fit). Pack the last right after them at sector alignment, keeping the
+        // original size if it fits, clamping only if it truly can't.
+        let off = align_up(earlier_end, SECTOR_ALIGN);
+        let size = if off.saturating_add(last) <= usable_end {
+            last
+        } else {
+            align_down(usable_end.saturating_sub(off), SECTOR_ALIGN)
+        };
         out.push((off, size));
-        offset = off + size;
     }
     out
 }
@@ -347,6 +361,20 @@ pub fn build_full_disk_plan(
     // the reconstructed layout valid.
     let sizes: Vec<u64> = reader.index.iter().map(|e| e.original_size).collect();
     let placed = pack_full_disk(&sizes, target_disk_size, align);
+    // Diagnostic: dump the reconstructed full-disk layout so a restore that
+    // fails validation can be traced back to the exact source sizes vs. placed
+    // offsets/sizes without another round-trip.
+    for (e, (off, size)) in reader.index.iter().zip(&placed) {
+        tracing::info!(
+            partition = e.index,
+            original_size = e.original_size,
+            used_bytes = e.used_bytes,
+            target_offset = off,
+            target_size = size,
+            disk_size = target_disk_size,
+            "full-disk plan placement"
+        );
+    }
     let mut entries: Vec<RestorePlanEntry> = reader
         .index
         .iter()
@@ -641,6 +669,30 @@ mod tests {
             off + size <= disk - 33 * 512,
             "must still leave room for the backup GPT (ends at {})",
             off + size
+        );
+    }
+
+    #[test]
+    fn full_disk_pack_anchors_last_without_shrinking() {
+        // MSR (15 MiB) + data (490 MiB) on a 512 MiB disk. Anchoring places the
+        // data partition at its true end position keeping its full size (no
+        // shrink), which is what stops raw/exFAT restores from tripping
+        // PartitionTooSmall.
+        let disk = 512 * 1024 * 1024u64;
+        let align = 1024 * 1024u64;
+        let msr = 15 * 1024 * 1024u64;
+        let data = 490 * 1024 * 1024u64;
+        let placed = pack_full_disk(&[msr, data], disk, align);
+        assert_eq!(placed[1].1, data, "last partition size must be preserved");
+        let end = placed[1].0 + placed[1].1;
+        assert!(
+            end <= disk - 33 * 512,
+            "last partition must leave room for backup GPT"
+        );
+        // No overlap with the MSR.
+        assert!(
+            placed[0].0 + placed[0].1 <= placed[1].0,
+            "MSR overlaps data"
         );
     }
 
