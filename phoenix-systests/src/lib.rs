@@ -186,11 +186,21 @@ pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result
 /// partition table, then creates + formats + letters each partition.
 pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
     let style = if gpt { "GPT" } else { "MBR" };
+    // Clear-Disk removes partitions but leaves the disk *initialized* (not RAW),
+    // so Initialize-Disk would reject it. Only initialize a genuinely-RAW disk;
+    // otherwise the existing (already-correct) style is reused. A wrong existing
+    // style would need a partition-table conversion we don't do here (removable
+    // disks are always MBR anyway).
     let mut script = format!(
         "$ErrorActionPreference='Stop'; \
-         if ((Get-Disk -Number {disk_index}).PartitionStyle -ne 'RAW') {{ \
-             Clear-Disk -Number {disk_index} -RemoveData -RemoveOEM -Confirm:$false }}; \
-         Initialize-Disk -Number {disk_index} -PartitionStyle {style}; "
+         $d = Get-Disk -Number {disk_index}; \
+         if ($d.PartitionStyle -ne 'RAW') {{ \
+             Clear-Disk -Number {disk_index} -RemoveData -RemoveOEM -Confirm:$false; \
+             $d = Get-Disk -Number {disk_index} }}; \
+         if ($d.PartitionStyle -eq 'RAW') {{ \
+             Initialize-Disk -Number {disk_index} -PartitionStyle {style} }} \
+         elseif ($d.PartitionStyle -ne '{style}') {{ \
+             throw \"disk {disk_index} is $($d.PartitionStyle), expected {style}\" }}; "
     );
     for p in parts {
         let size = if p.size_mb == 0 {
