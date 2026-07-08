@@ -9,21 +9,30 @@ authors = { workspace = true }
 phoenix-core = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
+winfsp = { version = "0.13", optional = true }
+widestring = { version = "1", optional = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Vhd",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_SystemInformation",
 ] }
+
+[build-dependencies]
+# Same crate, used from build.rs for delay-load link configuration.
+winfsp = { version = "0.13", optional = true }
 
 [features]
 # `winfsp` gates the zero-disk-space on-demand mount (serves reads straight
-# from the .phnx via a WinFsp filesystem). It requires the WinFsp SDK at build
+# from the .phnx via a WinFsp filesystem). It needs libclang (bindgen) at build
 # time and WinFsp installed at run time, so it is OFF by default; the default
-# build uses the materialize-to-temp-VHD path, which needs no external SDK.
+# build uses the materialize-to-temp-VHD path and needs neither.
 default = []
-winfsp = []
+winfsp = ["dep:winfsp", "dep:widestring"]
 
 [dev-dependencies]
 uuid = { workspace = true }

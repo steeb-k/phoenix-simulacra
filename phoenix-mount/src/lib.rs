@@ -20,8 +20,12 @@ pub mod vhd;
 pub mod attach;
 #[cfg(windows)]
 pub mod session;
+#[cfg(all(windows, feature = "winfsp"))]
+pub mod winfsp_mount;
 
 pub use chunkstore::{plan_layout, ChunkStore, PartitionSpan};
 #[cfg(windows)]
 pub use session::MountSession;
 pub use synthetic::SyntheticVhd;
+#[cfg(all(windows, feature = "winfsp"))]
+pub use winfsp_mount::WinFspMount;
