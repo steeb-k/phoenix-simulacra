@@ -24,5 +24,11 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 toml.workspace = true
 
+[features]
+# Space-efficient WinFsp on-demand mount. Enable for release builds (needs
+# libclang to build + WinFsp installed/bundled at run time).
+winfsp = ["phoenix-mount/winfsp", "dep:winfsp"]
+
 [build-dependencies]
 winres.workspace = true
+winfsp = { version = "0.13", optional = true }

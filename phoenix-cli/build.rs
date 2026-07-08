@@ -4,6 +4,10 @@ include!("../windows/build_info.rs");
 fn main() {
     emit_build_info();
     embed_windows_resources();
+    // Apply the winfsp-x64.dll delay-load link arg to this binary (it doesn't
+    // propagate from the winfsp-sys dependency).
+    #[cfg(feature = "winfsp")]
+    winfsp::build::winfsp_link_delayload();
 }
 
 fn embed_windows_resources() {

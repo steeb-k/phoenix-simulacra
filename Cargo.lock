@@ -2317,6 +2317,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "winfsp",
  "winres",
 ]
 
@@ -2369,6 +2370,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "winfsp",
  "winreg",
  "winres",
 ]

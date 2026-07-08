@@ -17,12 +17,16 @@ pub mod synthetic;
 pub mod vhd;
 
 #[cfg(windows)]
+pub mod active;
+#[cfg(windows)]
 pub mod attach;
 #[cfg(windows)]
 pub mod session;
 #[cfg(all(windows, feature = "winfsp"))]
 pub mod winfsp_mount;
 
+#[cfg(windows)]
+pub use active::ActiveMount;
 pub use chunkstore::{plan_layout, ChunkStore, PartitionSpan};
 #[cfg(windows)]
 pub use session::MountSession;

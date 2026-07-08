@@ -31,5 +31,11 @@ tracing-appender = "0.2.5"
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
 
+[features]
+# Space-efficient WinFsp on-demand mount. Enable for release builds (needs
+# libclang to build + WinFsp installed/bundled at run time).
+winfsp = ["phoenix-mount/winfsp", "dep:winfsp"]
+
 [build-dependencies]
 winres.workspace = true
+winfsp = { version = "0.13", optional = true }

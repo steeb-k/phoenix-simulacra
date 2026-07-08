@@ -182,14 +182,20 @@ fn main() -> anyhow::Result<()> {
 
 fn cmd_mount(backup: &std::path::Path) -> anyhow::Result<()> {
     let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
-    println!(
-        "Materializing and attaching {} (read-only)…",
-        backup.display()
-    );
-    let session = phoenix_mount::MountSession::mount(backup, &scratch)?;
+    if phoenix_mount::ActiveMount::space_efficient() {
+        println!("Mounting {} (read-only, on-demand)…", backup.display());
+    } else {
+        println!(
+            "Materializing and attaching {} (read-only)…\n\
+             note: this build lacks the `winfsp` feature, so it allocates a full-size temp \
+             image. Build with --features winfsp for the zero-space mount.",
+            backup.display()
+        );
+    }
+    let session = phoenix_mount::ActiveMount::open(backup, &scratch)?;
     println!(
         "Mounted a {:.1} GB virtual disk. Open Explorer to browse the volume(s).",
-        session.disk_size as f64 / 1e9
+        session.disk_size() as f64 / 1e9
     );
     println!("Press Enter to unmount.");
     let mut line = String::new();

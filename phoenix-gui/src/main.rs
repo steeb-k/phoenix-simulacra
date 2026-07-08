@@ -200,7 +200,7 @@ struct PhoenixApp {
     clone_verify: bool,
     /// Mount page: chosen .phnx and the currently-attached read-only mounts.
     mount_backup_path: String,
-    mounts: Vec<phoenix_mount::MountSession>,
+    mounts: Vec<phoenix_mount::ActiveMount>,
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
@@ -1623,12 +1623,12 @@ impl PhoenixApp {
             for (i, m) in self.mounts.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        m.backup_path
+                        m.backup_path()
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "backup".into()),
                     );
-                    ui.label(format!("({:.1} GB)", m.disk_size as f64 / 1e9));
+                    ui.label(format!("({:.1} GB)", m.disk_size() as f64 / 1e9));
                     if ui.button("Open in Explorer").clicked() {
                         let _ = std::process::Command::new("explorer.exe").spawn();
                     }
@@ -1647,11 +1647,14 @@ impl PhoenixApp {
     fn start_mount(&mut self) {
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
         let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
-        self.status = "Materializing and attaching… (this can take a moment)".into();
-        // Mounting materializes + attaches; MountSession holds a raw disk
-        // handle and isn't Send, so we do it inline. Materialization time
-        // scales with the backup's used size.
-        match phoenix_mount::MountSession::mount(&path, &scratch) {
+        self.status = if phoenix_mount::ActiveMount::space_efficient() {
+            "Mounting read-only (on-demand)…".into()
+        } else {
+            "Materializing and attaching… (this can take a moment)".into()
+        };
+        // The mount holds a non-Send disk handle, so do it inline. The WinFsp
+        // path is instant; the fallback's time scales with the used size.
+        match phoenix_mount::ActiveMount::open(&path, &scratch) {
             Ok(session) => {
                 self.status = format!(
                     "Mounted {} — browse it in Explorer",
