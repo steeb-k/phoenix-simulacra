@@ -21,7 +21,7 @@ impl MountSession {
     /// `scratch_dir` (a sparse temp file) and attach it. The contained volumes
     /// then appear with drive letters in Explorer.
     pub fn mount(backup: &Path, scratch_dir: &Path) -> Result<Self> {
-        let mut reader = PhnxReader::open(backup)?;
+        let reader = PhnxReader::open(backup)?;
         std::fs::create_dir_all(scratch_dir)?;
         let stem = backup
             .file_stem()
@@ -32,7 +32,7 @@ impl MountSession {
 
         let MaterializedImage {
             path, disk_size, ..
-        } = image::materialize(&mut reader, &image_path)?;
+        } = image::materialize(reader, &image_path)?;
 
         let attached =
             AttachedDisk::attach_readonly(path.to_str().ok_or_else(|| {

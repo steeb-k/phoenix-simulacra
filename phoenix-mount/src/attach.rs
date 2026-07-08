@@ -54,9 +54,8 @@ impl AttachedDisk {
         let mut handle: HANDLE = INVALID_HANDLE_VALUE;
         let mut open_params: OPEN_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
         open_params.Version = 1; // OPEN_VIRTUAL_DISK_VERSION_1
-        unsafe {
-            open_params.Anonymous.Version1.RWDepth = RW_DEPTH_DEFAULT;
-        }
+                                 // Writing a union field is safe; only reads are unsafe.
+        open_params.Anonymous.Version1.RWDepth = RW_DEPTH_DEFAULT;
         let rc = unsafe {
             OpenVirtualDisk(
                 &mut storage_type,

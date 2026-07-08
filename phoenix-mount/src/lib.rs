@@ -13,6 +13,7 @@
 pub mod chunkstore;
 pub mod gpt;
 pub mod image;
+pub mod synthetic;
 pub mod vhd;
 
 #[cfg(windows)]
@@ -23,3 +24,4 @@ pub mod session;
 pub use chunkstore::{plan_layout, ChunkStore, PartitionSpan};
 #[cfg(windows)]
 pub use session::MountSession;
+pub use synthetic::SyntheticVhd;
