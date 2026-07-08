@@ -22,8 +22,10 @@ use phoenix_core::disk::{enumerate_disks, refine_partition_fs};
 use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    chkdsk_clean, fill_fixture, partition_summary, require_admin, verify_fixture,
-    wait_for_disk_volumes, wait_for_letter, PartSpec, RealDisk, TestFs, TestVhd,
+    bitlocker_status, chkdsk_clean, disk_partition_boot_tags, enable_bitlocker_password,
+    fill_fixture, lock_bitlocker, partition_summary, require_admin, rescan_disk_volumes,
+    unlock_bitlocker_password, verify_fixture, wait_for_disk_volumes, wait_for_letter,
+    wait_for_letter_even_if_locked, wait_for_restored_letter, PartSpec, RealDisk, TestFs, TestVhd,
 };
 
 const MB: u64 = 1024 * 1024;
@@ -336,6 +338,190 @@ fn real_mbr_exfat_roundtrip() {
 
     let _ = std::fs::remove_file(&backup);
     eprintln!("[T3] real_mbr_exfat_roundtrip PASSED");
+}
+
+#[test]
+#[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
+fn real_mbr_bitlocker_roundtrip() {
+    use phoenix_core::disk::{BitlockerState, CaptureMode, FilesystemKind};
+
+    const PW: &str = "Phoenix-T3-Bl0cker!";
+
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    let idx = disk.index();
+
+    // Real MBR NTFS volume on real flash, then BitLocker-encrypt it.
+    disk.layout(
+        false,
+        &[PartSpec {
+            size_mb: 2048,
+            fs: TestFs::Ntfs,
+            letter: 'R',
+            label: "T3BL".into(),
+        }],
+    )
+    .expect("MBR layout");
+    assert!(wait_for_letter('R', 20_000), "NTFS didn't mount");
+    let digest = fill_fixture('R', 0xEE01).expect("fill fixture");
+    enable_bitlocker_password('R', PW).expect("enable bitlocker");
+
+    // UNLOCKED → normal NTFS used-block classification and capture.
+    let disks = enumerate_disks().unwrap();
+    let part = disks
+        .iter()
+        .find(|d| d.index == idx)
+        .unwrap()
+        .partitions
+        .iter()
+        .find(|p| p.drive_letter == Some('R'))
+        .expect("source partition")
+        .clone();
+    assert_eq!(part.fs_kind, FilesystemKind::Ntfs);
+    assert_eq!(part.capture_mode, CaptureMode::UsedBlocks);
+    assert_eq!(part.bitlocker, BitlockerState::Unlocked);
+    let unlocked_backup = backup_all(idx);
+    {
+        let reader = PhnxReader::open(&unlocked_backup).unwrap();
+        let pm = reader
+            .manifest
+            .partitions
+            .iter()
+            .find(|p| p.fs == "ntfs")
+            .expect("ntfs in manifest");
+        assert_eq!(pm.bitlocker.as_deref(), Some("unlocked"));
+    }
+
+    // LOCKED → raw ciphertext capture.
+    lock_bitlocker('R').expect("lock");
+    let disks = enumerate_disks().unwrap();
+    let part = disks
+        .iter()
+        .find(|d| d.index == idx)
+        .unwrap()
+        .partitions
+        .iter()
+        .find(|p| p.fs_kind == FilesystemKind::Bitlocker)
+        .expect("locked partition classified Bitlocker")
+        .clone();
+    assert_eq!(part.capture_mode, CaptureMode::Raw);
+    assert_eq!(part.bitlocker, BitlockerState::Locked);
+    let locked_backup = backup_all(idx);
+    {
+        let reader = PhnxReader::open(&locked_backup).unwrap();
+        let pm = reader
+            .manifest
+            .partitions
+            .iter()
+            .find(|p| p.fs == "bitlocker")
+            .expect("bitlocker in manifest");
+        assert_eq!(pm.capture_mode, "raw");
+        assert_eq!(pm.bitlocker.as_deref(), Some("locked"));
+    }
+
+    let disk_size = disk_size_bytes(idx);
+
+    // Restore the CIPHERTEXT image: volume comes back locked, original
+    // password unlocks it, fixture intact.
+    //
+    // A `clean` of this disk once failed with 0x80310000 (FVE facility)
+    // while the volume sat in the locked, force-dismounted state — likely a
+    // wedged dismount rather than "locked disks can't be wiped" (diskpart
+    // normally cleans locked BitLocker disks fine). Unlocking first is
+    // cheap insurance either way; the ciphertext is already safely
+    // captured in `locked_backup`.
+    unlock_bitlocker_password('R', PW).expect("unlock source before clean");
+    disk.clean().expect("clean");
+    let reader = PhnxReader::open(&locked_backup).unwrap();
+    let plan = default_plan_from_backup(locked_backup.to_str().unwrap(), &reader, idx, disk_size);
+    drop(reader);
+    run_restore(RestoreOptions {
+        backup_path: locked_backup.clone(),
+        plan,
+        verify_on_restore: true,
+        progress: None,
+    })
+    .expect("run_restore (ciphertext)");
+
+    // THE HARD GUARANTEE — proven from the on-disk bytes, not Windows' opinion.
+    //
+    // `Get-BitLockerVolume`/`manage-bde` report the OS's *cached mounted-volume*
+    // view, which on removable USB media stays stale in-session after a raw
+    // rewrite: the ciphertext sectors land under a volume Windows auto-mounted
+    // mid-restore, and nothing short of a re-plug/reboot makes it re-read them
+    // (FSCTL_DISMOUNT_VOLUME doesn't clear it on removable media). So we assert
+    // the property directly: read the restored partition's boot sector straight
+    // off `\\.\PhysicalDriveN` and require the BitLocker `-FVE-FS-` signature.
+    // Combined with verify-on-restore (every byte matched the captured image)
+    // this proves the restore reproduced the encrypted volume, not plaintext.
+    // Scan all partitions for the signature (robust to layout/MSR ordering).
+    let tags = disk_partition_boot_tags(idx).expect("scan restored partitions");
+    assert!(
+        tags.iter().any(|(_, _, t)| t == "-FVE-FS-"),
+        "no restored partition carries the BitLocker -FVE-FS- signature; saw {tags:?}"
+    );
+    eprintln!("[T3] a restored partition boot sector is -FVE-FS- (ciphertext intact): {tags:?}");
+
+    // Best-effort end-to-end: try to get Windows to recognize + unlock the
+    // restored volume and confirm the fixture. On removable media Windows may
+    // refuse to re-read the volume in-session (see above), so this leg is
+    // advisory — a failure to *recognize* is logged and skipped, but if it
+    // DOES unlock, the fixture must be intact.
+    rescan_disk_volumes(idx).ok();
+    if let Some(letter) = wait_for_letter_even_if_locked(idx, 30_000) {
+        match bitlocker_status(letter) {
+            Ok((vs, ls, _)) if vs == "FullyEncrypted" => {
+                if ls == "Unlocked" {
+                    eprintln!(
+                        "[T3] restored volume arrived unlocked (session key cache); re-locking"
+                    );
+                    let _ = lock_bitlocker(letter);
+                }
+                unlock_bitlocker_password(letter, PW).expect("unlock restored volume");
+                assert!(wait_for_letter(letter, 15_000), "unlocked root unreachable");
+                verify_fixture(letter, &digest)
+                    .expect("fixture preserved through ciphertext roundtrip");
+                eprintln!("[T3] end-to-end unlock + fixture verify passed");
+            }
+            other => {
+                eprintln!(
+                    "[T3] OS did not re-recognize the restored BitLocker volume in-session \
+                     (status {other:?}); on-disk -FVE-FS- check already proved the ciphertext. \
+                     Skipping the in-session unlock leg (would need a re-plug/reboot)."
+                );
+            }
+        }
+    }
+
+    // Restore the PLAINTEXT (unlocked-capture) image: volume comes back as
+    // a normal unencrypted NTFS volume.
+    disk.clean().expect("clean");
+    let reader = PhnxReader::open(&unlocked_backup).unwrap();
+    let plan = default_plan_from_backup(unlocked_backup.to_str().unwrap(), &reader, idx, disk_size);
+    drop(reader);
+    run_restore(RestoreOptions {
+        backup_path: unlocked_backup.clone(),
+        plan,
+        verify_on_restore: true,
+        progress: None,
+    })
+    .expect("run_restore (plaintext)");
+    let letter = wait_for_restored_letter(idx, 30_000).expect("restored plaintext got no letter");
+    if let Ok((vs, ls, _)) = bitlocker_status(letter) {
+        assert_eq!(
+            vs, "FullyDecrypted",
+            "plaintext restore must not be encrypted"
+        );
+        assert_eq!(ls, "Unlocked");
+    }
+    chkdsk_clean(letter).expect("chkdsk on restored plaintext NTFS");
+    verify_fixture(letter, &digest).expect("fixture preserved through plaintext roundtrip");
+
+    let _ = std::fs::remove_file(&unlocked_backup);
+    let _ = std::fs::remove_file(&locked_backup);
+    eprintln!("[T3] real_mbr_bitlocker_roundtrip PASSED");
 }
 
 #[test]

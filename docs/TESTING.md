@@ -77,6 +77,7 @@ cargo test -p phoenix-systests -- --ignored --test-threads=1 --nocapture
 | `fat_family.rs` | FAT32 and exFAT backup → restore round-trips |
 | `resize_roundtrip.rs` | NTFS **grow** (`FSCTL_EXTEND_VOLUME`) and **shrink** (relocation + MFT/`$Bitmap`/`$LogFile` rewrite) |
 | `mount.rs` | materialize-to-VHD mount (the dev fallback path) + browse fixture |
+| `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): encrypt with a password protector → **unlocked** volume classifies NTFS/used-blocks/`Unlocked` and round-trips as a normal *plaintext* backup → `Lock-BitLocker` → classifies Bitlocker/raw/`Locked`, backup is *ciphertext* (verify-after passes), restore comes back locked and yields the fixture only after `Unlock-BitLocker` with the original password |
 
 All disks in T2 are **GPT** (VHDX can't be MBR via this path) — MBR coverage
 comes from T3.
@@ -129,6 +130,7 @@ Without `PHOENIX_T3_DISK` set, the tests skip cleanly (nothing is wiped).
 | `real_mbr_multifs_roundtrip` | MBR NTFS + FAT32 image → full-disk restore, NTFS auto-grow, partition-table + data |
 | `real_mbr_restore_shrink` | NTFS relocation (shrink to 512 MB), chkdsk-clean |
 | `real_mbr_exfat_roundtrip` | exFAT (raw capture) + NTFS round-trip |
+| `real_mbr_bitlocker_roundtrip` | BitLocker on real flash: unlocked → plaintext backup/restore; locked → ciphertext backup/restore, ciphertext proven by reading `-FVE-FS-` off the physical disk (the in-session OS unlock leg is best-effort — Windows won't re-recognize a restored removable BitLocker volume without a re-plug/reboot) |
 | `real_clone_to_vhd` | clone the real disk → a VHD, read-back verify |
 
 Every scenario runs with **verify-after-backup on** (re-reads the USB source and
@@ -171,6 +173,9 @@ resize restores, mount (WinFsp), and 4Kn / USB media.
 - **winfsp tests / feature**: LLVM (`libclang`, for `winfsp-sys` bindgen) + WinFsp
   installed (https://winfsp.dev).
 - **T3-auto**: a spare USB disk you can fully erase.
+- **BitLocker tests** (T2 `bitlocker.rs`, T3 `real_mbr_bitlocker_roundtrip`):
+  a Windows SKU with the BitLocker cmdlets (Pro/Enterprise). Data volumes use
+  a password protector, so no TPM or group-policy change is needed.
 
 ## CI
 

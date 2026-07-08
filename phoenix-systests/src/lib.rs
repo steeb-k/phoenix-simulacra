@@ -214,6 +214,18 @@ pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Resu
             TestFs::Exfat => "exFAT",
             TestFs::Fat => "FAT",
         };
+        // A crashed prior run can leave the mount manager holding the drive
+        // letter for a volume that no longer exists (observed after a
+        // force-dismounted BitLocker volume's disk was cleared: mountvol
+        // still mapped R: to a dead \\?\Volume{...} GUID, and New-Partition
+        // then failed with "the requested access path is already in use").
+        // If no live partition owns the letter, drop the stale mapping.
+        script.push_str(&format!(
+            "if (-not (Get-Partition -ErrorAction SilentlyContinue | \
+                 Where-Object DriveLetter -eq '{letter}')) {{ \
+                 mountvol {letter}: /D 2>$null }}; ",
+            letter = p.letter
+        ));
         script.push_str(&format!(
             "New-Partition -DiskNumber {disk_index} {size} -DriveLetter {letter} | Out-Null; \
              Format-Volume -DriveLetter {letter} -FileSystem {fs} \
@@ -365,9 +377,40 @@ impl RealDisk {
     }
 
     /// Wipe the disk (re-validates safety first).
+    ///
+    /// diskpart `clean` is timing-sensitive: a freshly (re)mounted volume on
+    /// the disk — e.g. a just-unlocked BitLocker volume being scanned by the
+    /// search indexer or AV — can hold handles that surface as a spurious
+    /// "Access is denied" (0x80070005). Retry with backoff, then fall back
+    /// to `Clear-Disk`, which force-dismounts volumes and has succeeded on
+    /// disks diskpart refused.
     pub fn clean(&self) -> Result<()> {
         validate_real_disk(self.index)?;
-        run_diskpart(&format!("select disk {}\nclean\n", self.index)).context("clean real disk")?;
+        let mut last_err = None;
+        for attempt in 1u32..=3 {
+            match run_diskpart(&format!("select disk {}\nclean\n", self.index)) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    eprintln!("[T3] diskpart clean attempt {attempt} failed: {e:#}");
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+                }
+            }
+        }
+        eprintln!("[T3] falling back to Clear-Disk");
+        validate_real_disk(self.index)?;
+        powershell(&format!(
+            "Clear-Disk -Number {} -RemoveData -RemoveOEM -Confirm:$false",
+            self.index
+        ))
+        .with_context(|| {
+            format!(
+                "clean real disk: diskpart failed 3x ({}), then Clear-Disk failed",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            )
+        })?;
         Ok(())
     }
 
@@ -449,7 +492,10 @@ fn resolve_disk_number_for_vhd(vhd_path: &str, before: &[(u32, String)]) -> Resu
     }
 }
 
-fn powershell(script: &str) -> Result<String> {
+/// Run a PowerShell script (non-interactive, profile-less) and return its
+/// stdout, failing with stderr attached. Public so tests can drive tooling
+/// the harness doesn't wrap (e.g. the BitLocker cmdlets).
+pub fn powershell(script: &str) -> Result<String> {
     let out = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -504,6 +550,165 @@ pub fn cleanup_leaked_vhds() -> Result<()> {
 
 pub mod fixture;
 pub use fixture::{fill_fixture, verify_fixture, FixtureDigest};
+
+// ---- BitLocker test helpers (Windows Pro+; used by the T2 `bitlocker` and
+// ---- T3 `real_disk` BitLocker scenarios) ----
+
+/// `(VolumeStatus, LockStatus, ProtectionStatus)` for a mount point, via
+/// `Get-BitLockerVolume`. Errors if the cmdlet can't see the volume.
+pub fn bitlocker_status(letter: char) -> Result<(String, String, String)> {
+    let out = powershell(&format!(
+        "$v = Get-BitLockerVolume -MountPoint '{letter}:' -ErrorAction Stop; \
+         \"$($v.VolumeStatus)|$($v.LockStatus)|$($v.ProtectionStatus)\""
+    ))?;
+    let line = out.trim().to_string();
+    let f: Vec<&str> = line.split('|').collect();
+    if f.len() != 3 {
+        bail!("unexpected Get-BitLockerVolume output: {line}");
+    }
+    Ok((f[0].to_string(), f[1].to_string(), f[2].to_string()))
+}
+
+/// Encrypt a data volume with a password protector (used-space-only for
+/// speed) and block until conversion reports `FullyEncrypted`.
+pub fn enable_bitlocker_password(letter: char, password: &str) -> Result<()> {
+    powershell(&format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $pw = ConvertTo-SecureString '{password}' -AsPlainText -Force; \
+         Enable-BitLocker -MountPoint '{letter}:' -PasswordProtector -Password $pw \
+             -UsedSpaceOnly | Out-Null"
+    ))
+    .context("Enable-BitLocker")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let (volume_status, _, _) = bitlocker_status(letter)?;
+        if volume_status == "FullyEncrypted" {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("BitLocker conversion did not finish (status {volume_status})");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Lock an encrypted volume (dismounting any open handles).
+pub fn lock_bitlocker(letter: char) -> Result<()> {
+    powershell(&format!(
+        "Lock-BitLocker -MountPoint '{letter}:' -ForceDismount | Out-Null"
+    ))
+    .context("Lock-BitLocker")?;
+    Ok(())
+}
+
+/// Unlock an encrypted volume with its password.
+pub fn unlock_bitlocker_password(letter: char, password: &str) -> Result<()> {
+    powershell(&format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $pw = ConvertTo-SecureString '{password}' -AsPlainText -Force; \
+         Unlock-BitLocker -MountPoint '{letter}:' -Password $pw | Out-Null"
+    ))
+    .context("Unlock-BitLocker")?;
+    Ok(())
+}
+
+/// Read the 8-byte OEM/FS tag at offset 3 of a partition's first sector,
+/// reading through the **physical disk** handle (`\\.\PhysicalDriveN`). This
+/// bypasses the volume mount entirely, so it reports the on-disk truth
+/// regardless of how Windows has the volume cached — the deterministic,
+/// media-agnostic way to prove what a restore actually wrote. Returns e.g.
+/// `"NTFS    "`, `"-FVE-FS-"` (BitLocker), or `"EXFAT   "`.
+pub fn partition_boot_oem_tag(disk_index: u32, offset_bytes: u64) -> Result<String> {
+    let path = format!(r"\\.\PhysicalDrive{disk_index}");
+    // Read one 512-byte sector at the partition offset. `length` only bounds
+    // the reader; a single sector covers the OEM tag at bytes 3..11.
+    let mut pr = phoenix_capture::PartitionReader::open_disk_partition(&path, offset_bytes, 4096)
+        .map_err(|e| anyhow!("open partition reader at offset {offset_bytes}: {e}"))?;
+    let mut buf = [0u8; 512];
+    let mut got = 0usize;
+    while got < buf.len() {
+        let n = phoenix_capture::BlockSource::read_at(&mut pr, got as u64, &mut buf[got..])
+            .map_err(|e| anyhow!("read boot sector: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    if got < 11 {
+        bail!("short read of boot sector at offset {offset_bytes} (got {got} bytes)");
+    }
+    Ok(String::from_utf8_lossy(&buf[3..11]).to_string())
+}
+
+/// For every partition on a disk, read its boot-sector OEM tag off the
+/// physical device and return `(offset, size, tag)`. Lets a caller prove a
+/// signature (e.g. BitLocker's `-FVE-FS-`) is present on the disk without
+/// assuming which partition index it landed at — GPT data disks carry a
+/// Microsoft Reserved (MSR) partition ahead of the data one, so "partition 0"
+/// is not the volume of interest.
+pub fn disk_partition_boot_tags(disk_index: u32) -> Result<Vec<(u64, u64, String)>> {
+    let disks = phoenix_core::disk::enumerate_disks().map_err(|e| anyhow!("enumerate: {e}"))?;
+    let disk = disks
+        .iter()
+        .find(|d| d.index == disk_index)
+        .ok_or_else(|| anyhow!("disk {disk_index} not found"))?;
+    let mut out = Vec::new();
+    for p in &disk.partitions {
+        let tag = partition_boot_oem_tag(disk_index, p.offset_bytes).unwrap_or_default();
+        out.push((p.offset_bytes, p.size_bytes, tag));
+    }
+    Ok(out)
+}
+
+/// Force Windows to re-read a disk's volumes after raw sectors were written
+/// underneath them. Restoring a raw ciphertext BitLocker image writes the
+/// `-FVE-FS-` boot sector into a partition Windows already auto-mounted
+/// (and cached the pre-write, non-BitLocker view of), so `Get-BitLockerVolume`
+/// / `manage-bde` report the stale "Fully Decrypted, Unknown size" view even
+/// though the on-disk bytes are a valid encrypted volume.
+///
+/// We dismount each mounted volume on the disk with `FSCTL_DISMOUNT_VOLUME`
+/// (via [`phoenix_core::disk::dismount_volume`]); the next access re-mounts it
+/// fresh and reads the on-disk truth — the same refresh a reboot or re-plug
+/// gives in production. This works on removable USB media, unlike
+/// `Set-Disk -IsOffline` / diskpart `offline disk`, which reject removable
+/// disks. A storage-cache nudge follows to hurry re-enumeration along.
+pub fn rescan_disk_volumes(disk_index: u32) -> Result<()> {
+    let letters = disk_volume_letters(disk_index).unwrap_or_default();
+    for l in letters {
+        let vol = format!(r"\\.\{l}:");
+        if let Err(e) = phoenix_core::disk::dismount_volume(&vol) {
+            eprintln!("[rescan] dismount {vol} failed (continuing): {e}");
+        }
+    }
+    // Best-effort re-enumeration nudge; ignore failures (the subsequent
+    // letter-wait force-assigns and reachability-polls regardless).
+    let _ = powershell(&format!(
+        "Update-Disk -Number {disk_index} -ErrorAction SilentlyContinue"
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    Ok(())
+}
+
+/// Wait for a disk's partition to get a drive letter WITHOUT requiring the
+/// volume root to be reachable — a restored BitLocker-locked volume has a
+/// letter but no browsable filesystem until it's unlocked, so
+/// [`wait_for_restored_letter`] would time out on it.
+pub fn wait_for_letter_even_if_locked(disk_index: u32, timeout_ms: u64) -> Option<char> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(l) = disk_volume_letters(disk_index)
+            .ok()
+            .and_then(|ls| ls.into_iter().next())
+        {
+            return Some(l);
+        }
+        if std::time::Instant::now() >= deadline {
+            return assign_letter_to_largest(disk_index);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
 
 /// Run `chkdsk /scan` (read-only) on a drive letter and return an error if it
 /// reports problems. Used after restore/clone to assert the filesystem is

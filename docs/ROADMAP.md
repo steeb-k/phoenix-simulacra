@@ -11,52 +11,56 @@ Branch: `feature/engine-completion`.
 
 Backup, restore (with NTFS grow + shrink-relocation, FAT/exFAT grow), disk-to-disk
 clone (incl. live VSS), **verify-after-backup** (default on), format-v2 bulletproof
-verification, and the **zero-space WinFsp mount**. Validated by the full T1/T2
-suites and the real-disk (T3) matrix — see [TESTING.md](TESTING.md). Multiple
-real integrity bugs were found and fixed along the way, including a silent
-data-loss bug (`div_ceil` phantom cluster) that only real fragmented NTFS
-exposed.
+verification, the **zero-space WinFsp mount**, and **lock-state-aware BitLocker
+capture** (see below). Validated by the full T1/T2 suites and the real-disk (T3)
+matrix — see [TESTING.md](TESTING.md). Multiple real integrity bugs were found
+and fixed along the way, including a silent data-loss bug (`div_ceil` phantom
+cluster) that only real fragmented NTFS exposed.
+
+### BitLocker: lock-state-aware capture (implemented)
+
+**Lock state — not merely "is this BitLocker" — drives the capture mode:**
+
+- **Unlocked** BitLocker volume → a **completely normal** capture. Detection
+  compares the *physical* view of the boot sector (reads `-FVE-FS-` ciphertext
+  through `\\.\PhysicalDriveN`) with the *volume-device* view (reads the
+  decrypted filesystem once unlocked) — `classify_partition_on_disk` +
+  `apply_bitlocker_state` in `phoenix-core/src/disk.rs`. Since capture reads
+  through the volume device (or its VSS shadow), an unlocked volume streams
+  plaintext with used-block sizing, and the `.phnx` is a normal, unencrypted,
+  restorable image.
+- **Locked** BitLocker volume → **raw ciphertext** capture, loudly warned in
+  logs/CLI and flagged in the manifest; restore reproduces the locked volume,
+  which still needs the original key/recovery password. VSS is skipped for
+  locked volumes (nothing to snapshot); verify-after-backup works for both
+  states (ciphertext at rest is deterministic).
+- The per-partition manifest records `bitlocker: "unlocked" | "locked"`
+  (absent for non-BitLocker; old manifests deserialize unchanged). Restore
+  warns when writing ciphertext; GUI labels show "NTFS (BitLocker, unlocked)" /
+  "BitLocker (locked)"; `list` and `list-backup` in the CLI show the state.
+
+Design decisions (settled 2026-07): detection via dual boot-sector read (no
+WMI/COM dependency — it can never disagree with the bytes the capture handle
+actually reads); locked volumes are captured with a warning rather than
+refused or auto-unlocked; unlocked-capture images restore as plaintext, no
+re-encrypt-on-restore. Covered by T1 unit tests, the T2 `bitlocker.rs`
+lifecycle test (VHDX + password protector), and the T3
+`real_mbr_bitlocker_roundtrip` scenario — the latter **validated on real USB
+hardware** (2026-07-08): the locked ciphertext round-trips byte-correct (the
+restored partition's on-disk boot sector reads `-FVE-FS-`) and the unlocked
+path captures/restores plaintext with used-block sizing.
+
+Note on capturing a **locked** volume: fvevol rejects reads of a locked volume
+through the *volume device* (`ReadFile` → `FVE_E_LOCKED_VOLUME` 0x80310000), so
+both the backup and clone engines read a locked BitLocker partition through the
+*physical disk* handle at the partition offset. This is wired into
+`phoenix-capture`/`phoenix-clone` (a locked partition forces the PhysicalDrive
+read path, skipping VSS and the volume lock, which don't apply to an unmounted
+locked volume).
 
 ---
 
 ## Remaining work (prioritized)
-
-### P1 — BitLocker: lock-state-aware capture
-System disks are commonly BitLocker-encrypted, so this is core usability, not an
-edge case. **Lock state — not merely "is this BitLocker" — must drive the
-capture mode.** Today `classify_partition` marks any BitLocker partition
-`FilesystemKind::Bitlocker` → forced `CaptureMode::Raw` regardless of whether
-it's unlocked, so even an unlocked volume loses used-block sizing.
-
-Target behavior:
-- **Unlocked** BitLocker volume → a **completely normal** capture. An unlocked
-  volume device presents *decrypted* data, so used-block file-aware capture
-  (NTFS/FAT/exFAT) reads plaintext and the `.phnx` is a normal, unencrypted,
-  restorable image — "the backup itself is unlocked." **This is the preferred
-  case** (e.g. the live system disk, which runs unlocked → VSS snapshot is
-  plaintext → normal backup, once we stop forcing raw).
-- **Locked** BitLocker volume → **sector-by-sector (raw)** capture of the
-  encrypted volume via the raw disk handle. The `.phnx` holds ciphertext;
-  restoring reproduces the encrypted volume, which still needs the original
-  BitLocker key/recovery to unlock. Flag it clearly as encrypted.
-
-Work involved:
-- Detect per-volume lock state (WMI `Win32_EncryptableVolume`
-  `ProtectionStatus`/`LockStatus`, or `manage-bde -status`, or the FVE API).
-- Branch capture: unlocked → refine to the real filesystem + used-block; locked
-  → raw ciphertext.
-- Record encryption/lock state per partition in the manifest so restore, verify,
-  and mount know (a mounted ciphertext image would surface as an encrypted
-  volume and prompt for the key).
-- Surface state + clear warnings in CLI/GUI; verify-after-backup works for both
-  (BitLocker ciphertext at rest is deterministic, so a re-read matches).
-
-**Open for debate when we implement it** (per the user):
-- Prompt to unlock a locked volume before backup (to get a normal, usable
-  image) vs. just doing raw ciphertext?
-- Always restore the "unlocked" image as plaintext (preferred), or optionally
-  re-encrypt on restore?
-- Best lock-state detection mechanism (WMI vs `manage-bde` vs FVE COM).
 
 ### P1 — WinFsp installer bundling
 The mount feature requires the WinFsp driver at run time. The binary already
@@ -128,14 +132,25 @@ hard to automate safely; **4Kn media** could be automated if a 4Kn test device
 - **GPT on removable USB** is not possible (Windows policy), hence MBR-only T3.
 - **verify-after-backup roughly doubles source read time** (it re-reads the
   source). On by default; opt out with `backup --no-verify` when speed matters.
-- **BitLocker** — *today* any BitLocker partition is captured raw regardless of
-  lock state. Being fixed under P1 above (unlocked → normal used-block capture;
-  locked → raw ciphertext).
+- **BitLocker locked volumes** are captured as raw ciphertext by design (with
+  loud warnings); unlocking first yields a normal plaintext backup. There is no
+  prompt-to-unlock or re-encrypt-on-restore flow. Mounting a ciphertext image
+  surfaces an encrypted volume that prompts for the recovery key.
+- **Restoring a locked BitLocker (ciphertext) image needs a re-scan to be
+  recognized.** The restore writes the `-FVE-FS-` sectors correctly, but
+  Windows caches the mounted-volume view of the freshly-created partition from
+  *before* those bytes landed, so `manage-bde`/Explorer show a stale
+  "decrypted / unknown" volume until the disk is re-read. A **reboot or
+  unplug/replug** (or offline→online on a fixed disk) refreshes it and the
+  volume then prompts for the BitLocker key as expected. The on-disk bytes are
+  correct the whole time — this is purely an OS cache-refresh quirk, most
+  visible on removable USB media where `FSCTL_DISMOUNT_VOLUME` alone doesn't
+  clear it. (A future nicety: have restore trigger a rescan itself.)
 - **Restore to dissimilar hardware** may need Windows Startup Repair / `bcdedit`
   (expected; noted in the live checklist).
 
 ## Out of scope (explicit)
 
 Incrementals / differentials (the v2 format keeps reserved fields for them),
-cloud / sync / scheduling, and ReFS. (Note: BitLocker is now **in scope** and
-prioritized — see P1 above.)
+cloud / sync / scheduling, and ReFS. (BitLocker lock-state-aware capture is
+**done** — see "What's done" above.)
