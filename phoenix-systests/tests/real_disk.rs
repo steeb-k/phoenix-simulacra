@@ -18,12 +18,31 @@
 use phoenix_capture::backup::{run_backup, BackupOptions};
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::enumerate_disks;
-use phoenix_restore::plan::default_plan_from_backup;
+use phoenix_restore::plan::{default_plan_from_backup, RestorePlan, RestorePlanEntry};
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
     chkdsk_clean, fill_fixture, partition_summary, require_admin, verify_fixture,
     wait_for_disk_volumes, wait_for_letter, PartSpec, RealDisk, TestFs,
 };
+
+const MB: u64 = 1024 * 1024;
+
+/// Back up every partition of `idx` to a fresh `.phnx` (verify-after on).
+fn backup_all(idx: u32) -> std::path::PathBuf {
+    let parts = all_partition_indices(idx);
+    eprintln!("[T3] backing up disk {idx} partitions {parts:?}");
+    let backup = std::env::temp_dir().join(format!("t3-{}.phnx", uuid::Uuid::new_v4().simple()));
+    run_backup(BackupOptions {
+        disk_index: idx,
+        partition_indices: parts,
+        output: backup.clone(),
+        use_vss: false,
+        verify_after: true,
+        progress: None,
+    })
+    .expect("run_backup");
+    backup
+}
 
 /// Acquire the opt-in target disk, or `None` to skip (env unset). A failed
 /// safety gate panics rather than skipping.
@@ -157,4 +176,97 @@ fn real_mbr_multifs_roundtrip() {
 
     let _ = std::fs::remove_file(&backup);
     eprintln!("[T3] real_mbr_multifs_roundtrip PASSED");
+}
+
+#[test]
+#[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
+fn real_mbr_restore_shrink() {
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    let idx = disk.index();
+
+    // Source: NTFS 2 GB + FAT32 1 GB, filled.
+    disk.layout(
+        false,
+        &[
+            PartSpec {
+                size_mb: 2048,
+                fs: TestFs::Ntfs,
+                letter: 'R',
+                label: "T3NTFS".into(),
+            },
+            PartSpec {
+                size_mb: 1024,
+                fs: TestFs::Fat32,
+                letter: 'S',
+                label: "T3FAT".into(),
+            },
+        ],
+    )
+    .expect("MBR layout");
+    assert!(wait_for_letter('R', 20_000), "NTFS didn't mount");
+    assert!(wait_for_letter('S', 20_000), "FAT didn't mount");
+    let d_ntfs = fill_fixture('R', 0xBB01).expect("fill ntfs");
+    let d_fat = fill_fixture('S', 0xBB02).expect("fill fat");
+
+    let backup = backup_all(idx);
+
+    // Restore with the NTFS SHRUNK 2 GB -> 512 MB (forces relocation of the
+    // metadata NTFS parks near the volume end), FAT32 kept at 1 GB right after.
+    let ntfs_off = 1 * MB;
+    let ntfs_size = 512 * MB;
+    let fat_off = ntfs_off + ntfs_size;
+    let plan = RestorePlan {
+        backup_path: backup.to_str().unwrap().to_string(),
+        target_disk_index: idx,
+        full_disk: true,
+        entries: vec![
+            RestorePlanEntry {
+                source_partition_index: Some(0),
+                target_partition_index: 0,
+                restore: true,
+                target_offset_bytes: ntfs_off,
+                target_size_bytes: ntfs_size,
+            },
+            RestorePlanEntry {
+                source_partition_index: Some(1),
+                target_partition_index: 1,
+                restore: true,
+                target_offset_bytes: fat_off,
+                target_size_bytes: 1024 * MB,
+            },
+        ],
+    };
+    for e in &plan.entries {
+        eprintln!(
+            "[T3] shrink plan: src={:?} off={} size={}",
+            e.source_partition_index, e.target_offset_bytes, e.target_size_bytes
+        );
+    }
+
+    disk.clean().expect("clean");
+    run_restore(RestoreOptions {
+        backup_path: backup.clone(),
+        plan,
+        verify_on_restore: true,
+        progress: None,
+    })
+    .expect("run_restore (shrink)");
+
+    let letters = wait_for_disk_volumes(idx, 2, 60_000).expect("restored volumes");
+    let after = partition_summary(idx).expect("summary after");
+    eprintln!("[T3] restored (shrunk) partitions: {after:?}");
+    assert!(
+        after[0].1 <= 600 * MB,
+        "NTFS should have shrunk to ~512 MB, got {} bytes",
+        after[0].1
+    );
+    chkdsk_clean(letters[0]).expect("chkdsk on shrunk NTFS");
+    verify_fixture(letters[0], &d_ntfs).expect("NTFS fixture preserved across shrink");
+    verify_fixture(letters[1], &d_fat).expect("FAT32 fixture preserved");
+
+    let _ = std::fs::remove_file(&backup);
+    eprintln!("[T3] real_mbr_restore_shrink PASSED");
 }
