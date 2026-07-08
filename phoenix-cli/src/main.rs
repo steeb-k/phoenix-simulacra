@@ -32,6 +32,10 @@ enum Commands {
         output: PathBuf,
         #[arg(long, default_value_t = false)]
         vss: bool,
+        /// Skip the post-backup pass that re-reads the source and confirms the
+        /// backup matches it (on by default; roughly doubles read time).
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
     },
     /// List contents of a .phnx backup
     List { backup: PathBuf },
@@ -123,12 +127,14 @@ fn main() -> anyhow::Result<()> {
             partitions,
             output,
             vss,
+            no_verify,
         } => {
             run_backup(BackupOptions {
                 disk_index: disk,
                 partition_indices: partitions,
                 output,
                 use_vss: vss,
+                verify_after: !no_verify,
                 progress: None,
             })?;
         }

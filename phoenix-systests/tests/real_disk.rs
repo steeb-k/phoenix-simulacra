@@ -106,6 +106,7 @@ fn real_mbr_multifs_roundtrip() {
         partition_indices: parts,
         output: backup.clone(),
         use_vss: false,
+        verify_after: true,
         progress: None,
     })
     .expect("run_backup");

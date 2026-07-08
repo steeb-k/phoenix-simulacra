@@ -166,7 +166,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             default_backup_dir: None,
-            verify_after_backup: false,
+            // On by default: re-read the source after capture and confirm the
+            // backup matches it. Integrity is the point of making images.
+            verify_after_backup: true,
             default_verify_quick: true,
             clone_readback_verify: true,
             theme: ThemeChoice::System,

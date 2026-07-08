@@ -1,10 +1,13 @@
 use chrono::Utc;
-use phoenix_core::container::{Extent, Header, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION};
+use phoenix_core::container::{
+    Extent, Header, PhnxWriter, CHUNK_SIZE, EXTENT_LBA_BYTES, FORMAT_VERSION,
+};
 use phoenix_core::disk::guid_to_string;
 use phoenix_core::disk::{
     enumerate_disks, refine_partition_fs, CaptureMode, FilesystemKind, PartitionInfo,
 };
-use phoenix_core::error::Result;
+use phoenix_core::error::{PhoenixError, Result};
+use phoenix_core::hash;
 use phoenix_core::manifest::{
     capture_mode_to_string, fs_kind_to_string, BackupManifest, DiskManifest, PartitionManifest,
 };
@@ -15,13 +18,18 @@ use uuid::Uuid;
 use crate::fat::{capture_exfat, capture_fat, fat_plan};
 use crate::ntfs::{capture_ntfs, ntfs_plan};
 use crate::raw::{capture_raw, raw_extent_for_partition};
-use crate::reader::PartitionReader;
+use crate::reader::{BlockSource, PartitionReader};
 
 pub struct BackupOptions {
     pub disk_index: u32,
     pub partition_indices: Vec<u32>,
     pub output: std::path::PathBuf,
     pub use_vss: bool,
+    /// After capture, re-read the source and confirm every chunk still hashes
+    /// to what was recorded — proving the backup faithfully captured the disk.
+    /// Done while the VSS snapshot / volume lock is still held so the source
+    /// can't have changed. Defaults to on; roughly doubles source read time.
+    pub verify_after: bool,
     pub progress: Option<ProgressHandle>,
 }
 
@@ -369,10 +377,95 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         progress.set_detail(String::new());
     }
     writer.finalize(&manifest)?;
+
+    // ---- PHASE 3: verify against source (default on) ----
+    //
+    // Re-read the source and confirm every recorded chunk still hashes to what
+    // capture wrote. The VSS snapshot / volume lock from phase 1 is still held
+    // (both `vss` and `prepared` are alive until this function returns), so the
+    // source is the same frozen bytes we captured — a mismatch means the backup
+    // does not faithfully represent the disk, and we fail loudly.
+    if opts.verify_after {
+        if let Some(ref progress) = opts.progress {
+            progress.set_detail("Verifying backup against source…".to_string());
+        }
+        for (prep, pm) in prepared.iter_mut().zip(manifest.partitions.iter()) {
+            if let Some(ref progress) = opts.progress {
+                if progress.is_cancelled() {
+                    return Err(phoenix_core::error::PhoenixError::Cancelled);
+                }
+            }
+            verify_partition_against_source(
+                &mut prep.reader,
+                &prep.extents,
+                prep.capture_mode,
+                &pm.chunks,
+            )
+            .map_err(|e| {
+                phoenix_core::error::PhoenixError::Other(format!(
+                    "verify-after-backup failed for partition {}: {e}",
+                    prep.part.index
+                ))
+            })?;
+        }
+        info!("verify-after-backup: all partitions match the source");
+    }
+
     if let Some(ref progress) = opts.progress {
         progress.end();
     }
     info!("Backup written to {}", opts.output.display());
+    Ok(())
+}
+
+/// Re-read a partition's source and confirm every recorded chunk still hashes
+/// to its captured value. Each chunk is located directly from its `(extent,
+/// chunk_index)` position (chunks are `CHUNK_SIZE`-aligned within an extent, or
+/// within the whole partition for raw capture), so this doesn't depend on the
+/// capture walk order.
+fn verify_partition_against_source(
+    reader: &mut impl BlockSource,
+    extents: &[Extent],
+    capture_mode: CaptureMode,
+    expected: &[phoenix_core::manifest::ChunkRecord],
+) -> Result<()> {
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    for rec in expected {
+        let len = rec.uncompressed_len as usize;
+        if len == 0 || len > CHUNK_SIZE {
+            return Err(PhoenixError::Other(format!(
+                "chunk (extent {}, index {}) has invalid length {len}",
+                rec.extent_index, rec.chunk_index
+            )));
+        }
+        let base = if capture_mode == CaptureMode::Raw {
+            0
+        } else {
+            let ext = extents.get(rec.extent_index as usize).ok_or_else(|| {
+                PhoenixError::Other(format!(
+                    "chunk references extent {} of {}",
+                    rec.extent_index,
+                    extents.len()
+                ))
+            })?;
+            ext.start_sector * EXTENT_LBA_BYTES as u64
+        };
+        let offset = base + rec.chunk_index as u64 * CHUNK_SIZE as u64;
+        let n = reader.read_at(offset, &mut buf[..len])?;
+        if n != len {
+            return Err(PhoenixError::Other(format!(
+                "source read {n} bytes, expected {len} at offset {offset} (extent {}, chunk {})",
+                rec.extent_index, rec.chunk_index
+            )));
+        }
+        if hash::hash_hex(&buf[..len]) != rec.blake3 {
+            return Err(PhoenixError::Other(format!(
+                "extent {}, chunk {} at offset {offset} does not match the source — the backup does \
+                 not faithfully represent the disk",
+                rec.extent_index, rec.chunk_index
+            )));
+        }
+    }
     Ok(())
 }
 

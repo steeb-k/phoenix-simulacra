@@ -45,6 +45,7 @@ fn roundtrip_fs(fs: TestFs, size_mb: u64, seed: u64) {
         partition_indices: parts,
         output: backup_path.clone(),
         use_vss: false,
+        verify_after: true,
         progress: None,
     })
     .expect("run_backup");

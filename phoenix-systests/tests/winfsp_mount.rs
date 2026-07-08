@@ -73,6 +73,7 @@ fn winfsp_mount_and_browse_files() {
         partition_indices: parts,
         output: backup_path.clone(),
         use_vss: false,
+        verify_after: true,
         progress: None,
     })
     .expect("run_backup");

@@ -1118,6 +1118,7 @@ impl PhoenixApp {
                 partition_indices: parts,
                 output,
                 use_vss: self.use_vss,
+                verify_after: self.settings.verify_after_backup,
                 progress: Some(ProgressHandle::new()),
             });
         }
