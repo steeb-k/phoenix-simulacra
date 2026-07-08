@@ -305,24 +305,33 @@ fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> 
         return Vec::new();
     }
     let last = sizes[n - 1];
-
-    // A `.phnx` records partition sizes but not their source disk offsets, so
-    // we reconstruct the layout by packing the earlier partitions from the
-    // front and anchoring the LAST partition's end at the disk's usable end —
-    // keeping every original size (no shrink), which is essential for
-    // raw-captured (exFAT) or fixed-geometry (FAT) partitions that can't be
-    // resized. The only free variable is how tightly to pack:
-    //
-    //   * 1 MiB alignment is the modern performance default (and what a fresh
-    //     diskpart layout uses when there's slack).
-    //   * When the partitions nearly fill the disk (the source packed them
-    //     right after the GPT header with no 1 MiB lead — observed: MSR + data
-    //     leaving only ~80 KiB free), 1 MiB alignment doesn't fit, so fall back
-    //     to 4 KiB alignment with a minimal GPT-boundary lead.
-    //
-    // Try each packing from most- to least-preferred; the first whose earlier
-    // partitions end before the anchored last partition wins.
     let min_lead_4k = align_up(GPT_LEADING_BYTES, 4096);
+
+    // Pass 1 (preferred): pack EVERY partition sequentially from the front at
+    // 1 MiB alignment. When it fits, this is the layout to use — it leaves the
+    // extra room as trailing free space, which `expand_ntfs_slack` then grows
+    // the data partition into (so restoring to a larger disk actually enlarges
+    // the volume rather than stranding a gap).
+    {
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
+        let mut offset = align;
+        for &sz in sizes {
+            let off = align_up(offset, align);
+            out.push((off, sz));
+            offset = off + sz;
+        }
+        if out.last().map(|(o, s)| o + s <= usable_end).unwrap_or(true) {
+            return out;
+        }
+    }
+
+    // Pass 2: front-packing overshot — the source packed the partitions tight
+    // (no 1 MiB lead) and they nearly fill the disk. A `.phnx` records sizes but
+    // not source offsets, so reconstruct by packing the earlier partitions from
+    // the front and ANCHORING the last partition's end at the disk's usable end,
+    // keeping every original size (no shrink — essential for raw-captured exFAT
+    // or fixed-geometry FAT that can't be resized). Try 1 MiB first, then 4 KiB
+    // alignment with a minimal GPT-boundary lead; the first that fits wins.
     for &(lead, a) in &[
         (align.max(GPT_LEADING_BYTES), align),
         (min_lead_4k, 4096u64),
@@ -715,6 +724,37 @@ mod tests {
             placed[0].0 + placed[0].1 <= placed[1].0,
             "MSR overlaps data"
         );
+    }
+
+    #[test]
+    fn full_disk_pack_front_packs_when_there_is_room() {
+        // MSR (16 MiB) + NTFS (239 MiB) restored onto a 768 MiB disk. There's
+        // plenty of room, so the partitions must be FRONT-packed (NTFS right
+        // after the MSR), leaving the extra space as a trailing gap for
+        // expand_ntfs_slack to grow into — NOT anchored at the disk end.
+        let disk = 768 * 1024 * 1024u64;
+        let align = 1024 * 1024u64;
+        let msr = 16 * 1024 * 1024u64;
+        let ntfs = 239 * 1024 * 1024u64;
+        let placed = pack_full_disk(&[msr, ntfs], disk, align);
+        // NTFS packed right after the MSR (near the front), not at the end.
+        assert_eq!(placed[0], (align, msr));
+        assert_eq!(
+            placed[1].0,
+            align + msr,
+            "NTFS must be front-packed after MSR"
+        );
+        // Sizes preserved and generous trailing free space remains.
+        assert_eq!(placed[1].1, ntfs);
+        let end = placed[1].0 + placed[1].1;
+        assert!(
+            usable(disk) - end > 400 * 1024 * 1024,
+            "expected a large trailing gap for expansion, end={end}"
+        );
+    }
+
+    fn usable(disk: u64) -> u64 {
+        disk - 33 * 512
     }
 
     #[test]
