@@ -21,8 +21,8 @@ use phoenix_core::disk::enumerate_disks;
 use phoenix_restore::plan::default_plan_from_backup;
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, first_letter_on_disk, require_admin,
-    verify_fixture, wait_for_letter, FixtureDigest, PartSpec, TestFs, TestVhd,
+    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
+    wait_for_letter, wait_for_restored_letter, FixtureDigest, PartSpec, TestFs, TestVhd,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -61,21 +61,6 @@ fn backup_disk(source_mb: u64, seed: u64) -> (PathBuf, FixtureDigest) {
     (backup_path, digest)
 }
 
-/// Poll for the first drive letter to appear on a disk after a restore (the
-/// mount manager assigns it asynchronously once the disk is brought online).
-fn wait_for_disk_letter(disk_index: u32, timeout_ms: u64) -> Option<char> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    while std::time::Instant::now() < deadline {
-        if let Some(l) = first_letter_on_disk(disk_index) {
-            if Path::new(&format!("{l}:\\")).exists() {
-                return Some(l);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    None
-}
-
 /// Restore the backup as a full-disk layout onto `target` (whose size drives
 /// the NTFS grow/shrink), then assert the restored NTFS volume is consistent
 /// and its files are byte-identical.
@@ -111,7 +96,7 @@ fn restore_full_disk_and_verify(
     })
     .expect("run_restore");
 
-    let letter = wait_for_disk_letter(target.disk_index(), 45_000)
+    let letter = wait_for_restored_letter(target.disk_index(), 45_000)
         .expect("restored NTFS volume got no letter");
     chkdsk_clean(letter).expect("chkdsk clean");
     verify_fixture(letter, digest).expect("fixture preserved");

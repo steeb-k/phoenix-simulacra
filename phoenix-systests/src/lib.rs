@@ -335,6 +335,65 @@ pub fn chkdsk_clean(letter: char) -> Result<()> {
     );
 }
 
+/// Force a drive letter onto the largest partition of a disk and return it.
+/// After a restore the engine brings the disk online, but the mount manager
+/// assigns letters asynchronously and can be slow — especially for a freshly
+/// shrunk+relocated NTFS volume. This explicitly assigns one (idempotent: if a
+/// letter already exists it's returned as-is) so tests don't depend on mountmgr
+/// timing.
+pub fn assign_letter_to_largest(disk_index: u32) -> Option<char> {
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $p = Get-Partition -DiskNumber {disk_index} | Sort-Object Size -Descending | \
+              Select-Object -First 1; \
+         if ($p -and -not $p.DriveLetter) {{ \
+             Add-PartitionAccessPath -DiskNumber {disk_index} \
+                 -PartitionNumber $p.PartitionNumber -AssignDriveLetter \
+         }}; \
+         (Get-Partition -DiskNumber {disk_index} | Where-Object DriveLetter | \
+          Sort-Object Size -Descending | Select-Object -First 1 -ExpandProperty DriveLetter)"
+    );
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().chars().next()
+}
+
+/// Get a restored volume's drive letter, robust to mount-manager timing. Polls
+/// for an auto-assigned letter whose root is reachable; if none appears within
+/// the first half of `timeout_ms`, force-assigns one to the disk's largest
+/// partition (a freshly shrunk+relocated NTFS volume is often slow to
+/// auto-mount). Returns the reachable letter, or `None` on timeout.
+pub fn wait_for_restored_letter(disk_index: u32, timeout_ms: u64) -> Option<char> {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(timeout_ms);
+    let force_after = start + std::time::Duration::from_millis(timeout_ms / 2);
+    let mut forced = false;
+    let reachable = |l: char| Path::new(&format!("{l}:\\")).exists();
+
+    while std::time::Instant::now() < deadline {
+        if let Some(l) = first_letter_on_disk(disk_index).filter(|&l| reachable(l)) {
+            return Some(l);
+        }
+        if !forced && std::time::Instant::now() >= force_after {
+            forced = true;
+            if let Some(l) = assign_letter_to_largest(disk_index).filter(|&l| reachable(l)) {
+                return Some(l);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assign_letter_to_largest(disk_index).filter(|&l| reachable(l))
+}
+
 /// Drive letter currently assigned to the first lettered partition of a
 /// physical disk (via PowerShell `Get-Partition`), if any.
 pub fn first_letter_on_disk(disk_index: u32) -> Option<char> {

@@ -11,8 +11,8 @@ use phoenix_core::disk::enumerate_disks;
 use phoenix_restore::plan::default_plan_from_backup;
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, first_letter_on_disk, require_admin,
-    verify_fixture, wait_for_letter, PartSpec, TestFs, TestVhd,
+    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
+    wait_for_letter, wait_for_restored_letter, PartSpec, TestFs, TestVhd,
 };
 
 #[test]
@@ -76,12 +76,8 @@ fn ntfs_backup_restore_roundtrip_same_size() {
     .expect("run_restore");
 
     // --- Verify the restored volume ---
-    let letter =
-        first_letter_on_disk(target.disk_index()).expect("restored partition has no drive letter");
-    assert!(
-        wait_for_letter(letter, 30_000),
-        "restored volume {letter}: never mounted"
-    );
+    let letter = wait_for_restored_letter(target.disk_index(), 30_000)
+        .expect("restored volume got no drive letter");
     chkdsk_clean(letter).expect("chkdsk clean on restored volume");
     verify_fixture(letter, &digest).expect("fixture bytes preserved");
 

@@ -8,8 +8,8 @@
 use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs};
 use phoenix_systests::{
-    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, first_letter_on_disk, require_admin,
-    verify_fixture, wait_for_letter, PartSpec, TestFs, TestVhd,
+    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
+    wait_for_letter, wait_for_restored_letter, PartSpec, TestFs, TestVhd,
 };
 
 #[test]
@@ -65,11 +65,8 @@ fn ntfs_clone_same_size() {
     })
     .expect("run_clone");
 
-    let letter = first_letter_on_disk(target.disk_index()).expect("cloned partition has letter");
-    assert!(
-        wait_for_letter(letter, 30_000),
-        "cloned volume never mounted"
-    );
+    let letter =
+        wait_for_restored_letter(target.disk_index(), 30_000).expect("cloned volume got no letter");
     chkdsk_clean(letter).expect("chkdsk clean on cloned volume");
     verify_fixture(letter, &digest).expect("fixture bytes preserved by clone");
 }
@@ -125,11 +122,8 @@ fn ntfs_clone_expand_to_larger_target() {
     })
     .expect("run_clone expand");
 
-    let letter = first_letter_on_disk(target.disk_index()).expect("cloned partition has letter");
-    assert!(
-        wait_for_letter(letter, 30_000),
-        "cloned volume never mounted"
-    );
+    let letter =
+        wait_for_restored_letter(target.disk_index(), 30_000).expect("cloned volume got no letter");
     chkdsk_clean(letter).expect("chkdsk clean");
     verify_fixture(letter, &digest).expect("fixture preserved after expand-clone");
 }

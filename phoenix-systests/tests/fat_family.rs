@@ -11,8 +11,8 @@ use phoenix_core::disk::enumerate_disks;
 use phoenix_restore::plan::default_plan_from_backup;
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, first_letter_on_disk, require_admin,
-    verify_fixture, wait_for_letter, PartSpec, TestFs, TestVhd,
+    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
+    wait_for_letter, wait_for_restored_letter, PartSpec, TestFs, TestVhd,
 };
 
 fn roundtrip_fs(fs: TestFs, size_mb: u64, seed: u64) {
@@ -67,11 +67,8 @@ fn roundtrip_fs(fs: TestFs, size_mb: u64, seed: u64) {
     })
     .expect("run_restore");
 
-    let letter = first_letter_on_disk(target.disk_index()).expect("restored letter");
-    assert!(
-        wait_for_letter(letter, 30_000),
-        "restored volume never mounted"
-    );
+    let letter = wait_for_restored_letter(target.disk_index(), 30_000)
+        .expect("restored volume got no letter");
     chkdsk_clean(letter).expect("chkdsk clean");
     verify_fixture(letter, &digest).expect("fixture preserved");
     let _ = std::fs::remove_file(&backup_path);
