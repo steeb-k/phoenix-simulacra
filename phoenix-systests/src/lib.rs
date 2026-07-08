@@ -181,6 +181,41 @@ pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result
     Ok(())
 }
 
+/// Lay out a disk using PowerShell storage cmdlets, which (unlike diskpart's
+/// `format`) work on **removable** USB media. Clears the disk, initializes the
+/// partition table, then creates + formats + letters each partition.
+pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
+    let style = if gpt { "GPT" } else { "MBR" };
+    let mut script = format!(
+        "$ErrorActionPreference='Stop'; \
+         if ((Get-Disk -Number {disk_index}).PartitionStyle -ne 'RAW') {{ \
+             Clear-Disk -Number {disk_index} -RemoveData -RemoveOEM -Confirm:$false }}; \
+         Initialize-Disk -Number {disk_index} -PartitionStyle {style}; "
+    );
+    for p in parts {
+        let size = if p.size_mb == 0 {
+            "-UseMaximumSize".to_string()
+        } else {
+            format!("-Size {}MB", p.size_mb)
+        };
+        let fs = match p.fs {
+            TestFs::Ntfs => "NTFS",
+            TestFs::Fat32 => "FAT32",
+            TestFs::Exfat => "exFAT",
+            TestFs::Fat => "FAT",
+        };
+        script.push_str(&format!(
+            "New-Partition -DiskNumber {disk_index} {size} -DriveLetter {letter} | Out-Null; \
+             Format-Volume -DriveLetter {letter} -FileSystem {fs} \
+                 -NewFileSystemLabel {label} -Confirm:$false | Out-Null; ",
+            letter = p.letter,
+            label = p.label
+        ));
+    }
+    powershell(&script).context("powershell disk layout")?;
+    Ok(())
+}
+
 /// Drive letters assigned to a disk's partitions, in on-disk (offset) order.
 pub fn disk_volume_letters(disk_index: u32) -> Result<Vec<char>> {
     let out = powershell(&format!(
@@ -326,10 +361,11 @@ impl RealDisk {
         Ok(())
     }
 
-    /// Lay out partitions on the disk (re-validates safety first).
+    /// Lay out partitions on the disk (re-validates safety first). Uses the
+    /// PowerShell storage cmdlets, which work on removable USB media.
     pub fn layout(&self, gpt: bool, parts: &[PartSpec]) -> Result<()> {
         validate_real_disk(self.index)?;
-        diskpart_layout(self.index, gpt, parts)
+        powershell_layout(self.index, gpt, parts)
     }
 }
 
