@@ -17,6 +17,9 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
 - Bulletproof verification: format v2 checksums every metadata structure (footer CRC,
   total-length/truncation check, index-table hash, per-entry CRC); `verify --quick`
   runs a structural + sampled check, `verify` hashes every chunk
+- **Verify-after-backup (default on):** immediately re-reads the source and confirms
+  every chunk matches — proving the image faithfully captured the disk, not just that
+  the file is internally consistent (opt out with `backup --no-verify`)
 - Verify-on-restore (default) and optional read-back verification on clone
 - VSS support for live Windows backups (`--vss` / GUI checkbox)
 - CLI and egui GUI (WinPE-friendly, no WebView2)
