@@ -16,8 +16,22 @@ use windows_sys::Win32::Storage::Vhd::{
     VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE,
 };
 
-// VIRTUAL_STORAGE_TYPE_DEVICE_VHD = 2.
-const STORAGE_TYPE_DEVICE_VHD: u32 = 2;
+// VIRTUAL_STORAGE_TYPE_DEVICE_UNKNOWN = 0 — let the API detect VHD vs VHDX
+// from the file contents rather than asserting a device type ourselves.
+const STORAGE_TYPE_DEVICE_UNKNOWN: u32 = 0;
+// OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT.
+const RW_DEPTH_DEFAULT: u32 = 1;
+
+/// Decode a virtual-disk API return code. Codes in the FACILITY_VHD range
+/// (0xC03Axxxx) mean the *file* was rejected as a virtual disk (bad footer,
+/// checksum, or unsupported format); other codes are usually access/permission.
+fn describe_vhd_error(rc: u32) -> String {
+    if (0xC03A_0000..0xC03B_0000).contains(&rc) {
+        format!("0x{rc:08X} (VHD format error — the synthesized disk image was rejected)")
+    } else {
+        format!("{rc} (0x{rc:08X})")
+    }
+}
 
 pub struct AttachedDisk {
     handle: HANDLE,
@@ -33,15 +47,16 @@ impl AttachedDisk {
             .collect();
 
         let mut storage_type = VIRTUAL_STORAGE_TYPE {
-            DeviceId: STORAGE_TYPE_DEVICE_VHD,
-            VendorId: vendor_microsoft(),
+            DeviceId: STORAGE_TYPE_DEVICE_UNKNOWN,
+            VendorId: vendor_unknown(),
         };
 
         let mut handle: HANDLE = INVALID_HANDLE_VALUE;
-        let open_params = OPEN_VIRTUAL_DISK_PARAMETERS {
-            Version: 1, // OPEN_VIRTUAL_DISK_VERSION_1
-            Anonymous: unsafe { std::mem::zeroed() },
-        };
+        let mut open_params: OPEN_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
+        open_params.Version = 1; // OPEN_VIRTUAL_DISK_VERSION_1
+        unsafe {
+            open_params.Anonymous.Version1.RWDepth = RW_DEPTH_DEFAULT;
+        }
         let rc = unsafe {
             OpenVirtualDisk(
                 &mut storage_type,
@@ -54,7 +69,8 @@ impl AttachedDisk {
         };
         if rc != 0 {
             return Err(PhoenixError::Disk(format!(
-                "OpenVirtualDisk failed for {vhd_path} (Win32 error {rc})"
+                "OpenVirtualDisk failed for {vhd_path} (Win32 error {})",
+                describe_vhd_error(rc)
             )));
         }
 
@@ -75,8 +91,9 @@ impl AttachedDisk {
         if rc != 0 {
             unsafe { CloseHandle(handle) };
             return Err(PhoenixError::Disk(format!(
-                "AttachVirtualDisk failed for {vhd_path} (Win32 error {rc}). Mounting requires \
-                 Administrator."
+                "AttachVirtualDisk failed for {vhd_path} (Win32 error {}). Mounting requires \
+                 Administrator.",
+                describe_vhd_error(rc)
             )));
         }
         Ok(Self { handle })
@@ -93,12 +110,13 @@ impl Drop for AttachedDisk {
     }
 }
 
-fn vendor_microsoft() -> GUID {
-    // EC984AEC-A0F9-47E9-901F-71415A66345B
+/// VIRTUAL_STORAGE_TYPE_VENDOR_UNKNOWN — the all-zero GUID, paired with
+/// DEVICE_UNKNOWN so the API detects the format from the file.
+fn vendor_unknown() -> GUID {
     GUID {
-        data1: 0xEC98_4AEC,
-        data2: 0xA0F9,
-        data3: 0x47E9,
-        data4: [0x90, 0x1F, 0x71, 0x41, 0x5A, 0x66, 0x34, 0x5B],
+        data1: 0,
+        data2: 0,
+        data3: 0,
+        data4: [0; 8],
     }
 }
