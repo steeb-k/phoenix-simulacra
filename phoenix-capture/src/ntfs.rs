@@ -154,7 +154,12 @@ fn cluster_used(bitmap: &[u8], cluster: usize) -> bool {
 /// and 4Kn (4096) media.
 fn total_clusters_for(bs: &NtfsBootSector, cluster_size: u64) -> u64 {
     let volume_bytes = bs.total_sectors.saturating_mul(bs.bytes_per_sector as u64);
-    volume_bytes.div_ceil(cluster_size)
+    // FLOOR, not ceil: NTFS's cluster count is floor(volume_bytes / cluster_size).
+    // Any trailing sub-cluster slack is not a real cluster. Rounding up invents a
+    // phantom last cluster whose (padding) bitmap bit may be set, which would
+    // make capture try to read past the volume's readable end and silently drop
+    // data — see the loud guard in `capture_ntfs`.
+    volume_bytes / cluster_size
 }
 
 pub fn estimate_used_bytes(reader: &mut impl BlockSource) -> Result<u64> {
