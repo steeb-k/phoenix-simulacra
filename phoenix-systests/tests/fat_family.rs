@@ -52,37 +52,12 @@ fn roundtrip_fs(fs: TestFs, size_mb: u64, seed: u64) {
     let target = TestVhd::create(size_mb).expect("create target vhd");
     let reader = PhnxReader::open(&backup_path).unwrap();
     let target_disk_size = size_mb * 1024 * 1024;
-    // Diagnostics: dump the backup's per-partition sizes and the disk size so a
-    // layout/validation failure can be diagnosed from the test output alone.
-    eprintln!("=== fat_family diagnostics (target disk = {target_disk_size} bytes) ===");
-    for e in &reader.index {
-        let used = reader
-            .manifest
-            .partitions
-            .iter()
-            .find(|p| p.index == e.index)
-            .map(|p| p.used_bytes)
-            .unwrap_or(0);
-        eprintln!(
-            "  backup partition {}: original_size={} used_bytes={} fs={:?} capture={:?}",
-            e.index, e.original_size, used, e.fs_kind, e.capture_mode
-        );
-    }
     let plan = default_plan_from_backup(
         backup_path.to_str().unwrap(),
         &reader,
         target.disk_index(),
         target_disk_size,
     );
-    for entry in &plan.entries {
-        eprintln!(
-            "  plan entry: src={:?} target_offset={} target_size={} end={}",
-            entry.source_partition_index,
-            entry.target_offset_bytes,
-            entry.target_size_bytes,
-            entry.target_offset_bytes + entry.target_size_bytes
-        );
-    }
     drop(reader);
     run_restore(RestoreOptions {
         backup_path: backup_path.clone(),
