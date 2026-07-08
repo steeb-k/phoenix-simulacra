@@ -42,6 +42,17 @@ pub fn materialize(reader: &mut PhnxReader, out_path: &Path) -> Result<Materiali
         )));
     }
 
+    // STOPGAP: this materializes a full-size fixed VHD (the Windows virtual-disk
+    // driver rejects sparse fixed VHDs). That temporarily consumes ~the full
+    // disk size on disk, which violates the hard "mounting must never double a
+    // backup's footprint" constraint. The planned replacement is the WinFsp
+    // on-demand mount (zero materialization); see the plan's TOP PRIORITY note.
+    tracing::warn!(
+        disk_size,
+        "mount is materializing a full-size temp VHD (stopgap); the space-efficient WinFsp \
+         on-demand mount is the planned replacement and must land before this ships"
+    );
+
     // --- Build the GPT describing the partition layout ---
     let disk_guid = *reader.header.backup_id.as_bytes();
     let parts: Vec<GptPart> = spans

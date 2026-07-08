@@ -20,9 +20,12 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
 - VSS support for live Windows backups (`--vss` / GUI checkbox)
 - CLI and egui GUI (WinPE-friendly, no WebView2)
 
-A future `winfsp` build option will serve mount reads on demand straight from the
-`.phnx` (zero temp space) when WinFsp is installed; the default build materializes to
-a sparse VHD and needs no external SDK.
+> **Mount is not yet space-efficient.** The current mount materializes a full-size
+> temporary VHD (Windows rejects sparse fixed VHDs). The required implementation —
+> tracked as top priority — is a **WinFsp on-demand mount** that serves reads
+> straight from the `.phnx` with **zero extra disk space**; mounting must never
+> double a backup's footprint. Until that lands, mount is a stopgap suitable only
+> for small backups.
 
 ## Build
 
