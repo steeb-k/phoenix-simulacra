@@ -5,6 +5,11 @@ machine: backing up and cloning the **running** Windows system disk via VSS,
 and booting a cloned disk. Run them manually before a release, on real hardware
 or a spare disk you can afford to overwrite.
 
+> See [../docs/TESTING.md](../docs/TESTING.md) for the full test-tier overview.
+> Backup/restore/clone/resize round-trips on a real USB disk (MBR, NTFS/FAT32/
+> exFAT) are now **automated** in `phoenix-systests/tests/real_disk.rs` — this
+> checklist covers only what those can't (live system disk, boot, 4Kn).
+
 > ⚠️ Every step here writes to real disks. Double-check disk numbers with
 > `Get-Disk` before each destructive operation.
 
