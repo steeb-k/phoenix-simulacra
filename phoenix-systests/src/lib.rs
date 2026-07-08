@@ -135,22 +135,7 @@ impl TestVhd {
     /// Initialize the disk as GPT and create + format the given partitions,
     /// assigning drive letters. Returns once the volumes are mounted.
     pub fn init_gpt_with(&self, parts: &[PartSpec]) -> Result<()> {
-        let mut script = format!("select disk {}\nclean\nconvert gpt\n", self.disk_index);
-        for p in parts {
-            if p.size_mb == 0 {
-                script.push_str("create partition primary\n");
-            } else {
-                script.push_str(&format!("create partition primary size={}\n", p.size_mb));
-            }
-            script.push_str(&format!(
-                "format fs={} label={} quick\n",
-                p.fs.diskpart_fs(),
-                p.label
-            ));
-            script.push_str(&format!("assign letter={}\n", p.letter));
-        }
-        run_diskpart(&script).context("diskpart init/format partitions")?;
-        Ok(())
+        diskpart_layout(self.disk_index, true, parts)
     }
 
     /// Detach the VHD explicitly (also done on Drop). Idempotent.
@@ -169,6 +154,182 @@ impl Drop for TestVhd {
     fn drop(&mut self) {
         let _ = self.detach();
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Wipe `disk_index`, initialize its partition table (`gpt` true → GPT, else
+/// MBR), and create + format + letter the given partitions via diskpart.
+/// DESTRUCTIVE — used by both [`TestVhd`] and [`RealDisk`] (which safety-checks
+/// the target first).
+pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
+    let style = if gpt { "gpt" } else { "mbr" };
+    let mut script = format!("select disk {disk_index}\nclean\nconvert {style}\n");
+    for p in parts {
+        if p.size_mb == 0 {
+            script.push_str("create partition primary\n");
+        } else {
+            script.push_str(&format!("create partition primary size={}\n", p.size_mb));
+        }
+        script.push_str(&format!(
+            "format fs={} label={} quick\n",
+            p.fs.diskpart_fs(),
+            p.label
+        ));
+        script.push_str(&format!("assign letter={}\n", p.letter));
+    }
+    run_diskpart(&script).context("diskpart layout")?;
+    Ok(())
+}
+
+/// Drive letters assigned to a disk's partitions, in on-disk (offset) order.
+pub fn disk_volume_letters(disk_index: u32) -> Result<Vec<char>> {
+    let out = powershell(&format!(
+        "Get-Partition -DiskNumber {disk_index} -ErrorAction SilentlyContinue | \
+         Where-Object DriveLetter | Sort-Object Offset | ForEach-Object {{ $_.DriveLetter }}"
+    ))?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.trim().chars().next())
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect())
+}
+
+/// Poll until a disk has at least `want` lettered volumes (all roots
+/// reachable), force-assigning letters to any un-lettered partitions if the
+/// mount manager is slow. Returns the letters in on-disk order.
+pub fn wait_for_disk_volumes(disk_index: u32, want: usize, timeout_ms: u64) -> Result<Vec<char>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut forced = false;
+    loop {
+        let letters = disk_volume_letters(disk_index).unwrap_or_default();
+        let reachable: Vec<char> = letters
+            .into_iter()
+            .filter(|l| Path::new(&format!("{l}:\\")).exists())
+            .collect();
+        if reachable.len() >= want {
+            return Ok(reachable);
+        }
+        if std::time::Instant::now() >= deadline {
+            if !forced {
+                forced = true;
+                let _ = assign_letters_to_disk(disk_index);
+                continue;
+            }
+            bail!(
+                "disk {disk_index}: only {} of {want} volumes got drive letters",
+                reachable.len()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Assign a drive letter to every un-lettered partition on a disk (best effort).
+fn assign_letters_to_disk(disk_index: u32) -> Result<()> {
+    powershell(&format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-Partition -DiskNumber {disk_index} | Where-Object {{ -not $_.DriveLetter -and $_.Size -gt 1MB }} | \
+         ForEach-Object {{ Add-PartitionAccessPath -DiskNumber {disk_index} -PartitionNumber $_.PartitionNumber -AssignDriveLetter }}"
+    ))?;
+    Ok(())
+}
+
+/// A summary of a disk's partitions (offset, size, type string), sorted by
+/// offset — used to assert partition-table integrity across a restore.
+pub fn partition_summary(disk_index: u32) -> Result<Vec<(u64, u64, String)>> {
+    let out = powershell(&format!(
+        "Get-Partition -DiskNumber {disk_index} -ErrorAction SilentlyContinue | \
+         Sort-Object Offset | ForEach-Object {{ \"$($_.Offset)|$($_.Size)|$($_.Type)\" }}"
+    ))?;
+    let mut parts = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.trim().split('|').collect();
+        if f.len() >= 3 {
+            let off = f[0].trim().parse().unwrap_or(0);
+            let size = f[1].trim().parse().unwrap_or(0);
+            parts.push((off, size, f[2].trim().to_string()));
+        }
+    }
+    Ok(parts)
+}
+
+/// Re-run the full safety gate for `index`, returning the serial on success.
+/// Bails (never returns Ok) if ANY gate fails, so a destructive op can never
+/// proceed against the wrong disk even if indices shift between calls.
+fn validate_real_disk(index: u32) -> Result<String> {
+    let info = powershell(&format!(
+        "$d = Get-Disk -Number {index} -ErrorAction Stop; \
+         \"$($d.BusType)|$($d.IsBoot)|$($d.IsSystem)|$($d.Size)|$($d.SerialNumber)\""
+    ))
+    .with_context(|| format!("querying disk {index}"))?;
+    let f: Vec<&str> = info.trim().split('|').collect();
+    let bus = f.first().copied().unwrap_or("");
+    let is_boot = f.get(1).copied().unwrap_or("");
+    let is_system = f.get(2).copied().unwrap_or("");
+    let size: u64 = f.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let serial = f.get(4).copied().unwrap_or("").trim().to_string();
+
+    if !bus.eq_ignore_ascii_case("USB") {
+        bail!("SAFETY: disk {index} BusType={bus:?} — refusing (target must be USB)");
+    }
+    if is_boot.eq_ignore_ascii_case("True") {
+        bail!("SAFETY: disk {index} is the BOOT disk — refusing");
+    }
+    if is_system.eq_ignore_ascii_case("True") {
+        bail!("SAFETY: disk {index} is the SYSTEM disk — refusing");
+    }
+    let gb = size as f64 / 1e9;
+    if !(16.0..=64.0).contains(&gb) {
+        bail!("SAFETY: disk {index} size {gb:.1} GB outside 16–64 GB — refusing");
+    }
+    if let Ok(want) = std::env::var("PHOENIX_T3_SERIAL") {
+        if !serial.eq_ignore_ascii_case(want.trim()) {
+            bail!(
+                "SAFETY: disk {index} serial {serial:?} != PHOENIX_T3_SERIAL {want:?} — refusing"
+            );
+        }
+    }
+    Ok(serial)
+}
+
+/// A real, physical test disk opted into via the `PHOENIX_T3_DISK` env var and
+/// guarded so destructive tests can never hit a non-USB / boot / system disk.
+pub struct RealDisk {
+    index: u32,
+}
+
+impl RealDisk {
+    /// Resolve the opt-in real test disk. Returns `Ok(None)` when
+    /// `PHOENIX_T3_DISK` is unset (the test should skip). Every safety gate is
+    /// checked; a failure returns `Err` rather than a disk.
+    pub fn acquire() -> Result<Option<Self>> {
+        let Ok(raw) = std::env::var("PHOENIX_T3_DISK") else {
+            return Ok(None);
+        };
+        let index: u32 = raw
+            .trim()
+            .parse()
+            .context("PHOENIX_T3_DISK must be a disk number")?;
+        let serial = validate_real_disk(index)?;
+        eprintln!("[T3] target = disk {index}, USB, serial {serial} — safety gates passed");
+        Ok(Some(Self { index }))
+    }
+
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Wipe the disk (re-validates safety first).
+    pub fn clean(&self) -> Result<()> {
+        validate_real_disk(self.index)?;
+        run_diskpart(&format!("select disk {}\nclean\n", self.index)).context("clean real disk")?;
+        Ok(())
+    }
+
+    /// Lay out partitions on the disk (re-validates safety first).
+    pub fn layout(&self, gpt: bool, parts: &[PartSpec]) -> Result<()> {
+        validate_real_disk(self.index)?;
+        diskpart_layout(self.index, gpt, parts)
     }
 }
 
