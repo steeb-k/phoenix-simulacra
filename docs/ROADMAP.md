@@ -21,6 +21,43 @@ exposed.
 
 ## Remaining work (prioritized)
 
+### P1 — BitLocker: lock-state-aware capture
+System disks are commonly BitLocker-encrypted, so this is core usability, not an
+edge case. **Lock state — not merely "is this BitLocker" — must drive the
+capture mode.** Today `classify_partition` marks any BitLocker partition
+`FilesystemKind::Bitlocker` → forced `CaptureMode::Raw` regardless of whether
+it's unlocked, so even an unlocked volume loses used-block sizing.
+
+Target behavior:
+- **Unlocked** BitLocker volume → a **completely normal** capture. An unlocked
+  volume device presents *decrypted* data, so used-block file-aware capture
+  (NTFS/FAT/exFAT) reads plaintext and the `.phnx` is a normal, unencrypted,
+  restorable image — "the backup itself is unlocked." **This is the preferred
+  case** (e.g. the live system disk, which runs unlocked → VSS snapshot is
+  plaintext → normal backup, once we stop forcing raw).
+- **Locked** BitLocker volume → **sector-by-sector (raw)** capture of the
+  encrypted volume via the raw disk handle. The `.phnx` holds ciphertext;
+  restoring reproduces the encrypted volume, which still needs the original
+  BitLocker key/recovery to unlock. Flag it clearly as encrypted.
+
+Work involved:
+- Detect per-volume lock state (WMI `Win32_EncryptableVolume`
+  `ProtectionStatus`/`LockStatus`, or `manage-bde -status`, or the FVE API).
+- Branch capture: unlocked → refine to the real filesystem + used-block; locked
+  → raw ciphertext.
+- Record encryption/lock state per partition in the manifest so restore, verify,
+  and mount know (a mounted ciphertext image would surface as an encrypted
+  volume and prompt for the key).
+- Surface state + clear warnings in CLI/GUI; verify-after-backup works for both
+  (BitLocker ciphertext at rest is deterministic, so a re-read matches).
+
+**Open for debate when we implement it** (per the user):
+- Prompt to unlock a locked volume before backup (to get a normal, usable
+  image) vs. just doing raw ciphertext?
+- Always restore the "unlocked" image as plaintext (preferred), or optionally
+  re-encrypt on restore?
+- Best lock-state detection mechanism (WMI vs `manage-bde` vs FVE COM).
+
 ### P1 — WinFsp installer bundling
 The mount feature requires the WinFsp driver at run time. The binary already
 delay-loads `winfsp-<arch>.dll` and finds it via the registry, so the app just
@@ -91,13 +128,14 @@ hard to automate safely; **4Kn media** could be automated if a 4Kn test device
 - **GPT on removable USB** is not possible (Windows policy), hence MBR-only T3.
 - **verify-after-backup roughly doubles source read time** (it re-reads the
   source). On by default; opt out with `backup --no-verify` when speed matters.
-- **BitLocker-locked volumes** are captured raw only (must be unlocked for
-  file-aware capture), as today.
+- **BitLocker** — *today* any BitLocker partition is captured raw regardless of
+  lock state. Being fixed under P1 above (unlocked → normal used-block capture;
+  locked → raw ciphertext).
 - **Restore to dissimilar hardware** may need Windows Startup Repair / `bcdedit`
   (expected; noted in the live checklist).
 
 ## Out of scope (explicit)
 
 Incrementals / differentials (the v2 format keeps reserved fields for them),
-cloud / sync / scheduling, ReFS, and file-aware capture of BitLocker-locked
-volumes.
+cloud / sync / scheduling, and ReFS. (Note: BitLocker is now **in scope** and
+prioritized — see P1 above.)
