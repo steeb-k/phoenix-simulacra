@@ -132,22 +132,30 @@ boot-the-clone, and 4Kn media manually. The live-system and boot checks are
 hard to automate safely; **4Kn media** could be automated if a 4Kn test device
 (or a 4Kn-emulating VHD) is available.
 
-### P3 — Faster verify-after-backup
-verify-after re-reads the entire used set sequentially on one thread and
-re-hashes it; on a large source (e.g. a ~700 GB boot-disk capture) that's a
-second multi-hour read pass. The guarantee (image matches the frozen source)
-requires the re-read, but the wall-clock can shrink substantially:
-- **Overlap I/O and hashing** (double-buffered / queued reads; today each
-  chunk is read-then-hashed serially — BLAKE3 is multi-GB/s, so the device
-  should never wait on the hasher, or vice versa).
-- **Pipeline verify with capture**: verify partition N while capturing
-  partition N+1 (same VSS snapshot lifetime, overlapping instead of
-  sequential phases; watch source-device contention).
-- **Device-aware parallel readers**: several reader threads over disjoint
-  extent ranges — a big win on NVMe, counterproductive on spinning/USB media,
-  so gate on bus/media type.
+### P3 — Engine throughput: pipeline/parallelize backup, restore, AND verify
+Every data path (capture, restore, verify-after) runs one serial loop per
+chunk: read → compress/decompress → hash → write, each stage waiting on the
+previous. Real-world baseline from the first production-scale run (2026-07,
+~709 GB used, NVMe source → SATA/USB targets): capture+verify ≈ 3 h
+(~130 MB/s effective), restore projected ~2 h. The devices are capable of
+much more; the loop shape is the bottleneck. Avenues:
+- **Pipeline the stages** (applies to all three paths): double/triple-buffer
+  so the reader, the CPU work (zstd + BLAKE3), and the writer overlap instead
+  of alternating. Likely the single biggest win and media-agnostic.
+- **Parallel chunk compression/decompression**: chunks are independent —
+  fan 4 MiB chunks across a small worker pool; keep write order stable.
+  BLAKE3 is already multi-GB/s; zstd is the CPU-side cost to hide.
+- **Adaptive compression**: skip/lighten compression for incompressible
+  chunks (entropy probe or trial-block), which also speeds restore.
+- **Device-aware parallel I/O**: multiple readers over disjoint extents on
+  NVMe; strictly sequential on spinning/USB media (gate on bus/media type).
+- **Pipeline verify with capture**: verify partition N while capturing N+1
+  under the same VSS snapshot lifetime (watch source-device contention).
 - Optional **sampled verify-after** tier for speed-sensitive runs (full
   re-read stays the default; mirrors `verify --quick` semantics).
+Constraint to preserve: the torn-read re-read-confirm logic and the
+frozen-vs-unfrozen verify strategy in `verify_partition_against_source` /
+run_backup phase 3.
 
 ### Nice-to-have
 - **Progress step for verify-after-backup** — it currently shows as a detail
