@@ -32,6 +32,18 @@
 //!    handles: the fallback locks, backs up, unlocks (proven by writing to the
 //!    volume afterward), and the restored fixture matches byte-for-byte.
 //!
+//! And the lock's OUTBOUND exclusivity — while the lock is held, the rest of
+//! the system must be unable to open/write files on the volume (that's the
+//! consistency `FSCTL_LOCK_VOLUME` buys when VSS isn't available):
+//!
+//! 5. `volume_lock_blocks_external_writes` — take the lock via the engine's
+//!    own primitive and prove external file creates/opens fail while it's
+//!    held, then succeed after release. Fully deterministic.
+//! 6. `locked_backup_blocks_writers_for_duration` — run a locked (no-VSS)
+//!    backup on a thread while this test hammers write attempts at the
+//!    volume: at least one attempt must be refused during the backup window,
+//!    and writes must succeed again once it completes.
+//!
 //! Requires an elevated shell (diskpart + VSS need admin):
 //!   cargo test -p phoenix-systests --test vss -- --ignored --test-threads=1 --nocapture
 
@@ -236,6 +248,103 @@ fn vss_fallback_enforces_volume_lock() {
         }
     }
     drop(held);
+}
+
+/// OUTBOUND lock exclusivity, primitive level: while the engine's
+/// `PartitionReader::lock_volume` holds `FSCTL_LOCK_VOLUME`, any other
+/// handle's attempt to create/open files on the volume must be refused —
+/// that refusal is exactly the consistency guarantee the no-VSS path relies
+/// on. Deterministic: no racing against a live backup.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn volume_lock_blocks_external_writes() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let _vhd = make_ntfs_vhd('X', "LOCKX");
+    std::fs::write(r"X:\pre-lock.txt", b"before").expect("pre-lock write");
+
+    {
+        let mut reader =
+            phoenix_capture::PartitionReader::open_volume(r"\\.\X:").expect("open volume");
+        reader.lock_volume(r"\\.\X:").expect("lock_volume");
+        assert!(reader.is_locked());
+
+        // New file creation must be refused while the lock is held.
+        let write_attempt = std::fs::write(r"X:\during-lock.txt", b"should not land");
+        assert!(
+            write_attempt.is_err(),
+            "created a file on X: while the volume was locked — FSCTL_LOCK_VOLUME is not \
+             providing exclusivity"
+        );
+        // Opening an existing file through a fresh handle must be refused too.
+        let read_attempt = std::fs::read(r"X:\pre-lock.txt");
+        assert!(
+            read_attempt.is_err(),
+            "opened a file on X: while the volume was locked"
+        );
+        eprintln!("[vss] lock held: external create + open both refused, as required");
+        // Reader drops here → FSCTL_UNLOCK_VOLUME + handle close.
+    }
+
+    std::fs::write(r"X:\after-unlock.txt", b"after").expect("write after unlock");
+    assert_eq!(
+        std::fs::read(r"X:\pre-lock.txt").expect("read after unlock"),
+        b"before"
+    );
+    eprintln!("[vss] lock released: volume usable again");
+}
+
+/// OUTBOUND lock exclusivity, end-to-end: a locked (no-VSS) backup runs on a
+/// worker thread while this thread hammers write attempts at the volume.
+/// At least one attempt must be refused while the backup window is open —
+/// proving the engine really holds the lock for the capture's duration —
+/// and writes must succeed again after it returns.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn locked_backup_blocks_writers_for_duration() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let source = make_ntfs_vhd('X', "LOCKDUR");
+    let digest = fill_fixture('X', 0x8888).expect("fill fixture");
+    let disk_index = source.disk_index();
+
+    let backup_thread = std::thread::spawn(move || backup_disk(disk_index, false));
+
+    // Hammer the volume while the backup runs. The pre-flight lock lands
+    // within the first second or two; every attempt after that must fail
+    // until run_backup returns (the lock is held through verify-after).
+    let mut refused = 0u32;
+    let mut allowed = 0u32;
+    while !backup_thread.is_finished() {
+        match std::fs::write(r"X:\writer-probe.txt", b"probe") {
+            Ok(_) => allowed += 1,
+            Err(_) => refused += 1,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let backup_path = backup_thread
+        .join()
+        .expect("backup thread panicked")
+        .expect("locked backup failed");
+    eprintln!(
+        "[vss] during backup: {refused} write attempts refused, {allowed} allowed \
+         (pre-lock window only)"
+    );
+    assert!(
+        refused > 0,
+        "no write attempt was ever refused during a locked backup — the engine did not \
+         hold FSCTL_LOCK_VOLUME for the capture window"
+    );
+
+    // Lock released after completion; volume writable again.
+    std::fs::write(r"X:\post-backup.txt", b"unlocked").expect("volume still locked after backup");
+
+    // And the captured image is faithful despite the write attempts.
+    restore_and_verify(&backup_path, &digest);
+    let _ = std::fs::remove_file(&backup_path);
+    eprintln!("[vss] locked backup held exclusivity for its duration and restored faithfully");
 }
 
 /// FORCED-FALLBACK round-trip: FAT32 + `use_vss: true`, no open handles. The
