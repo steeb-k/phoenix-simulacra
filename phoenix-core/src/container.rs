@@ -397,11 +397,22 @@ impl PhnxWriter {
         header: Header,
         progress: Option<ProgressHandle>,
     ) -> Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Hold the backup file EXCLUSIVELY while writing (other processes may
+        // still read). Rust's std default share mode includes
+        // FILE_SHARE_DELETE, which lets anything rename — or worse, delete —
+        // the half-written backup out from under us (observed live: an
+        // in-progress .phnx renamed from Explorer). A rename is survivable
+        // (the handle tracks the file object, not the name) but a delete
+        // silently discards the whole backup on close; refuse both.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            options.share_mode(FILE_SHARE_READ);
+        }
+        let file = options.open(path)?;
         let mut w = Self {
             file,
             header,
@@ -1082,6 +1093,40 @@ mod tests {
         let c = compress_chunk(&data).unwrap();
         let d = decompress_chunk(&c, 1000).unwrap();
         assert_eq!(d, data);
+    }
+
+    /// A backup being written must be held exclusively: rename and delete
+    /// from another handle must FAIL while the writer is alive (Rust std's
+    /// default share mode includes FILE_SHARE_DELETE, which allowed an
+    /// in-progress .phnx to be renamed from Explorer), and succeed after.
+    #[cfg(windows)]
+    #[test]
+    fn writer_holds_file_exclusively() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("excl-{}.phnx", Uuid::new_v4().simple()));
+        let renamed = dir.join(format!("excl-{}.renamed", Uuid::new_v4().simple()));
+        let header = Header {
+            version: FORMAT_VERSION,
+            flags: 1,
+            timestamp: 1,
+            backup_id: Uuid::new_v4(),
+            disk_signature: 1,
+            partition_count: 0,
+        };
+        let writer = PhnxWriter::create(&path, header).unwrap();
+
+        assert!(
+            std::fs::rename(&path, &renamed).is_err(),
+            "renamed a .phnx while its writer was alive"
+        );
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "deleted a .phnx while its writer was alive"
+        );
+
+        drop(writer);
+        std::fs::rename(&path, &renamed).expect("rename must work after the writer closes");
+        std::fs::remove_file(&renamed).unwrap();
     }
 
     #[test]
