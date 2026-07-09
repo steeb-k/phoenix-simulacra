@@ -83,18 +83,17 @@ already delivered; remaining polish:
 - Live validation banner driven by `validate_layout`.
 - Share one layout editor between the Restore and Clone pages.
 
-### P2 — GPT on a real fixed disk (harness ready; needs the disk)
-T3 covers **MBR** on real hardware; Windows won't make a removable USB flash
-drive GPT, so real-hardware **GPT** validation needs a spare *fixed*
-(non-removable) disk. GPT is already thoroughly covered by the all-GPT T2 VHD
-suite, so this is confidence-on-real-hardware, not a correctness gap.
-
-**Implemented and ready to run** — `real_disk.rs` has `real_gpt_multifs_roundtrip`
-(NTFS + FAT32 GPT round-trip), and the safety gate allows a fixed disk under an
-explicit fail-closed opt-in (`PHOENIX_T3_ALLOW_FIXED=1` + mandatory
-`PHOENIX_T3_SERIAL` + configurable `PHOENIX_T3_MIN_GB`/`MAX_GB`, boot/system
-still refused). See TESTING.md for the exact invocation. Just needs a fixed test
-disk attached; run pending.
+### ~~P2 — GPT on a real fixed disk~~ (DONE — validated on real hardware 2026-07)
+`real_disk.rs` has `real_gpt_multifs_roundtrip` (NTFS + FAT32 + the diskpart
+auto-MSR, full GPT round-trip), gated behind a fail-closed opt-in for
+non-removable disks (`PHOENIX_T3_ALLOW_FIXED=1` + mandatory `PHOENIX_T3_SERIAL`
++ configurable `PHOENIX_T3_MIN_GB`/`MAX_GB`; boot/system always refused).
+**Validated on a real 4 TB external HDD** — GPT primary+backup tables, MSR, and
+both filesystems round-tripped, offline `chkdsk /F` clean on the first pass.
+`PHOENIX_T3_LAYOUT_GB` caps grow-to-fill so a multi-TB disk runs in seconds
+without shrinking GPT coverage (table still spans the whole disk). This closes
+the last real-hardware coverage gap: the engine is now validated on both MBR
+(real USB) and GPT (real fixed disk). See TESTING.md.
 
 ### P3 — CI coverage for the winfsp + real-disk tiers
 - The `winfsp` feature isn't built in CI (needs LLVM/`libclang` + WinFsp on the
