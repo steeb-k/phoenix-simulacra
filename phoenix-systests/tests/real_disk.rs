@@ -19,9 +19,13 @@
 //! ```text
 //! $env:PHOENIX_T3_DISK="3"; $env:PHOENIX_T3_ALLOW_FIXED="1"
 //! $env:PHOENIX_T3_SERIAL="<exact-serial>"   # MANDATORY for a fixed disk
-//! $env:PHOENIX_T3_MAX_GB="512"              # widen if the disk is >64 GB
-//! cargo test -p phoenix-systests --test real_disk real_gpt_multifs_roundtrip -- --ignored --test-threads=1 --nocapture
+//! $env:PHOENIX_T3_MAX_GB="4100"             # widen if the disk is >64 GB
+//! $env:PHOENIX_T3_LAYOUT_GB="16"            # cap restore layout on a huge disk
+//! cargo test -p phoenix-systests --test real_disk -- --ignored --test-threads=1 --nocapture real_gpt_multifs_roundtrip
 //! ```
+//!
+//! `PHOENIX_T3_LAYOUT_GB` caps how far the restore lays partitions into a big
+//! disk (so NTFS doesn't grow to fill 4 TB); GPT still spans the whole disk.
 
 use phoenix_capture::backup::{run_backup, BackupOptions};
 use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
@@ -125,6 +129,25 @@ fn multifs_roundtrip(disk: &RealDisk, gpt: bool) {
     let before = partition_summary(idx).expect("summary before");
     eprintln!("[T3] {style} source partitions: {before:?}");
     let disk_size = disk_size_bytes(idx);
+    // On a very large disk, cap the region the restore lays into (so NTFS
+    // doesn't auto-grow to fill e.g. 4 TB and drag chkdsk out). This does NOT
+    // reduce GPT coverage: the partition table still spans the whole disk —
+    // the backup GPT header is written at the disk's true last LBA regardless
+    // of how far the partitions extend. Unset → use the full disk (the 30 GB
+    // USB tests still exercise grow-to-fill).
+    let layout_size = std::env::var("PHOENIX_T3_LAYOUT_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|gb| ((gb * 1e9) as u64).min(disk_size))
+        .unwrap_or(disk_size);
+    if layout_size != disk_size {
+        eprintln!(
+            "[T3] {style} capping restore layout to {:.1} GB of the {:.1} GB disk \
+             (PHOENIX_T3_LAYOUT_GB); GPT still spans the full disk",
+            layout_size as f64 / 1e9,
+            disk_size as f64 / 1e9
+        );
+    }
 
     // --- Back up every partition ---
     let parts = all_partition_indices(idx);
@@ -153,7 +176,7 @@ fn multifs_roundtrip(disk: &RealDisk, gpt: bool) {
     // --- Wipe + full-disk restore back onto the same disk ---
     disk.clean().expect("clean disk");
     let reader = PhnxReader::open(&backup).unwrap();
-    let plan = default_plan_from_backup(backup.to_str().unwrap(), &reader, idx, disk_size);
+    let plan = default_plan_from_backup(backup.to_str().unwrap(), &reader, idx, layout_size);
     for e in &plan.entries {
         eprintln!(
             "[T3] {style} restore plan: src={:?} off={} size={} end={}",

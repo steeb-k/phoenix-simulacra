@@ -139,9 +139,18 @@ safety net). Size bounds default to 16–64 GB and widen via `PHOENIX_T3_MIN_GB`
 $env:PHOENIX_T3_DISK        = "3"
 $env:PHOENIX_T3_ALLOW_FIXED = "1"
 $env:PHOENIX_T3_SERIAL      = "<exact-serial>"   # MANDATORY for a fixed disk
-$env:PHOENIX_T3_MAX_GB      = "512"              # widen if the disk is >64 GB
-cargo test -p phoenix-systests --test real_disk real_gpt_multifs_roundtrip -- --ignored --test-threads=1 --nocapture
+$env:PHOENIX_T3_MAX_GB      = "4100"             # widen if the disk is >64 GB
+$env:PHOENIX_T3_LAYOUT_GB   = "16"               # cap restore layout (see below)
+cargo test -p phoenix-systests --test real_disk -- --ignored --test-threads=1 --nocapture real_gpt_multifs_roundtrip
 ```
+
+`PHOENIX_T3_LAYOUT_GB` caps how far the restore lays partitions into a big disk
+so NTFS doesn't auto-grow to fill (e.g.) 4 TB and drag out the final `chkdsk`.
+It does **not** reduce GPT coverage — the partition table still spans the whole
+disk (the backup GPT header is written at the disk's true last LBA). None of the
+scenarios image the full disk regardless: they use small fixed-size partitions
+(a few GB) and capture used-blocks, so the unallocated remainder is never
+touched. Leave it unset on a small (USB-stick) disk to exercise grow-to-fill.
 
 | Scenario | Covers |
 |----------|--------|
