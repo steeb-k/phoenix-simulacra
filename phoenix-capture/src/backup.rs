@@ -501,11 +501,41 @@ fn verify_partition_against_source(
                 rec.extent_index, rec.chunk_index
             )));
         }
-        if hash::hash_hex(&buf[..len]) != rec.blake3 {
+        let got_hash = hash::hash_hex(&buf[..len]);
+        if got_hash != rec.blake3 {
+            // Diagnose before failing: is this a transient torn read (a
+            // re-read matches what capture recorded), or has the source
+            // content genuinely changed since capture (re-reads agree with
+            // each other but not with the recorded hash)? Observed on VSS
+            // shadow-device reads, where the two cases point at completely
+            // different problems (volsnap read race vs. shadow invalidation).
+            let probe = |reader: &mut dyn FnMut(u64, &mut [u8]) -> Result<usize>| -> String {
+                let mut pbuf = vec![0u8; len];
+                let mut pgot = 0usize;
+                while pgot < len {
+                    match reader(offset + pgot as u64, &mut pbuf[pgot..len]) {
+                        Ok(0) => return "short-read".into(),
+                        Ok(n) => pgot += n,
+                        Err(e) => return format!("read-error({e})"),
+                    }
+                }
+                hash::hash_hex(&pbuf[..len])
+            };
+            let mut f = |off: u64, b: &mut [u8]| reader.read_at(off, b);
+            let reread1 = probe(&mut f);
+            let reread2 = probe(&mut f);
+            let verdict = if reread1 == rec.blake3 || reread2 == rec.blake3 {
+                "a re-read MATCHES the recorded hash — transient torn read from the source device"
+            } else if reread1 == got_hash && reread2 == got_hash {
+                "re-reads are stable but differ from capture — source content changed after capture"
+            } else {
+                "re-reads are UNSTABLE — source device is returning inconsistent data"
+            };
             return Err(PhoenixError::Other(format!(
-                "extent {}, chunk {} at offset {offset} does not match the source — the backup does \
-                 not faithfully represent the disk",
-                rec.extent_index, rec.chunk_index
+                "extent {}, chunk {} at offset {offset} (len {len}) does not match the source — \
+                 the backup does not faithfully represent the disk. recorded={}, verify-read={}, \
+                 reread1={}, reread2={}. Diagnosis: {verdict}",
+                rec.extent_index, rec.chunk_index, rec.blake3, got_hash, reread1, reread2
             )));
         }
         offset += len as u64;
