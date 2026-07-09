@@ -149,28 +149,6 @@ requires the re-read, but the wall-clock can shrink substantially:
 - Optional **sampled verify-after** tier for speed-sensitive runs (full
   re-read stays the default; mirrors `verify --quick` semantics).
 
-### P3 — Resumable (partial) backups
-Requested after cancelling a multi-hour boot-disk capture: reopen a partial
-`.phnx` and continue instead of starting over. Design notes for when this is
-picked up:
-- The container is append-friendly (sequential chunk stream + index/footer
-  written at finalize), so "how far did we get" is recoverable: validate the
-  partial file's chunks against their recorded hashes and truncate to the
-  last complete chunk boundary.
-- The hard part is **consistency, not file format**: the VSS snapshot dies
-  with the process, and a new snapshot sees a *different* source. Chunks
-  captured under snapshot A cannot be mixed with snapshot B's within one
-  partition without breaking the "image == one point-in-time" guarantee.
-- Safe granularities: resume at the **partition** boundary (fully-captured
-  partitions are internally consistent point-in-time captures; note each
-  partition then has its own capture timestamp — acceptable for data disks,
-  document the caveat for system disks), or re-verify already-captured
-  chunks against the *new* snapshot and keep only those that still match
-  (cheap for cold data, degrades to a full re-capture for hot data).
-- Persistent VSS snapshots could make resume fully consistent (snapshot
-  survives the process), at the cost of holding a growing diff area between
-  runs.
-
 ### Nice-to-have
 - **Progress step for verify-after-backup** — it currently shows as a detail
   message under "Finalizing"; a formal step in the GUI progress checklist would
@@ -218,3 +196,11 @@ picked up:
 Incrementals / differentials (the v2 format keeps reserved fields for them),
 cloud / sync / scheduling, and ReFS. (BitLocker lock-state-aware capture is
 **done** — see "What's done" above.)
+
+**Resumable (partial) backups** — considered and rejected (2026-07). The
+container format could support it (validate partial chunks, truncate to the
+last complete one), but the VSS snapshot dies with the process, so any resume
+of a *live* source mixes two points in time — including sector-by-sector
+mode, which changes what we read, not whether the source mutates. The only
+clean cases are frozen sources (locked BitLocker, offline disks), too niche
+to justify the checkpoint machinery. Interrupted backups restart.
