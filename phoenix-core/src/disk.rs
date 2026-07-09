@@ -8,8 +8,9 @@ use std::ptr;
 use tracing::{debug, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetVolumeInformationW, ReadFile, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
+    CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    GetVolumeInformationW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, StorageDeviceProperty, DRIVE_LAYOUT_INFORMATION_EX,
@@ -277,7 +278,14 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                     } else {
                         CaptureMode::UsedBlocks
                     };
-                    let volume_path = find_volume_for_partition(index, e.starting_offset, e.length);
+                    // Prefer the drive-letter device; fall back to the
+                    // un-lettered volume-GUID device (ESP/Recovery) so those
+                    // partitions can be locked/snapshotted during capture
+                    // instead of being read unprotected off the live disk.
+                    let volume_path = find_volume_for_partition(index, e.starting_offset, e.length)
+                        .or_else(|| {
+                            find_volume_guid_for_partition(index, e.starting_offset, e.length)
+                        });
                     let drive_letter = volume_path.as_deref().and_then(parse_drive_letter);
                     let volume_label = volume_path.as_deref().and_then(query_volume_label);
                     let usage = volume_path.as_deref().and_then(query_partition_usage);
@@ -308,7 +316,10 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                 .enumerate()
                 .map(|(i, e)| {
                     let fs_kind = FilesystemKind::Unknown;
-                    let volume_path = find_volume_for_partition(index, e.starting_offset, e.length);
+                    let volume_path = find_volume_for_partition(index, e.starting_offset, e.length)
+                        .or_else(|| {
+                            find_volume_guid_for_partition(index, e.starting_offset, e.length)
+                        });
                     let drive_letter = volume_path.as_deref().and_then(parse_drive_letter);
                     let volume_label = volume_path.as_deref().and_then(query_volume_label);
                     let usage = volume_path.as_deref().and_then(query_partition_usage);
@@ -813,6 +824,15 @@ fn classify_boot_sector(buf: &[u8]) -> Option<FilesystemKind> {
 }
 
 pub fn refine_partition_fs(part: &mut PartitionInfo) {
+    // Never re-type an EFI System or MSR partition. The ESP contains a FAT32
+    // filesystem, so now that un-lettered partitions get a volume path (for
+    // lock/snapshot consistency), boot-sector detection would reclassify it
+    // as plain `Fat` — flipping capture to used-blocks and, on an MBR
+    // restore, stamping type 0x0C instead of 0xEF. The GPT type GUID is the
+    // authoritative identity for these; keep them Efi/Msr + raw.
+    if matches!(part.fs_kind, FilesystemKind::Efi | FilesystemKind::Msr) {
+        return;
+    }
     if let Some(ref vol) = part.volume_path {
         let detected = detect_volume_fs(vol);
         if detected != FilesystemKind::Unknown {
@@ -1052,78 +1072,128 @@ pub fn find_volume_for_partition(disk_index: u32, offset: u64, length: u64) -> O
         // doesn't accept. The previous formatting silently failed for every
         // letter, leaving `volume_path = None` for all partitions.
         let vol = format!(r"\\.\{}:", letter as char);
-        let wide = to_wide(&vol);
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null(),
-                OPEN_EXISTING,
-                0,
-                ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            continue;
-        }
-        #[repr(C)]
-        struct DiskExtent {
-            disk_number: u32,
-            starting_offset: i64,
-            extent_length: i64,
-        }
-        #[repr(C)]
-        struct VolumeDiskExtents {
-            number_of_disk_extents: u32,
-            extents: [DiskExtent; 1],
-        }
-        let mut extents = VolumeDiskExtents {
-            number_of_disk_extents: 0,
-            extents: [DiskExtent {
-                disk_number: 0,
-                starting_offset: 0,
-                extent_length: 0,
-            }],
-        };
-        let mut returned = 0u32;
-        let ok = unsafe {
-            DeviceIoControl(
-                handle,
-                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                ptr::null(),
-                0,
-                &mut extents as *mut _ as *mut _,
-                size_of::<VolumeDiskExtents>() as u32,
-                &mut returned,
-                ptr::null_mut(),
-            )
-        };
-        unsafe { CloseHandle(handle) };
-        if ok != 0
-            && extents.number_of_disk_extents > 0
-            && extents.extents[0].disk_number == disk_index
-            && extents.extents[0].starting_offset as u64 == offset
-            && extents.extents[0].extent_length as u64 == length
-        {
-            let path = format!(r"\\.\{}:", letter as char);
+        if volume_covers_extent(&vol, disk_index, offset, length) {
             debug!(
-                volume = path.as_str(),
+                volume = vol.as_str(),
                 disk = disk_index,
                 offset = offset,
                 length = length,
                 "find_volume_for_partition: matched"
             );
-            return Some(path);
+            return Some(vol);
         }
     }
     debug!(
         disk = disk_index,
         offset = offset,
         length = length,
-        "find_volume_for_partition: no match"
+        "find_volume_for_partition: no drive-letter match"
     );
     None
+}
+
+/// Find the `\\?\Volume{GUID}` device for a partition that has **no drive
+/// letter** — the EFI System and Recovery partitions on a typical Windows
+/// disk. Mountmgr creates a volume device for every filesystem-bearing
+/// partition regardless of letter assignment, so these can be opened,
+/// snapshotted, and — critically — **locked** like any lettered volume.
+/// Without this, un-lettered partitions were captured raw from the live
+/// physical disk with no consistency protection at all, and a multi-hour
+/// backup window let the OS write to the ESP between capture and verify
+/// (caught live by verify-after-backup on a real boot-disk capture).
+///
+/// Returns the path WITHOUT the trailing backslash (`\\?\Volume{...}`), the
+/// form `CreateFileW` needs to open the volume *device* rather than its
+/// root directory. Returns `None` for partitions with no volume device
+/// (MSR — not a filesystem volume at all).
+pub fn find_volume_guid_for_partition(disk_index: u32, offset: u64, length: u64) -> Option<String> {
+    let mut name = [0u16; 512];
+    let find = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
+    if find == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut result = None;
+    loop {
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        let vol = String::from_utf16_lossy(&name[..len]);
+        let device = vol.trim_end_matches('\\').to_string();
+        if volume_covers_extent(&device, disk_index, offset, length) {
+            debug!(
+                volume = device.as_str(),
+                disk = disk_index,
+                offset = offset,
+                length = length,
+                "find_volume_guid_for_partition: matched un-lettered volume"
+            );
+            result = Some(device);
+            break;
+        }
+        let more = unsafe { FindNextVolumeW(find, name.as_mut_ptr(), name.len() as u32) };
+        if more == 0 {
+            break;
+        }
+    }
+    unsafe { FindVolumeClose(find) };
+    result
+}
+
+/// Whether the volume device at `vol_path` consists of exactly one disk
+/// extent matching `(disk_index, offset, length)`. Shared by the drive-letter
+/// and volume-GUID discovery paths.
+fn volume_covers_extent(vol_path: &str, disk_index: u32, offset: u64, length: u64) -> bool {
+    let wide = to_wide(vol_path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    #[repr(C)]
+    struct DiskExtent {
+        disk_number: u32,
+        starting_offset: i64,
+        extent_length: i64,
+    }
+    #[repr(C)]
+    struct VolumeDiskExtents {
+        number_of_disk_extents: u32,
+        extents: [DiskExtent; 1],
+    }
+    let mut extents = VolumeDiskExtents {
+        number_of_disk_extents: 0,
+        extents: [DiskExtent {
+            disk_number: 0,
+            starting_offset: 0,
+            extent_length: 0,
+        }],
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            ptr::null(),
+            0,
+            &mut extents as *mut _ as *mut _,
+            size_of::<VolumeDiskExtents>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    ok != 0
+        && extents.number_of_disk_extents > 0
+        && extents.extents[0].disk_number == disk_index
+        && extents.extents[0].starting_offset as u64 == offset
+        && extents.extents[0].extent_length as u64 == length
 }
 
 fn format_guid(bytes: &[u8; 16]) -> String {
