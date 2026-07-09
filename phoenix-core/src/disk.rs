@@ -119,6 +119,13 @@ pub struct PartitionInfo {
     /// doesn't accidentally strip "no auto-mount" / "hidden" flags
     /// off a Recovery partition we're meant to leave alone.
     pub gpt_attributes: u64,
+    /// GPT partition **unique** GUID (`PARTITION_INFORMATION_GPT.PartitionId`)
+    /// — the identity the BCD uses to reference the boot/OS partitions on a
+    /// GPT disk. Captured into the manifest and written back on restore so a
+    /// cloned system disk keeps its BCD device references intact (a
+    /// regenerated PartitionId is the classic "cloned disk drops into
+    /// Startup Repair" failure). All-zero for MBR partitions.
+    pub unique_guid: [u8; 16],
     pub offset_bytes: u64,
     pub size_bytes: u64,
     pub fs_kind: FilesystemKind,
@@ -278,6 +285,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         index: i as u32,
                         name: e.name,
                         type_guid: e.type_guid,
+                        unique_guid: e.unique_guid,
                         gpt_attributes: e.attributes,
                         offset_bytes: e.starting_offset,
                         size_bytes: e.length,
@@ -308,6 +316,7 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         index: i as u32,
                         name: format!("Partition{i}"),
                         type_guid: [0u8; 16],
+                        unique_guid: [0u8; 16],
                         gpt_attributes: 0,
                         offset_bytes: e.starting_offset,
                         size_bytes: e.length,
@@ -445,6 +454,7 @@ fn bus_type_label(bus_type: i32, removable: u8) -> String {
 struct GptEntry {
     name: String,
     type_guid: [u8; 16],
+    unique_guid: [u8; 16],
     attributes: u64,
     starting_offset: u64,
     length: u64,
@@ -566,9 +576,11 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
             let name_wide: Vec<u16> = gpt.Name.iter().take_while(|&&c| c != 0).copied().collect();
             let name = String::from_utf16_lossy(&name_wide);
             let type_guid: [u8; 16] = unsafe { std::mem::transmute(gpt.PartitionType) };
+            let unique_guid: [u8; 16] = unsafe { std::mem::transmute(gpt.PartitionId) };
             entries.push(GptEntry {
                 name,
                 type_guid,
+                unique_guid,
                 attributes: gpt.Attributes,
                 starting_offset: part.StartingOffset as u64,
                 length: part.PartitionLength as u64,
@@ -1142,6 +1154,26 @@ pub fn guid_to_string(g: &[u8; 16]) -> String {
     format_guid(g)
 }
 
+/// Parse a dashed GUID string back into the on-disk mixed-endian byte layout
+/// `format_guid`/`guid_to_string` produce (data1/2/3 little-endian, data4
+/// verbatim — the same layout `windows-sys`'s `GUID` uses). Returns `None`
+/// for malformed input.
+pub fn guid_from_string(s: &str) -> Option<[u8; 16]> {
+    let u = uuid::Uuid::parse_str(s.trim()).ok()?;
+    let be = u.as_bytes();
+    let mut out = [0u8; 16];
+    out[0] = be[3];
+    out[1] = be[2];
+    out[2] = be[1];
+    out[3] = be[0];
+    out[4] = be[5];
+    out[5] = be[4];
+    out[6] = be[7];
+    out[7] = be[6];
+    out[8..16].copy_from_slice(&be[8..16]);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1228,7 @@ mod tests {
             index: 0,
             name: "test".into(),
             type_guid: [0u8; 16],
+            unique_guid: [0u8; 16],
             gpt_attributes: 0,
             offset_bytes: 1024 * 1024,
             size_bytes: 64 * 1024 * 1024,
@@ -1266,6 +1299,18 @@ mod tests {
             assert_eq!(p.fs_kind, fs);
             assert_eq!(p.capture_mode, mode);
         }
+    }
+
+    #[test]
+    fn guid_string_roundtrip() {
+        let g: [u8; 16] = [
+            0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E,
+            0xC9, 0x3B,
+        ];
+        let s = guid_to_string(&g);
+        assert_eq!(s, "C12A7328-F81F-11D2-BA4B-00A0C93EC93B");
+        assert_eq!(guid_from_string(&s), Some(g));
+        assert_eq!(guid_from_string("not-a-guid"), None);
     }
 
     #[test]

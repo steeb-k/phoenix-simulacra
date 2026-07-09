@@ -168,6 +168,38 @@ confirms the backup matches before restoring).
 
 ---
 
+## Tier 3B (automated) — boot-disk cloning from the LIVE system disk
+
+`phoenix-systests/tests/boot_disk.rs` images this machine's **running boot
+disk** (read-only, via VSS) and restores it to the opt-in test disk in a
+matrix of layouts. The source disk is never written; every destructive step
+goes through the standard `RealDisk` gate (which refuses boot/system disks),
+plus a check that the image file doesn't live on the target disk.
+
+```powershell
+$env:PHOENIX_BOOT_SRC_DISK = "0"                # imaged read-only via VSS
+$env:PHOENIX_BOOT_IMG_DIR  = "D:\phoenix-boot"  # .phnx location (not on src/target!)
+# target = the standard T3 gate (non-removable disks need ALLOW_FIXED + SERIAL)
+cargo test -p phoenix-systests --test boot_disk -- --ignored --test-threads=1 --nocapture
+```
+
+| Stage | Covers |
+|-------|--------|
+| `boot_a_capture_image` | live VSS capture of the whole boot disk (EFI/MSR/OS/Recovery) with verify-after + independent full verify; asserts GPT + boot-clone fidelity fields (partition unique GUIDs + attribute bits) landed in the manifest |
+| `boot_b_restore_asis` | full-disk restore, every partition at its ORIGINAL size; target must be GPT; type/unique GUIDs + attributes match; \Windows artifacts + ESP BCD present; offline chkdsk |
+| `boot_c_restore_shrink` | main NTFS shrunk to used+25% (relocation); all other partitions keep exact size and order |
+| `boot_d_restore_grow` | main NTFS grown (default plan); trailing partitions (Recovery) move but keep exact size |
+| `boot_e_partial_ntfs` | partial restore: plop only the NTFS from the image over the target's existing slot; all other partitions byte-identical before/after |
+
+**Boot-clone fidelity:** backups now record each GPT partition's **unique
+GUID** (`PartitionId`) and **attribute bits** in the manifest, and restore
+writes them back — the BCD references boot partitions by unique GUID, so this
+is what makes a restored disk actually bootable without Startup Repair.
+Actually **booting** the clone remains a manual step (swap the drive); note
+that the restored disk keeps the source's disk GUID, so Windows may flag a
+collision while both are attached (it regenerates on online — harmless for
+testing, and correct when the clone is moved to another machine).
+
 ## Tier 3 (manual) — live system disk + boot
 
 Some behavior can't be automated safely on a build machine: backing up and

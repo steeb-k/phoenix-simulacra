@@ -43,6 +43,19 @@ pub struct PartitionManifest {
     /// BitLocker key/recovery password to unlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitlocker: Option<String>,
+    /// GPT partition **unique** GUID (`PartitionId`) as a dashed string.
+    /// Restored verbatim so a cloned system disk keeps its BCD device
+    /// references (the BCD identifies boot/OS partitions by this GUID on
+    /// GPT). Absent for MBR sources and pre-fidelity backups — restore then
+    /// leaves PartitionId zeroed and Windows generates a fresh one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_guid: Option<String>,
+    /// GPT `Attributes` bits (PlatformRequired / Hidden / NoDriveLetter …)
+    /// captured from the source partition table and restored verbatim, so
+    /// e.g. a Recovery partition stays hidden/no-auto-mount after restore.
+    /// Absent for MBR sources and pre-fidelity backups (restored as 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_attributes: Option<u64>,
     pub chunks: Vec<ChunkRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitmap_hash: Option<String>,

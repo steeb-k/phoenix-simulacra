@@ -188,6 +188,7 @@ mod tests {
             fs_kind: FilesystemKind::Ntfs,
             capture_mode: CaptureMode::UsedBlocks,
             bitlocker: phoenix_core::disk::BitlockerState::None,
+            unique_guid: [0u8; 16],
             volume_path: None,
             drive_letter: None,
             volume_label: None,

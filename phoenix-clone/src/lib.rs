@@ -431,6 +431,10 @@ fn build_gpt_entries(source: &DiskInfo, plan: &ClonePlan) -> Vec<GptEntry> {
                 offset_bytes: e.target_offset_bytes,
                 size_bytes: e.target_size_bytes,
                 type_guid: src.type_guid,
+                // Preserve the source's partition unique GUID so a cloned
+                // system disk keeps its BCD device references (BCD
+                // identifies GPT partitions by this GUID).
+                unique_guid: src.unique_guid,
                 attributes: src.gpt_attributes,
                 name: src.name.clone(),
             })

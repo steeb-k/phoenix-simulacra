@@ -47,6 +47,11 @@ pub struct GptEntry {
     pub offset_bytes: u64,
     pub size_bytes: u64,
     pub type_guid: [u8; 16],
+    /// Partition **unique** GUID (`PartitionId`). All-zero → Windows
+    /// generates a fresh one. Preserved from the backup manifest for
+    /// restored system disks so BCD device references (which identify GPT
+    /// partitions by this GUID) survive the clone.
+    pub unique_guid: [u8; 16],
     pub attributes: u64,
     /// Free-form partition name. Truncated to 35 UTF-16 code units when
     /// written (the on-disk GPT entry has a 36-`wchar` field; we reserve
@@ -559,14 +564,22 @@ fn set_drive_layout(
         // is safe in current Rust — only *reading* from a union without
         // knowing which variant is active is unsafe — so no `unsafe`
         // wrapper here.
-        part.Anonymous.Gpt = windows_sys::Win32::System::Ioctl::PARTITION_INFORMATION_GPT {
-            PartitionType: type_guid,
-            PartitionId: GUID {
+        // All-zero unique GUID → leave PartitionId zeroed and Windows
+        // generates a fresh one; otherwise preserve the source identity
+        // (BCD references GPT partitions by this GUID).
+        let partition_id = if entry.unique_guid.iter().all(|&b| b == 0) {
+            GUID {
                 data1: 0,
                 data2: 0,
                 data3: 0,
                 data4: [0; 8],
-            },
+            }
+        } else {
+            bytes_to_guid(entry.unique_guid)
+        };
+        part.Anonymous.Gpt = windows_sys::Win32::System::Ioctl::PARTITION_INFORMATION_GPT {
+            PartitionType: type_guid,
+            PartitionId: partition_id,
             Attributes: entry.attributes,
             Name: name_buf,
         };

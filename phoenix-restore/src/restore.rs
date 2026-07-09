@@ -610,11 +610,23 @@ fn build_gpt_layout_entries(
                     (Some(idx), None) => (idx.type_guid, idx.name.clone()),
                     _ => ([0u8; 16], String::new()),
                 };
+                // Boot-clone fidelity: restore the source's GPT attribute
+                // bits (Recovery stays hidden/no-auto-mount) and partition
+                // unique GUID (BCD device references survive) when the
+                // manifest recorded them. Absent (older backups / MBR
+                // sources) → attributes 0 + fresh Windows-generated ID,
+                // the pre-fidelity behavior.
+                let attributes = manifest_part.and_then(|m| m.gpt_attributes).unwrap_or(0);
+                let unique_guid = manifest_part
+                    .and_then(|m| m.unique_guid.as_deref())
+                    .and_then(phoenix_core::disk::guid_from_string)
+                    .unwrap_or([0u8; 16]);
                 GptLayoutEntry {
                     offset_bytes: entry.target_offset_bytes,
                     size_bytes: entry.target_size_bytes,
                     type_guid,
-                    attributes: 0,
+                    unique_guid,
+                    attributes,
                     name,
                 }
             } else {
@@ -630,6 +642,7 @@ fn build_gpt_layout_entries(
                         offset_bytes: entry.target_offset_bytes,
                         size_bytes: entry.target_size_bytes,
                         type_guid: p.type_guid,
+                        unique_guid: p.unique_guid,
                         attributes: p.gpt_attributes,
                         name: p.name.clone(),
                     },
@@ -643,6 +656,7 @@ fn build_gpt_layout_entries(
                             offset_bytes: entry.target_offset_bytes,
                             size_bytes: entry.target_size_bytes,
                             type_guid: [0u8; 16],
+                            unique_guid: [0u8; 16],
                             attributes: 0,
                             name: String::new(),
                         }

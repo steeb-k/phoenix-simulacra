@@ -1149,6 +1149,8 @@ mod tests {
                 original_size: 4096,
                 used_bytes: 8192,
                 bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
                 chunks,
                 bitmap_hash: None,
             }],

@@ -143,6 +143,8 @@ mod tests {
                 original_size: ext_bytes as u64,
                 used_bytes: ext_bytes as u64,
                 bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
                 chunks,
                 bitmap_hash: None,
             }],

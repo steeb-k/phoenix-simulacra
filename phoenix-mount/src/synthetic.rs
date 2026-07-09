@@ -218,6 +218,8 @@ mod tests {
                 original_size: ext_bytes,
                 used_bytes: ext_bytes,
                 bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
                 chunks,
                 bitmap_hash: None,
             }],

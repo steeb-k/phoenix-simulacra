@@ -375,6 +375,16 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             original_size: part.size_bytes,
             used_bytes,
             bitlocker: bitlocker_state_to_manifest(part.bitlocker),
+            unique_guid: if part.unique_guid.iter().all(|&b| b == 0) {
+                None
+            } else {
+                Some(guid_to_string(&part.unique_guid))
+            },
+            gpt_attributes: if disk.is_gpt {
+                Some(part.gpt_attributes)
+            } else {
+                None
+            },
             chunks,
             bitmap_hash,
         });

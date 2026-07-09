@@ -163,6 +163,8 @@ fn fat16_capture_reproduces_used_clusters() {
             original_size: (g.total_sectors * SECTOR) as u64,
             used_bytes,
             bitlocker: None,
+            unique_guid: None,
+            gpt_attributes: None,
             chunks,
             bitmap_hash,
         }],

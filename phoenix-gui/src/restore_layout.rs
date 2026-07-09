@@ -69,6 +69,14 @@ pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
                     .find(|p| p.index == e.index)
                     .and_then(|p| p.bitlocker.as_deref()),
             ),
+            unique_guid: reader
+                .manifest
+                .partitions
+                .iter()
+                .find(|p| p.index == e.index)
+                .and_then(|p| p.unique_guid.as_deref())
+                .and_then(phoenix_core::disk::guid_from_string)
+                .unwrap_or([0u8; 16]),
             volume_path: None,
             drive_letter: None,
             volume_label: None,
@@ -233,6 +241,7 @@ impl RestoreLayoutState {
                     fs_kind: src.fs_kind,
                     capture_mode: src.capture_mode,
                     bitlocker: src.bitlocker,
+                    unique_guid: src.unique_guid,
                     volume_path: None,
                     drive_letter: src.drive_letter,
                     volume_label: src.volume_label.clone(),

@@ -80,6 +80,8 @@ fn phnx_write_read_manifest() {
             original_size: 4096,
             used_bytes: 4096,
             bitlocker: None,
+            unique_guid: None,
+            gpt_attributes: None,
             chunks: vec![ChunkRecord {
                 chunk_index: 0,
                 extent_index: 0,
