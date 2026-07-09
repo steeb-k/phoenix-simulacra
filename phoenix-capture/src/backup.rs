@@ -4,8 +4,8 @@ use phoenix_core::container::{
 };
 use phoenix_core::disk::guid_to_string;
 use phoenix_core::disk::{
-    enumerate_disks, refine_partition_fs, BitlockerState, CaptureMode, FilesystemKind,
-    PartitionInfo,
+    enumerate_disks, parse_drive_letter, refine_partition_fs, BitlockerState, CaptureMode,
+    FilesystemKind, PartitionInfo,
 };
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
@@ -75,6 +75,16 @@ struct PreparedPartition<'a> {
     /// the raw disk path isn't a mounted volume in this OS).
     #[allow(dead_code)]
     is_live: bool,
+    /// True when the bytes this reader serves CANNOT change for the
+    /// backup's duration: a VSS shadow, a volume held under
+    /// `FSCTL_LOCK_VOLUME`, or a BitLocker-locked partition's static
+    /// ciphertext. Drives the verify-after strategy: frozen sources get the
+    /// full re-read-the-source verification; unfrozen ones (un-lettered
+    /// volumes Windows refuses to lock or snapshot — e.g. the ESP on some
+    /// systems — and raw physical reads like the MSR) get image-integrity
+    /// verification instead, because byte-comparing a mutable source
+    /// against a point-in-time image is a guaranteed spurious failure.
+    frozen: bool,
 }
 
 pub fn run_backup(opts: BackupOptions) -> Result<()> {
@@ -245,8 +255,18 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         let (extents, bytes_per_cluster, capture_mode, fs_kind, bitmap_hash) =
             plan_capture(part, &mut reader)?;
 
+        // Frozen-source bookkeeping: a VSS shadow is frozen by definition,
+        // and a locked-BitLocker partition's ciphertext is static while it
+        // stays locked. A live volume becomes frozen only if the lock below
+        // succeeds.
+        let mut frozen = original_volume
+            .as_deref()
+            .map(|orig| orig != read_path.as_str())
+            .unwrap_or(false)
+            || locked_bitlocker;
+
         if is_live {
-            // Use the original drive-letter path as the user-facing label
+            // Use the original volume path as the user-facing label
             // (e.g. `\\.\E:`); we don't want shadow GLOBALROOT junk in the
             // error message even though we'd never actually take this
             // branch with a shadow path.
@@ -264,11 +284,30 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                     partition_count
                 ));
             }
-            // Returns `PhoenixError::VolumeLockFailed` after exhausting all
-            // retries; propagating it here aborts the whole backup before
-            // any bytes are streamed, and `prepared` drops to release any
-            // earlier-acquired locks.
-            reader.lock_volume(&label)?;
+            match reader.lock_volume(&label) {
+                Ok(()) => frozen = true,
+                Err(e) => {
+                    // Lettered volumes: a lock failure means files are open
+                    // and the filesystem is actively mutating — abort before
+                    // any bytes are streamed (`prepared` drops, releasing
+                    // earlier locks). Un-lettered volumes (ESP/Recovery via
+                    // their \\?\Volume{GUID} device): Windows can refuse the
+                    // lock outright (observed: ERROR_ACCESS_DENIED on the
+                    // ESP), and there is no user-closeable "open file" to
+                    // remedy — capture unfrozen instead, and verify-after
+                    // checks the image's integrity rather than re-reading
+                    // the (mutable) source.
+                    if parse_drive_letter(&label).is_some() {
+                        return Err(e);
+                    }
+                    warn!(
+                        volume = label.as_str(),
+                        error = %e,
+                        "cannot lock un-lettered volume; capturing without a frozen source \
+                         (verify-after will check image integrity instead of source match)"
+                    );
+                }
+            }
         }
 
         prepared.push(PreparedPartition {
@@ -280,6 +319,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             fs_kind,
             bitmap_hash,
             is_live,
+            frozen,
         });
     }
 
@@ -415,22 +455,35 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     }
     writer.finalize(&manifest)?;
 
-    // ---- PHASE 3: verify against source (default on) ----
+    // ---- PHASE 3: verify (default on), strategy matched to consistency ----
     //
-    // Re-read the source and confirm every recorded chunk still hashes to what
-    // capture wrote. The VSS snapshot / volume lock from phase 1 is still held
-    // (both `vss` and `prepared` are alive until this function returns), so the
-    // source is the same frozen bytes we captured — a mismatch means the backup
-    // does not faithfully represent the disk, and we fail loudly.
+    // FROZEN sources (VSS shadow, volume held under FSCTL_LOCK_VOLUME,
+    // locked-BitLocker ciphertext): re-read the source and confirm every
+    // recorded chunk still hashes to what capture wrote — the strongest
+    // guarantee (image == the frozen source). The snapshot / lock from
+    // phase 1 is still held (`vss` and `prepared` live until return).
+    //
+    // UNFROZEN sources (un-lettered volumes Windows refused to lock or
+    // snapshot, raw physical reads like the MSR): the source may legally
+    // have changed since capture, so re-reading it produces spurious
+    // "mismatch" failures (observed live: the ESP during a 4-hour boot-disk
+    // capture). Verify the IMAGE instead — decompress and BLAKE3-check every
+    // chunk of those partitions against the manifest, proving the backup
+    // file faithfully holds what capture read.
     if opts.verify_after {
         if let Some(ref progress) = opts.progress {
             progress.set_detail("Verifying backup against source…".to_string());
         }
+        let mut image_verify: Vec<u32> = Vec::new();
         for (prep, pm) in prepared.iter_mut().zip(manifest.partitions.iter()) {
             if let Some(ref progress) = opts.progress {
                 if progress.is_cancelled() {
                     return Err(phoenix_core::error::PhoenixError::Cancelled);
                 }
+            }
+            if !prep.frozen {
+                image_verify.push(prep.part.index);
+                continue;
             }
             verify_partition_against_source(
                 &mut prep.reader,
@@ -445,7 +498,31 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 ))
             })?;
         }
-        info!("verify-after-backup: all partitions match the source");
+        if !image_verify.is_empty() {
+            warn!(
+                partitions = ?image_verify,
+                "these partitions were captured without a frozen source (no snapshot/lock \
+                 available); verifying image integrity (chunk BLAKE3) instead of source match"
+            );
+            if let Some(ref progress) = opts.progress {
+                progress
+                    .set_detail("Verifying image integrity for unfrozen partitions…".to_string());
+            }
+            let mut image_reader = phoenix_core::container::PhnxReader::open(&opts.output)?;
+            for idx in image_verify {
+                if let Some(ref progress) = opts.progress {
+                    if progress.is_cancelled() {
+                        return Err(phoenix_core::error::PhoenixError::Cancelled);
+                    }
+                }
+                image_reader.verify_partition(idx, false).map_err(|e| {
+                    phoenix_core::error::PhoenixError::Other(format!(
+                        "image-integrity verify failed for partition {idx}: {e}"
+                    ))
+                })?;
+            }
+        }
+        info!("verify-after-backup: all partitions verified");
     }
 
     if let Some(ref progress) = opts.progress {

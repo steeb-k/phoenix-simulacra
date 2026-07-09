@@ -132,22 +132,25 @@ pub fn delete_all_snapshots() -> Result<()> {
 fn create_snapshot(volume_path: &str) -> Option<(String, String)> {
     use std::process::Command;
 
-    // Normalize whatever volume form the caller has into an `X:\` root path
-    // for `Win32_ShadowCopy.Create`. We only know how to snapshot drive-
-    // letter style volumes; if someone hands us an existing GLOBALROOT
-    // shadow path (or anything we can't classify), pass it through
-    // untouched.
-    let drive_letter = match extract_drive_letter(volume_path) {
-        Some(c) => c,
-        None => {
-            tracing::warn!(
-                volume = volume_path,
-                "VSS: not a drive-letter volume; reading from the path as-is"
-            );
-            return None;
-        }
+    // Normalize whatever volume form the caller has into a root path
+    // `Win32_ShadowCopy.Create` accepts: `X:\` for lettered volumes, or the
+    // `\\?\Volume{GUID}\` form (trailing backslash required) for un-lettered
+    // ones like the EFI System / Recovery partitions. Anything else (an
+    // existing GLOBALROOT shadow path, a physical-drive path) can't be
+    // snapshotted; the caller falls back to reading the path as-is.
+    let drive_root = if let Some(c) = extract_drive_letter(volume_path) {
+        format!("{c}:\\")
+    } else if volume_path.starts_with(r"\\?\Volume{") {
+        let mut s = volume_path.trim_end_matches('\\').to_string();
+        s.push('\\');
+        s
+    } else {
+        tracing::warn!(
+            volume = volume_path,
+            "VSS: not a snapshottable volume path; reading from the path as-is"
+        );
+        return None;
     };
-    let drive_root = format!("{drive_letter}:\\");
 
     // Single-quoted PowerShell string is literal, so the trailing backslash
     // in `C:\` doesn't need escaping. We separate the device path and ID on
