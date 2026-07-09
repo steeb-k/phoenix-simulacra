@@ -115,10 +115,10 @@ fixtures could not.
 ### ⚠️ These tests WIPE the target disk. Safety model
 
 They only run when explicitly opted in via `PHOENIX_T3_DISK`, and the harness
-(`RealDisk::acquire`) **refuses** — before every destructive step — any disk
-that is not USB, or is the boot/system disk, or is outside ~16–64 GB. Optionally
-pin the exact device with `PHOENIX_T3_SERIAL`. If any gate fails it panics
-without writing.
+(`RealDisk::acquire`) **refuses** — before every destructive step — the
+boot/system disk, an out-of-size disk, or (by default) any non-removable disk.
+Optionally pin the exact device with `PHOENIX_T3_SERIAL`. If any gate fails it
+panics without writing.
 
 ```powershell
 $env:PHOENIX_T3_DISK    = "2"                        # the disk number to wipe
@@ -128,19 +128,32 @@ cargo test -p phoenix-systests --test real_disk -- --ignored --test-threads=1 --
 
 Without `PHOENIX_T3_DISK` set, the tests skip cleanly (nothing is wiped).
 
+**Targeting a FIXED disk (for GPT).** Windows won't make removable media GPT, so
+the GPT scenario needs a fixed (non-removable) disk — which the gate allows only
+under a stricter opt-in: set `PHOENIX_T3_ALLOW_FIXED=1` **and** pin the exact
+`PHOENIX_T3_SERIAL` (mandatory here, since a fixed disk has no throwaway-USB
+safety net). Size bounds default to 16–64 GB and widen via `PHOENIX_T3_MIN_GB` /
+`PHOENIX_T3_MAX_GB`. The boot/system-disk refusal always applies.
+
+```powershell
+$env:PHOENIX_T3_DISK        = "3"
+$env:PHOENIX_T3_ALLOW_FIXED = "1"
+$env:PHOENIX_T3_SERIAL      = "<exact-serial>"   # MANDATORY for a fixed disk
+$env:PHOENIX_T3_MAX_GB      = "512"              # widen if the disk is >64 GB
+cargo test -p phoenix-systests --test real_disk real_gpt_multifs_roundtrip -- --ignored --test-threads=1 --nocapture
+```
+
 | Scenario | Covers |
 |----------|--------|
 | `real_mbr_multifs_roundtrip` | MBR NTFS + FAT32 image → full-disk restore, NTFS auto-grow, partition-table + data, offline `chkdsk /F` on the restored NTFS |
+| `real_gpt_multifs_roundtrip` | Same round-trip on a **GPT** disk — real-hardware GPT partition-table read/write. Needs a fixed disk (see opt-in above); skips cleanly on a USB target |
 | `real_mbr_restore_shrink` | NTFS relocation (shrink to 512 MB), online `chkdsk /scan` + offline `chkdsk /F /X` structural check |
 | `real_mbr_exfat_roundtrip` | exFAT (used-block capture via allocation bitmap) + NTFS round-trip |
 | `real_mbr_bitlocker_roundtrip` | BitLocker on real flash: unlocked → plaintext backup/restore; locked → ciphertext backup/restore, ciphertext proven by reading `-FVE-FS-` off the physical disk (the in-session OS unlock leg is best-effort — Windows won't re-recognize a restored removable BitLocker volume without a re-plug/reboot) |
 | `real_clone_to_vhd` | clone the real disk → a VHD, read-back verify |
 
-Every scenario runs with **verify-after-backup on** (re-reads the USB source and
+Every scenario runs with **verify-after-backup on** (re-reads the source and
 confirms the backup matches before restoring).
-
-Note: Windows won't make a removable USB flash drive GPT, so T3 uses MBR.
-GPT-on-real-hardware needs a spare *fixed* disk (see `docs/ROADMAP.md`).
 
 ---
 

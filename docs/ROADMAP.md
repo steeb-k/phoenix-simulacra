@@ -83,13 +83,18 @@ already delivered; remaining polish:
 - Live validation banner driven by `validate_layout`.
 - Share one layout editor between the Restore and Clone pages.
 
-### P2 — GPT on a real fixed disk
+### P2 — GPT on a real fixed disk (harness ready; needs the disk)
 T3 covers **MBR** on real hardware; Windows won't make a removable USB flash
 drive GPT, so real-hardware **GPT** validation needs a spare *fixed*
 (non-removable) disk. GPT is already thoroughly covered by the all-GPT T2 VHD
-suite, so this is confidence-on-real-hardware, not a correctness gap. When a
-spare fixed disk is available, extend `real_disk.rs` with a GPT variant
-(`RealDisk::layout(true, …)` already supports it).
+suite, so this is confidence-on-real-hardware, not a correctness gap.
+
+**Implemented and ready to run** — `real_disk.rs` has `real_gpt_multifs_roundtrip`
+(NTFS + FAT32 GPT round-trip), and the safety gate allows a fixed disk under an
+explicit fail-closed opt-in (`PHOENIX_T3_ALLOW_FIXED=1` + mandatory
+`PHOENIX_T3_SERIAL` + configurable `PHOENIX_T3_MIN_GB`/`MAX_GB`, boot/system
+still refused). See TESTING.md for the exact invocation. Just needs a fixed test
+disk attached; run pending.
 
 ### P3 — CI coverage for the winfsp + real-disk tiers
 - The `winfsp` feature isn't built in CI (needs LLVM/`libclang` + WinFsp on the

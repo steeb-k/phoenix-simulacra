@@ -1,19 +1,27 @@
-//! Tier-3 DESTRUCTIVE tests against a REAL physical USB disk.
+//! Tier-3 DESTRUCTIVE tests against a REAL physical disk.
 //!
 //! These WIPE the target disk repeatedly. They only run when opted in via the
 //! `PHOENIX_T3_DISK` env var, and the harness ([`RealDisk::acquire`]) refuses
-//! any disk that isn't USB / is the boot or system disk / is outside a sane USB
-//! size — re-checking before every destructive step. Optionally pin the exact
-//! device with `PHOENIX_T3_SERIAL`.
+//! the boot/system disk, an out-of-size disk, or — by default — any
+//! non-removable disk, re-checking before every destructive step. Optionally
+//! pin the exact device with `PHOENIX_T3_SERIAL`.
 //!
-//! Run (ELEVATED):
+//! Run the USB/MBR matrix (ELEVATED):
 //! ```text
 //! $env:PHOENIX_T3_DISK="2"; $env:PHOENIX_T3_SERIAL="04018bdbdd996130c3c9"
 //! cargo test -p phoenix-systests --test real_disk -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! NOTE: Windows won't make a removable USB flash drive GPT, so these use MBR
-//! layouts — which also fills a real coverage gap (the T2 VHD tests are all GPT).
+//! Windows won't make a removable USB flash drive GPT, so the USB scenarios use
+//! MBR (a real coverage gap the all-GPT T2 VHD suite never touches). To validate
+//! **GPT on real hardware** you need a FIXED (non-removable) disk, which the
+//! gate only allows under an explicit opt-in (see `real_gpt_multifs_roundtrip`):
+//! ```text
+//! $env:PHOENIX_T3_DISK="3"; $env:PHOENIX_T3_ALLOW_FIXED="1"
+//! $env:PHOENIX_T3_SERIAL="<exact-serial>"   # MANDATORY for a fixed disk
+//! $env:PHOENIX_T3_MAX_GB="512"              # widen if the disk is >64 GB
+//! cargo test -p phoenix-systests --test real_disk real_gpt_multifs_roundtrip -- --ignored --test-threads=1 --nocapture
+//! ```
 
 use phoenix_capture::backup::{run_backup, BackupOptions};
 use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
@@ -82,18 +90,17 @@ fn all_partition_indices(idx: u32) -> Vec<u32> {
         .collect()
 }
 
-#[test]
-#[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
-fn real_mbr_multifs_roundtrip() {
-    require_admin();
-    let Some(disk) = skip_or_disk() else {
-        return;
-    };
+/// Shared body for the MBR and GPT multi-filesystem round-trips: lay out an
+/// NTFS + FAT32 disk, fill fixtures, back up every partition, wipe, full-disk
+/// restore, and verify the partition table + data. `gpt` selects the partition
+/// style — the only real difference on the wire, since the engine reads/writes
+/// GPT vs MBR tables through different paths.
+fn multifs_roundtrip(disk: &RealDisk, gpt: bool) {
     let idx = disk.index();
+    let style = if gpt { "GPT" } else { "MBR" };
 
-    // --- Lay out an MBR disk: NTFS + FAT32, fill deterministic fixtures ---
     disk.layout(
-        false,
+        gpt,
         &[
             PartSpec {
                 size_mb: 2048,
@@ -109,21 +116,24 @@ fn real_mbr_multifs_roundtrip() {
             },
         ],
     )
-    .expect("MBR layout");
+    .unwrap_or_else(|e| panic!("{style} layout: {e:#}"));
     assert!(wait_for_letter('R', 20_000), "NTFS volume didn't mount");
     assert!(wait_for_letter('S', 20_000), "FAT volume didn't mount");
     let d_ntfs = fill_fixture('R', 0xAA01).expect("fill ntfs fixture");
     let d_fat = fill_fixture('S', 0xAA02).expect("fill fat fixture");
 
     let before = partition_summary(idx).expect("summary before");
-    eprintln!("[T3] source partitions: {before:?}");
+    eprintln!("[T3] {style} source partitions: {before:?}");
     let disk_size = disk_size_bytes(idx);
 
     // --- Back up every partition ---
     let parts = all_partition_indices(idx);
     eprintln!("[T3] backing up disk {idx} partitions {parts:?}");
-    let backup =
-        std::env::temp_dir().join(format!("t3-mbr-{}.phnx", uuid::Uuid::new_v4().simple()));
+    let backup = std::env::temp_dir().join(format!(
+        "t3-{}-{}.phnx",
+        style.to_ascii_lowercase(),
+        uuid::Uuid::new_v4().simple()
+    ));
     run_backup(BackupOptions {
         disk_index: idx,
         partition_indices: parts,
@@ -146,7 +156,7 @@ fn real_mbr_multifs_roundtrip() {
     let plan = default_plan_from_backup(backup.to_str().unwrap(), &reader, idx, disk_size);
     for e in &plan.entries {
         eprintln!(
-            "[T3] restore plan: src={:?} off={} size={} end={}",
+            "[T3] {style} restore plan: src={:?} off={} size={} end={}",
             e.source_partition_index,
             e.target_offset_bytes,
             e.target_size_bytes,
@@ -164,9 +174,9 @@ fn real_mbr_multifs_roundtrip() {
 
     // --- Partition-table + data integrity ---
     let letters = wait_for_disk_volumes(idx, 2, 60_000).expect("restored volumes got letters");
-    eprintln!("[T3] restored letters (offset order): {letters:?}");
+    eprintln!("[T3] {style} restored letters (offset order): {letters:?}");
     let after = partition_summary(idx).expect("summary after");
-    eprintln!("[T3] restored partitions: {after:?}");
+    eprintln!("[T3] {style} restored partitions: {after:?}");
     assert_eq!(
         after.len(),
         before.len(),
@@ -182,7 +192,41 @@ fn real_mbr_multifs_roundtrip() {
     chkdsk_offline_fix(letters[0]).expect("offline chkdsk on restored NTFS");
 
     let _ = std::fs::remove_file(&backup);
-    eprintln!("[T3] real_mbr_multifs_roundtrip PASSED");
+    eprintln!(
+        "[T3] real_{}_multifs_roundtrip PASSED",
+        style.to_ascii_lowercase()
+    );
+}
+
+#[test]
+#[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
+fn real_mbr_multifs_roundtrip() {
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    multifs_roundtrip(&disk, false);
+}
+
+/// GPT on real hardware. Windows won't make a removable USB drive GPT, so this
+/// needs a FIXED disk: set PHOENIX_T3_ALLOW_FIXED=1 and pin PHOENIX_T3_SERIAL
+/// (see `RealDisk::acquire`). Skips cleanly if the acquired target is USB.
+#[test]
+#[ignore = "DESTRUCTIVE: wipes a real FIXED disk; needs PHOENIX_T3_ALLOW_FIXED=1 + PHOENIX_T3_SERIAL"]
+fn real_gpt_multifs_roundtrip() {
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    if disk.is_usb() {
+        eprintln!(
+            "[T3] skipping GPT test: target disk {} is removable USB (Windows can't make it \
+             GPT). Attach a fixed disk and set PHOENIX_T3_ALLOW_FIXED=1 + PHOENIX_T3_SERIAL.",
+            disk.index()
+        );
+        return;
+    }
+    multifs_roundtrip(&disk, true);
 }
 
 #[test]
