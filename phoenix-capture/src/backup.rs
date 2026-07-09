@@ -457,11 +457,15 @@ fn verify_partition_against_source(
     capture_mode: CaptureMode,
     expected: &[phoenix_core::manifest::ChunkRecord],
 ) -> Result<()> {
-    // How many proven-transient torn reads verify tolerates (each one is
-    // WARN-logged and re-read-confirmed against the recorded hash) before
-    // concluding the source device is genuinely unstable and failing.
-    const TORN_READ_BUDGET: u32 = 8;
-    let mut torn_reads = 0u32;
+    // Count of proven-transient torn reads (each one WARN-logged and
+    // re-read-confirmed against the recorded hash — direct proof the image
+    // matches the source for that chunk). Not capped: on slow media through
+    // a VSS shadow these happen once per block the live volume modifies
+    // mid-backup (the read races volsnap's just-completed copy-on-write), so
+    // the count scales with elapsed time and live write churn, not with
+    // device health. Genuine problems still fail via the stable-divergence
+    // and unstable-re-read verdicts below.
+    let mut torn_reads = 0u64;
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut cur_extent: Option<u32> = None;
@@ -533,7 +537,7 @@ fn verify_partition_against_source(
             let reread1 = probe(&mut f);
             let reread2 = probe(&mut f);
 
-            if (reread1 == rec.blake3 || reread2 == rec.blake3) && torn_reads < TORN_READ_BUDGET {
+            if reread1 == rec.blake3 || reread2 == rec.blake3 {
                 // Transient: a re-read reproduces exactly what capture
                 // recorded, so the source is intact and the image matches it.
                 torn_reads += 1;
@@ -549,9 +553,7 @@ fn verify_partition_against_source(
                 continue;
             }
 
-            let verdict = if reread1 == rec.blake3 || reread2 == rec.blake3 {
-                "transient torn reads, but too many of them — the source device is unstable"
-            } else if reread1 == got_hash && reread2 == got_hash {
+            let verdict = if reread1 == got_hash && reread2 == got_hash {
                 "re-reads are stable but differ from capture — source content changed after capture"
             } else {
                 "re-reads are UNSTABLE — source device is returning inconsistent data"
@@ -564,6 +566,13 @@ fn verify_partition_against_source(
             )));
         }
         offset += len as u64;
+    }
+    if torn_reads > 0 {
+        info!(
+            torn_reads,
+            "verify-after-backup: partition verified; {torn_reads} transient torn read(s) \
+             were re-read-confirmed against the recorded hashes"
+        );
     }
     Ok(())
 }
