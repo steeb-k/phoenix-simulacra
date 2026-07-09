@@ -132,6 +132,23 @@ boot-the-clone, and 4Kn media manually. The live-system and boot checks are
 hard to automate safely; **4Kn media** could be automated if a 4Kn test device
 (or a 4Kn-emulating VHD) is available.
 
+### P3 — Faster verify-after-backup
+verify-after re-reads the entire used set sequentially on one thread and
+re-hashes it; on a large source (e.g. a ~700 GB boot-disk capture) that's a
+second multi-hour read pass. The guarantee (image matches the frozen source)
+requires the re-read, but the wall-clock can shrink substantially:
+- **Overlap I/O and hashing** (double-buffered / queued reads; today each
+  chunk is read-then-hashed serially — BLAKE3 is multi-GB/s, so the device
+  should never wait on the hasher, or vice versa).
+- **Pipeline verify with capture**: verify partition N while capturing
+  partition N+1 (same VSS snapshot lifetime, overlapping instead of
+  sequential phases; watch source-device contention).
+- **Device-aware parallel readers**: several reader threads over disjoint
+  extent ranges — a big win on NVMe, counterproductive on spinning/USB media,
+  so gate on bus/media type.
+- Optional **sampled verify-after** tier for speed-sensitive runs (full
+  re-read stays the default; mirrors `verify --quick` semantics).
+
 ### Nice-to-have
 - **Progress step for verify-after-backup** — it currently shows as a detail
   message under "Finalizing"; a formal step in the GUI progress checklist would
