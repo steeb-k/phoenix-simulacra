@@ -647,6 +647,93 @@ pub fn cleanup_leaked_vhds() -> Result<()> {
 pub mod fixture;
 pub use fixture::{fill_fixture, verify_fixture, FixtureDigest};
 
+/// Console progress reporter for long-running engine operations in tests:
+/// hand `handle()` to `BackupOptions`/`RestoreOptions` and a background
+/// thread prints step transitions and byte progress to stderr (visible under
+/// `--nocapture`). Dropping the reporter stops the thread.
+///
+/// Prints on: step/phase change, every +1% (or +1 GiB, whichever is larger),
+/// and a 30 s heartbeat so multi-hour phases never look hung.
+pub struct ConsoleProgress {
+    handle: phoenix_core::ProgressHandle,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ConsoleProgress {
+    pub fn start(label: &str) -> Self {
+        use std::sync::atomic::Ordering;
+        let handle = phoenix_core::ProgressHandle::new();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let label = label.to_string();
+        let h = handle.clone();
+        let s = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut last_phase = String::new();
+            let mut last_detail = String::new();
+            let mut last_printed_bytes = 0u64;
+            let mut last_print = std::time::Instant::now();
+            let gb = |b: u64| b as f64 / 1e9;
+            while !s.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let snap = h.snapshot();
+                if !snap.active && snap.phase.is_empty() {
+                    continue;
+                }
+                let step_changed = snap.phase != last_phase;
+                let detail_changed = !snap.detail.is_empty() && snap.detail != last_detail;
+                let byte_step = (snap.total / 100).max(1_000_000_000);
+                let bytes_moved = snap.current.saturating_sub(last_printed_bytes) >= byte_step;
+                let heartbeat = last_print.elapsed().as_secs() >= 30;
+                if step_changed || detail_changed || bytes_moved || heartbeat {
+                    let pct = if snap.total > 0 {
+                        (snap.current as f64 / snap.total as f64 * 100.0).min(100.0)
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[{label}] {} — {:.1} / {:.1} GB ({pct:.0}%){}",
+                        if snap.phase.is_empty() {
+                            "working"
+                        } else {
+                            &snap.phase
+                        },
+                        gb(snap.current),
+                        gb(snap.total),
+                        if snap.detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", snap.detail)
+                        }
+                    );
+                    last_phase = snap.phase.clone();
+                    last_detail = snap.detail.clone();
+                    last_printed_bytes = snap.current;
+                    last_print = std::time::Instant::now();
+                }
+            }
+        });
+        Self {
+            handle,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn handle(&self) -> phoenix_core::ProgressHandle {
+        self.handle.clone()
+    }
+}
+
+impl Drop for ConsoleProgress {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 // ---- BitLocker test helpers (Windows Pro+; used by the T2 `bitlocker` and
 // ---- T3 `real_disk` BitLocker scenarios) ----
 

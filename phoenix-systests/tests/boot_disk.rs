@@ -48,7 +48,7 @@ use phoenix_restore::plan::{
 };
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    chkdsk_offline_fix, powershell, require_admin, wait_for_disk_volumes, RealDisk,
+    chkdsk_offline_fix, powershell, require_admin, wait_for_disk_volumes, ConsoleProgress, RealDisk,
 };
 
 const ALIGN: u64 = 1024 * 1024;
@@ -175,11 +175,12 @@ fn front_pack_plan(
 }
 
 fn run_restore_plan(backup: &Path, plan: RestorePlan) {
+    let progress = ConsoleProgress::start("restore");
     run_restore(RestoreOptions {
         backup_path: backup.to_path_buf(),
         plan,
         verify_on_restore: true,
-        progress: None,
+        progress: Some(progress.handle()),
     })
     .expect("run_restore");
 }
@@ -330,19 +331,25 @@ fn boot_a_capture_image() {
         image.display()
     );
 
+    let progress = ConsoleProgress::start("capture");
     run_backup(BackupOptions {
         disk_index: src,
         partition_indices: parts,
         output: image.clone(),
         use_vss: true,
         verify_after: true,
-        progress: None,
+        progress: Some(progress.handle()),
     })
     .expect("live VSS capture of the source disk failed");
+    drop(progress);
 
     // Independent full verification of the image file itself.
     let mut reader = PhnxReader::open(&image).expect("open image");
-    reader.verify_all(false).expect("image fails full verify");
+    let vprogress = ConsoleProgress::start("verify-image");
+    reader
+        .verify_all_with_progress(false, Some(vprogress.handle()))
+        .expect("image fails full verify");
+    drop(vprogress);
 
     eprintln!("[T3B] image verified. Manifest:");
     assert_eq!(reader.manifest.disk.style, "gpt");
