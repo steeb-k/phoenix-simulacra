@@ -200,6 +200,31 @@ fn vss_backup_roundtrip_with_open_handle() {
     // Keep the handle alive until after the backup finishes, then release it.
     drop(held);
 
+    // Diagnostic + guard: if FSCTL_GET_VOLUME_BITMAP failed on the shadow
+    // handle, planning silently degrades to all-clusters-used and the backup
+    // reads FREE space through the shadow — which volsnap leaves undefined
+    // (free blocks aren't copy-on-write protected). used_bytes near the full
+    // partition size is the tell.
+    {
+        let reader = PhnxReader::open(&backup_path).unwrap();
+        for pm in &reader.manifest.partitions {
+            eprintln!(
+                "[vss] manifest: partition {} fs={} mode={} used={} of {} bytes",
+                pm.index, pm.fs, pm.capture_mode, pm.used_bytes, pm.original_size
+            );
+            if pm.fs == "ntfs" {
+                assert!(
+                    pm.used_bytes < pm.original_size / 2,
+                    "NTFS shadow capture used {} of {} bytes — the volume bitmap query \
+                     likely failed on the shadow handle and degraded to all-clusters-used \
+                     (capturing free space through a shadow is undefined behavior)",
+                    pm.used_bytes,
+                    pm.original_size
+                );
+            }
+        }
+    }
+
     // Restore to a fresh VHD and verify every fixture byte survived the
     // shadow-read path.
     restore_and_verify(&backup_path, &digest);

@@ -457,6 +457,12 @@ fn verify_partition_against_source(
     capture_mode: CaptureMode,
     expected: &[phoenix_core::manifest::ChunkRecord],
 ) -> Result<()> {
+    // How many proven-transient torn reads verify tolerates (each one is
+    // WARN-logged and re-read-confirmed against the recorded hash) before
+    // concluding the source device is genuinely unstable and failing.
+    const TORN_READ_BUDGET: u32 = 8;
+    let mut torn_reads = 0u32;
+
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut cur_extent: Option<u32> = None;
     let mut offset = 0u64;
@@ -503,12 +509,14 @@ fn verify_partition_against_source(
         }
         let got_hash = hash::hash_hex(&buf[..len]);
         if got_hash != rec.blake3 {
-            // Diagnose before failing: is this a transient torn read (a
-            // re-read matches what capture recorded), or has the source
-            // content genuinely changed since capture (re-reads agree with
-            // each other but not with the recorded hash)? Observed on VSS
-            // shadow-device reads, where the two cases point at completely
-            // different problems (volsnap read race vs. shadow invalidation).
+            // Distinguish a transient torn read from real divergence before
+            // failing. Observed live on VSS shadow-device reads: one verify
+            // read returns wrong bytes, and immediate re-reads return the
+            // recorded content — the image is faithful, the *verify read*
+            // hiccuped (volsnap racing the live volume's copy-on-write). In
+            // that proven-transient case, retry instead of failing the whole
+            // backup — loudly, and only up to a small budget, so genuine
+            // instability still fails.
             let probe = |reader: &mut dyn FnMut(u64, &mut [u8]) -> Result<usize>| -> String {
                 let mut pbuf = vec![0u8; len];
                 let mut pgot = 0usize;
@@ -524,8 +532,25 @@ fn verify_partition_against_source(
             let mut f = |off: u64, b: &mut [u8]| reader.read_at(off, b);
             let reread1 = probe(&mut f);
             let reread2 = probe(&mut f);
+
+            if (reread1 == rec.blake3 || reread2 == rec.blake3) && torn_reads < TORN_READ_BUDGET {
+                // Transient: a re-read reproduces exactly what capture
+                // recorded, so the source is intact and the image matches it.
+                torn_reads += 1;
+                tracing::warn!(
+                    extent = rec.extent_index,
+                    chunk = rec.chunk_index,
+                    offset,
+                    torn_reads,
+                    "verify-after-backup: transient torn read from the source device \
+                     (re-read matches the recorded hash); continuing"
+                );
+                offset += len as u64;
+                continue;
+            }
+
             let verdict = if reread1 == rec.blake3 || reread2 == rec.blake3 {
-                "a re-read MATCHES the recorded hash — transient torn read from the source device"
+                "transient torn reads, but too many of them — the source device is unstable"
             } else if reread1 == got_hash && reread2 == got_hash {
                 "re-reads are stable but differ from capture — source content changed after capture"
             } else {
