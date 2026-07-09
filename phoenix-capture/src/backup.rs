@@ -17,7 +17,7 @@ use phoenix_core::ProgressHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::fat::{capture_exfat, capture_fat, fat_plan};
+use crate::fat::{capture_exfat, capture_fat, exfat_plan, fat_plan};
 use crate::ntfs::{capture_ntfs, ntfs_plan};
 use crate::raw::{capture_raw, raw_extent_for_partition};
 use crate::reader::{BlockSource, PartitionReader};
@@ -548,18 +548,33 @@ pub fn plan_capture(
         (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => {
             // exFAT records contiguous files with the "NoFatChain" flag, so
             // their clusters are NOT in the FAT — they're tracked only in the
-            // allocation bitmap. A FAT-based used-block scan therefore misses
-            // every contiguous file (the common case), which would silently
-            // drop data. Until we parse the exFAT allocation bitmap, capture
-            // exFAT volumes in full (raw) so restores are always correct.
-            // (FAT12/16/32 don't have this problem: every file is a FAT chain.)
-            Ok((
-                raw_extent_for_partition(part.size_bytes, 512),
-                0,
-                CaptureMode::Raw,
-                fs,
-                None,
-            ))
+            // allocation bitmap. `exfat_plan` reads that bitmap (authoritative
+            // for all allocation) to compute used-cluster extents. On ANY
+            // parse failure we fall back to a full raw capture rather than
+            // risk silently dropping data from a volume we couldn't fully
+            // understand.
+            match exfat_plan(reader) {
+                Ok((extents, bitmap_hash, bytes_per_cluster)) => Ok((
+                    extents,
+                    bytes_per_cluster,
+                    CaptureMode::UsedBlocks,
+                    fs,
+                    bitmap_hash,
+                )),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "exFAT allocation-bitmap plan failed; falling back to full raw capture"
+                    );
+                    Ok((
+                        raw_extent_for_partition(part.size_bytes, 512),
+                        0,
+                        CaptureMode::Raw,
+                        fs,
+                        None,
+                    ))
+                }
+            }
         }
         _ => Ok((
             raw_extent_for_partition(part.size_bytes, 512),

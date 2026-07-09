@@ -12,8 +12,10 @@ Branch: `feature/engine-completion`.
 Backup, restore (with NTFS grow + shrink-relocation, FAT/exFAT grow), disk-to-disk
 clone (incl. live VSS), **verify-after-backup** (default on), format-v2 bulletproof
 verification, the **zero-space WinFsp mount**, and **lock-state-aware BitLocker
-capture** (see below). Validated by the full T1/T2 suites and the real-disk (T3)
-matrix — see [TESTING.md](TESTING.md). Multiple real integrity bugs were found
+capture** (see below). Used-block capture covers NTFS (volume bitmap), FAT12/16/32
+(FAT scan), and **exFAT (allocation bitmap** — including `NoFatChain` contiguous
+files a FAT scan would miss). Validated by the full T1/T2 suites and the real-disk
+(T3) matrix — see [TESTING.md](TESTING.md). Multiple real integrity bugs were found
 and fixed along the way, including a silent data-loss bug (`div_ceil` phantom
 cluster) that only real fragmented NTFS exposed.
 
@@ -96,13 +98,6 @@ spare fixed disk is available, extend `real_disk.rs` with a GPT variant
   test (WinFsp via `choco install winfsp`).
 - The T3 real-disk tier is inherently manual (it wipes a physical disk); keep it
   as a documented pre-release step.
-
-### P3 — Used-block exFAT capture
-exFAT is currently captured **raw** (the whole partition), because exFAT's
-`NoFatChain` contiguous files aren't discoverable from the FAT alone. This makes
-exFAT backups larger/slower than they need to be. Capturing via the exFAT
-**allocation bitmap** would give used-block sizing like NTFS/FAT. Correctness is
-fine today; this is an efficiency improvement.
 
 ### P3 — Automate the manual T3 items (where safe)
 `scripts/live-smoke-checklist.md` covers live VSS system-disk backup/clone,

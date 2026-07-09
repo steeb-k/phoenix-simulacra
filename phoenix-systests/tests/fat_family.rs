@@ -50,6 +50,31 @@ fn roundtrip_fs(fs: TestFs, size_mb: u64, seed: u64) {
     })
     .expect("run_backup");
 
+    // exFAT is now captured used-blocks (via the allocation bitmap), not raw:
+    // confirm the manifest says so and the backup is materially smaller than
+    // the whole partition. FAT32 was already used-blocks (via the FAT).
+    {
+        let reader = PhnxReader::open(&backup_path).unwrap();
+        let fs_name = if fs == TestFs::Exfat { "exfat" } else { "fat" };
+        let pm = reader
+            .manifest
+            .partitions
+            .iter()
+            .find(|p| p.fs == fs_name)
+            .unwrap_or_else(|| panic!("{fs_name} partition in manifest"));
+        assert_eq!(
+            pm.capture_mode, "used-blocks",
+            "{fs_name} should capture used-blocks, not raw"
+        );
+        let part_size = size_mb * 1024 * 1024;
+        assert!(
+            pm.used_bytes < part_size / 2,
+            "{fs_name} used-block backup should be well under half the {part_size}-byte \
+             partition (mostly-empty volume + small fixture), got {} bytes",
+            pm.used_bytes
+        );
+    }
+
     let target = TestVhd::create(size_mb).expect("create target vhd");
     let reader = PhnxReader::open(&backup_path).unwrap();
     let target_disk_size = size_mb * 1024 * 1024;

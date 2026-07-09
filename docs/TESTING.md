@@ -31,6 +31,9 @@ cargo test --workspace
 Coverage highlights:
 - **FAT parsing** — FAT12/16/32 cluster-count derivation, EOC-terminal cluster
   capture, 12-bit packed reads (regression for two data-loss bugs).
+- **exFAT allocation bitmap** — `exfat_plan` locates the bitmap via the root
+  directory and derives used-cluster extents from it; a synthetic-image test
+  proves a `NoFatChain` contiguous file (absent from the FAT) is captured.
 - **NTFS metadata** — `ntfs_meta` run-list parsing hardened against malformed
   bytes (never panics on untrusted input); truncation fuzz loop.
 - **Container format v2** — footer CRC, total-length/truncation, index-table
@@ -74,7 +77,7 @@ cargo test -p phoenix-systests -- --ignored --test-threads=1 --nocapture
 |------|--------|
 | `backup_restore_roundtrip.rs` | NTFS backup → restore, same size, fixture + chkdsk |
 | `clone.rs` | disk-to-disk clone, same-size and expand-to-larger |
-| `fat_family.rs` | FAT32 and exFAT backup → restore round-trips |
+| `fat_family.rs` | FAT32 and exFAT backup → restore round-trips; asserts both capture **used-blocks** (exFAT via the allocation bitmap) and the backup is materially smaller than the partition |
 | `resize_roundtrip.rs` | NTFS **grow** (`FSCTL_EXTEND_VOLUME`) and **shrink** (relocation + MFT/`$Bitmap`/`$LogFile` rewrite) |
 | `mount.rs` | materialize-to-VHD mount (the dev fallback path) + browse fixture |
 | `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): encrypt with a password protector → **unlocked** volume classifies NTFS/used-blocks/`Unlocked` and round-trips as a normal *plaintext* backup → `Lock-BitLocker` → classifies Bitlocker/raw/`Locked`, backup is *ciphertext* (verify-after passes), restore comes back locked and yields the fixture only after `Unlock-BitLocker` with the original password |
@@ -129,7 +132,7 @@ Without `PHOENIX_T3_DISK` set, the tests skip cleanly (nothing is wiped).
 |----------|--------|
 | `real_mbr_multifs_roundtrip` | MBR NTFS + FAT32 image → full-disk restore, NTFS auto-grow, partition-table + data, offline `chkdsk /F` on the restored NTFS |
 | `real_mbr_restore_shrink` | NTFS relocation (shrink to 512 MB), online `chkdsk /scan` + offline `chkdsk /F /X` structural check |
-| `real_mbr_exfat_roundtrip` | exFAT (raw capture) + NTFS round-trip |
+| `real_mbr_exfat_roundtrip` | exFAT (used-block capture via allocation bitmap) + NTFS round-trip |
 | `real_mbr_bitlocker_roundtrip` | BitLocker on real flash: unlocked → plaintext backup/restore; locked → ciphertext backup/restore, ciphertext proven by reading `-FVE-FS-` off the physical disk (the in-session OS unlock leg is best-effort — Windows won't re-recognize a restored removable BitLocker volume without a re-plug/reboot) |
 | `real_clone_to_vhd` | clone the real disk → a VHD, read-back verify |
 

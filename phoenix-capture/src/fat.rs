@@ -238,13 +238,21 @@ fn fat_used_extents(
             used.push(c);
         }
     }
+    used_clusters_to_extents(&used, cluster_size, data_start)
+}
 
-    // Collect byte ranges to capture. The reserved region [0, data_start) --
-    // boot sector, the FAT copies, and (for FAT12/16) the root directory -- is
-    // filesystem metadata and must ALWAYS be captured; without it a restored
-    // volume has no boot sector and mounts as RAW. NTFS gets this for free
-    // because its bitmap marks the metadata clusters used, but FAT's data-only
-    // cluster scan does not, so we add the reserved region explicitly.
+/// Turn a sorted list of used cluster numbers (2-based, as in FAT/exFAT) into
+/// captured [`Extent`]s, always prepending the reserved region `[0, data_start)`.
+///
+/// The reserved region — boot sector(s), the FAT copies, and (for FAT12/16)
+/// the root directory — is filesystem metadata that must ALWAYS be captured;
+/// without it a restored volume has no boot sector and mounts as RAW. NTFS
+/// gets this for free because its bitmap marks the metadata clusters used, but
+/// the FAT/exFAT cluster scans cover only the data (cluster-heap) region, so we
+/// add the reserved region explicitly. For exFAT the cluster-heap allocation
+/// bitmap, up-case table, and root directory sit *inside* the heap and so are
+/// already covered by `used`.
+fn used_clusters_to_extents(used: &[u64], cluster_size: u64, data_start: u64) -> Vec<Extent> {
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     if data_start > 0 {
         ranges.push((0, data_start));
@@ -252,7 +260,7 @@ fn fat_used_extents(
     if !used.is_empty() {
         let mut start = used[0];
         let mut prev = used[0];
-        let mut push_run = |ranges: &mut Vec<(u64, u64)>, start: u64, prev: u64| {
+        let push_run = |ranges: &mut Vec<(u64, u64)>, start: u64, prev: u64| {
             let byte_start = data_start + (start - 2) * cluster_size;
             let byte_end = data_start + (prev - 2 + 1) * cluster_size;
             ranges.push((byte_start, byte_end));
@@ -299,6 +307,244 @@ fn fat_used_extents(
             sector_count: (e - s) / SECTOR,
         })
         .collect()
+}
+
+/// exFAT geometry pulled from the boot sector — everything [`exfat_plan`]
+/// needs to locate the FAT, the root directory, and the cluster heap.
+struct ExfatGeom {
+    cluster_size: u64,
+    cluster_count: u64,
+    /// Byte offset of cluster #2 (the start of the cluster heap).
+    data_start: u64,
+    fat_byte_offset: u64,
+    fat_byte_len: u64,
+    root_dir_first_cluster: u64,
+}
+
+fn parse_exfat_geom(boot: &[u8]) -> Result<ExfatGeom> {
+    if boot.len() < 512 || &boot[3..11] != b"EXFAT   " {
+        return Err(PhoenixError::Other("not exFAT".into()));
+    }
+    let bps_shift = boot[108];
+    let spc_shift = boot[109];
+    if !(9..=12).contains(&bps_shift) {
+        return Err(PhoenixError::Other(format!(
+            "exFAT BytesPerSectorShift {bps_shift} out of range (expected 9..=12)"
+        )));
+    }
+    if spc_shift as u32 > 25 - bps_shift as u32 {
+        return Err(PhoenixError::Other(format!(
+            "exFAT SectorsPerClusterShift {spc_shift} out of range"
+        )));
+    }
+    let bytes_per_sector = 1u64 << bps_shift;
+    let cluster_size = bytes_per_sector << spc_shift;
+    let fat_offset = u32::from_le_bytes(boot[80..84].try_into().unwrap()) as u64;
+    let fat_length = u32::from_le_bytes(boot[84..88].try_into().unwrap()) as u64;
+    let cluster_heap_offset = u32::from_le_bytes(boot[88..92].try_into().unwrap()) as u64;
+    let cluster_count = u32::from_le_bytes(boot[92..96].try_into().unwrap()) as u64;
+    let root_dir_first_cluster = u32::from_le_bytes(boot[96..100].try_into().unwrap()) as u64;
+    if cluster_count == 0 || cluster_heap_offset == 0 || fat_length == 0 {
+        return Err(PhoenixError::Other(
+            "exFAT boot sector reports zero cluster_count / cluster_heap_offset / fat_length"
+                .into(),
+        ));
+    }
+    if root_dir_first_cluster < 2 || root_dir_first_cluster > cluster_count + 1 {
+        return Err(PhoenixError::Other(format!(
+            "exFAT FirstClusterOfRootDirectory {root_dir_first_cluster} out of range"
+        )));
+    }
+    Ok(ExfatGeom {
+        cluster_size,
+        cluster_count,
+        data_start: cluster_heap_offset * bytes_per_sector,
+        fat_byte_offset: fat_offset * bytes_per_sector,
+        fat_byte_len: fat_length * bytes_per_sector,
+        root_dir_first_cluster,
+    })
+}
+
+/// The next-cluster value for `cluster` from the exFAT FAT. exFAT FAT entries
+/// are full 32-bit (unlike FAT32's 28-bit); end-of-chain is `0xFFFF_FFFF`.
+fn exfat_fat_next(fat: &[u8], cluster: u64) -> Option<u64> {
+    let idx = (cluster * 4) as usize;
+    let b = fat.get(idx..idx + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
+}
+
+/// Read a FAT-chained cluster stream (the root directory) starting at
+/// `first_cluster`, stopping at end-of-chain / an out-of-range link or after
+/// `max_clusters` (a runaway guard). exFAT's root directory is always
+/// FAT-chained (never `NoFatChain`), so following the chain is spec-correct.
+fn read_exfat_chain(
+    reader: &mut impl BlockSource,
+    geom: &ExfatGeom,
+    fat: &[u8],
+    first_cluster: u64,
+    max_clusters: u64,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cluster = first_cluster;
+    let mut count = 0u64;
+    while cluster >= 2 && cluster <= geom.cluster_count + 1 && count < max_clusters {
+        let off = geom.data_start + (cluster - 2) * geom.cluster_size;
+        let mut buf = vec![0u8; geom.cluster_size as usize];
+        let n = reader.read_at(off, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        count += 1;
+        match exfat_fat_next(fat, cluster) {
+            Some(next) if next >= 2 && next <= geom.cluster_count + 1 => cluster = next,
+            // 0xFFFF_FFFF (EOC), bad-cluster markers, or anything out of range
+            // terminates the chain.
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Read exactly `data_length` bytes of a stream (the allocation bitmap)
+/// starting at `first_cluster`. Follows the FAT chain when it points to a
+/// valid next cluster; otherwise assumes the stream is contiguous. Real exFAT
+/// allocation bitmaps are laid out contiguously (and some formatters leave
+/// their FAT entries unset, `NoFatChain`-style), so the contiguous fallback is
+/// the common path.
+fn read_exfat_stream_by_len(
+    reader: &mut impl BlockSource,
+    geom: &ExfatGeom,
+    fat: &[u8],
+    first_cluster: u64,
+    data_length: u64,
+) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::with_capacity(data_length as usize);
+    let mut cluster = first_cluster;
+    let mut guard = 0u64;
+    let max_iters = geom.cluster_count + 2;
+    while (out.len() as u64) < data_length {
+        if cluster < 2 || cluster > geom.cluster_count + 1 {
+            break;
+        }
+        let off = geom.data_start + (cluster - 2) * geom.cluster_size;
+        let mut buf = vec![0u8; geom.cluster_size as usize];
+        let n = reader.read_at(off, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let remaining = (data_length - out.len() as u64) as usize;
+        let take = remaining.min(n);
+        out.extend_from_slice(&buf[..take]);
+        cluster = match exfat_fat_next(fat, cluster) {
+            Some(next) if next >= 2 && next <= geom.cluster_count + 1 => next,
+            _ => cluster + 1,
+        };
+        guard += 1;
+        if guard > max_iters {
+            break;
+        }
+    }
+    out.truncate(data_length as usize);
+    Ok(out)
+}
+
+/// Scan root-directory entries (32 bytes each) for the in-use Allocation
+/// Bitmap entry (type `0x81`, BitmapFlags bit 0 clear = the first/only
+/// bitmap on a non-TexFAT volume) and return its `(first_cluster, data_length)`.
+fn find_exfat_alloc_bitmap(root: &[u8]) -> Result<(u64, u64)> {
+    let mut off = 0usize;
+    while off + 32 <= root.len() {
+        let entry_type = root[off];
+        if entry_type == 0x00 {
+            break; // end-of-directory marker
+        }
+        if entry_type == 0x81 && root[off + 1] & 1 == 0 {
+            let first_cluster =
+                u32::from_le_bytes(root[off + 20..off + 24].try_into().unwrap()) as u64;
+            let data_length = u64::from_le_bytes(root[off + 24..off + 32].try_into().unwrap());
+            return Ok((first_cluster, data_length));
+        }
+        off += 32;
+    }
+    Err(PhoenixError::Other(
+        "exFAT allocation bitmap directory entry (0x81) not found in root directory".into(),
+    ))
+}
+
+/// Build used-cluster extents from the exFAT allocation bitmap. Bit `i`
+/// (LSB-first) covers cluster `i + 2`; a set bit means allocated. This is
+/// authoritative for ALL allocated clusters — including `NoFatChain`
+/// contiguous files, which a FAT scan misses entirely.
+fn exfat_used_extents(
+    bitmap: &[u8],
+    cluster_size: u64,
+    data_start: u64,
+    cluster_count: u64,
+) -> Vec<Extent> {
+    let mut used = Vec::new();
+    for i in 0..cluster_count {
+        let byte = (i / 8) as usize;
+        let bit = (i % 8) as u32;
+        if byte < bitmap.len() && (bitmap[byte] >> bit) & 1 == 1 {
+            used.push(i + 2);
+        }
+    }
+    used_clusters_to_extents(&used, cluster_size, data_start)
+}
+
+/// exFAT used-block plan: derive used-cluster extents from the **allocation
+/// bitmap** (not the FAT). Mirrors [`fat_plan`]/[`crate::ntfs::ntfs_plan`] in
+/// shape — returns `(extents, bitmap_hash, bytes_per_cluster)` — so the
+/// planned extents become the manifest's authoritative extent table.
+///
+/// Why the bitmap and not the FAT: exFAT stores contiguous files with the
+/// `NoFatChain` flag, meaning their clusters are NOT linked in the FAT (their
+/// FAT entries read as free). A FAT scan therefore silently drops every
+/// contiguous file — the reason exFAT was previously captured raw. The
+/// allocation bitmap marks every allocated cluster regardless.
+pub fn exfat_plan(reader: &mut impl BlockSource) -> Result<(Vec<Extent>, Option<String>, u32)> {
+    let mut boot = vec![0u8; 512];
+    reader.read_at(0, &mut boot)?;
+    let geom = parse_exfat_geom(&boot)?;
+
+    let mut fat = vec![0u8; geom.fat_byte_len as usize];
+    reader.read_at(geom.fat_byte_offset, &mut fat)?;
+
+    // The Allocation Bitmap / Up-case / Volume Label entries sit at the very
+    // start of the root directory, so a modest cluster cap covers them while
+    // still tolerating a fragmented root.
+    let root = read_exfat_chain(reader, &geom, &fat, geom.root_dir_first_cluster, 256)?;
+    let (bitmap_first_cluster, bitmap_len) = find_exfat_alloc_bitmap(&root)?;
+    if bitmap_first_cluster < 2 || bitmap_first_cluster > geom.cluster_count + 1 {
+        return Err(PhoenixError::Other(format!(
+            "exFAT allocation bitmap first cluster {bitmap_first_cluster} out of range"
+        )));
+    }
+    let expected_len = geom.cluster_count.div_ceil(8);
+    if bitmap_len < expected_len {
+        return Err(PhoenixError::Other(format!(
+            "exFAT allocation bitmap DataLength {bitmap_len} < {expected_len} needed for {} clusters",
+            geom.cluster_count
+        )));
+    }
+    let bitmap = read_exfat_stream_by_len(reader, &geom, &fat, bitmap_first_cluster, bitmap_len)?;
+    if (bitmap.len() as u64) < expected_len {
+        return Err(PhoenixError::Other(format!(
+            "exFAT allocation bitmap read short: got {} bytes, need {expected_len}",
+            bitmap.len()
+        )));
+    }
+
+    let extents = exfat_used_extents(
+        &bitmap,
+        geom.cluster_size,
+        geom.data_start,
+        geom.cluster_count,
+    );
+    let bitmap_hash = Some(hash::hash_hex(&bitmap[..expected_len as usize]));
+    let bytes_per_cluster: u32 = geom.cluster_size.try_into().unwrap_or(u32::MAX);
+    Ok((extents, bitmap_hash, bytes_per_cluster))
 }
 
 fn fat_cluster_value(fat: &[u8], cluster: u64, fat_type: FatType) -> u32 {
@@ -349,7 +595,13 @@ pub fn capture_exfat(
 }
 
 pub fn estimate_fat_used(reader: &mut impl BlockSource, exfat: bool) -> Result<u64> {
-    let (extents, _hash, _bpc) = fat_plan(reader, exfat)?;
+    // exFAT used-blocks come from the allocation bitmap (the FAT misses
+    // NoFatChain files); FAT12/16/32 come from the FAT itself.
+    let (extents, _hash, _bpc) = if exfat {
+        exfat_plan(reader)?
+    } else {
+        fat_plan(reader, false)?
+    };
     Ok(extents.iter().map(|e| e.sector_count * SECTOR).sum())
 }
 
@@ -803,5 +1055,111 @@ mod tests {
         let extents = fat_used_extents(&fat, FatType::Fat16, cluster_size, 0, total_clusters);
         // Clusters 2 and 4 used, 3 free → two separate runs.
         assert_eq!(extents.len(), 2);
+    }
+
+    // ---- exFAT allocation-bitmap plan ----
+
+    /// Build a minimal but valid-enough exFAT image (512-byte sectors,
+    /// 1-sector clusters) whose allocation bitmap marks clusters 2, 3, 5, 6
+    /// used — where clusters 5 & 6 are a **`NoFatChain` contiguous file**
+    /// (their FAT entries are 0/free). A FAT scan would miss 5 & 6; the
+    /// bitmap scan must catch them.
+    ///
+    /// Layout: boot @0, FAT @sector 24 (1 sector), cluster heap @sector 32.
+    /// Root dir = cluster 2, allocation bitmap = cluster 3.
+    fn build_exfat_image() -> Vec<u8> {
+        const SEC: usize = 512;
+        let fat_offset_sec = 24usize;
+        let heap_offset_sec = 32usize;
+        let cluster_count = 10u32;
+        // Cover the whole heap (clusters 2..=11): heap end = (32 + 10) sectors.
+        let total_sectors = heap_offset_sec + cluster_count as usize; // 42
+        let mut img = vec![0u8; total_sectors * SEC];
+
+        // Boot sector.
+        img[3..11].copy_from_slice(b"EXFAT   ");
+        img[80..84].copy_from_slice(&(fat_offset_sec as u32).to_le_bytes());
+        img[84..88].copy_from_slice(&1u32.to_le_bytes()); // FatLength = 1 sector
+        img[88..92].copy_from_slice(&(heap_offset_sec as u32).to_le_bytes());
+        img[92..96].copy_from_slice(&cluster_count.to_le_bytes());
+        img[96..100].copy_from_slice(&2u32.to_le_bytes()); // root dir @ cluster 2
+        img[108] = 9; // BytesPerSectorShift → 512
+        img[109] = 0; // SectorsPerClusterShift → 1 sector/cluster
+
+        // FAT (sector 24): entries are 4 bytes each.
+        let fat_base = fat_offset_sec * SEC;
+        let set_fat = |img: &mut [u8], cluster: usize, val: u32| {
+            let o = fat_base + cluster * 4;
+            img[o..o + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        set_fat(&mut img, 0, 0xFFFF_FFF8); // media
+        set_fat(&mut img, 1, 0xFFFF_FFFF);
+        set_fat(&mut img, 2, 0xFFFF_FFFF); // root dir: single-cluster EOC
+        set_fat(&mut img, 3, 0xFFFF_FFFF); // bitmap: single-cluster EOC
+                                           // Clusters 5 & 6 deliberately left 0 (NoFatChain contiguous file).
+
+        let cluster_off = |c: usize| (heap_offset_sec + (c - 2)) * SEC;
+
+        // Root directory (cluster 2): one Allocation Bitmap entry, then EOD.
+        let rd = cluster_off(2);
+        img[rd] = 0x81; // Allocation Bitmap
+        img[rd + 1] = 0x00; // flags: first/only bitmap
+        img[rd + 20..rd + 24].copy_from_slice(&3u32.to_le_bytes()); // FirstCluster = 3
+        img[rd + 24..rd + 32].copy_from_slice(&2u64.to_le_bytes()); // DataLength = 2 bytes
+                                                                    // (Byte at rd + 32 is already 0x00 = end-of-directory.)
+
+        // Allocation bitmap (cluster 3): bit i → cluster i+2.
+        // Set clusters 2,3,5,6 → bits 0,1,3,4 → 0b0001_1011 = 0x1B.
+        let bm = cluster_off(3);
+        img[bm] = 0x1B;
+        img[bm + 1] = 0x00;
+
+        img
+    }
+
+    #[test]
+    fn exfat_plan_captures_nofatchain_file_via_bitmap() {
+        use crate::reader::MemoryBlockSource;
+        let img = build_exfat_image();
+        let mut src = MemoryBlockSource::new(img);
+        let (extents, bitmap_hash, bytes_per_cluster) = exfat_plan(&mut src).unwrap();
+        assert_eq!(bytes_per_cluster, 512);
+        assert!(bitmap_hash.is_some());
+
+        // data_start = 32 sectors, cluster_size = 512.
+        // Used clusters 2,3,5,6 → reserved [0,32) + clusters 2-3 coalesce to
+        // sectors [0, 34); clusters 5-6 → sectors [35, 37).
+        assert_eq!(
+            extents.len(),
+            2,
+            "expected reserved+2-3 run and the 5-6 run"
+        );
+        assert_eq!(extents[0].start_sector, 0);
+        assert_eq!(extents[0].sector_count, 34);
+        // The NoFatChain file (clusters 5,6) MUST be captured — this is the
+        // whole point of using the bitmap instead of the FAT.
+        assert_eq!(extents[1].start_sector, 35);
+        assert_eq!(extents[1].sector_count, 2);
+    }
+
+    #[test]
+    fn exfat_used_extents_marks_only_allocated_bits() {
+        // clusters 2 and 4 used (bits 0 and 2), cluster 3 free.
+        let bitmap = [0b0000_0101u8];
+        let extents = exfat_used_extents(&bitmap, 512, 32 * 512, 3);
+        // reserved [0,32) coalesces with cluster 2 → sectors [0, 33);
+        // cluster 4 (bit2) → sectors [34, 35).
+        assert_eq!(extents.len(), 2);
+        assert_eq!(extents[0].start_sector, 0);
+        assert_eq!(extents[0].sector_count, 33);
+        assert_eq!(extents[1].start_sector, 34);
+        assert_eq!(extents[1].sector_count, 1);
+    }
+
+    #[test]
+    fn exfat_plan_rejects_non_exfat() {
+        use crate::reader::MemoryBlockSource;
+        let mut src = MemoryBlockSource::new(vec![0u8; 4096]);
+        assert!(exfat_plan(&mut src).is_err());
     }
 }

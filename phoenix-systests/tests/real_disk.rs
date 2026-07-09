@@ -291,8 +291,8 @@ fn real_mbr_exfat_roundtrip() {
     };
     let idx = disk.index();
 
-    // exFAT (captured raw) + NTFS. exFAT first (kept at size), NTFS last (grows
-    // to fill on the full-disk restore).
+    // exFAT (used-block capture via the allocation bitmap) + NTFS. exFAT first
+    // (kept at size), NTFS last (grows to fill on the full-disk restore).
     disk.layout(
         false,
         &[
