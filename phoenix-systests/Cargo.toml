@@ -17,6 +17,7 @@ phoenix-capture = { workspace = true }
 phoenix-restore = { workspace = true }
 phoenix-clone = { workspace = true }
 phoenix-mount = { workspace = true }
+phoenix-vss = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }

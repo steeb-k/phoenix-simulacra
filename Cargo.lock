@@ -2414,6 +2414,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-mount",
  "phoenix-restore",
+ "phoenix-vss",
  "uuid",
  "winfsp",
 ]

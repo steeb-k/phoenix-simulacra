@@ -600,6 +600,128 @@ fn real_mbr_bitlocker_roundtrip() {
     eprintln!("[T3] real_mbr_bitlocker_roundtrip PASSED");
 }
 
+/// VSS on real media. Adapts to what the hardware supports:
+/// - **Non-removable** target (external/internal HDD): VSS should work — run a
+///   backup with `use_vss: true` while holding an open file handle, which the
+///   engine can only survive by reading a shadow (the live-volume fallback
+///   would fail `FSCTL_LOCK_VOLUME` against our handle). Then restore+verify.
+/// - **Removable** flash: Windows can't shadow removable media, so assert the
+///   fallback contract instead: with a handle open the backup MUST fail with a
+///   lock error; with handles closed it must lock, capture faithfully, and
+///   release.
+#[test]
+#[ignore = "DESTRUCTIVE: wipes the real disk; set PHOENIX_T3_DISK"]
+fn real_vss_backup_roundtrip() {
+    use std::io::Write;
+
+    require_admin();
+    let Some(disk) = skip_or_disk() else {
+        return;
+    };
+    let idx = disk.index();
+
+    disk.layout(
+        !disk.is_removable(), // GPT where possible, MBR on removable
+        &[PartSpec {
+            size_mb: 2048,
+            fs: TestFs::Ntfs,
+            letter: 'R',
+            label: "T3VSS".into(),
+        }],
+    )
+    .expect("layout");
+    assert!(wait_for_letter('R', 20_000), "NTFS didn't mount");
+    let digest = fill_fixture('R', 0xF0F0).expect("fill fixture");
+    let disk_size = disk_size_bytes(idx);
+
+    // Probe: can this volume actually be shadowed? (Removable flash can't.)
+    let shadow_works = {
+        let mut probe = phoenix_vss::VssSession::new();
+        let path = probe.snapshot_volume(r"\\.\R:").unwrap_or_default();
+        path.contains("HarddiskVolumeShadowCopy")
+    };
+    eprintln!("[T3] VSS probe on R:: shadow_works={shadow_works}");
+
+    let mut held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(r"R:\held-open.bin")
+        .expect("open held file");
+    held.write_all(b"held during backup").expect("write held");
+
+    let backup =
+        std::env::temp_dir().join(format!("t3-vss-{}.phnx", uuid::Uuid::new_v4().simple()));
+    let result = run_backup(BackupOptions {
+        disk_index: idx,
+        partition_indices: all_partition_indices(idx),
+        output: backup.clone(),
+        use_vss: true,
+        verify_after: true,
+        progress: None,
+    });
+
+    let backup = if shadow_works {
+        // Shadow media: the held handle proves the shadow was genuinely used.
+        result.expect("use_vss=true backup failed on shadow-capable media");
+        drop(held);
+        eprintln!("[T3] VSS shadow backup succeeded with a handle held open");
+        backup
+    } else {
+        // Removable media: VSS must have fallen back, and the fallback must
+        // have refused to proceed past the held handle.
+        match result {
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    msg.contains("lock"),
+                    "unexpected failure (wanted lock): {e}"
+                );
+                eprintln!("[T3] fallback correctly enforced the volume lock: {e}");
+            }
+            Ok(_) => panic!(
+                "backup succeeded with VSS unavailable and a handle held open — fallback \
+                 did not enforce the volume lock"
+            ),
+        }
+        drop(held);
+        // Now with handles closed the locked fallback must produce a good backup.
+        run_backup(BackupOptions {
+            disk_index: idx,
+            partition_indices: all_partition_indices(idx),
+            output: backup.clone(),
+            use_vss: true,
+            verify_after: true,
+            progress: None,
+        })
+        .expect("fallback (locked) backup failed");
+        std::fs::write(r"R:\post-backup.txt", b"unlocked").expect("volume still locked");
+        backup
+    };
+
+    // Wipe + restore back onto the same disk; fixture must survive.
+    disk.clean().expect("clean");
+    let reader = PhnxReader::open(&backup).unwrap();
+    let layout_size = std::env::var("PHOENIX_T3_LAYOUT_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|gb| ((gb * 1e9) as u64).min(disk_size))
+        .unwrap_or(disk_size);
+    let plan = default_plan_from_backup(backup.to_str().unwrap(), &reader, idx, layout_size);
+    drop(reader);
+    run_restore(RestoreOptions {
+        backup_path: backup.clone(),
+        plan,
+        verify_on_restore: true,
+        progress: None,
+    })
+    .expect("run_restore");
+    let letter = wait_for_restored_letter(idx, 30_000).expect("restored volume got no letter");
+    verify_fixture(letter, &digest).expect("fixture preserved through VSS/fallback backup");
+
+    let _ = std::fs::remove_file(&backup);
+    eprintln!("[T3] real_vss_backup_roundtrip PASSED");
+}
+
 #[test]
 #[ignore = "DESTRUCTIVE: wipes the real USB disk; set PHOENIX_T3_DISK"]
 fn real_clone_to_vhd() {

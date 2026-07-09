@@ -81,6 +81,7 @@ cargo test -p phoenix-systests -- --ignored --test-threads=1 --nocapture
 | `resize_roundtrip.rs` | NTFS **grow** (`FSCTL_EXTEND_VOLUME`) and **shrink** (relocation + MFT/`$Bitmap`/`$LogFile` rewrite) |
 | `mount.rs` | materialize-to-VHD mount (the dev fallback path) + browse fixture |
 | `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): encrypt with a password protector → **unlocked** volume classifies NTFS/used-blocks/`Unlocked` and round-trips as a normal *plaintext* backup → `Lock-BitLocker` → classifies Bitlocker/raw/`Locked`, backup is *ciphertext* (verify-after passes), restore comes back locked and yields the fixture only after `Unlock-BitLocker` with the original password |
+| `vss.rs` | VSS **proven working, not just not-erroring** (fallback is silent, so naive tests can pass with VSS broken): (1) point-in-time — snapshot, modify a file, read the *original* bytes through the shadow device; (2) backup with `use_vss` while a file handle is held open — only a real shadow read can succeed (fallback would fail the volume lock), then restore+verify; (3+4) **forced fallback** via FAT32 (VSS is NTFS-only): with a handle open the fallback must *fail* with a lock error (proves the lock is enforced), and with handles closed it must lock → capture → unlock → restore byte-for-byte |
 
 All disks in T2 are **GPT** (VHDX can't be MBR via this path) — MBR coverage
 comes from T3.
@@ -159,6 +160,7 @@ touched. Leave it unset on a small (USB-stick) disk to exercise grow-to-fill.
 | `real_mbr_restore_shrink` | NTFS relocation (shrink to 512 MB), online `chkdsk /scan` + offline `chkdsk /F /X` structural check |
 | `real_mbr_exfat_roundtrip` | exFAT (used-block capture via allocation bitmap) + NTFS round-trip |
 | `real_mbr_bitlocker_roundtrip` | BitLocker on real flash: unlocked → plaintext backup/restore; locked → ciphertext backup/restore, ciphertext proven by reading `-FVE-FS-` off the physical disk (the in-session OS unlock leg is best-effort — Windows won't re-recognize a restored removable BitLocker volume without a re-plug/reboot) |
+| `real_vss_backup_roundtrip` | VSS on real media, adaptive: non-removable → shadow backup with a handle held open (only a real shadow read passes) + restore/verify; removable flash (unshadowable) → asserts the fallback enforces the volume lock, then locked backup round-trip |
 | `real_clone_to_vhd` | clone the real disk → a VHD, read-back verify |
 
 Every scenario runs with **verify-after-backup on** (re-reads the source and
