@@ -9,6 +9,29 @@ Branch: `feature/engine-completion`.
 
 ## What's done (for context)
 
+### VSS + volume-lock consistency: verified on virtual and real media (2026-07)
+
+Both consistency strategies are now **proven**, not just plumbed, across T2
+(VHDX) and T3 (real USB flash + real external HDD) — with tests constructed so
+`VssSession`'s silent live-volume fallback *fails* them rather than sneaking
+past (see TESTING.md, `vss.rs` + `real_vss_backup_roundtrip`): point-in-time
+shadow semantics; backup genuinely reading through the shadow (proven by
+succeeding with a file handle held open); the no-VSS fallback enforcing
+`FSCTL_LOCK_VOLUME` in both directions (refuses to start past open handles,
+and blocks external opens/writes for the capture's duration); and byte-exact
+round-trips on every path.
+
+**Field finding — volsnap torn reads:** reading a shadow *device* while the
+live volume takes writes can return a wrong read **once** for a block volsnap
+has just copied-on-written; the very next read returns the frozen content.
+Frequency scales with elapsed time × live write churn (1 occurrence on a fast
+VHDX, 9 on a 4 TB USB HDD in a 15-second window). verify-after-backup now
+re-reads any mismatched chunk: a re-read matching the recorded hash proves the
+image faithful for that chunk (WARN + counted, unbounded — the count tracks
+churn, not device health); stable divergence or unstable re-reads still fail
+loudly. A capture-side tear is caught by the same mechanism as a hard
+"source changed after capture" verify failure — never silent corruption.
+
 Backup, restore (with NTFS grow + shrink-relocation, FAT/exFAT grow), disk-to-disk
 clone (incl. live VSS), **verify-after-backup** (default on), format-v2 bulletproof
 verification, the **zero-space WinFsp mount**, and **lock-state-aware BitLocker
