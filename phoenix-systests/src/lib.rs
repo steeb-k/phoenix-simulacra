@@ -310,11 +310,15 @@ pub fn partition_summary(disk_index: u32) -> Result<Vec<(u64, u64, String)>> {
     Ok(parts)
 }
 
-/// Outcome of the safety gate: the disk's serial and whether it's a removable
-/// USB device (vs. a fixed disk, which is only allowed under a stricter opt-in).
+/// Outcome of the safety gate: the disk's serial and whether it's **removable**
+/// media (a throwaway USB flash stick) vs. a non-removable disk (internal disk
+/// OR external USB HDD), which holds real data and is only allowed under a
+/// stricter opt-in. Removability — not bus type — is the right axis: a 4 TB
+/// USB HDD reports `BusType=USB` but is non-removable (and GPT-capable), so it
+/// must get the same protection as an internal disk.
 struct ValidatedDisk {
     serial: String,
-    is_usb: bool,
+    is_removable: bool,
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -336,21 +340,25 @@ fn env_gb(name: &str) -> Option<f64> {
 /// gate fails, so a destructive op can never proceed against the wrong disk
 /// even if indices shift between calls.
 ///
-/// Two target classes:
-/// - **USB removable** (the default): allowed with the historical gates
-///   (not boot/system, size in range, optional serial pin).
-/// - **Fixed (non-removable)** disk: only when `PHOENIX_T3_ALLOW_FIXED=1` is
-///   set AND `PHOENIX_T3_SERIAL` pins the exact device (MANDATORY here — a
-///   fixed disk has no "throwaway USB stick" safety net, so we require the
-///   operator to name the precise serial). Needed for GPT-on-real-hardware,
-///   which Windows won't do on removable media.
+/// Two target classes, keyed on **removable media** (Win32_DiskDrive
+/// `MediaType` = "Removable Media"), NOT bus type:
+/// - **Removable** (a USB flash stick): allowed with the historical gates —
+///   not boot/system, size in range, optional serial pin.
+/// - **Non-removable** (internal disk OR external USB HDD): only when
+///   `PHOENIX_T3_ALLOW_FIXED=1` is set AND `PHOENIX_T3_SERIAL` pins the exact
+///   device (MANDATORY here — a real disk holds real data, so we require the
+///   operator to name the precise serial). This is the class GPT-on-real-
+///   hardware needs, since Windows won't make removable media GPT.
 ///
 /// Size bounds default to 16–64 GB (a USB-stick heuristic) and are widenable
 /// via `PHOENIX_T3_MIN_GB` / `PHOENIX_T3_MAX_GB` for a larger fixed test disk.
+///
+/// Unknown/blank `MediaType` fails safe: treated as NON-removable (strict).
 fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
     let info = powershell(&format!(
         "$d = Get-Disk -Number {index} -ErrorAction Stop; \
-         \"$($d.BusType)|$($d.IsBoot)|$($d.IsSystem)|$($d.Size)|$($d.SerialNumber)\""
+         $dd = Get-CimInstance Win32_DiskDrive -Filter \"Index={index}\"; \
+         \"$($d.BusType)|$($d.IsBoot)|$($d.IsSystem)|$($d.Size)|$($d.SerialNumber)|$($dd.MediaType)\""
     ))
     .with_context(|| format!("querying disk {index}"))?;
     let f: Vec<&str> = info.trim().split('|').collect();
@@ -359,23 +367,26 @@ fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
     let is_system = f.get(2).copied().unwrap_or("");
     let size: u64 = f.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let serial = f.get(4).copied().unwrap_or("").trim().to_string();
+    let media = f.get(5).copied().unwrap_or("").trim();
 
-    let is_usb = bus.eq_ignore_ascii_case("USB");
-    if !is_usb {
+    // "Removable Media" = a flash stick. "External/Fixed hard disk media" =
+    // non-removable. Blank/unknown → fail safe as non-removable (strict).
+    let is_removable = media.to_lowercase().contains("removable");
+    if !is_removable {
         if !env_truthy("PHOENIX_T3_ALLOW_FIXED") {
             bail!(
-                "SAFETY: disk {index} BusType={bus:?} is not USB — refusing. To target a FIXED \
-                 (non-removable) disk you MUST set PHOENIX_T3_ALLOW_FIXED=1 AND pin the exact \
-                 device with PHOENIX_T3_SERIAL."
+                "SAFETY: disk {index} is non-removable media (MediaType={media:?}, \
+                 BusType={bus:?}) — refusing. Non-removable disks (internal, or external USB \
+                 HDDs) can hold real data. To target one you MUST set PHOENIX_T3_ALLOW_FIXED=1 \
+                 AND pin the exact device with PHOENIX_T3_SERIAL."
             );
         }
-        // Fixed disk: the exact-serial pin is MANDATORY (belt-and-suspenders
-        // against wiping the wrong drive now that the removable safety net is
-        // gone).
+        // The exact-serial pin is MANDATORY (belt-and-suspenders against wiping
+        // the wrong drive now that the removable safety net is gone).
         let want = std::env::var("PHOENIX_T3_SERIAL").map_err(|_| {
             anyhow!(
-                "SAFETY: targeting a FIXED disk requires PHOENIX_T3_SERIAL set to the exact \
-                 device serial (got PHOENIX_T3_ALLOW_FIXED but no serial pin)"
+                "SAFETY: targeting a non-removable disk requires PHOENIX_T3_SERIAL set to the \
+                 exact device serial (got PHOENIX_T3_ALLOW_FIXED but no serial pin)"
             )
         })?;
         if !serial.eq_ignore_ascii_case(want.trim()) {
@@ -399,8 +410,8 @@ fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
              (widen with PHOENIX_T3_MIN_GB / PHOENIX_T3_MAX_GB if this really is your test disk)"
         );
     }
-    // USB path keeps the historical *optional* serial pin.
-    if is_usb {
+    // Removable path keeps the historical *optional* serial pin.
+    if is_removable {
         if let Ok(want) = std::env::var("PHOENIX_T3_SERIAL") {
             if !serial.eq_ignore_ascii_case(want.trim()) {
                 bail!(
@@ -409,15 +420,18 @@ fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
             }
         }
     }
-    Ok(ValidatedDisk { serial, is_usb })
+    Ok(ValidatedDisk {
+        serial,
+        is_removable,
+    })
 }
 
 /// A real, physical test disk opted into via the `PHOENIX_T3_DISK` env var and
 /// guarded so destructive tests can never hit a boot/system disk, an out-of-size
-/// disk, or (without an explicit fixed-disk opt-in) a non-removable disk.
+/// disk, or (without an explicit opt-in) a non-removable disk.
 pub struct RealDisk {
     index: u32,
-    is_usb: bool,
+    is_removable: bool,
 }
 
 impl RealDisk {
@@ -435,16 +449,16 @@ impl RealDisk {
         let v = validate_real_disk(index)?;
         eprintln!(
             "[T3] target = disk {index}, {}, serial {} — safety gates passed",
-            if v.is_usb {
-                "USB removable"
+            if v.is_removable {
+                "removable (USB flash)"
             } else {
-                "FIXED (non-removable)"
+                "NON-REMOVABLE (internal / external HDD)"
             },
             v.serial
         );
         Ok(Some(Self {
             index,
-            is_usb: v.is_usb,
+            is_removable: v.is_removable,
         }))
     }
 
@@ -452,10 +466,10 @@ impl RealDisk {
         self.index
     }
 
-    /// Whether the target is a removable USB device. GPT tests skip a USB
-    /// target (Windows can't make removable media GPT).
-    pub fn is_usb(&self) -> bool {
-        self.is_usb
+    /// Whether the target is removable media (a USB flash stick). GPT tests
+    /// skip a removable target — Windows won't make removable media GPT.
+    pub fn is_removable(&self) -> bool {
+        self.is_removable
     }
 
     /// Wipe the disk (re-validates safety first).

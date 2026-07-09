@@ -218,10 +218,11 @@ fn real_gpt_multifs_roundtrip() {
     let Some(disk) = skip_or_disk() else {
         return;
     };
-    if disk.is_usb() {
+    if disk.is_removable() {
         eprintln!(
-            "[T3] skipping GPT test: target disk {} is removable USB (Windows can't make it \
-             GPT). Attach a fixed disk and set PHOENIX_T3_ALLOW_FIXED=1 + PHOENIX_T3_SERIAL.",
+            "[T3] skipping GPT test: target disk {} is removable media (Windows can't make it \
+             GPT). Use a non-removable disk (internal or external HDD) with \
+             PHOENIX_T3_ALLOW_FIXED=1 + PHOENIX_T3_SERIAL.",
             disk.index()
         );
         return;
