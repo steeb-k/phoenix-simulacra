@@ -42,6 +42,19 @@ files a FAT scan would miss). Validated by the full T1/T2 suites and the real-di
 and fixed along the way, including a silent data-loss bug (`div_ceil` phantom
 cluster) that only real fragmented NTFS exposed.
 
+### Engine throughput: parallel chunk pipeline (2026-07)
+
+Capture, restore, full image verify, and clone no longer run serial per-chunk
+loops. `phoenix_core::pipeline` overlaps device I/O with parallel BLAKE3 +
+zstd workers while keeping chunk commit order — and therefore the `.phnx`
+file layout — byte-identical to the old serial code (equivalence-tested
+against a serial reference). The clone engine double-buffers its raw copy so
+source reads overlap target writes. Synthetic bench: capture-side CPU
+throughput 786 → 2040 MB/s, full verify 976 → 3284 MB/s vs one worker. The
+frozen-source verify (`verify_partition_against_source`) intentionally stays
+serial — its torn-read re-read logic needs ordered device reads and it is
+device-bound regardless. Details under the P3 throughput item below.
+
 ### BitLocker: lock-state-aware capture (implemented)
 
 **Lock state — not merely "is this BitLocker" — drives the capture mode:**
@@ -145,29 +158,50 @@ hard to automate safely; **4Kn media** could be automated if a 4Kn test device
 (or a 4Kn-emulating VHD) is available.
 
 ### P3 — Engine throughput: pipeline/parallelize backup, restore, AND verify
-Every data path (capture, restore, verify-after) runs one serial loop per
-chunk: read → compress/decompress → hash → write, each stage waiting on the
-previous. Real-world baseline from the first production-scale run (2026-07,
-~709 GB used, NVMe source → SATA/USB targets): capture+verify ≈ 3 h
-(~130 MB/s effective), restore projected ~2 h. The devices are capable of
-much more; the loop shape is the bottleneck. Avenues:
-- **Pipeline the stages** (applies to all three paths): double/triple-buffer
-  so the reader, the CPU work (zstd + BLAKE3), and the writer overlap instead
-  of alternating. Likely the single biggest win and media-agnostic.
-- **Parallel chunk compression/decompression**: chunks are independent —
-  fan 4 MiB chunks across a small worker pool; keep write order stable.
-  BLAKE3 is already multi-GB/s; zstd is the CPU-side cost to hide.
-- **Adaptive compression**: skip/lighten compression for incompressible
-  chunks (entropy probe or trial-block), which also speeds restore.
+**Core work DONE (2026-07)** — see "What's done"; the deliberately deferred
+avenues remain below. The old shape: every data path ran one serial loop per
+chunk (read → compress/decompress → hash → write, each stage waiting on the
+previous); real-world baseline from the first production-scale run (2026-07,
+~709 GB used, NVMe source → SATA/USB targets) was capture+verify ≈ 3 h
+(~130 MB/s effective), restore projected ~2 h.
+
+Landed in `phoenix_core::pipeline` (+ the clone loop):
+- **Capture**: `PartitionStreamWriter::write_chunk` feeds a worker pool
+  (BLAKE3 + zstd in parallel) while a dedicated writer thread commits chunks
+  in submission order — the `.phnx` layout stays **byte-identical** to the
+  serial loop (proven by a serial-reference equivalence test). Source reads
+  overlap the CPU work via bounded-channel backpressure (≤ ~128 MiB in
+  flight at the default `min(cores, 8)` workers; `PHOENIX_WORKERS`
+  overrides).
+- **Restore + full image verify**: `process_chunks_parallel` — a reader
+  thread streams compressed chunks, workers decompress + hash-check, the
+  caller consumes plaintext in order on its own thread (raw-disk writes stay
+  on the calling thread; target offsets stay monotonic for spinning media).
+- **Clone**: `stream_extents` is double-buffered — a scoped reader thread
+  reads ahead through a bounded channel while the caller writes, so source
+  read and target write overlap instead of alternating.
+- Synthetic bench (release, 512 MiB half-compressible, this dev machine):
+  capture-side 786 → 2040 MB/s and full verify 976 → 3284 MB/s vs one
+  worker — the CPU ceiling now clears any single source device.
+- **Preserved by design**: `verify_partition_against_source` (frozen-source
+  re-read) stays serial — its torn-read re-read-confirm logic needs ordered
+  device reads, and it is device-bound anyway (BLAKE3 is a rounding error
+  next to the source read). The frozen-vs-unfrozen verify strategy in
+  run_backup phase 3 is untouched.
+
+Remaining avenues (deferred until real-hardware profiling says otherwise):
+- **Adaptive compression**: skipping zstd for incompressible chunks needs a
+  stored-raw chunk flag — a format change — and the parallel workers already
+  hide zstd below device speed. Revisit only if capture on real hardware
+  still shows CPU as the limiter.
 - **Device-aware parallel I/O**: multiple readers over disjoint extents on
   NVMe; strictly sequential on spinning/USB media (gate on bus/media type).
-- **Pipeline verify with capture**: verify partition N while capturing N+1
-  under the same VSS snapshot lifetime (watch source-device contention).
+  Only pays once a single reader can't saturate the source.
+- **Pipeline verify with capture**: verify partition N while capturing N+1 —
+  helps only multi-partition backups and contends for the same source
+  device; the common one-big-data-partition case gains nothing.
 - Optional **sampled verify-after** tier for speed-sensitive runs (full
   re-read stays the default; mirrors `verify --quick` semantics).
-Constraint to preserve: the torn-read re-read-confirm logic and the
-frozen-vs-unfrozen verify strategy in `verify_partition_against_source` /
-run_backup phase 3.
 
 ### Nice-to-have
 - **Progress step for verify-after-backup** — it currently shows as a detail

@@ -47,6 +47,18 @@ Coverage highlights:
 - **Mount** — VHD footer bytes, GPT synthesis + CRCs, `SyntheticVhd` /
   `ChunkStore` on-demand reads (chunk-interior, straddle, gap→zeros, corrupt
   chunk → error).
+- **Parallel chunk pipeline** (`pipeline_equivalence.rs`,
+  `restore_parallel_roundtrip.rs`, `stream_extents_overlap.rs`) — the
+  pipelined capture writer is byte-equivalent to a serially-computed
+  reference layout (offsets, compressed bytes, record order, stream handoff
+  between partitions); parallel decode preserves order, attributes
+  `HashMismatch` correctly, and propagates consumer errors; `restore_raw`
+  round-trips into a sentinel-filled temp file proving extent-only writes
+  and fails on a corrupted chunk; the double-buffered clone loop matches a
+  reference image (plain, ReadBack, relocation split) and cancels without
+  deadlock. An `#[ignore]`d `pipeline_throughput` probe prints MB/s
+  (`cargo test -p phoenix-core --release pipeline_throughput -- --ignored
+  --nocapture`).
 
 ---
 
