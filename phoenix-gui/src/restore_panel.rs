@@ -127,6 +127,7 @@ fn draw_source_row(
                 selected,
                 None,
             );
+            response.on_hover_ui_at_pointer(|ui| disk_map::partition_tooltip(ui, p));
             true
         },
     );
@@ -298,6 +299,7 @@ fn draw_target_row(
             assigned,
             overlay.as_deref(),
         );
+        move_body.on_hover_ui_at_pointer(|ui| disk_map::partition_tooltip(ui, p));
         true
     });
 

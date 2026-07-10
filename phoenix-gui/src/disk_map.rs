@@ -13,7 +13,7 @@ use crate::util::format_bytes;
 
 pub const CHECKBOX_COLUMN_WIDTH: f32 = 36.0;
 pub const CHECKBOX_GAP: f32 = 6.0;
-pub const INFO_CARD_WIDTH: f32 = 150.0;
+pub const INFO_CARD_WIDTH: f32 = 108.0;
 pub const INFO_CARD_GAP: f32 = 10.0;
 pub const ROW_HEIGHT: f32 = 92.0;
 pub const SEGMENT_GUTTER: f32 = 4.0;
@@ -21,8 +21,29 @@ pub const FILL_BAR_HEIGHT: f32 = 5.0;
 pub const SEGMENT_ROUNDING: f32 = 6.0;
 pub const ROW_VERTICAL_GAP: f32 = 12.0;
 pub const MIN_GAP_BYTES: u64 = 4 * 1024 * 1024;
-pub const MIN_PARTITION_WIDTH: f32 = 95.0;
-pub const MIN_UNALLOCATED_WIDTH: f32 = 70.0;
+/// Absolute floor for a partition segment: the width used for the very smallest
+/// partitions, and a comfortable click/hover target.
+pub const MIN_PARTITION_WIDTH: f32 = 24.0;
+/// Ceiling for the size-aware minimum (see [`min_partition_width`]).
+pub const MAX_PARTITION_MIN_WIDTH: f32 = 110.0;
+pub const MIN_UNALLOCATED_WIDTH: f32 = 30.0;
+
+/// A size-aware minimum width so the map keeps a visible hierarchy even among
+/// partitions that are all far too small to render proportionally against a
+/// multi-hundred-GB neighbour. The floor grows with `log2(size)`, so a 16 GB
+/// recovery partition always reserves more width than a 128 MB reserved one,
+/// which in turn beats a 4 MB sliver — instead of every small partition
+/// collapsing to one identical stub. Above the floor, the normal proportional
+/// pass still applies, so large partitions grow past this minimum.
+pub fn min_partition_width(size_bytes: u64) -> f32 {
+    if size_bytes == 0 {
+        return MIN_PARTITION_WIDTH;
+    }
+    // Anchored at 128 MB (log2 = 27); ~5.5 px of extra floor per doubling.
+    let log2 = (size_bytes as f64).log2() as f32;
+    let scaled = MIN_PARTITION_WIDTH + 5.5 * (log2 - 27.0);
+    scaled.clamp(MIN_PARTITION_WIDTH, MAX_PARTITION_MIN_WIDTH)
+}
 
 const PARTITION_SENSE: Sense = Sense {
     click: true,
@@ -83,7 +104,7 @@ pub fn compute_segment_widths(
     let mins: Vec<f32> = segments
         .iter()
         .map(|s| match s {
-            SegmentKind::Partition(_) => MIN_PARTITION_WIDTH,
+            SegmentKind::Partition(p) => min_partition_width(p.size_bytes),
             SegmentKind::Unallocated { .. } => MIN_UNALLOCATED_WIDTH,
         })
         .collect();
@@ -142,7 +163,7 @@ pub fn min_disk_row_width(disk: &DiskInfo) -> f32 {
     let segment_min_total: f32 = segments
         .iter()
         .map(|s| match s {
-            SegmentKind::Partition(_) => MIN_PARTITION_WIDTH,
+            SegmentKind::Partition(p) => min_partition_width(p.size_bytes),
             SegmentKind::Unallocated { .. } => MIN_UNALLOCATED_WIDTH,
         })
         .sum();
@@ -177,16 +198,7 @@ pub fn draw_disk_info_card(
         );
     }
 
-    let icon_pos = egui::pos2(rect.left() + 28.0, rect.center().y);
-    painter.text(
-        icon_pos,
-        Align2::CENTER_CENTER,
-        egui_phosphor::regular::HARD_DRIVES,
-        fonts::icon(30.0),
-        palette.icon_color,
-    );
-
-    let text_x = rect.left() + 56.0;
+    let text_x = rect.left() + 14.0;
     painter.text(
         egui::pos2(text_x, rect.top() + 18.0),
         Align2::LEFT_TOP,
@@ -247,6 +259,7 @@ pub fn draw_partition_map(
                     let id = ui.id().with(("partition", disk.index, p.index));
                     let response = ui.interact(seg_rect, id, PARTITION_SENSE);
                     draw_partition_segment_visual(ui, seg_rect, p, palette, response.hovered());
+                    response.on_hover_ui_at_pointer(|ui| partition_tooltip(ui, p));
                 }
             }
             SegmentKind::Unallocated { length } => {
@@ -331,16 +344,15 @@ pub fn draw_partition_segment_visual_styled(
         );
     }
 
-    let text_x = rect.left() + 10.0;
+    // All three lines are always drawn; `painter_at(rect)` clips them to the
+    // segment, so on a narrow partition they simply truncate at the edge rather
+    // than overflowing into the neighbour. The hover tooltip carries the full,
+    // un-clipped details.
+    let text_x = rect.left() + 8.0;
     let title_top = rect.top() + FILL_BAR_HEIGHT + 8.0;
-    let title = overlay_title.map(|s| s.to_string()).unwrap_or_else(|| {
-        match (&p.drive_letter, p.volume_label.as_deref()) {
-            (Some(c), Some(label)) if !label.is_empty() => format!("{c}: {label}"),
-            (Some(c), _) => format!("{c}:"),
-            (None, Some(label)) if !label.is_empty() => format!("*: {label}"),
-            (None, _) => "*:".into(),
-        }
-    });
+    let title = overlay_title
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| partition_title(p));
     painter.text(
         egui::pos2(text_x, title_top),
         Align2::LEFT_TOP,
@@ -355,14 +367,38 @@ pub fn draw_partition_segment_visual_styled(
         fonts::regular(12.0),
         palette.icon_color,
     );
-    let fs_text = describe_filesystem(p);
     painter.text(
         egui::pos2(text_x, title_top + 40.0),
         Align2::LEFT_TOP,
-        &fs_text,
+        describe_filesystem(p),
         fonts::regular(11.0),
         palette.subtle_text,
     );
+}
+
+/// The short `C: OS` / `*: label` heading shown on a partition segment.
+pub fn partition_title(p: &PartitionInfo) -> String {
+    match (&p.drive_letter, p.volume_label.as_deref()) {
+        (Some(c), Some(label)) if !label.is_empty() => format!("{c}: {label}"),
+        (Some(c), _) => format!("{c}:"),
+        (None, Some(label)) if !label.is_empty() => format!("*: {label}"),
+        (None, _) => "*:".into(),
+    }
+}
+
+/// Full partition details for a hover tooltip — always available even when the
+/// segment is too narrow to show inline text.
+pub fn partition_tooltip(ui: &mut Ui, p: &PartitionInfo) {
+    ui.strong(partition_title(p));
+    ui.label(format!("Size: {}", format_bytes(p.size_bytes)));
+    ui.label(describe_filesystem(p));
+    if let Some(u) = p.usage {
+        ui.label(format!(
+            "Used: {} of {}",
+            format_bytes(u.used_bytes()),
+            format_bytes(u.total_bytes),
+        ));
+    }
 }
 
 pub fn describe_filesystem(p: &PartitionInfo) -> String {
@@ -587,6 +623,7 @@ pub fn draw_backup_disk_row(
                 selected,
                 None,
             );
+            let response = response.on_hover_ui_at_pointer(|ui| partition_tooltip(ui, p));
             if response.clicked() {
                 let key = (disk_index, p.index);
                 if selected {

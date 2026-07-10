@@ -59,6 +59,13 @@ pub struct ModalView<'a> {
 const MODAL_WIDTH: f32 = 460.0;
 const CANCEL_BUTTON_ID: &str = "status_modal_cancel";
 const CLOSE_BUTTON_ID: &str = "status_modal_close";
+/// How long the user must hold the Cancel button before the job is actually
+/// cancelled. A deliberate friction so a stray click can't kill a long backup.
+const CANCEL_HOLD_SECS: f32 = 1.5;
+/// Temp-memory keys for the hold-to-cancel state (see `show_hold_cancel_button`).
+/// Cleared centrally when the finished modal appears so the next job starts fresh.
+const CANCEL_HOLD_START_ID: &str = "status_modal_cancel_hold_start";
+const CANCEL_HOLD_FIRED_ID: &str = "status_modal_cancel_hold_fired";
 
 pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> ModalAction {
     // --- Backdrop: full-screen dim layer above panels, below the dialog.
@@ -249,43 +256,178 @@ fn step_style(i: usize, view: &ModalView<'_>, palette: &Palette) -> StepStyle {
 
 fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> ModalAction {
     let mut action = ModalAction::None;
-    ui.vertical_centered(|ui| {
-        let resp = match view.outcome {
-            // Running: a plain, theme-colored button — cancelling is no longer
-            // styled as a "danger" action.
-            None => {
-                let resp = ui
-                    .push_id(egui::Id::new(CANCEL_BUTTON_ID), |ui| {
-                        ui.add_sized([160.0, 38.0], egui::Button::new("Cancel"))
-                    })
-                    .inner;
-                resp.request_focus();
-                resp
+    ui.vertical_centered(|ui| match view.outcome {
+        // Running: a hold-to-cancel button. A quick click does nothing; the
+        // job is cancelled only once the user holds it long enough to fill the
+        // bar (see `show_hold_cancel_button`).
+        None => {
+            if show_hold_cancel_button(ui, palette) {
+                action = ModalAction::Cancel;
             }
-            // Finished: a Close button tinted by the outcome (blue success,
-            // amber warning/cancelled, red failure).
-            Some(outcome) => {
-                let resp = ui
-                    .push_id(egui::Id::new(CLOSE_BUTTON_ID), |ui| {
-                        ui.add_sized(
-                            [160.0, 38.0],
-                            egui::Button::new(RichText::new("Close").color(Color32::WHITE))
-                                .fill(outcome_color(palette, outcome)),
-                        )
-                    })
-                    .inner;
-                resp.request_focus();
-                resp
+        }
+        // Finished: a Close button tinted by the outcome (blue success,
+        // amber warning/cancelled, red failure).
+        Some(outcome) => {
+            // The job is over — clear any hold-to-cancel latch so the next
+            // job's button starts from a clean, empty state.
+            ui.data_mut(|d| {
+                d.remove::<f64>(egui::Id::new(CANCEL_HOLD_START_ID));
+                d.remove::<bool>(egui::Id::new(CANCEL_HOLD_FIRED_ID));
+            });
+            let resp = ui
+                .push_id(egui::Id::new(CLOSE_BUTTON_ID), |ui| {
+                    ui.add_sized(
+                        [160.0, 38.0],
+                        egui::Button::new(RichText::new("Close").color(Color32::WHITE))
+                            .fill(outcome_color(palette, outcome)),
+                    )
+                })
+                .inner;
+            resp.request_focus();
+            if resp.clicked() {
+                action = ModalAction::Close;
             }
-        };
-        if resp.clicked() {
-            action = match view.outcome {
-                None => ModalAction::Cancel,
-                Some(_) => ModalAction::Close,
-            };
         }
     });
     action
+}
+
+/// The running-job Cancel control: a hold-to-confirm button. A quick click does
+/// nothing. The user must hold it — pointer down, or Space/Enter while focused —
+/// for [`CANCEL_HOLD_SECS`], during which a red bar fills the button from left
+/// to right in a single smooth sweep. Cancellation fires only on the frame the
+/// bar reaches the far edge, and exactly once per hold: after it fires, the bar
+/// latches full and reads "Cancelling…" (rather than re-arming and re-filling
+/// while the worker takes a moment to actually stop). Returns `true` on the one
+/// frame the hold completes.
+fn show_hold_cancel_button(ui: &mut egui::Ui, palette: &Palette) -> bool {
+    let size = egui::vec2(180.0, 38.0);
+    let (rect, resp) = ui
+        .push_id(egui::Id::new(CANCEL_BUTTON_ID), |ui| {
+            ui.allocate_exact_size(size, egui::Sense::click_and_drag())
+        })
+        .inner;
+    // Keep the button focused so it always shows an affordance (focus ring +
+    // hover fill) and so keyboard users can hold Space/Enter to cancel.
+    resp.request_focus();
+
+    let now = ui.input(|i| i.time);
+    let key_held = resp.has_focus()
+        && ui.input(|i| i.key_down(egui::Key::Space) || i.key_down(egui::Key::Enter));
+    let held = resp.is_pointer_button_down_on() || key_held;
+
+    // Two bits of per-widget temp state: when the current hold began, and
+    // whether it has already fired. Releasing (or a job restart, when the first
+    // idle frame runs) clears both, so every cancel is a fresh 1.5 s sweep.
+    let start_id = egui::Id::new(CANCEL_HOLD_START_ID);
+    let fired_id = egui::Id::new(CANCEL_HOLD_FIRED_ID);
+    let start: Option<f64> = ui.data(|d| d.get_temp(start_id));
+    let fired: bool = ui.data(|d| d.get_temp(fired_id)).unwrap_or(false);
+
+    let mut just_completed = false;
+    let progress = if held {
+        let started_at = match start {
+            Some(s) => s,
+            None => {
+                ui.data_mut(|d| d.insert_temp(start_id, now));
+                now
+            }
+        };
+        let p = (((now - started_at) as f32) / CANCEL_HOLD_SECS).clamp(0.0, 1.0);
+        if p >= 1.0 && !fired {
+            just_completed = true;
+            ui.data_mut(|d| d.insert_temp(fired_id, true));
+        }
+        p
+    } else {
+        // Released before firing: reset so the next hold starts from empty.
+        // Once it has *fired*, we deliberately keep the `fired` latch — the bar
+        // must stay full/red until the job actually ends (cleared centrally
+        // when the finished modal appears), so letting go can't "un-cancel".
+        if !fired && start.is_some() {
+            ui.data_mut(|d| d.remove::<f64>(start_id));
+        }
+        0.0
+    };
+    // Once fired, keep the bar visibly full while the worker winds down.
+    let display_progress = if fired { 1.0 } else { progress };
+
+    // --- paint ---
+    let rounding = egui::Rounding::same(6.0);
+    let inactive = ui.visuals().widgets.inactive.bg_fill;
+    // Make hover obvious: clearly lift the fill and switch the border to the
+    // accent. The default `widgets.hovered.bg_fill` tint is too subtle to
+    // notice on this hand-painted button. (Suppressed while held/latched, when
+    // the red bar already carries the state.)
+    let show_hover = resp.hovered() && !held && !fired;
+    let contrast = if palette.light_mode {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    let base = if show_hover {
+        theme::tint(inactive, 0.35, contrast)
+    } else {
+        inactive
+    };
+    let (stroke_w, stroke_c) = if show_hover {
+        (2.0, palette.accent)
+    } else {
+        (1.0, palette.subtle_text)
+    };
+    let fill = palette.danger;
+    let painter = ui.painter();
+    painter.rect_filled(rect, rounding, base);
+    if display_progress > 0.0 {
+        let fill_rect = egui::Rect::from_min_size(
+            rect.left_top(),
+            egui::vec2(rect.width() * display_progress, rect.height()),
+        );
+        // Square off the leading edge until the bar is full, then round it to
+        // match the button's corners.
+        let full = display_progress >= 1.0;
+        painter.rect_filled(
+            fill_rect,
+            egui::Rounding {
+                nw: rounding.nw,
+                sw: rounding.sw,
+                ne: if full { rounding.ne } else { 0.0 },
+                se: if full { rounding.se } else { 0.0 },
+            },
+            fill,
+        );
+    }
+    painter.rect_stroke(rect, rounding, egui::Stroke::new(stroke_w, stroke_c));
+    let label = if fired {
+        "Cancelling…"
+    } else if held {
+        "Keep holding…"
+    } else {
+        "Hold to Cancel"
+    };
+    // White reads cleanly over the red fill; at rest the fill is absent but the
+    // hold-to-cancel copy is still legible on the neutral button.
+    let text_color = if display_progress > 0.35 {
+        Color32::WHITE
+    } else {
+        palette.icon_color
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        fonts::bold(15.0),
+        text_color,
+    );
+    theme::draw_focus_outline(ui, &resp, palette);
+
+    // Keep the modal ticking: while the sweep animates, and after it has fired
+    // (even if the pointer is released) so we notice the moment the job
+    // finishes and this button is swapped for the Close button.
+    if held || fired {
+        ui.ctx().request_repaint();
+    }
+    just_completed
 }
 
 fn outcome_color(palette: &Palette, outcome: JobOutcome) -> Color32 {
