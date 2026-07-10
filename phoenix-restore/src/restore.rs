@@ -42,6 +42,7 @@ pub struct RestoreSummary {
 }
 
 pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
+    let op_start = std::time::Instant::now();
     let mut reader = PhnxReader::open(&opts.backup_path)?;
     opts.plan.validate_against_backup(&reader.manifest)?;
     // Pre-flight: refuse a shrink whose source has data physically
@@ -485,10 +486,13 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     if let Some(ref p) = opts.progress {
         p.end();
     }
+    let total_secs = op_start.elapsed().as_secs_f64();
     info!(
         partitions_restored = summary.partitions_restored,
         partitions_resized = summary.partitions_resized,
         restored_locked_bitlocker = summary.restored_locked_bitlocker,
+        elapsed = %phoenix_core::progress::format_elapsed(total_secs),
+        throughput = %phoenix_core::progress::format_rate(bytes_done, total_secs),
         "Restore complete"
     );
     Ok(summary)

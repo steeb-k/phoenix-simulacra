@@ -1,6 +1,32 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Human-readable duration for log lines and perf summaries:
+/// `"2h 14m 05s"`, `"8m 32s"`, `"42.7s"`.
+pub fn format_elapsed(secs: f64) -> String {
+    let whole = secs.max(0.0) as u64;
+    if whole >= 3600 {
+        format!("{}h {:02}m {:02}s", whole / 3600, (whole % 3600) / 60, whole % 60)
+    } else if whole >= 60 {
+        format!("{}m {:02}s", whole / 60, whole % 60)
+    } else {
+        format!("{:.1}s", secs.max(0.0))
+    }
+}
+
+/// `"412.5 GB at 187 MB/s"` — volume plus effective throughput. Falls back
+/// to volume alone when the elapsed time is too small to divide by.
+pub fn format_rate(bytes: u64, secs: f64) -> String {
+    if secs <= 0.0 {
+        return format!("{:.1} GB", bytes as f64 / 1e9);
+    }
+    format!(
+        "{:.1} GB at {:.0} MB/s",
+        bytes as f64 / 1e9,
+        bytes as f64 / 1e6 / secs
+    )
+}
+
 /// Thread-safe progress snapshot for GUI or CLI.
 #[derive(Clone, Debug, Default)]
 pub struct ProgressSnapshot {

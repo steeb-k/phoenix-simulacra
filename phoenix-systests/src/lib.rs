@@ -650,14 +650,20 @@ pub use fixture::{fill_fixture, verify_fixture, FixtureDigest};
 /// Console progress reporter for long-running engine operations in tests:
 /// hand `handle()` to `BackupOptions`/`RestoreOptions` and a background
 /// thread prints step transitions and byte progress to stderr (visible under
-/// `--nocapture`). Dropping the reporter stops the thread.
+/// `--nocapture`). Dropping the reporter stops the thread, prints a total
+/// elapsed/throughput summary, and appends a row to the perf log (see
+/// [`perf_log_path`]) so run-over-run speed changes are measurable instead of
+/// vibes.
 ///
-/// Prints on: step/phase change, every +1% (or +1 GiB, whichever is larger),
-/// and a 30 s heartbeat so multi-hour phases never look hung.
+/// Prints on: step/phase change (with the finished phase's elapsed time and
+/// rate), every +1% (or +1 GiB, whichever is larger), and a 30 s heartbeat so
+/// multi-hour phases never look hung.
 pub struct ConsoleProgress {
     handle: phoenix_core::ProgressHandle,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    label: String,
+    started: std::time::Instant,
 }
 
 impl ConsoleProgress {
@@ -665,6 +671,7 @@ impl ConsoleProgress {
         use std::sync::atomic::Ordering;
         let handle = phoenix_core::ProgressHandle::new();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let label_owned = label.to_string();
         let label = label.to_string();
         let h = handle.clone();
         let s = stop.clone();
@@ -673,6 +680,12 @@ impl ConsoleProgress {
             let mut last_detail = String::new();
             let mut last_printed_bytes = 0u64;
             let mut last_print = std::time::Instant::now();
+            // Per-phase timing: when the phase label changes, report how long
+            // the finished phase took and how many bytes it moved. Sampled at
+            // 1 Hz, so sub-second phases can be missed — fine for perf notes.
+            let mut phase_started = std::time::Instant::now();
+            let mut phase_start_bytes = 0u64;
+            let mut prev_current = 0u64;
             let gb = |b: u64| b as f64 / 1e9;
             while !s.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -685,6 +698,32 @@ impl ConsoleProgress {
                 let byte_step = (snap.total / 100).max(1_000_000_000);
                 let bytes_moved = snap.current.saturating_sub(last_printed_bytes) >= byte_step;
                 let heartbeat = last_print.elapsed().as_secs() >= 30;
+                if step_changed {
+                    if !last_phase.is_empty() {
+                        let secs = phase_started.elapsed().as_secs_f64();
+                        let bytes = prev_current.saturating_sub(phase_start_bytes);
+                        if bytes > 0 {
+                            eprintln!(
+                                "[{label}] time: {last_phase}: {} in {}",
+                                phoenix_core::progress::format_rate(bytes, secs),
+                                phoenix_core::progress::format_elapsed(secs),
+                            );
+                        } else {
+                            eprintln!(
+                                "[{label}] time: {last_phase}: {}",
+                                phoenix_core::progress::format_elapsed(secs),
+                            );
+                        }
+                    }
+                    phase_started = std::time::Instant::now();
+                    // A `begin()` between phases resets the byte counter; start
+                    // the new phase's baseline from wherever the counter is now.
+                    phase_start_bytes = if snap.current < prev_current {
+                        snap.current
+                    } else {
+                        prev_current
+                    };
+                }
                 if step_changed || detail_changed || bytes_moved || heartbeat {
                     let pct = if snap.total > 0 {
                         (snap.current as f64 / snap.total as f64 * 100.0).min(100.0)
@@ -711,12 +750,15 @@ impl ConsoleProgress {
                     last_printed_bytes = snap.current;
                     last_print = std::time::Instant::now();
                 }
+                prev_current = snap.current;
             }
         });
         Self {
             handle,
             stop,
             thread: Some(thread),
+            label: label_owned,
+            started: std::time::Instant::now(),
         }
     }
 
@@ -731,7 +773,74 @@ impl Drop for ConsoleProgress {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        // `ProgressHandle::end()` snaps `current` to `total`, so the final
+        // snapshot still carries the operation's byte count. On an error path
+        // (drop during unwind) it reflects however far the op got — the log
+        // row is still honest about elapsed time and bytes moved.
+        let snap = self.handle.snapshot();
+        let secs = self.started.elapsed().as_secs_f64();
+        eprintln!(
+            "[{}] TOTAL: {} in {}",
+            self.label,
+            phoenix_core::progress::format_rate(snap.current, secs),
+            phoenix_core::progress::format_elapsed(secs),
+        );
+        match append_perf_row(&self.label, secs, snap.current) {
+            Ok(path) => eprintln!("[{}] perf row appended to {}", self.label, path.display()),
+            Err(e) => eprintln!("[{}] perf-log append failed: {e}", self.label),
+        }
     }
+}
+
+/// Where perf rows land: `PHOENIX_PERF_LOG` if set, else
+/// `<workspace>/target/perf-log.csv` (survives across runs, dies with
+/// `cargo clean` — export it somewhere durable if you care long-term).
+pub fn perf_log_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("PHOENIX_PERF_LOG") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("target")
+        .join("perf-log.csv")
+}
+
+/// Append one operation's timing to the perf log (CSV, header written on
+/// first use). `workers` records the pipeline width so runs with different
+/// `PHOENIX_WORKERS` settings stay comparable. Returns the log path.
+fn append_perf_row(label: &str, secs: f64, bytes: u64) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let path = perf_log_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let write_header = !path.exists();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    if write_header {
+        writeln!(f, "timestamp,label,elapsed_s,bytes,mb_per_s,workers")?;
+    }
+    let mb_per_s = if secs > 0.0 {
+        bytes as f64 / 1e6 / secs
+    } else {
+        0.0
+    };
+    writeln!(
+        f,
+        "{},{},{:.1},{},{:.1},{}",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+        label,
+        secs,
+        bytes,
+        mb_per_s,
+        phoenix_core::pipeline::worker_count(),
+    )?;
+    Ok(path)
 }
 
 // ---- BitLocker test helpers (Windows Pro+; used by the T2 `bitlocker` and

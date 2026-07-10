@@ -226,6 +226,20 @@ BOTH disks attached would chain-load the ORIGINAL Windows volume.
 validate the target disk's EXISTING layout instead of re-restoring — for
 finishing a stage whose multi-hour restore succeeded but whose assertions
 tripped. Only meaningful when the disk currently holds that stage's layout.
+**Unset it before a full run** — with it set, every stage after the one
+matching the disk's current layout fails by design (and no restore code is
+actually exercised).
+
+**Timing / perf log:** every `ConsoleProgress`-wrapped engine operation
+prints per-phase and total elapsed + throughput lines, each T3B stage prints
+its wall-clock at PASSED, and one CSV row per operation
+(`timestamp,label,elapsed_s,bytes,mb_per_s,workers`) is appended to
+`target/perf-log.csv` (override with `PHOENIX_PERF_LOG=<path>`; the default
+lives under `target/`, so `cargo clean` wipes it). The engine itself also
+logs elapsed + effective MB/s at the end of `run_backup` (capture and
+verify phases separately), `run_restore`, and `run_clone` via `tracing`, so
+real CLI/GUI runs are measurable too. Use these numbers — not memory of how
+long the last run felt — when judging throughput changes.
 
 ## Tier 3 (manual) — live system disk + boot
 

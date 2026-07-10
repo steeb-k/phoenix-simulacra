@@ -88,6 +88,7 @@ struct PreparedPartition<'a> {
 }
 
 pub fn run_backup(opts: BackupOptions) -> Result<()> {
+    let op_start = std::time::Instant::now();
     let mut disks = enumerate_disks()?;
     for disk in &mut disks {
         for part in &mut disk.partitions {
@@ -455,6 +456,16 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     }
     writer.finalize(&manifest)?;
 
+    // Timing lines so multi-hour runs leave a durable record of what each
+    // phase cost — the numbers that justify (or indict) throughput work.
+    let capture_secs = op_start.elapsed().as_secs_f64();
+    let captured_bytes: u64 = manifest.partitions.iter().map(|p| p.used_bytes).sum();
+    info!(
+        "capture phase done (incl. snapshot setup): {} in {}",
+        phoenix_core::progress::format_rate(captured_bytes, capture_secs),
+        phoenix_core::progress::format_elapsed(capture_secs),
+    );
+
     // ---- PHASE 3: verify (default on), strategy matched to consistency ----
     //
     // FROZEN sources (VSS shadow, volume held under FSCTL_LOCK_VOLUME,
@@ -471,6 +482,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     // chunk of those partitions against the manifest, proving the backup
     // file faithfully holds what capture read.
     if opts.verify_after {
+        let verify_start = std::time::Instant::now();
         if let Some(ref progress) = opts.progress {
             progress.set_detail("Verifying backup against source…".to_string());
         }
@@ -522,13 +534,22 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 })?;
             }
         }
-        info!("verify-after-backup: all partitions verified");
+        let verify_secs = verify_start.elapsed().as_secs_f64();
+        info!(
+            "verify-after-backup: all partitions verified — {} in {}",
+            phoenix_core::progress::format_rate(captured_bytes, verify_secs),
+            phoenix_core::progress::format_elapsed(verify_secs),
+        );
     }
 
     if let Some(ref progress) = opts.progress {
         progress.end();
     }
-    info!("Backup written to {}", opts.output.display());
+    info!(
+        "Backup written to {} — total {}",
+        opts.output.display(),
+        phoenix_core::progress::format_elapsed(op_start.elapsed().as_secs_f64()),
+    );
     Ok(())
 }
 

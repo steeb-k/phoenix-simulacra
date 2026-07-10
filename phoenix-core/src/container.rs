@@ -990,11 +990,20 @@ impl PhnxReader {
         // we spend time decompressing), then hash every chunk.
         self.verify_structure()?;
 
+        // Progress is byte-denominated (uncompressed) so observers can render
+        // real sizes and rates; the chunk counter lives in the detail string.
         let total_chunks: u64 = self
             .manifest
             .partitions
             .iter()
             .map(|p| p.chunks.len() as u64)
+            .sum();
+        let total_bytes: u64 = self
+            .manifest
+            .partitions
+            .iter()
+            .flat_map(|p| p.chunks.iter())
+            .map(|c| c.uncompressed_len as u64)
             .sum();
 
         // Declare one step per partition up front so the GUI modal can show
@@ -1014,19 +1023,20 @@ impl PhnxReader {
                 })
                 .collect();
             p.set_steps(steps);
-            p.begin(total_chunks.max(1), "Verify");
+            p.begin(total_bytes.max(1), "Verify");
         }
 
-        let mut done = 0u64;
+        let mut done = (0u64, 0u64);
         for (step, idx) in indices.into_iter().enumerate() {
             if let Some(ref p) = progress {
                 p.set_step(step);
             }
-            // The helper takes the running count and returns the new
-            // CUMULATIVE count — assign, don't add (a `+=` here made the
+            // The helper takes the running counts and returns the new
+            // CUMULATIVE counts — assign, don't add (a `+=` here made the
             // progress counter overrun its total by ~4x on a 6-partition
             // verify; display-only, but embarrassing on a 3-hour run).
-            done = self.verify_partition_with_progress(idx, progress.as_ref(), done)?;
+            done =
+                self.verify_partition_with_progress(idx, progress.as_ref(), done, total_chunks)?;
         }
 
         if let Some(ref p) = progress {
@@ -1035,12 +1045,15 @@ impl PhnxReader {
         Ok(())
     }
 
+    /// `done` is the running `(bytes, chunks)` pair across the whole verify;
+    /// bytes drive the progress bar, chunks drive the detail string.
     fn verify_partition_with_progress(
         &mut self,
         partition_index: u32,
         progress: Option<&ProgressHandle>,
-        mut done: u64,
-    ) -> Result<u64> {
+        mut done: (u64, u64),
+        total_chunks: u64,
+    ) -> Result<(u64, u64)> {
         let entry = self
             .index
             .iter()
@@ -1061,15 +1074,16 @@ impl PhnxReader {
             paired_chunks(&stream.chunks, &chunk_records, partition_index)?,
             partition_index,
         );
-        self.process_chunks(&items, |_, _| {
+        self.process_chunks(&items, |_, data| {
             if let Some(p) = progress {
                 if p.is_cancelled() {
                     return Err(PhoenixError::Cancelled);
                 }
             }
-            done += 1;
+            done.0 += data.len() as u64;
+            done.1 += 1;
             if let Some(p) = progress {
-                p.set(done, format!("Chunk {} / {}", done, p.snapshot().total));
+                p.set(done.0, format!("Chunk {} / {}", done.1, total_chunks));
             }
             Ok(())
         })?;

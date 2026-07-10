@@ -53,6 +53,12 @@ use phoenix_systests::{
 
 const ALIGN: u64 = 1024 * 1024;
 
+/// Wall-clock for the whole stage (engine ops get their own per-op timing
+/// from `ConsoleProgress`; this also covers chkdsk, diskpart, and waits).
+fn stage_elapsed(start: std::time::Instant) -> String {
+    phoenix_core::progress::format_elapsed(start.elapsed().as_secs_f64())
+}
+
 // ---------- environment / safety plumbing ----------
 
 fn src_disk_index() -> Option<u32> {
@@ -338,6 +344,7 @@ fn assert_boot_artifacts(target: u32) {
 #[ignore = "images the LIVE source disk (read-only); set PHOENIX_BOOT_SRC_DISK + PHOENIX_BOOT_IMG_DIR"]
 fn boot_a_capture_image() {
     require_admin();
+    let stage_start = std::time::Instant::now();
     let Some(src) = src_disk_index() else {
         eprintln!("[T3B] PHOENIX_BOOT_SRC_DISK not set — skipping");
         return;
@@ -421,7 +428,8 @@ fn boot_a_capture_image() {
         ntfs_used as f64 / 1e9
     );
     eprintln!(
-        "[T3B] boot_a_capture_image PASSED — image at {}",
+        "[T3B] boot_a_capture_image PASSED in {} — image at {}",
+        stage_elapsed(stage_start),
         image.display()
     );
 }
@@ -431,6 +439,7 @@ fn boot_a_capture_image() {
 #[ignore = "DESTRUCTIVE to the target disk; needs the stage-A image + T3 target env"]
 fn boot_b_restore_asis() {
     require_admin();
+    let stage_start = std::time::Instant::now();
     let (Some(src), Some(image)) = (src_disk_index(), image_path()) else {
         eprintln!("[T3B] source/image env not set — skipping");
         return;
@@ -478,7 +487,10 @@ fn boot_b_restore_asis() {
         );
     }
     assert_boot_artifacts(target.index());
-    eprintln!("[T3B] boot_b_restore_asis PASSED");
+    eprintln!(
+        "[T3B] boot_b_restore_asis PASSED in {}",
+        stage_elapsed(stage_start)
+    );
 }
 
 /// Stage C: main NTFS SHRUNK (relocation path); every other partition keeps
@@ -487,6 +499,7 @@ fn boot_b_restore_asis() {
 #[ignore = "DESTRUCTIVE to the target disk; needs the stage-A image + T3 target env"]
 fn boot_c_restore_shrink() {
     require_admin();
+    let stage_start = std::time::Instant::now();
     let (Some(src), Some(image)) = (src_disk_index(), image_path()) else {
         eprintln!("[T3B] source/image env not set — skipping");
         return;
@@ -546,7 +559,10 @@ fn boot_c_restore_shrink() {
         );
     }
     assert_boot_artifacts(target.index());
-    eprintln!("[T3B] boot_c_restore_shrink PASSED");
+    eprintln!(
+        "[T3B] boot_c_restore_shrink PASSED in {}",
+        stage_elapsed(stage_start)
+    );
 }
 
 /// Stage D: main NTFS GROWN via the default plan (trailing partitions move to
@@ -556,6 +572,7 @@ fn boot_c_restore_shrink() {
 #[ignore = "DESTRUCTIVE to the target disk; needs the stage-A image + T3 target env"]
 fn boot_d_restore_grow() {
     require_admin();
+    let stage_start = std::time::Instant::now();
     let (Some(src), Some(image)) = (src_disk_index(), image_path()) else {
         eprintln!("[T3B] source/image env not set — skipping");
         return;
@@ -629,7 +646,10 @@ fn boot_d_restore_grow() {
         }
     }
     assert_boot_artifacts(target.index());
-    eprintln!("[T3B] boot_d_restore_grow PASSED");
+    eprintln!(
+        "[T3B] boot_d_restore_grow PASSED in {}",
+        stage_elapsed(stage_start)
+    );
 }
 
 /// Stage E: PARTIAL restore — plop only the NTFS partition from the image
@@ -639,6 +659,7 @@ fn boot_d_restore_grow() {
 #[ignore = "DESTRUCTIVE to the target's NTFS slot; run after boot_b/c/d"]
 fn boot_e_partial_ntfs() {
     require_admin();
+    let stage_start = std::time::Instant::now();
     let (Some(src), Some(image)) = (src_disk_index(), image_path()) else {
         eprintln!("[T3B] source/image env not set — skipping");
         return;
@@ -713,5 +734,8 @@ fn boot_e_partial_ntfs() {
         );
     }
     assert_boot_artifacts(target.index());
-    eprintln!("[T3B] boot_e_partial_ntfs PASSED");
+    eprintln!(
+        "[T3B] boot_e_partial_ntfs PASSED in {}",
+        stage_elapsed(stage_start)
+    );
 }

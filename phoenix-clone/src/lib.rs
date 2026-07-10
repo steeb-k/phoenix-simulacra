@@ -63,6 +63,7 @@ pub struct CloneSummary {
 
 /// Clone `source_disk_index` onto `target_disk_index` per the plan.
 pub fn run_clone(opts: CloneOptions) -> Result<CloneSummary> {
+    let op_start = std::time::Instant::now();
     let mut disks = enumerate_disks()?;
     for d in &mut disks {
         for p in &mut d.partitions {
@@ -100,6 +101,15 @@ pub fn run_clone(opts: CloneOptions) -> Result<CloneSummary> {
     opts.plan.validate(&source, &target)?;
 
     let summary = clone_inner(&source, &target, &opts)?;
+    let total_secs = op_start.elapsed().as_secs_f64();
+    info!(
+        partitions_cloned = summary.partitions_cloned,
+        partitions_resized = summary.partitions_resized,
+        elapsed = %phoenix_core::progress::format_elapsed(total_secs),
+        // `bytes_copied` counts read-back re-reads too, matching the meter.
+        throughput = %phoenix_core::progress::format_rate(summary.bytes_copied, total_secs),
+        "Clone complete"
+    );
     Ok(summary)
 }
 

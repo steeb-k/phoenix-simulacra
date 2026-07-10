@@ -21,6 +21,7 @@ phoenix-vss = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
+chrono = { workspace = true }
 
 [features]
 # Enables the WinFsp zero-space mount test (needs WinFsp + libclang to build).
