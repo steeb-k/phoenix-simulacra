@@ -95,6 +95,29 @@ fn backup_disk(disk_index: u32, use_vss: bool) -> phoenix_core::error::Result<st
     .map(|_| backup_path)
 }
 
+/// A freshly filled volume is frequently still being scanned by Windows
+/// Defender and the search indexer, which hold open handles that make
+/// `FSCTL_LOCK_VOLUME` return ERROR_ACCESS_DENIED (Win32 error 5). Block until
+/// the volume is quiescent enough to lock cleanly — proven by taking and
+/// immediately releasing the lock through the engine's own primitive (its
+/// internal 5×/~3.75 s retry rides out a transient scanner). This keeps the
+/// scanner from racing the timed backup's pre-flight lock; best-effort on
+/// timeout so a genuinely stuck volume still surfaces the real error below.
+fn wait_until_lockable(volume: &str, timeout_ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Ok(mut reader) = phoenix_capture::PartitionReader::open_volume(volume) {
+            if reader.lock_volume(volume).is_ok() {
+                return; // reader drops here → FSCTL_UNLOCK_VOLUME
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 fn restore_and_verify(backup_path: &std::path::Path, digest: &phoenix_systests::FixtureDigest) {
     let target = TestVhd::create(VHD_MB).expect("create target vhd");
     let reader = PhnxReader::open(backup_path).unwrap();
@@ -335,11 +358,23 @@ fn locked_backup_blocks_writers_for_duration() {
     let digest = fill_fixture('X', 0x8888).expect("fill fixture");
     let disk_index = source.disk_index();
 
+    // Let Defender / the indexer finish scanning the just-written fixture and
+    // release their handles, so the backup's pre-flight lock isn't racing them
+    // (they, not our writer, are what starved the lock across all 5 retries).
+    wait_until_lockable(r"\\.\X:", 30_000);
+
     let backup_thread = std::thread::spawn(move || backup_disk(disk_index, false));
 
-    // Hammer the volume while the backup runs. The pre-flight lock lands
-    // within the first second or two; every attempt after that must fail
-    // until run_backup returns (the lock is held through verify-after).
+    // Give the engine's pre-flight lock a brief contention-free window to land
+    // before we start hammering — the writer's own transient handles can
+    // otherwise coincide with FSCTL_LOCK_VOLUME. The backup + verify-after
+    // window is far longer than this head start, so probes still overlap the
+    // locked period and `refused > 0` holds.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Hammer the volume while the backup runs. The pre-flight lock is held
+    // by now; every attempt must fail until run_backup returns (the lock is
+    // held through verify-after).
     let mut refused = 0u32;
     let mut allowed = 0u32;
     while !backup_thread.is_finished() {
