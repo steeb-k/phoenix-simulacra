@@ -12,3 +12,6 @@ phoenix-restore = { workspace = true }
 phoenix-vss = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

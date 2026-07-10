@@ -2331,6 +2331,7 @@ dependencies = [
  "phoenix-restore",
  "phoenix-vss",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

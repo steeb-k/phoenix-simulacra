@@ -330,38 +330,76 @@ fn clone_one_partition(
 /// Copy every byte of `extents` from source to target in CHUNK_SIZE blocks,
 /// translating destination offsets through the relocation map when shrinking,
 /// and optionally reading each block back to verify it.
-fn stream_extents(
-    reader: &mut PartitionReader,
+///
+/// Double-buffered: a scoped reader thread walks the extents and reads ahead
+/// through a small bounded channel while this thread writes (and, in ReadBack
+/// mode, re-reads) the target — so on a disk-to-disk clone the source read
+/// and the target write overlap instead of strictly alternating. The channel
+/// depth bounds read-ahead memory to a few `CHUNK_SIZE` buffers, and the
+/// write side preserves the exact serial semantics: same offsets, same
+/// relocation splits, same short-read handling (`read_at` returning 0 ends
+/// that extent early, matching the old `break`).
+///
+/// Public (rather than private to `run_clone`) so the T1 no-admin test can
+/// drive it with a [`MemoryBlockSource`] against a temp-file-backed
+/// [`PartitionWriter`]; production calls it with a [`PartitionReader`].
+pub fn stream_extents(
+    reader: &mut (impl phoenix_capture::BlockSource + Send),
     writer: &mut PartitionWriter,
     extents: &[Extent],
     relocation: Option<&RelocationMap>,
     opts: &CloneOptions,
     mut bytes_done: u64,
 ) -> Result<u64> {
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    for extent in extents {
-        let base = extent.start_sector * EXTENT_LBA_BYTES as u64;
-        let byte_len = extent.sector_count * EXTENT_LBA_BYTES as u64;
-        let mut pos = 0u64;
-        while pos < byte_len {
+    // Read-ahead depth: 4 chunks (16 MiB). Enough to hide read latency
+    // behind writes without hoarding memory.
+    const READ_AHEAD: usize = 4;
+
+    std::thread::scope(|scope| -> Result<u64> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<
+            std::result::Result<(u64, Vec<u8>), PhoenixError>,
+        >(READ_AHEAD);
+
+        scope.spawn(move || {
+            for extent in extents {
+                let base = extent.start_sector * EXTENT_LBA_BYTES as u64;
+                let byte_len = extent.sector_count * EXTENT_LBA_BYTES as u64;
+                let mut pos = 0u64;
+                while pos < byte_len {
+                    let to_read = (CHUNK_SIZE as u64).min(byte_len - pos) as usize;
+                    let mut buf = vec![0u8; to_read];
+                    match reader.read_at(base + pos, &mut buf) {
+                        Ok(0) => break, // extent ends early (serial `break`)
+                        Ok(n) => {
+                            buf.truncate(n);
+                            if tx.send(Ok((base + pos, buf))).is_err() {
+                                return; // writer bailed (error/cancel)
+                            }
+                            pos += n as u64;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        while let Ok(msg) = rx.recv() {
             if let Some(ref p) = opts.progress {
                 if p.is_cancelled() {
                     return Err(PhoenixError::Cancelled);
                 }
             }
-            let to_read = (CHUNK_SIZE as u64).min(byte_len - pos) as usize;
-            let n = reader.read_at(base + pos, &mut buf[..to_read])?;
-            if n == 0 {
-                break;
-            }
-            let data = &buf[..n];
-            let src_offset = base + pos;
+            let (src_offset, data) = msg?;
+            let n = data.len();
 
             match relocation {
                 None => {
-                    writer.write_at(src_offset, data)?;
+                    writer.write_at(src_offset, &data)?;
                     if opts.verify == CloneVerify::ReadBack {
-                        verify_readback(writer, src_offset, data)?;
+                        verify_readback(writer, src_offset, &data)?;
                         bytes_done += n as u64;
                         bump(opts, bytes_done);
                     }
@@ -383,10 +421,11 @@ fn stream_extents(
             }
             bytes_done += n as u64;
             bump(opts, bytes_done);
-            pos += n as u64;
         }
-    }
-    Ok(bytes_done)
+        Ok(bytes_done)
+        // Early return drops `rx`; the reader thread's next send fails and it
+        // exits, then the scope joins it.
+    })
 }
 
 /// Re-read `len` bytes at `offset` from the target and compare to `expected`.

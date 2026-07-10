@@ -75,6 +75,15 @@ pub struct PartitionReader {
     locked: bool,
 }
 
+// SAFETY: `HANDLE` is a raw pointer only in the type-system sense — it is a
+// process-scoped kernel object reference with no thread affinity. Every
+// operation this type performs (SetFilePointerEx/ReadFile, DeviceIoControl
+// for lock/unlock/bitmap, CloseHandle in Drop) is valid from any thread, and
+// `&mut self` on all of them means a moved reader is never used from two
+// threads at once. This unblocks the clone engine's double-buffered reader
+// thread, which takes the reader by `&mut` for the duration of the copy.
+unsafe impl Send for PartitionReader {}
+
 impl PartitionReader {
     pub fn open_disk_partition(
         disk_path: &str,
