@@ -277,6 +277,26 @@ pub fn align_down(value: u64, align: u64) -> u64 {
     (value / align) * align
 }
 
+/// The last byte an MBR partition entry can address: starting LBA and sector
+/// count are 32-bit fields, so with 512-byte sectors nothing may extend past
+/// ~2 TiB. `IOCTL_DISK_SET_DRIVE_LAYOUT_EX` happily accepts 64-bit values and
+/// the data writes succeed — the failure only surfaces afterwards, as a
+/// partition Windows can't mount because the on-disk table can't represent it
+/// (observed on the T3 MBR round-trip against a 4 TB disk: the grown layout
+/// planted the FAT32 partition at byte 3.6 TiB and it never got a letter).
+pub const MBR_ADDRESSABLE_BYTES: u64 = (u32::MAX as u64) * 512;
+
+/// Usable layout region on the target disk: the full disk for GPT sources,
+/// clamped to the 32-bit sector horizon for MBR sources (the space past it
+/// simply stays unallocated).
+pub fn layout_ceiling(target_disk_size: u64, source_is_gpt: bool) -> u64 {
+    if source_is_gpt {
+        target_disk_size
+    } else {
+        target_disk_size.min(MBR_ADDRESSABLE_BYTES)
+    }
+}
+
 pub fn default_plan_from_backup(
     backup_path: &str,
     reader: &PhnxReader,
@@ -385,8 +405,17 @@ pub fn build_full_disk_plan(
     // the disk end when the source had inter-partition gaps (e.g. an MSR
     // partition). Aligning each start and clamping the final partition keeps
     // the reconstructed layout valid.
+    let source_is_gpt = reader.manifest.disk.style.eq_ignore_ascii_case("gpt");
+    let usable_size = layout_ceiling(target_disk_size, source_is_gpt);
+    if usable_size != target_disk_size {
+        tracing::info!(
+            disk_size = target_disk_size,
+            clamped_to = usable_size,
+            "MBR source: layout clamped to the 2 TiB MBR-addressable region"
+        );
+    }
     let sizes: Vec<u64> = reader.index.iter().map(|e| e.original_size).collect();
-    let placed = pack_full_disk(&sizes, target_disk_size, align);
+    let placed = pack_full_disk(&sizes, usable_size, align);
     // Diagnostic: dump the reconstructed full-disk layout so a restore that
     // fails validation can be traced back to the exact source sizes vs. placed
     // offsets/sizes without another round-trip.
@@ -397,7 +426,7 @@ pub fn build_full_disk_plan(
             used_bytes = e.used_bytes,
             target_offset = off,
             target_size = size,
-            disk_size = target_disk_size,
+            disk_size = usable_size,
             "full-disk plan placement"
         );
     }
@@ -414,7 +443,7 @@ pub fn build_full_disk_plan(
         })
         .collect();
 
-    expand_ntfs_slack(&mut entries, reader, target_disk_size, align);
+    expand_ntfs_slack(&mut entries, reader, usable_size, align);
 
     RestorePlan {
         backup_path: backup_path.to_string(),
@@ -648,6 +677,17 @@ mod tests {
             problem.contains("past the target disk end"),
             "got: {problem}"
         );
+    }
+
+    #[test]
+    fn mbr_layout_ceiling_clamps_only_mbr_sources() {
+        let four_tb = 4_000_000_000_000u64;
+        assert_eq!(layout_ceiling(four_tb, true), four_tb);
+        assert_eq!(layout_ceiling(four_tb, false), MBR_ADDRESSABLE_BYTES);
+        // A disk already below the horizon is untouched either way.
+        let one_tb = 1_000_000_000_000u64;
+        assert_eq!(layout_ceiling(one_tb, false), one_tb);
+        assert_eq!(layout_ceiling(one_tb, true), one_tb);
     }
 
     #[test]

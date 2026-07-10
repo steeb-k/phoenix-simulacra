@@ -88,6 +88,27 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     let mode = opts.plan.mode();
     let source_was_gpt = reader.manifest.disk.style.eq_ignore_ascii_case("gpt");
 
+    // MBR entries are 32-bit sector fields: nothing may extend past ~2 TiB.
+    // `default_plan_from_backup` already clamps its layout, but a hand-edited
+    // plan.toml can still overshoot — and the failure mode is nasty (the data
+    // restore succeeds, then the volume never mounts because the on-disk
+    // table can't represent it), so refuse it up front.
+    if !source_was_gpt {
+        for entry in opts.plan.entries.iter().filter(|e| e.restore) {
+            let end = entry
+                .target_offset_bytes
+                .saturating_add(entry.target_size_bytes);
+            if end > crate::plan::MBR_ADDRESSABLE_BYTES {
+                return Err(phoenix_core::error::PhoenixError::Plan(format!(
+                    "partition {} would end at byte {end}, past the ~2 TiB limit MBR's \
+                     32-bit sector fields can address; keep the layout below 2 TiB (the \
+                     source image is MBR) or use a GPT-imaged source for larger targets",
+                    entry.target_partition_index
+                )));
+            }
+        }
+    }
+
     // --- Build the ordered step plan up front so the GUI modal can render
     // upcoming steps grayed out. Steps are condition-aware: disk init only
     // runs for a full-disk restore, the layout write only when we (re)stamp
