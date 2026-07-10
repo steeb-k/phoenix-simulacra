@@ -468,15 +468,6 @@ pub fn pixel_to_disk_offset(map_rect: Rect, disk_size_bytes: u64, x: f32) -> u64
     (frac as f64 * disk_size_bytes as f64) as u64
 }
 
-/// Disk offset to pixel X inside the map (linear; ignores segment mins).
-pub fn disk_offset_to_pixel(map_rect: Rect, disk_size_bytes: u64, offset: u64) -> f32 {
-    if disk_size_bytes == 0 {
-        return map_rect.left();
-    }
-    let frac = offset as f64 / disk_size_bytes as f64;
-    map_rect.left() + map_rect.width() * frac as f32
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiskCheckState {
     All,

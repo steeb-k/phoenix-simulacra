@@ -210,7 +210,7 @@ struct PhoenixApp {
     page: Page,
     job: Option<BackgroundJob>,
     /// Finished-job snapshot that keeps the status modal up (final step list
-    /// + colored Close button) until the user dismisses it. `None` once
+    /// and colored Close button) until the user dismisses it. `None` once
     /// dismissed or while a job is still running.
     completed: Option<CompletedJob>,
     palette: Palette,
@@ -310,14 +310,6 @@ impl PhoenixApp {
         self.restore_backup_load_after = None;
         self.restore_backup_load_now = false;
         self.restore_layout = None;
-    }
-
-    fn target_disk_size_bytes(&self) -> u64 {
-        self.disks
-            .iter()
-            .find(|d| d.index == self.target_disk_index)
-            .map(|d| d.size_bytes)
-            .unwrap_or(0)
     }
 
     fn try_load_restore_backup(&mut self) {
@@ -808,21 +800,6 @@ fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str
     ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
     ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
     ui.add_space(14.0);
-}
-
-fn coming_soon(ui: &mut egui::Ui, palette: &Palette, blurb: &str) {
-    ui.add_space(40.0);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            egui::RichText::new(egui_phosphor::regular::SPARKLE)
-                .font(fonts::icon(56.0))
-                .color(palette.accent),
-        );
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Coming soon").font(fonts::bold(18.0)));
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(blurb).color(palette.subtle_text));
-    });
 }
 
 /// Large phosphor refresh control for re-enumerating disks.
@@ -1494,7 +1471,7 @@ impl PhoenixApp {
                     .and_then(|i| disk_labels.iter().find(|(d, _)| *d == i))
                     .map(|(_, l)| l.clone())
                     .unwrap_or_else(|| "Choose…".into());
-                egui::ComboBox::from_id_source("clone_src")
+                egui::ComboBox::from_id_salt("clone_src")
                     .selected_text(src_label)
                     .show_ui(ui, |ui| {
                         for (idx, label) in &disk_labels {
@@ -1509,7 +1486,7 @@ impl PhoenixApp {
                     .and_then(|i| disk_labels.iter().find(|(d, _)| *d == i))
                     .map(|(_, l)| l.clone())
                     .unwrap_or_else(|| "Choose…".into());
-                egui::ComboBox::from_id_source("clone_tgt")
+                egui::ComboBox::from_id_salt("clone_tgt")
                     .selected_text(tgt_label)
                     .show_ui(ui, |ui| {
                         for (idx, label) in &disk_labels {

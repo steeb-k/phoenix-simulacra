@@ -17,6 +17,10 @@ pub struct TargetAssignment {
     pub offset_bytes: u64,
     pub size_bytes: u64,
     pub source_used_bytes: u64,
+    /// Original on-disk size of the source partition. Retained for the P2
+    /// resize UX (reset-to-original / shrink validation); populated but not yet
+    /// surfaced in the UI — see ROADMAP "GUI resize UX revamp".
+    #[allow(dead_code)]
     pub source_original_size: u64,
 }
 
@@ -420,6 +424,9 @@ impl RestoreLayoutState {
     }
 
     /// Aligned minimum size a mapped partition can shrink to (its used data).
+    /// Retained for the P2 resize UX (surfacing the minimum shrink size in the
+    /// layout editor) — see ROADMAP "GUI resize UX revamp".
+    #[allow(dead_code)]
     pub fn min_size_for(&self, target_part: u32) -> u64 {
         self.assignments
             .get(&target_part)
@@ -514,17 +521,6 @@ fn overlaps_assignments(
         }
         let a_end = a.offset_bytes.saturating_add(a.size_bytes);
         offset < a_end && end > a.offset_bytes
-    })
-}
-
-fn overlaps_other(target: &DiskInfo, skip: u32, offset: u64, size: u64) -> bool {
-    let end = offset.saturating_add(size);
-    target.partitions.iter().any(|p| {
-        if p.index == skip {
-            return false;
-        }
-        let p_end = p.offset_bytes.saturating_add(p.size_bytes);
-        offset < p_end && end > p.offset_bytes
     })
 }
 

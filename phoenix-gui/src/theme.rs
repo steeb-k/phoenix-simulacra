@@ -10,14 +10,9 @@ const FALLBACK_ACCENT: Color32 = Color32::from_rgb(0x00, 0x78, 0xD4);
 pub struct Palette {
     pub accent: Color32,
     pub sidebar_bg: Color32,
-    pub sidebar_selected_bg: Color32,
     pub sidebar_hover_bg: Color32,
     pub subtle_text: Color32,
     pub icon_color: Color32,
-    /// Background tint for inputs that are missing a required value (e.g.
-    /// the Backup name field on the Backup page). Picked to be clearly red
-    /// without overwhelming the rest of the form in either theme.
-    pub error_bg: Color32,
     /// Default fill color for input widgets (`TextEdit`, drag values, …),
     /// chosen to sit a notch off the panel background so form fields stand
     /// out at a glance instead of disappearing into the page. Light mode
@@ -65,11 +60,9 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
         Palette {
             accent,
             sidebar_bg: Color32::from_rgb(0xF3, 0xF3, 0xF3),
-            sidebar_selected_bg: tint(accent, 0.12, Color32::WHITE),
             sidebar_hover_bg: Color32::from_black_alpha(12),
             subtle_text: Color32::from_rgb(0x60, 0x60, 0x60),
             icon_color: Color32::from_rgb(0x30, 0x30, 0x30),
-            error_bg: Color32::from_rgb(0xFF, 0xD6, 0xD6),
             input_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
             content_card_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
@@ -81,11 +74,9 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
         Palette {
             accent,
             sidebar_bg: Color32::from_rgb(0x1F, 0x1F, 0x1F),
-            sidebar_selected_bg: tint(accent, 0.18, Color32::BLACK),
             sidebar_hover_bg: Color32::from_white_alpha(14),
             subtle_text: Color32::from_rgb(0xB0, 0xB0, 0xB0),
             icon_color: Color32::from_rgb(0xE6, 0xE6, 0xE6),
-            error_bg: Color32::from_rgb(0x5A, 0x2A, 0x2A),
             input_bg: Color32::from_rgb(0x3C, 0x3C, 0x3C),
             content_card_bg: Color32::from_rgb(0x33, 0x33, 0x33),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),

@@ -7,7 +7,7 @@ use phoenix_core::disk::DiskInfo;
 
 use crate::disk_map::{
     self, draw_disk_info_card, draw_partition_map, draw_partition_segment_visual_styled,
-    pixel_to_disk_offset, row_stride, CHECKBOX_COLUMN_WIDTH, CHECKBOX_GAP, INFO_CARD_GAP,
+    pixel_to_disk_offset, CHECKBOX_COLUMN_WIDTH, CHECKBOX_GAP, INFO_CARD_GAP,
     INFO_CARD_WIDTH, ROW_HEIGHT, ROW_VERTICAL_GAP,
 };
 use crate::restore_layout::RestoreLayoutState;
@@ -304,8 +304,4 @@ fn draw_target_row(
     });
 
     changed
-}
-
-pub fn row_stride_with_gap() -> f32 {
-    row_stride()
 }
