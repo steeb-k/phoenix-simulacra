@@ -103,22 +103,32 @@ pub fn restore_raw(
 
     let sector_size = entry.sector_size as u64;
     let mut bytes_for_partition = 0u64;
-    for (chunk, record) in
+
+    // Parallel decode: a reader thread streams the compressed chunks out of
+    // the .phnx in file order, a worker pool decompresses (and, when `verify`
+    // is on, BLAKE3-checks) them, and the closure below consumes the
+    // plaintext IN CHUNK ORDER on this thread — the raw-disk handle stays
+    // here, and target writes keep their monotonically increasing offsets.
+    let paired: Vec<_> =
         phoenix_core::container::paired_chunks(&stream.chunks, &chunk_records, entry.index)?
-    {
+            .collect();
+    let items: Vec<phoenix_core::pipeline::DecodeItem> = paired
+        .iter()
+        .map(|(chunk, record)| phoenix_core::pipeline::DecodeItem {
+            file_offset: chunk.file_offset,
+            compressed_len: chunk.compressed_len,
+            uncompressed_len: chunk.uncompressed_len,
+            expected_blake3: verify.then(|| record.blake3.clone()),
+            partition_index: entry.index,
+            chunk_index: record.chunk_index,
+        })
+        .collect();
+
+    reader.process_chunks(&items, |seq, data| {
+        let (chunk, record) = paired[seq];
         if let Some(p) = progress {
             if p.is_cancelled() {
                 return Err(PhoenixError::Cancelled);
-            }
-        }
-        let data = reader.read_chunk(chunk)?;
-        if verify {
-            let computed = phoenix_core::hash::hash_hex(&data);
-            if computed != record.blake3 {
-                return Err(PhoenixError::HashMismatch {
-                    partition_index: entry.index,
-                    chunk_index: record.chunk_index,
-                });
             }
         }
         let extent = stream
@@ -172,7 +182,8 @@ pub fn restore_raw(
                 format!("Chunk {} / {}", record.chunk_index + 1, chunk_records.len()),
             );
         }
-    }
+        Ok(())
+    })?;
     Ok(bytes_for_partition)
 }
 

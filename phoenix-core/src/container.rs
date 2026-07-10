@@ -475,11 +475,7 @@ impl PhnxWriter {
             writer: self,
             stream_offset,
             data_start,
-            extents: extents.to_vec(),
-            bytes_per_cluster,
-            chunk_indices: Vec::new(),
-            chunk_records: Vec::new(),
-            current_data_offset: data_start,
+            pipeline: None,
             extent_index: 0,
             chunk_in_extent: 0,
         })
@@ -537,11 +533,11 @@ pub struct PartitionStreamWriter<'a> {
     writer: &'a mut PhnxWriter,
     stream_offset: u64,
     data_start: u64,
-    extents: Vec<Extent>,
-    bytes_per_cluster: u32,
-    chunk_indices: Vec<ChunkIndex>,
-    chunk_records: Vec<ChunkRecord>,
-    current_data_offset: u64,
+    /// Parallel hash + compress + ordered-write engine, spawned lazily on the
+    /// first chunk so zero-chunk streams never pay for threads. The pipeline
+    /// writes through a cloned file handle with positional I/O; the main
+    /// handle's cursor is untouched until `finish` joins the threads.
+    pipeline: Option<crate::pipeline::EncodePipeline>,
     extent_index: u32,
     chunk_in_extent: u32,
 }
@@ -555,50 +551,57 @@ impl PartitionStreamWriter<'_> {
     pub fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         // Single cancel chokepoint for every capture path. `capture_raw`,
         // `capture_fat`, and `capture_ntfs` all funnel each chunk through
-        // here, so a check before we hash + compress aborts the backup at
-        // the next chunk boundary regardless of which filesystem driver
-        // was used. Latency to honor a Cancel click is bounded by one
-        // chunk's worth of read + write.
+        // here, so a check before we enqueue aborts the backup at the next
+        // chunk boundary regardless of which filesystem driver was used.
+        // Latency to honor a Cancel click is bounded by one chunk's worth
+        // of read plus whatever is already queued in the pipeline.
         if let Some(ref progress) = self.writer.progress {
             if progress.is_cancelled() {
                 return Err(PhoenixError::Cancelled);
             }
         }
-        let hash_hex = hash::hash_hex(plaintext);
-        let compressed = compress_chunk(plaintext)?;
-        let file_offset = self.current_data_offset;
-        self.writer.file.seek(SeekFrom::Start(file_offset))?;
-        self.writer.file.write_all(&compressed)?;
-        self.current_data_offset += compressed.len() as u64;
-
-        let chunk_index = self.chunk_indices.len() as u32;
-        self.chunk_indices.push(ChunkIndex {
-            file_offset,
-            compressed_len: compressed.len() as u32,
-            uncompressed_len: plaintext.len() as u32,
-            extent_index: self.extent_index,
-            chunk_index: self.chunk_in_extent,
-        });
-        self.chunk_records.push(ChunkRecord {
-            chunk_index,
-            extent_index: self.extent_index,
-            uncompressed_len: plaintext.len() as u32,
-            blake3: hash_hex,
-        });
-        self.chunk_in_extent += 1;
-        if let Some(ref progress) = self.writer.progress {
-            progress.bump(plaintext.len() as u64);
+        if self.pipeline.is_none() {
+            self.pipeline = Some(crate::pipeline::EncodePipeline::new(
+                self.writer.file.try_clone()?,
+                self.data_start,
+                self.writer.progress.clone(),
+            ));
         }
+        // The copy hands the pipeline an owned buffer (the capture loops
+        // reuse theirs); ~0.4 ms per 4 MiB chunk, dwarfed by what parallel
+        // compression buys. `submit` blocks when the pool is saturated,
+        // which is the backpressure that keeps memory bounded.
+        self.pipeline
+            .as_mut()
+            .expect("pipeline just created")
+            .submit(self.extent_index, self.chunk_in_extent, plaintext.to_vec())?;
+        self.chunk_in_extent += 1;
         Ok(())
     }
 
     pub fn finish(self) -> Result<(Vec<ChunkRecord>, u64)> {
-        let stream_length = self.current_data_offset - self.stream_offset;
-        let chunk_count = self.chunk_indices.len() as u32;
+        // Join the pipeline first: every compressed chunk is on disk and the
+        // tables are complete (in submission order, same as the old serial
+        // loop) before we lay the chunk-index table down after the data.
+        let out = match self.pipeline {
+            Some(p) => p.finish()?,
+            None => crate::pipeline::EncodeOutput {
+                chunk_indices: Vec::new(),
+                chunk_records: Vec::new(),
+                end_offset: self.data_start,
+            },
+        };
+        let current_data_offset = out.end_offset;
+        let chunk_indices = out.chunk_indices;
+        let stream_length = current_data_offset - self.stream_offset;
+        let chunk_count = chunk_indices.len() as u32;
 
-        // Write chunk index table after compressed data
-        let index_table_offset = self.current_data_offset;
-        for c in &self.chunk_indices {
+        // Write chunk index table after compressed data. The explicit seek
+        // matters now: the pipeline wrote the data region through its own
+        // cloned handle, so this handle's cursor is stale.
+        let index_table_offset = current_data_offset;
+        self.writer.file.seek(SeekFrom::Start(index_table_offset))?;
+        for c in &chunk_indices {
             self.writer.file.write_u64::<LittleEndian>(c.file_offset)?;
             self.writer
                 .file
@@ -610,7 +613,7 @@ impl PartitionStreamWriter<'_> {
             self.writer.file.write_u32::<LittleEndian>(c.chunk_index)?;
         }
         let total_stream_len =
-            index_table_offset + self.chunk_indices.len() as u64 * 24 - self.stream_offset;
+            index_table_offset + chunk_indices.len() as u64 * 24 - self.stream_offset;
 
         // Patch chunk count in stream header
         self.writer
@@ -620,9 +623,9 @@ impl PartitionStreamWriter<'_> {
 
         let idx = self.writer.index_entries.len() - 1;
         self.writer.index_entries[idx].stream_length = total_stream_len;
-        self.writer.current_offset = index_table_offset + self.chunk_indices.len() as u64 * 24;
+        self.writer.current_offset = index_table_offset + chunk_indices.len() as u64 * 24;
 
-        Ok((self.chunk_records, stream_length))
+        Ok((out.chunk_records, stream_length))
     }
 }
 
@@ -743,6 +746,20 @@ impl PhnxReader {
         let mut compressed = vec![0u8; chunk.compressed_len as usize];
         self.file.read_exact(&mut compressed)?;
         decompress_chunk(&compressed, chunk.uncompressed_len as usize)
+    }
+
+    /// Run `items` through the parallel decode pipeline against this backup's
+    /// file (see [`crate::pipeline::process_chunks_parallel`]): a reader
+    /// thread streams the compressed chunks, workers decompress and
+    /// hash-verify, and `on_chunk` consumes the plaintext **in item order** on
+    /// the calling thread. Restore uses this so its raw-disk writes stay on
+    /// the calling thread; the full-verify tier uses it with a bookkeeping
+    /// closure.
+    pub fn process_chunks<F>(&self, items: &[crate::pipeline::DecodeItem], on_chunk: F) -> Result<()>
+    where
+        F: FnMut(usize, Vec<u8>) -> Result<()>,
+    {
+        crate::pipeline::process_chunks_parallel(&self.file, items, on_chunk)
     }
 
     /// Structural integrity check — validates the stream tables of every
@@ -924,17 +941,13 @@ impl PhnxReader {
             return self.verify_sampled(16, 0);
         }
 
-        for (chunk, record) in paired_chunks(&stream.chunks, &chunk_records, partition_index)? {
-            let data = self.read_chunk(chunk)?;
-            let computed = hash::hash_hex(&data);
-            if computed != record.blake3 {
-                return Err(PhoenixError::HashMismatch {
-                    partition_index,
-                    chunk_index: record.chunk_index,
-                });
-            }
-        }
-        Ok(())
+        let items = decode_items_for_verify(
+            paired_chunks(&stream.chunks, &chunk_records, partition_index)?,
+            partition_index,
+        );
+        // Workers hash-check each chunk (HashMismatch carries the right
+        // partition/chunk attribution); nothing to do with the plaintext.
+        self.process_chunks(&items, |_, _| Ok(()))
     }
 
     pub fn verify_all(&mut self, quick: bool) -> Result<()> {
@@ -1044,27 +1057,45 @@ impl PhnxReader {
             .map(|p| p.chunks.clone())
             .ok_or_else(|| PhoenixError::Manifest("partition manifest missing".into()))?;
 
-        for (chunk, record) in paired_chunks(&stream.chunks, &chunk_records, partition_index)? {
+        let items = decode_items_for_verify(
+            paired_chunks(&stream.chunks, &chunk_records, partition_index)?,
+            partition_index,
+        );
+        self.process_chunks(&items, |_, _| {
             if let Some(p) = progress {
                 if p.is_cancelled() {
                     return Err(PhoenixError::Cancelled);
                 }
             }
-            let data = self.read_chunk(chunk)?;
-            let computed = hash::hash_hex(&data);
-            if computed != record.blake3 {
-                return Err(PhoenixError::HashMismatch {
-                    partition_index,
-                    chunk_index: record.chunk_index,
-                });
-            }
             done += 1;
             if let Some(p) = progress {
                 p.set(done, format!("Chunk {} / {}", done, p.snapshot().total));
             }
-        }
+            Ok(())
+        })?;
         Ok(done)
     }
+}
+
+/// Build the parallel-decode work list for a full verify: every chunk, each
+/// carrying its manifest hash so the workers do the BLAKE3 comparison.
+fn decode_items_for_verify<'a>(
+    paired: std::iter::Zip<
+        std::slice::Iter<'a, ChunkIndex>,
+        std::slice::Iter<'a, crate::manifest::ChunkRecord>,
+    >,
+    partition_index: u32,
+) -> Vec<crate::pipeline::DecodeItem> {
+    paired
+        .map(|(chunk, record)| crate::pipeline::DecodeItem {
+            file_offset: chunk.file_offset,
+            compressed_len: chunk.compressed_len,
+            uncompressed_len: chunk.uncompressed_len,
+            expected_blake3: Some(record.blake3.clone()),
+            partition_index,
+            chunk_index: record.chunk_index,
+        })
+        .collect()
 }
 
 #[cfg(test)]

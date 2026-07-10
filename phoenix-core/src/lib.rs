@@ -7,6 +7,7 @@ pub mod disk;
 pub mod error;
 pub mod hash;
 pub mod manifest;
+pub mod pipeline;
 pub mod progress;
 pub mod relocation;
 
