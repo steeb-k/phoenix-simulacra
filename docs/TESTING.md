@@ -81,6 +81,7 @@ cargo test -p phoenix-systests -- --ignored --test-threads=1 --nocapture
 | `resize_roundtrip.rs` | NTFS **grow** (`FSCTL_EXTEND_VOLUME`) and **shrink** (relocation + MFT/`$Bitmap`/`$LogFile` rewrite) |
 | `mount.rs` | materialize-to-VHD mount (the dev fallback path) + browse fixture |
 | `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): encrypt with a password protector → **unlocked** volume classifies NTFS/used-blocks/`Unlocked` and round-trips as a normal *plaintext* backup → `Lock-BitLocker` → classifies Bitlocker/raw/`Locked`, backup is *ciphertext* (verify-after passes), restore comes back locked and yields the fixture only after `Unlock-BitLocker` with the original password |
+| `gpt_identity.rs` | restore preserves the source's **disk GUID, partition unique GUIDs, and attribute bits** (the identities the BCD uses) — proven collision-free by detaching the source VHD before restoring |
 | `vss.rs` | VSS **proven working, not just not-erroring** (fallback is silent, so naive tests can pass with VSS broken): (1) point-in-time — snapshot, modify a file, read the *original* bytes through the shadow device; (2) backup with `use_vss` while a file handle is held open — only a real shadow read can succeed (fallback would fail the volume lock), then restore+verify; (3+4) **forced fallback** via FAT32 (VSS is NTFS-only): with a handle open the fallback must *fail* with a lock error (proves the lock is enforced), and with handles closed it must lock → capture → unlock → restore byte-for-byte; (5+6) **outbound lock exclusivity** — while the lock is held (primitive-level, and for a whole locked backup's duration under a concurrent writer hammer) external file creates/opens on the volume must be refused, and allowed again after release |
 
 All disks in T2 are **GPT** (VHDX can't be MBR via this path) — MBR coverage
@@ -191,14 +192,28 @@ cargo test -p phoenix-systests --test boot_disk -- --ignored --test-threads=1 --
 | `boot_d_restore_grow` | main NTFS grown (default plan); trailing partitions (Recovery) move but keep exact size |
 | `boot_e_partial_ntfs` | partial restore: plop only the NTFS from the image over the target's existing slot; all other partitions byte-identical before/after |
 
-**Boot-clone fidelity:** backups now record each GPT partition's **unique
-GUID** (`PartitionId`) and **attribute bits** in the manifest, and restore
-writes them back — the BCD references boot partitions by unique GUID, so this
-is what makes a restored disk actually bootable without Startup Repair.
-Actually **booting** the clone remains a manual step (swap the drive); note
-that the restored disk keeps the source's disk GUID, so Windows may flag a
-collision while both are attached (it regenerates on online — harmless for
-testing, and correct when the clone is moved to another machine).
+**Boot-clone fidelity:** backups record each GPT partition's **unique GUID**
+(`PartitionId`) and **attribute bits** in the manifest, and restore writes
+them back — the BCD references boot partitions by unique GUID, so this is
+what makes a restored disk actually bootable without Startup Repair.
+
+**Same-machine GUID dedup (measured, not theoretical):** Windows forbids
+duplicate GPT identities among online disks. Restoring while the source disk
+is attached makes Windows regenerate the clone's disk GUID **and every
+partition unique GUID** as a sequential batch when the disk comes online —
+the engine wrote the source identities; the OS replaced them. The T3B
+fidelity check therefore treats a unique-GUID mismatch as a failure **only
+when no other online disk holds the expected GUID**; collision-free
+preservation is proven by T2 `gpt_identity.rs` (source detached first).
+Consequence for real clones made with the source attached: the clone's BCD
+still references the ORIGINAL GUIDs, so booting it requires detaching the
+source or a post-restore BCD fixup (see ROADMAP). Booting the clone with
+BOTH disks attached would chain-load the ORIGINAL Windows volume.
+
+**Re-running just the checks:** `PHOENIX_BOOT_SKIP_RESTORE=1` makes a stage
+validate the target disk's EXISTING layout instead of re-restoring — for
+finishing a stage whose multi-hour restore succeeded but whose assertions
+tripped. Only meaningful when the disk currently holds that stage's layout.
 
 ## Tier 3 (manual) — live system disk + boot
 

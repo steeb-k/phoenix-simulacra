@@ -1009,7 +1009,11 @@ impl PhnxReader {
             if let Some(ref p) = progress {
                 p.set_step(step);
             }
-            done += self.verify_partition_with_progress(idx, progress.as_ref(), done)?;
+            // The helper takes the running count and returns the new
+            // CUMULATIVE count — assign, don't add (a `+=` here made the
+            // progress counter overrun its total by ~4x on a 6-partition
+            // verify; display-only, but embarrassing on a 3-hour run).
+            done = self.verify_partition_with_progress(idx, progress.as_ref(), done)?;
         }
 
         if let Some(ref p) = progress {

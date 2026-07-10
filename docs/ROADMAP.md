@@ -97,6 +97,18 @@ open-source project. End users then never do a separate install. This is
 packaging/installer work, not engine work. Until it's done, mount requires the
 user to install WinFsp manually.
 
+### P2 — Post-restore BCD fixup for same-machine clones
+Windows regenerates a clone's disk GUID and all partition unique GUIDs when
+it comes online while the source disk is attached (duplicate GPT identities
+are forbidden; observed live in T3B). The clone's BCD then still references
+the ORIGINAL GUIDs — booting it either fails or, with both disks attached,
+silently chain-loads the ORIGINAL Windows volume. A restore option should
+rewrite the clone's BCD device elements to its actual (post-dedup) ESP +
+Windows partition identities — effectively `bcdboot <clone>\Windows /s
+<clone-ESP> /f UEFI`, or in-place BCD device-element editing. Without it,
+"bootable clone" only holds when the clone is created with the source absent
+or moved to a machine where the source never appears.
+
 ### P2 — GUI resize UX revamp (deferred "Phase 7")
 The engine-first decision deferred this. The numeric partition-size entry is
 already delivered; remaining polish:
