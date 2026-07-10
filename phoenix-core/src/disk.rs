@@ -254,6 +254,143 @@ pub fn dismount_volume(volume_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// A mounted volume that has been **locked and dismounted** so its on-disk
+/// sectors can be overwritten through a raw physical-disk handle.
+///
+/// Windows guards the sectors of a mounted volume: a raw write to them from a
+/// `\\.\PhysicalDriveN` handle fails with `ERROR_ACCESS_DENIED` (Win32 5). A
+/// full-disk restore avoids ever tripping this by planting the partition table
+/// *last*, so no volume is mounted while data lands. A **partial** restore has
+/// no such luxury — it writes into an existing table whose target slot may
+/// still carry a live volume — so it clears the slot first with this guard:
+/// `FSCTL_LOCK_VOLUME` takes exclusive access (and flushes the FS cache), then
+/// `FSCTL_DISMOUNT_VOLUME` tears the volume down in place. The volume handle is
+/// held open for the guard's whole lifetime so nothing can re-mount and
+/// re-guard the region mid-write. Dropping the guard unlocks and closes the
+/// handle; the next access re-mounts the volume fresh, re-reading the boot
+/// sector the restore just wrote.
+pub struct LockedVolume {
+    handle: HANDLE,
+    path: String,
+}
+
+impl LockedVolume {
+    /// Lock, then dismount, the volume device at `volume_path` (`\\.\X:` or a
+    /// `\\?\Volume{GUID}` device path with no trailing backslash — exactly the
+    /// forms [`find_volume_for_partition`] / [`find_volume_guid_for_partition`]
+    /// return). The lock is retried with exponential backoff (5 attempts,
+    /// ~250 ms → 4 s) to ride out a transient handle held by an AV scan or the
+    /// search indexer. Returns [`PhoenixError::VolumeLockFailed`] if the volume
+    /// still can't be locked — another process holds files open on it, and the
+    /// slot can't be safely overwritten while it's in use.
+    pub fn acquire(volume_path: &str) -> Result<Self> {
+        const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+        const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
+        const ATTEMPTS: u32 = 5;
+
+        let handle = open_volume_readonly(volume_path)?;
+
+        let mut backoff_ms: u64 = 250;
+        let mut last_err = 0u32;
+        let mut locked = false;
+        for attempt in 1..=ATTEMPTS {
+            let mut returned = 0u32;
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle,
+                    FSCTL_LOCK_VOLUME,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                locked = true;
+                break;
+            }
+            last_err = unsafe { GetLastError() };
+            warn!(
+                volume = volume_path,
+                attempt,
+                err = last_err,
+                "FSCTL_LOCK_VOLUME on target slot failed; another process has files open on it"
+            );
+            if attempt < ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = backoff_ms.saturating_mul(2).min(4_000);
+            }
+        }
+        if !locked {
+            unsafe { CloseHandle(handle) };
+            return Err(PhoenixError::VolumeLockFailed {
+                drive: volume_path.to_string(),
+                last_error: last_err,
+            });
+        }
+
+        // Tear the mounted volume down in place. The still-locked handle stays
+        // open (below) so nothing re-mounts it before the raw writes finish.
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_DISMOUNT_VOLUME,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe { CloseHandle(handle) };
+            return Err(PhoenixError::Disk(format!(
+                "FSCTL_DISMOUNT_VOLUME on {volume_path} failed (Win32 error {err})"
+            )));
+        }
+
+        tracing::info!(
+            volume = volume_path,
+            "locked + dismounted target slot volume so its sectors can be restored"
+        );
+        Ok(Self {
+            handle,
+            path: volume_path.to_string(),
+        })
+    }
+}
+
+impl Drop for LockedVolume {
+    fn drop(&mut self) {
+        const FSCTL_UNLOCK_VOLUME: u32 = 0x0009_001C;
+        let mut returned = 0u32;
+        unsafe {
+            // Unlock explicitly (CloseHandle would release the lock anyway, but
+            // being explicit keeps the intent clear and the ordering defined).
+            DeviceIoControl(
+                self.handle,
+                FSCTL_UNLOCK_VOLUME,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                &mut returned,
+                ptr::null_mut(),
+            );
+            CloseHandle(self.handle);
+        }
+        debug!(
+            volume = self.path.as_str(),
+            "released target slot volume lock; it will re-mount fresh"
+        );
+    }
+}
+
 fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
     let size_bytes = get_disk_length(handle)?;
     let layout = get_drive_layout(handle)?;

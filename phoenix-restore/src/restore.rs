@@ -232,6 +232,17 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // per-partition steps declared in the plan above.
     let mut restore_seq = 0usize;
 
+    // A partial restore writes into an *existing* partition table whose target
+    // slots may still carry live mounted volumes; Windows bounces raw writes to
+    // a mounted volume's sectors with ERROR_ACCESS_DENIED (Win32 5). Before
+    // writing each slot we lock + dismount its covering volume and keep the
+    // guard here so nothing re-mounts mid-write. The guards are dropped after
+    // PHASE 3 re-stamps the layout — PHASE 4's FSCTL_EXTEND_VOLUME needs the
+    // volumes mounted again, and the remount then re-reads the boot sectors we
+    // just wrote. (A full-disk restore never populates this: it plants the
+    // table last, so no volume is mounted while data lands.)
+    let mut locked_target_volumes: Vec<phoenix_core::disk::LockedVolume> = Vec::new();
+
     for entry in &opts.plan.entries {
         if !entry.restore {
             continue;
@@ -280,6 +291,37 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                 ));
             }
         }
+        // Partial restore only: if a live volume still covers this target
+        // slot, lock + dismount it first so the raw writes below aren't
+        // rejected with ERROR_ACCESS_DENIED (Win32 5). Full-disk restore
+        // reaches the writes with the table not yet planted, so no volume is
+        // mounted and there is nothing to clear. `volume_path` is populated by
+        // `enumerate_disks` (drive-letter or `\\?\Volume{GUID}` device); `None`
+        // means the slot is already unmounted (raw/empty or a prior restore
+        // left it dismounted) and needs no guard.
+        if mode == RestoreMode::Partial {
+            if let Some(vol) = disk
+                .partitions
+                .iter()
+                .find(|p| p.index == entry.target_partition_index)
+                .and_then(|p| p.volume_path.clone())
+            {
+                let guard = phoenix_core::disk::LockedVolume::acquire(&vol).map_err(|e| {
+                    phoenix_core::error::PhoenixError::Disk(format!(
+                        "could not clear the volume {vol} occupying target partition {} before \
+                         restoring into it (close any open files/handles on it and retry): {e}",
+                        entry.target_partition_index
+                    ))
+                })?;
+                info!(
+                    volume = vol.as_str(),
+                    partition = entry.target_partition_index,
+                    "dismounted live target-slot volume for partial restore"
+                );
+                locked_target_volumes.push(guard);
+            }
+        }
+
         let mut writer =
             PartitionWriter::open_disk(&disk.path, entry.target_offset_bytes, disk.sector_size)?;
 
@@ -417,6 +459,14 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             notify_disk_updated(&disk.path);
         }
     }
+
+    // The restored slots are on disk and the layout has been (re)stamped, so
+    // release the target-slot volume locks now. Windows re-mounts each volume
+    // fresh — re-reading the boot sector we just restored — and PHASE 4's
+    // FSCTL_EXTEND_VOLUME needs those volumes mounted to grow them. No-op for a
+    // full-disk restore (the Vec is empty). Explicit drop so the ordering
+    // against PHASE 4 is unmistakable rather than relying on end-of-scope.
+    drop(locked_target_volumes);
 
     // PHASE 4 — for every NTFS partition we wrote at a larger size
     // than the source, ask NTFS to extend its `$Bitmap` / `$MFT` /
