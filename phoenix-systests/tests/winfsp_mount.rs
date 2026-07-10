@@ -25,19 +25,15 @@ use phoenix_systests::{
     TestFs, TestVhd,
 };
 
-/// Scan drive letters D..Z for one whose root holds `phoenix-fixture`, other
-/// than `exclude` (the source volume).
-fn find_fixture_letter(exclude: char) -> Option<char> {
-    for c in b'D'..=b'Z' {
-        let letter = c as char;
-        if letter == exclude {
-            continue;
-        }
-        if Path::new(&format!("{letter}:\\phoenix-fixture")).exists() {
-            return Some(letter);
-        }
-    }
-    None
+/// Drive letters D..Z whose root holds a `phoenix-fixture` directory. See
+/// `mount.rs`: snapshot before mounting, then look for a NEW letter — a
+/// leftover fixture volume on another attached disk (e.g. the T3 real-disk
+/// target left online after its restore) must not be mistaken for the mount.
+fn fixture_letters() -> Vec<char> {
+    (b'D'..=b'Z')
+        .map(|c| c as char)
+        .filter(|l| Path::new(&format!("{l}:\\phoenix-fixture")).exists())
+        .collect()
 }
 
 #[test]
@@ -78,7 +74,9 @@ fn winfsp_mount_and_browse_files() {
     })
     .expect("run_backup");
 
-    // Mount read-only through WinFsp (zero materialization).
+    // Mount read-only through WinFsp (zero materialization). Snapshot
+    // fixture-bearing volumes first so only a NEW letter counts as ours.
+    let pre_existing = fixture_letters();
     let scratch = std::env::temp_dir()
         .join("phoenix-systests")
         .join("winfsp-mounts");
@@ -107,7 +105,10 @@ fn winfsp_mount_and_browse_files() {
     // fixture volume and verify every file byte-for-byte.
     let mut mounted = None;
     for _ in 0..30 {
-        if let Some(l) = find_fixture_letter('X') {
+        if let Some(l) = fixture_letters()
+            .into_iter()
+            .find(|l| !pre_existing.contains(l))
+        {
             mounted = Some(l);
             break;
         }

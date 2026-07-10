@@ -101,20 +101,18 @@ fn compare_vhd_footer_with_windows() {
     let _ = std::fs::remove_file(&vhd);
 }
 
-/// Scan drive letters D..Z for one whose root contains `phoenix-fixture`,
-/// excluding `exclude`. Returns the first match.
-fn find_fixture_letter(exclude: char) -> Option<char> {
-    for c in b'D'..=b'Z' {
-        let letter = c as char;
-        if letter == exclude {
-            continue;
-        }
-        let marker = format!("{letter}:\\phoenix-fixture");
-        if Path::new(&marker).exists() {
-            return Some(letter);
-        }
-    }
-    None
+/// Drive letters D..Z whose root contains a `phoenix-fixture` directory.
+/// Callers snapshot this BEFORE mounting and look for a NEW letter after —
+/// matching on the marker alone is not enough, because any volume another
+/// suite filled with a fixture can still be attached (observed: the T3
+/// real-disk target left online after its restore held `phoenix-fixture`
+/// on an earlier letter than the fresh mount, and the fixture compare then
+/// diffed against the wrong volume).
+fn fixture_letters() -> Vec<char> {
+    (b'D'..=b'Z')
+        .map(|c| c as char)
+        .filter(|l| Path::new(&format!("{l}:\\phoenix-fixture")).exists())
+        .collect()
 }
 
 #[test]
@@ -155,14 +153,20 @@ fn mount_backup_and_browse_files() {
     })
     .expect("run_backup");
 
-    // Mount it read-only.
+    // Mount it read-only. Snapshot fixture-bearing volumes first so a
+    // leftover fixture on some other attached disk can't be mistaken for
+    // the mount (the source X: is naturally in this set too).
+    let pre_existing = fixture_letters();
     let scratch = std::env::temp_dir().join("phoenix-systests").join("mounts");
     let session = MountSession::mount(&backup_path, &scratch).expect("mount");
 
-    // Find the mounted volume (a new letter carrying the fixture) and verify.
+    // Find the mounted volume (a NEW letter carrying the fixture) and verify.
     let mut mounted_letter = None;
     for _ in 0..30 {
-        if let Some(l) = find_fixture_letter('X') {
+        if let Some(l) = fixture_letters()
+            .into_iter()
+            .find(|l| !pre_existing.contains(l))
+        {
             mounted_letter = Some(l);
             break;
         }
