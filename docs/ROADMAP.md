@@ -5,7 +5,9 @@ hardware.** This document tracks what's left: known caveats, follow-up work, and
 things noted during development that could use extra love. Nothing here blocks
 using the tool; these are polish, packaging, and coverage-expansion items.
 
-Branch: `feature/engine-completion`.
+Status: **merged to `master`** (2026-07). The engine work (formerly
+`feature/engine-completion`), the parallel chunk pipeline, and the
+partial-restore volume-lock fix are all on `master`.
 
 ## What's done (for context)
 
@@ -54,6 +56,21 @@ throughput 786 → 2040 MB/s, full verify 976 → 3284 MB/s vs one worker. The
 frozen-source verify (`verify_partition_against_source`) intentionally stays
 serial — its torn-read re-read logic needs ordered device reads and it is
 device-bound regardless. Details under the P3 throughput item below.
+
+### Partial restore over a live target (2026-07)
+
+A partial restore (writing one partition into an **existing** slot, rather than
+a full-disk restore) now **locks and dismounts** the target slot's mounted
+volume before writing its sectors — via the `phoenix_core::disk::LockedVolume`
+guard (`FSCTL_LOCK_VOLUME` with backoff retry → `FSCTL_DISMOUNT_VOLUME`, holding
+the handle open so nothing re-mounts mid-write; released right after the layout
+is re-stamped so the volume re-mounts fresh — and *before* the NTFS grow pass,
+which needs it mounted). Without this, raw writes to a still-mounted slot were
+rejected with `ERROR_ACCESS_DENIED` (Win32 5) — the failure the T3B `boot_e`
+partial-restore stage hit. Full-disk restore never needed it: it plants the
+partition table last, so no volume is ever mounted while data lands. Covered by
+the T1 restore unit suite; end-to-end hardware proof is the `boot_e` T3B stage
+(not yet re-run on hardware since the fix landed).
 
 ### BitLocker: lock-state-aware capture (implemented)
 

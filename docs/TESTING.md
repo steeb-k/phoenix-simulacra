@@ -202,7 +202,7 @@ cargo test -p phoenix-systests --test boot_disk -- --ignored --test-threads=1 --
 | `boot_b_restore_asis` | full-disk restore, every partition at its ORIGINAL size; target must be GPT; type/unique GUIDs + attributes match; \Windows artifacts + ESP BCD present; offline chkdsk |
 | `boot_c_restore_shrink` | main NTFS shrunk to used+25% (relocation); all other partitions keep exact size and order |
 | `boot_d_restore_grow` | main NTFS grown (default plan); trailing partitions (Recovery) move but keep exact size |
-| `boot_e_partial_ntfs` | partial restore: plop only the NTFS from the image over the target's existing slot; all other partitions byte-identical before/after |
+| `boot_e_partial_ntfs` | partial restore: lock+dismount the target's existing (mounted) NTFS slot, then plop only the NTFS from the image over it; all other partitions byte-identical before/after |
 
 **Boot-clone fidelity:** backups record each GPT partition's **unique GUID**
 (`PartitionId`) and **attribute bits** in the manifest, and restore writes
