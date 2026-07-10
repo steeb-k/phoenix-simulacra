@@ -157,11 +157,46 @@ impl Drop for TestVhd {
     }
 }
 
+/// Make sure `letter` is actually assignable before a fixture demands it.
+///
+/// Two distinct squatters produce Windows' "the requested access path is
+/// already in use":
+///
+/// * A **stale mount-manager mapping** — a crashed prior run can leave
+///   `mountvol` mapping the letter to a volume that no longer exists
+///   (observed after a force-dismounted BitLocker volume's disk was cleared,
+///   and again after an aborted boot-disk run). No live partition owns the
+///   letter, so dropping the dead mapping is safe: self-heal with
+///   `mountvol <letter>: /D`.
+/// * A **live volume** — e.g. a restored test-clone disk that is still
+///   online and grabbed letters on auto-mount. Freeing someone's mounted
+///   volume is not our call; fail fast with a message that names the owner
+///   so the user can offline the disk or move the letter.
+fn ensure_letter_free(letter: char) -> Result<()> {
+    let out = powershell(&format!(
+        "$p = Get-Partition -ErrorAction SilentlyContinue | \
+             Where-Object DriveLetter -eq '{letter}' | Select-Object -First 1; \
+         if ($p) {{ \"LIVE disk $($p.DiskNumber) partition $($p.PartitionNumber)\" }} \
+         else {{ mountvol {letter}: /D 2>$null; 'FREE' }}"
+    ))?;
+    if let Some(owner) = out.trim().strip_prefix("LIVE ") {
+        bail!(
+            "drive letter {letter}: is in use by {owner}, but the system tests need it free. \
+             If that's a restored test-clone disk, take it offline \
+             (`Set-Disk -Number <n> -IsOffline $true`) or remove the letter, then re-run."
+        );
+    }
+    Ok(())
+}
+
 /// Wipe `disk_index`, initialize its partition table (`gpt` true → GPT, else
 /// MBR), and create + format + letter the given partitions via diskpart.
 /// DESTRUCTIVE — used by both [`TestVhd`] and [`RealDisk`] (which safety-checks
 /// the target first).
 pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
+    for p in parts {
+        ensure_letter_free(p.letter)?;
+    }
     let style = if gpt { "gpt" } else { "mbr" };
     let mut script = format!("select disk {disk_index}\nclean\nconvert {style}\n");
     for p in parts {
@@ -185,6 +220,9 @@ pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result
 /// `format`) work on **removable** USB media. Clears the disk, initializes the
 /// partition table, then creates + formats + letters each partition.
 pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
+    for p in parts {
+        ensure_letter_free(p.letter)?;
+    }
     let style = if gpt { "GPT" } else { "MBR" };
     // Clear-Disk removes partitions but leaves the disk *initialized* (not RAW),
     // so Initialize-Disk would reject it. Only initialize a genuinely-RAW disk;
@@ -214,18 +252,8 @@ pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Resu
             TestFs::Exfat => "exFAT",
             TestFs::Fat => "FAT",
         };
-        // A crashed prior run can leave the mount manager holding the drive
-        // letter for a volume that no longer exists (observed after a
-        // force-dismounted BitLocker volume's disk was cleared: mountvol
-        // still mapped R: to a dead \\?\Volume{...} GUID, and New-Partition
-        // then failed with "the requested access path is already in use").
-        // If no live partition owns the letter, drop the stale mapping.
-        script.push_str(&format!(
-            "if (-not (Get-Partition -ErrorAction SilentlyContinue | \
-                 Where-Object DriveLetter -eq '{letter}')) {{ \
-                 mountvol {letter}: /D 2>$null }}; ",
-            letter = p.letter
-        ));
+        // Stale-mapping / live-collision handling for the letter happens in
+        // the `ensure_letter_free` preflight above.
         script.push_str(&format!(
             "New-Partition -DiskNumber {disk_index} {size} -DriveLetter {letter} | Out-Null; \
              Format-Volume -DriveLetter {letter} -FileSystem {fs} \

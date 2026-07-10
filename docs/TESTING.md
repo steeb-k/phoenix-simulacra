@@ -230,6 +230,14 @@ tripped. Only meaningful when the disk currently holds that stage's layout.
 matching the disk's current layout fails by design (and no restore code is
 actually exercised).
 
+**Drive letters:** the T2 VHD fixtures hard-require letter `X:` (real-disk
+tests use `R:`/`S:`). The harness pre-flights each requested letter: a stale
+mount-manager mapping left by a crashed run is dropped automatically
+(`mountvol <L>: /D`), but a letter held by a LIVE volume — typically a
+restored test-clone disk that came online and auto-mounted — fails fast with
+a message naming the owner. Park such a disk with
+`Set-Disk -Number <n> -IsOffline $true` before running the suites.
+
 **Timing / perf log:** every `ConsoleProgress`-wrapped engine operation
 prints per-phase and total elapsed + throughput lines, each T3B stage prints
 its wall-clock at PASSED, and one CSV row per operation
