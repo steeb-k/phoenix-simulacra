@@ -235,8 +235,11 @@ tests use `R:`/`S:`). The harness pre-flights each requested letter: a stale
 mount-manager mapping left by a crashed run is dropped automatically
 (`mountvol <L>: /D`), but a letter held by a LIVE volume — typically a
 restored test-clone disk that came online and auto-mounted — fails fast with
-a message naming the owner. Park such a disk with
-`Set-Disk -Number <n> -IsOffline $true` before running the suites.
+a message naming the owner (letters held by the target disk itself are fine;
+the layout wipes it anyway). Park such a disk with
+`Set-Disk -Number <n> -IsOffline $true` before running the suites — if the
+parked disk IS the `PHOENIX_T3_DISK` target, `RealDisk::acquire` brings it
+back online automatically (the env opt-in is the consent).
 
 **Timing / perf log:** every `ConsoleProgress`-wrapped engine operation
 prints per-phase and total elapsed + throughput lines, each T3B stage prints

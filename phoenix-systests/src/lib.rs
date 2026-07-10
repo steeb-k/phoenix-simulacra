@@ -171,19 +171,28 @@ impl Drop for TestVhd {
 /// * A **live volume** — e.g. a restored test-clone disk that is still
 ///   online and grabbed letters on auto-mount. Freeing someone's mounted
 ///   volume is not our call; fail fast with a message that names the owner
-///   so the user can offline the disk or move the letter.
-fn ensure_letter_free(letter: char) -> Result<()> {
+///   so the user can offline the disk or move the letter. Exception: a
+///   volume on `target_disk` itself — the layout is about to `clean` that
+///   disk, which frees the letter anyway.
+fn ensure_letter_free(letter: char, target_disk: u32) -> Result<()> {
     let out = powershell(&format!(
         "$p = Get-Partition -ErrorAction SilentlyContinue | \
              Where-Object DriveLetter -eq '{letter}' | Select-Object -First 1; \
-         if ($p) {{ \"LIVE disk $($p.DiskNumber) partition $($p.PartitionNumber)\" }} \
+         if ($p) {{ \"LIVE $($p.DiskNumber) $($p.PartitionNumber)\" }} \
          else {{ mountvol {letter}: /D 2>$null; 'FREE' }}"
     ))?;
     if let Some(owner) = out.trim().strip_prefix("LIVE ") {
+        let mut fields = owner.split_whitespace();
+        let disk: Option<u32> = fields.next().and_then(|s| s.parse().ok());
+        let part = fields.next().unwrap_or("?");
+        if disk == Some(target_disk) {
+            return Ok(());
+        }
         bail!(
-            "drive letter {letter}: is in use by {owner}, but the system tests need it free. \
-             If that's a restored test-clone disk, take it offline \
-             (`Set-Disk -Number <n> -IsOffline $true`) or remove the letter, then re-run."
+            "drive letter {letter}: is in use by disk {} partition {part}, but the system \
+             tests need it free. If that's a restored test-clone disk, take it offline \
+             (`Set-Disk -Number <n> -IsOffline $true`) or remove the letter, then re-run.",
+            disk.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
         );
     }
     Ok(())
@@ -195,7 +204,7 @@ fn ensure_letter_free(letter: char) -> Result<()> {
 /// the target first).
 pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
     for p in parts {
-        ensure_letter_free(p.letter)?;
+        ensure_letter_free(p.letter, disk_index)?;
     }
     let style = if gpt { "gpt" } else { "mbr" };
     let mut script = format!("select disk {disk_index}\nclean\nconvert {style}\n");
@@ -221,7 +230,7 @@ pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result
 /// partition table, then creates + formats + letters each partition.
 pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
     for p in parts {
-        ensure_letter_free(p.letter)?;
+        ensure_letter_free(p.letter, disk_index)?;
     }
     let style = if gpt { "GPT" } else { "MBR" };
     // Clear-Disk removes partitions but leaves the disk *initialized* (not RAW),
@@ -484,6 +493,22 @@ impl RealDisk {
             },
             v.serial
         );
+        // The target may have been parked offline between runs (recommended
+        // hygiene so a restored test clone's volumes don't squat on drive
+        // letters). Consent to destroy this disk is explicit — the env
+        // opt-in plus the gates above — so bring it back online rather than
+        // letting every diskpart clean / Clear-Disk fail with "The disk is
+        // offline". Also drop a read-only attribute a previous offline may
+        // have left behind. Best-effort: an actual failure surfaces on the
+        // first destructive op with a precise error.
+        let onlined = powershell(&format!(
+            "$d = Get-Disk -Number {index}; \
+             if ($d.IsReadOnly) {{ Set-Disk -Number {index} -IsReadOnly $false }}; \
+             if ($d.IsOffline) {{ Set-Disk -Number {index} -IsOffline $false; 'onlined' }}"
+        ));
+        if matches!(onlined.as_deref().map(str::trim), Ok("onlined")) {
+            eprintln!("[T3] target disk {index} was offline — brought it online");
+        }
         Ok(Some(Self {
             index,
             is_removable: v.is_removable,
