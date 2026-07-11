@@ -94,10 +94,13 @@ cargo test -p phoenix-systests -- --ignored --test-threads=1 --nocapture
 | `mount.rs` | materialize-to-VHD mount (the dev fallback path) + browse fixture |
 | `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): encrypt with a password protector → **unlocked** volume classifies NTFS/used-blocks/`Unlocked` and round-trips as a normal *plaintext* backup → `Lock-BitLocker` → classifies Bitlocker/raw/`Locked`, backup is *ciphertext* (verify-after passes), restore comes back locked and yields the fixture only after `Unlock-BitLocker` with the original password |
 | `gpt_identity.rs` | restore preserves the source's **disk GUID, partition unique GUIDs, and attribute bits** (the identities the BCD uses) — proven collision-free by detaching the source VHD before restoring |
+| `partial_mbr.rs` | partial restores that **rewrite the partition table**: MBR shrunk-slot rewrite with a preserved sibling surviving byte-identical, deleting a live partition from the plan (its mounted volume locked + dismounted first), and a `reinit_style = "gpt"` plan re-initializing an MBR disk as GPT — the engine paths behind the GUI layout editor's replace/delete/blank/style-switch actions |
 | `vss.rs` | VSS **proven working, not just not-erroring** (fallback is silent, so naive tests can pass with VSS broken): (1) point-in-time — snapshot, modify a file, read the *original* bytes through the shadow device; (2) backup with `use_vss` while a file handle is held open — only a real shadow read can succeed (fallback would fail the volume lock), then restore+verify; (3+4) **forced fallback** via FAT32 (VSS is NTFS-only): with a handle open the fallback must *fail* with a lock error (proves the lock is enforced), and with handles closed it must lock → capture → unlock → restore byte-for-byte; (5+6) **outbound lock exclusivity** — while the lock is held (primitive-level, and for a whole locked backup's duration under a concurrent writer hammer) external file creates/opens on the volume must be refused, and allowed again after release |
 
-All disks in T2 are **GPT** (VHDX can't be MBR via this path) — MBR coverage
-comes from T3.
+Most T2 disks are **GPT**; `partial_mbr.rs` lays its VHDX fixtures out as MBR
+(`diskpart clean` + `convert mbr` works fine on an attached VHDX), so T2 now
+covers MBR partial-restore table rewrites too. Full-disk MBR round-trips on
+real media remain T3.
 
 ### WinFsp zero-space mount test
 

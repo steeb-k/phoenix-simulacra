@@ -139,14 +139,30 @@ Windows partition identities — effectively `bcdboot <clone>\Windows /s
 "bootable clone" only holds when the clone is created with the source absent
 or moved to a machine where the source never appears.
 
-### P2 — GUI resize UX revamp (deferred "Phase 7")
-The engine-first decision deferred this. The numeric partition-size entry is
-already delivered; remaining polish:
-- Snap-to-alignment drag handles (wider hit target than the current ~6 px).
+### ~~P2 — GUI resize UX revamp (deferred "Phase 7")~~ (LARGELY DONE 2026-07)
+Delivered as the restore layout editor (modeled on Macrium/Backupper):
+- Drag ghost, replace-on-drop with bright highlight (keep size → spill into
+  trailing free space → shrink → refuse with a NotAllowed cursor), drop into
+  unallocated space creates a new partition.
+- Move/ResizeHorizontal cursors, glow on the click-target partition, 8 px
+  edge handles, snap-to-fill within ~12 px, and pointer-crossing hysteresis
+  so a drag can't accidentally reorder partitions (pure math + unit tests in
+  `phoenix-restore::layout_edit`).
+- Editable slot model with a toolbar: MBR/GPT style switch, blank layout,
+  delete selected (or Delete key), reset. Plans are built straight from the
+  slots (`reinit_style` on `RestorePlan`); the engine rewrites the table on
+  partial MBR now too and locks volumes of deleted partitions
+  (`partial_mbr.rs` T2 tests).
+
+Remaining polish:
 - Surface the **minimum shrink size** from the same computation
-  `build_relocation_map` uses, so the UI can't propose an impossible shrink.
+  `build_relocation_map` uses, so the UI can't propose an impossible shrink
+  (the editor currently floors at used bytes, which can be optimistic when
+  data sits beyond the shrink point).
 - Live validation banner driven by `validate_layout`.
-- Share one layout editor between the Restore and Clone pages.
+- Share the layout editor with the Clone page.
+- Pixel↔byte mapping is linear while segments render with log-scaled minimum
+  widths, so pointer tracking is approximate on very skewed layouts.
 
 ### ~~P2 — GPT on a real fixed disk~~ (DONE — validated on real hardware 2026-07)
 `real_disk.rs` has `real_gpt_multifs_roundtrip` (NTFS + FAT32 + the diskpart
