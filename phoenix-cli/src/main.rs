@@ -87,7 +87,13 @@ enum Commands {
     },
     /// Mount a backup read-only so its files are browsable in Explorer. Runs
     /// in the foreground; press Enter to unmount.
-    Mount { backup: PathBuf },
+    Mount {
+        backup: PathBuf,
+        /// Only expose these partition indices (comma-separated, as shown by
+        /// `inspect`). Default: every volume gets a drive letter.
+        #[arg(long, value_delimiter = ',')]
+        partitions: Option<Vec<u32>>,
+    },
     /// Dump every partition's stream header (extents + chunks) for forensic
     /// inspection. Useful when a manifest's extent table is suspected of
     /// containing garbage values (e.g. start_sectors near `u64::MAX`) — the
@@ -188,13 +194,13 @@ fn main() -> anyhow::Result<()> {
             no_vss,
             yes,
         } => cmd_clone(source_disk, target_disk, expand, verify, !no_vss, yes)?,
-        Commands::Mount { backup } => cmd_mount(&backup)?,
+        Commands::Mount { backup, partitions } => cmd_mount(&backup, partitions.as_deref())?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
     }
     Ok(())
 }
 
-fn cmd_mount(backup: &std::path::Path) -> anyhow::Result<()> {
+fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Result<()> {
     let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
     if phoenix_mount::ActiveMount::space_efficient() {
         println!("Mounting {} (read-only, on-demand)…", backup.display());
@@ -206,11 +212,17 @@ fn cmd_mount(backup: &std::path::Path) -> anyhow::Result<()> {
             backup.display()
         );
     }
-    let session = phoenix_mount::ActiveMount::open(backup, &scratch)?;
+    let session = phoenix_mount::ActiveMount::open_selected(backup, &scratch, partitions)?;
     println!(
         "Mounted a {:.1} GB virtual disk. Open Explorer to browse the volume(s).",
         session.disk_size() as f64 / 1e9
     );
+    for v in session.volumes() {
+        match v.drive_letter {
+            Some(l) => println!("  partition {} -> {l}:", v.partition_index),
+            None => println!("  partition {} -> no mountable volume", v.partition_index),
+        }
+    }
     println!("Press Enter to unmount.");
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).ok();

@@ -11,7 +11,7 @@ source, and the full source → backup → restore/clone round-trip byte-for-byt
 |------|------|-------|--------|-------------|
 | **T1** | Pure unit tests (no disks) | every lib crate + `#[test]` | no | yes |
 | **T2** | System tests on virtual disks (VHDX via diskpart) | `phoenix-systests/tests/` | **yes** | elevated job |
-| **T2-winfsp** | Zero-space WinFsp mount system test | `phoenix-systests/tests/winfsp_mount.rs` | **yes** | manual (needs WinFsp + libclang) |
+| **T2-winfsp** | Zero-space WinFsp mount system tests (incl. partition selection) | `phoenix-systests/tests/winfsp_mount.rs` | **yes** | elevated job (CI installs WinFsp) |
 | **T3-auto** | Destructive tests on a **real physical USB disk** | `phoenix-systests/tests/real_disk.rs` | **yes** | no (opt-in, real hardware) |
 | **T3-manual** | Live system-disk VSS backup/clone + boot | `scripts/live-smoke-checklist.md` | **yes** | no (manual, pre-release) |
 
@@ -102,21 +102,30 @@ Most T2 disks are **GPT**; `partial_mbr.rs` lays its VHDX fixtures out as MBR
 covers MBR partial-restore table rewrites too. Full-disk MBR round-trips on
 real media remain T3.
 
-### WinFsp zero-space mount test
+### WinFsp zero-space mount tests
 
-The real (space-efficient) mount path is tested separately because it needs the
-`winfsp` build feature, which needs **libclang** (LLVM) to build and **WinFsp**
-installed to run:
+The real (space-efficient) mount path needs the `winfsp` build feature, which
+needs **libclang** (LLVM) to build and **WinFsp** installed to run.
+`run-system-tests.ps1` builds with the feature automatically (it points
+`LIBCLANG_PATH` at the standard LLVM install), or run the mount tests alone:
 
 ```powershell
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # if LLVM isn't on PATH
 cargo test -p phoenix-systests --features winfsp --test winfsp_mount -- --ignored --test-threads=1 --nocapture
 ```
 
-`winfsp_mount.rs` serves a synthesized `backup.vhd` on demand from the `.phnx`
-through WinFsp, attaches it read-only, and verifies the fixture through the
-attached disk — i.e. it proves `AttachVirtualDisk` works over a user-mode
-filesystem with **zero extra disk space**.
+`winfsp_mount.rs` has two tests:
+
+- `winfsp_mount_and_browse_files` serves a synthesized `backup.vhd` on demand
+  from the `.phnx` through WinFsp, attaches it read-only, and verifies the
+  fixture through the attached disk — i.e. it proves `AttachVirtualDisk` works
+  over a user-mode filesystem with **zero extra disk space**.
+- `winfsp_mount_selected_partition_only` backs up a two-partition disk and
+  mounts it with only the second partition selected: exactly that partition
+  gets a (new) drive letter, its fixture verifies, the unselected sibling
+  surfaces no letter, and the letter is removed again on unmount — the engine
+  path behind the GUI Mount page's partition checkboxes and the CLI's
+  `mount --partitions`.
 
 ---
 

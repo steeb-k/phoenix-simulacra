@@ -216,6 +216,14 @@ struct PhoenixApp {
     clone_verify: bool,
     /// Mount page: chosen .phnx and the currently-attached read-only mounts.
     mount_backup_path: String,
+    /// Path whose layout is currently shown on the Mount page (skip
+    /// redundant re-opens).
+    mount_loaded_path: String,
+    /// The chosen backup's partition layout, for the selection map.
+    mount_source: Option<DiskInfo>,
+    /// Partitions picked on the mount map (`(0, partition_index)` — the
+    /// synthesized source disk always renders as disk 0).
+    mount_selection: HashSet<(u32, u32)>,
     mounts: Vec<phoenix_mount::ActiveMount>,
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
@@ -268,6 +276,9 @@ impl PhoenixApp {
             clone_expand: false,
             clone_verify,
             mount_backup_path: String::new(),
+            mount_loaded_path: String::new(),
+            mount_source: None,
+            mount_selection: HashSet::new(),
             mounts: Vec::new(),
             settings,
             history: phoenix_core::appdata::History::load(),
@@ -663,9 +674,7 @@ impl PhoenixApp {
             let message = if count == 1 {
                 "A backup file with this name already exists. Overwrite it?".to_string()
             } else {
-                format!(
-                    "{count} backup files with these names already exist. Overwrite them?"
-                )
+                format!("{count} backup files with these names already exist. Overwrite them?")
             };
             let view = ConfirmView {
                 title: "Backup file already exists",
@@ -685,7 +694,8 @@ impl PhoenixApp {
             }
             ConfirmAction::Cancel => {
                 self.pending_overwrite = None;
-                self.status = "Backup cancelled — choose a different name to keep the old one".into();
+                self.status =
+                    "Backup cancelled — choose a different name to keep the old one".into();
             }
             ConfirmAction::None => {}
         }
@@ -1592,23 +1602,65 @@ impl PhoenixApp {
             "Attach a backup read-only so its files are browsable in Explorer.",
         );
 
+        let path_before = self.mount_backup_path.clone();
+        let mut path_edited = false;
         ui.add_enabled_ui(self.job.is_none(), |ui| {
-            let _ = backup_path_picker(
+            let browsed = backup_path_picker(
                 ui,
                 "Backup file",
                 "Path to .phnx file",
                 &mut self.mount_backup_path,
-                None,
+                Some(&mut || path_edited = true),
             );
+            path_edited |= browsed;
         });
+        let path_changed = path_edited && self.mount_backup_path != path_before;
+        if path_changed
+            || (self.mount_source.is_none()
+                && self.mount_loaded_path != self.mount_backup_path.trim())
+        {
+            self.try_load_mount_backup();
+        }
 
-        let path_filled = !self.mount_backup_path.trim().is_empty();
-        ui.add_space(4.0);
-        ui.add_enabled_ui(path_filled, |ui| {
-            if ui.button("Mount read-only").clicked() {
-                self.start_mount();
+        if let Some(source) = self.mount_source.clone() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Choose the partition(s) to mount.")
+                    .color(self.palette.subtle_text),
+            );
+            ui.add_space(4.0);
+            // Same width discipline as the Backup page: capture the real
+            // viewport width before ScrollArea::both virtualizes it.
+            let viewport_width = ui.available_width();
+            let row_width = viewport_width.max(disk_map::min_disk_row_width(&source));
+            egui::ScrollArea::both()
+                .id_salt("mount_partition_map")
+                .max_height(disk_map::row_stride() * 1.5)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    disk_map::draw_backup_disk_row(
+                        ui,
+                        row_width,
+                        &source,
+                        &mut self.mount_selection,
+                        &self.palette,
+                    );
+                });
+
+            let any_selected = !self.mount_selection.is_empty();
+            ui.add_space(4.0);
+            ui.add_enabled_ui(any_selected, |ui| {
+                if ui.button("Mount selected read-only").clicked() {
+                    self.start_mount();
+                }
+            });
+            if !any_selected {
+                ui.label(
+                    egui::RichText::new("Select at least one partition above.")
+                        .color(self.palette.subtle_text),
+                );
             }
-        });
+        }
 
         if !self.mounts.is_empty() {
             ui.add_space(12.0);
@@ -1623,8 +1675,14 @@ impl PhoenixApp {
                             .unwrap_or_else(|| "backup".into()),
                     );
                     ui.label(format!("({:.1} GB)", m.disk_size() as f64 / 1e9));
-                    if ui.button("Open in Explorer").clicked() {
-                        let _ = std::process::Command::new("explorer.exe").spawn();
+                    ui.label(describe_mounted_volumes(m));
+                    let first_letter = m.volumes().iter().find_map(|v| v.drive_letter);
+                    if let Some(l) = first_letter {
+                        if ui.button("Open in Explorer").clicked() {
+                            let _ = std::process::Command::new("explorer.exe")
+                                .arg(format!("{l}:\\"))
+                                .spawn();
+                        }
                     }
                     if ui.button("Unmount").clicked() {
                         unmount_idx = Some(i);
@@ -1632,8 +1690,49 @@ impl PhoenixApp {
                 });
             }
             if let Some(i) = unmount_idx {
-                self.mounts.remove(i); // Drop detaches + cleans the temp image
+                self.mounts.remove(i); // Drop removes letters, detaches, cleans up
                 self.status = "Unmounted".into();
+            }
+        }
+    }
+
+    /// (Re)load the chosen backup's partition layout for the mount map. All
+    /// partitions start selected.
+    fn try_load_mount_backup(&mut self) {
+        let path_str = self.mount_backup_path.trim().to_string();
+        if path_str.is_empty() {
+            self.mount_loaded_path.clear();
+            self.mount_source = None;
+            self.mount_selection.clear();
+            return;
+        }
+        if self.mount_loaded_path == path_str {
+            return;
+        }
+        // Record the attempt (success or not) so a bad path isn't re-opened
+        // every frame.
+        self.mount_loaded_path = path_str.clone();
+        let path = Path::new(&path_str);
+        if !path.is_file() {
+            self.mount_source = None;
+            self.mount_selection.clear();
+            return;
+        }
+        match PhnxReader::open(path) {
+            Ok(reader) => {
+                let source = restore_layout::backup_to_disk_info(&reader);
+                self.mount_selection = source
+                    .partitions
+                    .iter()
+                    .map(|p| (source.index, p.index))
+                    .collect();
+                self.mount_source = Some(source);
+                self.status = format!("Loaded backup — {} partition(s)", reader.index.len());
+            }
+            Err(e) => {
+                self.mount_source = None;
+                self.mount_selection.clear();
+                self.status = format!("Load failed: {e}");
             }
         }
     }
@@ -1641,6 +1740,7 @@ impl PhoenixApp {
     fn start_mount(&mut self) {
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
         let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
+        let selected: Vec<u32> = self.mount_selection.iter().map(|&(_, part)| part).collect();
         self.status = if phoenix_mount::ActiveMount::space_efficient() {
             "Mounting read-only (on-demand)…".into()
         } else {
@@ -1648,10 +1748,11 @@ impl PhoenixApp {
         };
         // The mount holds a non-Send disk handle, so do it inline. The WinFsp
         // path is instant; the fallback's time scales with the used size.
-        match phoenix_mount::ActiveMount::open(&path, &scratch) {
+        match phoenix_mount::ActiveMount::open_selected(&path, &scratch, Some(&selected)) {
             Ok(session) => {
+                let letters = describe_mounted_volumes(&session);
                 self.status = format!(
-                    "Mounted {} — browse it in Explorer",
+                    "Mounted {} — {letters}",
                     path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default()
@@ -1831,6 +1932,25 @@ fn default_backup_folder() -> String {
         return format!(r"{profile}\Documents");
     }
     String::new()
+}
+
+/// Short per-partition exposure summary for an active mount, e.g.
+/// `"E:, F:"` or `"E: (+1 with no mountable volume)"`.
+fn describe_mounted_volumes(m: &phoenix_mount::ActiveMount) -> String {
+    let vols = m.volumes();
+    if vols.is_empty() {
+        return "browse it in Explorer".into();
+    }
+    let letters: Vec<String> = vols
+        .iter()
+        .filter_map(|v| v.drive_letter.map(|l| format!("{l}:")))
+        .collect();
+    let unexposed = vols.len() - letters.len();
+    match (letters.is_empty(), unexposed) {
+        (true, _) => "no mountable volume in the selection".into(),
+        (false, 0) => letters.join(", "),
+        (false, n) => format!("{} (+{n} with no mountable volume)", letters.join(", ")),
+    }
 }
 
 /// Render a disk as the `"Disk N - 3.67 TB - Samsung SSD 970 EVO"` label

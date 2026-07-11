@@ -72,6 +72,24 @@ partition table last, so no volume is ever mounted while data lands. Covered by
 the T1 restore unit suite; end-to-end hardware proof is the `boot_e` T3B stage
 (not yet re-run on hardware since the fix landed).
 
+### Mount: winfsp-by-default + per-partition selection (2026-07)
+
+The `winfsp` feature is now a **default feature of the GUI and CLI**, so a
+plain `cargo build`/`cargo run` gets the zero-space on-demand mount — the
+stopgap full-size temp-VHD materialization had been silently reachable in dev
+builds (and failed outright on low disk space, violating the never-double-the-
+footprint rule). The fallback now requires an explicit `--no-default-features`.
+CI installs WinFsp (`choco install winfsp`) and builds/tests the feature on
+both targets; `run-system-tests.ps1` builds T2 with it too.
+
+The GUI Mount page also gained the shared partition map (same widget as
+Backup): the chosen `.phnx`'s layout renders with checkboxes and **only the
+selected partitions get drive letters**. Mechanism: attach with
+`ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER`, correlate volumes to backup
+partitions by disk-extent start offset (`phoenix_mount::letters`), assign
+letters explicitly, remove them on unmount. CLI: `mount --partitions 2,3`.
+Covered by the `winfsp_mount_selected_partition_only` T2 test.
+
 ### BitLocker: lock-state-aware capture (implemented)
 
 **Lock state — not merely "is this BitLocker" — drives the capture mode:**
@@ -176,11 +194,12 @@ without shrinking GPT coverage (table still spans the whole disk). This closes
 the last real-hardware coverage gap: the engine is now validated on both MBR
 (real USB) and GPT (real fixed disk). See TESTING.md.
 
-### P3 — CI coverage for the winfsp + real-disk tiers
-- The `winfsp` feature isn't built in CI (needs LLVM/`libclang` + WinFsp on the
-  runner), so the mount code isn't clippy-checked or tested there. Add a CI job
-  that installs both and runs `--features winfsp` clippy + the `winfsp_mount`
-  test (WinFsp via `choco install winfsp`).
+### ~~P3 — CI coverage for the winfsp tier~~ (DONE 2026-07) / real-disk tier
+- ~~The `winfsp` feature isn't built in CI~~ — CI now installs WinFsp
+  (`choco install winfsp`, libclang is preinstalled on the runners) and the
+  feature is a GUI/CLI default, so the workspace build + clippy cover the
+  mount code, and the elevated system-tests job runs `--features winfsp`
+  (including the `winfsp_mount` tests).
 - The T3 real-disk tier is inherently manual (it wipes a physical disk); keep it
   as a documented pre-release step.
 
@@ -245,8 +264,9 @@ Remaining avenues (deferred until real-hardware profiling says otherwise):
 
 ## Known caveats (documented, by design)
 
-- **Mount without the `winfsp` feature** falls back to materializing a
-  full-size temp VHD — a **dev-only stopgap**. It's never used in a `winfsp`
+- **Mount without the `winfsp` feature** (an explicit `--no-default-features`
+  build — the feature is on by default for GUI/CLI) falls back to materializing
+  a full-size temp VHD — a **dev-only stopgap**. It's never used in a `winfsp`
   build; a `winfsp` build that can't reach WinFsp errors rather than silently
   doubling disk usage. Mounting must never double a backup's footprint.
 - **GPT on removable USB** is not possible (Windows policy), hence MBR-only T3.

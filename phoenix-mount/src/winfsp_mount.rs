@@ -237,17 +237,33 @@ pub struct WinFspMount {
     mount_dir: PathBuf,
     pub backup_path: PathBuf,
     pub disk_size: u64,
+    pub volumes: Vec<crate::letters::MountedVolume>,
+    /// Letters we assigned (selection mode); removed again on drop.
+    assigned_letters: Vec<char>,
 }
 
 impl WinFspMount {
+    /// Mount `backup` read-only with zero materialization and all volumes
+    /// exposed (Windows assigns the drive letters).
+    pub fn mount(backup: &Path, scratch_dir: &Path) -> Result<Self> {
+        Self::mount_selected(backup, scratch_dir, None)
+    }
+
     /// Mount `backup` read-only with zero materialization. `scratch_dir` holds
     /// the transient WinFsp mount point (a directory, not a drive letter).
-    pub fn mount(backup: &Path, scratch_dir: &Path) -> Result<Self> {
+    /// With `selection: Some(indices)` only those partitions get drive
+    /// letters; `None` exposes everything (mount-manager policy).
+    pub fn mount_selected(
+        backup: &Path,
+        scratch_dir: &Path,
+        selection: Option<&[u32]>,
+    ) -> Result<Self> {
         ensure_winfsp()?;
         let reader = PhnxReader::open(backup)?;
         let backup_id = reader.header.backup_id;
         let vhd = SyntheticVhd::build(reader)?;
         let disk_size = vhd.disk_size();
+        let spans = vhd.spans().to_vec();
         let fs = VhdFs::new(vhd)?;
 
         let mut params = VolumeParams::new();
@@ -277,10 +293,11 @@ impl WinFspMount {
             .map_err(|e| PhoenixError::Other(format!("WinFsp start failed: {e}")))?;
 
         let vhd_path = mount_dir.join(VHD_NAME);
-        let attached = AttachedDisk::attach_readonly(
+        let attached = AttachedDisk::attach_readonly_opts(
             vhd_path
                 .to_str()
                 .ok_or_else(|| PhoenixError::Other("non-UTF-8 mount path".into()))?,
+            selection.is_none(),
         )
         .map_err(|e| {
             // Tear the FS back down if attach fails, so we don't leak a mount.
@@ -289,12 +306,22 @@ impl WinFspMount {
             e
         })?;
 
+        let (volumes, assigned_letters) = match selection {
+            Some(sel) => {
+                let disk = attached.physical_drive_number()?;
+                crate::letters::expose_selected(disk, &spans, sel)?
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
         Ok(Self {
             attached: Some(attached),
             host,
             mount_dir,
             backup_path: backup.to_path_buf(),
             disk_size,
+            volumes,
+            assigned_letters,
         })
     }
 
@@ -307,7 +334,9 @@ impl WinFspMount {
 
 impl Drop for WinFspMount {
     fn drop(&mut self) {
-        // Detach the virtual disk first (releases the handle on backup.vhd)…
+        // Remove any letters we assigned while the volumes still exist…
+        crate::letters::remove_letters(&self.assigned_letters);
+        // …then detach the virtual disk (releases the open handle on backup.vhd)…
         self.attached.take();
         // …then stop and unmount the filesystem.
         self.host.stop();

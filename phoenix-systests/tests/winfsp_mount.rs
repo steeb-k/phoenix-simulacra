@@ -121,3 +121,114 @@ fn winfsp_mount_and_browse_files() {
     drop(session); // detach + unmount + cleanup
     let _ = std::fs::remove_file(&backup_path);
 }
+
+/// Selective mount: back up a two-partition disk, mount with only the second
+/// partition selected, and confirm exactly that partition gets a (new) drive
+/// letter, its data verifies, and the letter is removed again on unmount.
+#[test]
+#[ignore = "requires elevation + WinFsp + --features winfsp"]
+fn winfsp_mount_selected_partition_only() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    // Source: two NTFS partitions with distinct fixtures.
+    let source = TestVhd::create(384).expect("create source");
+    source
+        .init_gpt_with(&[
+            PartSpec {
+                size_mb: 128,
+                fs: TestFs::Ntfs,
+                letter: 'X',
+                label: "SRC1".into(),
+            },
+            PartSpec {
+                size_mb: 0,
+                fs: TestFs::Ntfs,
+                letter: 'Y',
+                label: "SRC2".into(),
+            },
+        ])
+        .expect("init source");
+    assert!(wait_for_letter('X', 15_000), "first source never mounted");
+    assert!(wait_for_letter('Y', 15_000), "second source never mounted");
+    let _digest1 = fill_fixture('X', 0x1111).expect("fill fixture 1");
+    let digest2 = fill_fixture('Y', 0x2222).expect("fill fixture 2");
+
+    let disks = enumerate_disks().unwrap();
+    let disk = disks
+        .iter()
+        .find(|d| d.index == source.disk_index())
+        .unwrap();
+    let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
+    let backup_path =
+        std::env::temp_dir().join(format!("winfsp-sel-{}.phnx", uuid::Uuid::new_v4().simple()));
+    run_backup(BackupOptions {
+        disk_index: source.disk_index(),
+        partition_indices: parts,
+        output: backup_path.clone(),
+        use_vss: false,
+        verify_after: true,
+        progress: None,
+    })
+    .expect("run_backup");
+
+    // Pick the second partition's index out of the backup by its label.
+    let reader = phoenix_core::container::PhnxReader::open(&backup_path).expect("open backup");
+    let second_idx = reader
+        .index
+        .iter()
+        .find(|e| e.name.contains("SRC2"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no SRC2 entry in backup index (names: {:?})",
+                reader.index.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        })
+        .index;
+    drop(reader);
+
+    let pre_existing = fixture_letters();
+    let scratch = std::env::temp_dir()
+        .join("phoenix-systests")
+        .join("winfsp-mounts");
+    let session = WinFspMount::mount_selected(&backup_path, &scratch, Some(&[second_idx]))
+        .expect("winfsp selective mount");
+
+    // Exactly one exposure, with a letter, and it's the selected partition.
+    assert_eq!(
+        session.volumes.len(),
+        1,
+        "one selected partition, one entry"
+    );
+    assert_eq!(session.volumes[0].partition_index, second_idx);
+    let letter = session.volumes[0]
+        .drive_letter
+        .expect("selected NTFS partition should get a drive letter");
+    eprintln!("selected partition exposed as {letter}:");
+    verify_fixture(letter, &digest2).expect("selected partition readable");
+
+    // The unselected partition must NOT have surfaced: the only new
+    // fixture-bearing letter is the one we were handed.
+    let new_letters: Vec<char> = fixture_letters()
+        .into_iter()
+        .filter(|l| !pre_existing.contains(l))
+        .collect();
+    assert_eq!(
+        new_letters,
+        vec![letter],
+        "unselected partition leaked a drive letter"
+    );
+
+    // Unmount removes the letter again.
+    drop(session);
+    let root = format!("{letter}:\\");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while Path::new(&root).exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(
+        !Path::new(&root).exists(),
+        "assigned letter still present after unmount"
+    );
+    let _ = std::fs::remove_file(&backup_path);
+}

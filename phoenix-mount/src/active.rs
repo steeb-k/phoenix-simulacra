@@ -22,16 +22,34 @@ impl ActiveMount {
     /// Mount `backup` read-only. `scratch_dir` holds any transient state (the
     /// WinFsp mount point, or the temp image for the fallback).
     pub fn open(backup: &Path, scratch_dir: &Path) -> Result<Self> {
+        Self::open_selected(backup, scratch_dir, None)
+    }
+
+    /// Mount `backup` read-only, exposing drive letters only for the
+    /// partitions in `selection` (backup partition indices). `None` exposes
+    /// every volume via mount-manager policy.
+    pub fn open_selected(
+        backup: &Path,
+        scratch_dir: &Path,
+        selection: Option<&[u32]>,
+    ) -> Result<Self> {
         #[cfg(feature = "winfsp")]
-        let inner = crate::winfsp_mount::WinFspMount::mount(backup, scratch_dir)?;
+        let inner =
+            crate::winfsp_mount::WinFspMount::mount_selected(backup, scratch_dir, selection)?;
         #[cfg(not(feature = "winfsp"))]
-        let inner = crate::session::MountSession::mount(backup, scratch_dir)?;
+        let inner = crate::session::MountSession::mount_selected(backup, scratch_dir, selection)?;
         Ok(Self { inner })
     }
 
     /// Size of the mounted virtual disk in bytes.
     pub fn disk_size(&self) -> u64 {
         self.inner.disk_size
+    }
+
+    /// Per-partition exposure of a selection mount (empty for `None` mounts:
+    /// letters were assigned by Windows, not tracked here).
+    pub fn volumes(&self) -> &[crate::letters::MountedVolume] {
+        &self.inner.volumes
     }
 
     /// Path of the backup that is mounted.
