@@ -1,6 +1,12 @@
-//! Restore-page partition layout state and plan generation.
+//! Restore-page target-layout editing state and plan generation.
+//!
+//! The planned target layout is a list of [`LayoutSlot`]s — an editable model
+//! seeded from the live target disk. Slots can be replaced by dropping a
+//! source partition onto them, created by dropping into unallocated space,
+//! moved/resized by dragging, deleted, or wiped wholesale (blank layout /
+//! partition-table style switch). The restore plan is generated directly from
+//! the slots, so what the map shows is exactly what the engine writes.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
@@ -8,21 +14,31 @@ use phoenix_core::disk::{DiskInfo, FilesystemKind, PartitionInfo, PartitionUsage
 use phoenix_core::manifest::{bitlocker_state_from_manifest, fs_kind_from_string};
 use phoenix_restore::layout_edit::{move_candidate, resize_left_candidate, resize_right_candidate};
 use phoenix_restore::plan::{
-    align_up, alignment_bytes, build_full_disk_plan, build_partial_plan, partition_allows_resize,
-    RestorePlan,
+    align_up, alignment_bytes, build_full_disk_plan, layout_ceiling, partition_allows_resize,
+    RestorePlan, RestorePlanEntry,
 };
 
+/// The source partition mapped into a slot.
 #[derive(Debug, Clone)]
-pub struct TargetAssignment {
+pub struct SlotSource {
     pub source_index: u32,
+    pub used_bytes: u64,
+}
+
+/// One partition of the planned target layout.
+#[derive(Debug, Clone)]
+pub struct LayoutSlot {
+    /// Stable UI key — survives reorders, never reused within a layout.
+    pub id: u32,
     pub offset_bytes: u64,
     pub size_bytes: u64,
-    pub source_used_bytes: u64,
-    /// Original on-disk size of the source partition. Retained for the P2
-    /// resize UX (reset-to-original / shrink validation); populated but not yet
-    /// surfaced in the UI — see ROADMAP "GUI resize UX revamp".
-    #[allow(dead_code)]
-    pub source_original_size: u64,
+    /// The live target partition this slot descends from; `None` for slots
+    /// created by dropping into unallocated space. Kept so a preserved slot
+    /// retains its on-disk identity and a replaced slot can be volume-locked
+    /// before the engine overwrites it.
+    pub existing: Option<PartitionInfo>,
+    /// Mapped source partition; `None` = preserved as-is.
+    pub source: Option<SlotSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,15 +47,29 @@ pub struct RestoreLayoutState {
     pub source_disk: DiskInfo,
     pub index: Vec<PartitionIndexEntry>,
     pub full_disk: bool,
-    pub assignments: HashMap<u32, TargetAssignment>,
     pub align_bytes: u64,
-    /// Active edge/body drag: (target_part, edge or body, start offset/size)
+    /// Active edge/body drag.
     pub drag: Option<LayoutDrag>,
+    /// The planned layout, unordered (sort by offset for display/plan).
+    pub slots: Vec<LayoutSlot>,
+    /// Planned partition-table style; seeded from the live target.
+    pub table_gpt: bool,
+    /// True once the layout stops deriving from the live table (blank layout
+    /// or style switch) — the restore must then re-initialize the disk.
+    pub reinit_table: bool,
+    /// Slot id the toolbar's delete button acts on.
+    pub selected_slot: Option<u32>,
+    next_slot_id: u32,
+    /// (index, size) of the target the slots were built from, so the layout
+    /// re-seeds when the target changes under it.
+    target_key: Option<(u32, u64)>,
+    target_size: u64,
+    target_sector: u32,
 }
 
-/// How a dragged source partition would fit if dropped onto a target slot,
-/// replacing it. The available room is the slot itself plus any contiguous
-/// unallocated space immediately after it.
+/// How a dragged source partition would fit if dropped. The available room is
+/// the replaced slot itself plus any contiguous unallocated space after it
+/// (or the gap being dropped into).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropFit {
     /// Source keeps its own original size.
@@ -47,8 +77,8 @@ pub enum DropFit {
     /// Source is larger than the available room but its data fits: it shrinks
     /// to exactly fill the room.
     Shrinks(u64),
-    /// Even the used data doesn't fit (or the source filesystem can't shrink):
-    /// the drop must be refused.
+    /// Even the used data doesn't fit (or the source filesystem can't shrink,
+    /// or an MBR layout is already at its four-partition limit): refuse.
     TooSmall,
 }
 
@@ -143,10 +173,89 @@ impl RestoreLayoutState {
             source_disk: backup_to_disk_info(reader),
             index: reader.index.clone(),
             full_disk: false,
-            assignments: HashMap::new(),
             align_bytes: alignment_bytes(reader),
             drag: None,
+            slots: Vec::new(),
+            table_gpt: false,
+            reinit_table: false,
+            selected_slot: None,
+            next_slot_id: 0,
+            target_key: None,
+            target_size: 0,
+            target_sector: 512,
         }
+    }
+
+    /// Re-seed the slots from the live target whenever the target under the
+    /// panel changes (first frame included). No-op while it stays the same, so
+    /// user edits survive.
+    pub fn ensure_target(&mut self, target: &DiskInfo) {
+        let key = (target.index, target.size_bytes);
+        if self.target_key != Some(key) {
+            self.target_key = Some(key);
+            self.rebuild_from_target(target);
+        }
+    }
+
+    /// Discard every edit and mirror the target disk's current partitions.
+    pub fn rebuild_from_target(&mut self, target: &DiskInfo) {
+        self.target_size = target.size_bytes;
+        self.target_sector = target.sector_size;
+        self.table_gpt = target.is_gpt;
+        self.reinit_table = false;
+        self.selected_slot = None;
+        self.drag = None;
+        self.full_disk = false;
+        self.slots.clear();
+        let mut parts: Vec<&PartitionInfo> = target.partitions.iter().collect();
+        parts.sort_by_key(|p| p.offset_bytes);
+        for p in parts {
+            let id = self.fresh_id();
+            self.slots.push(LayoutSlot {
+                id,
+                offset_bytes: p.offset_bytes,
+                size_bytes: p.size_bytes,
+                existing: Some((*p).clone()),
+                source: None,
+            });
+        }
+    }
+
+    fn fresh_id(&mut self) -> u32 {
+        let id = self.next_slot_id;
+        self.next_slot_id += 1;
+        id
+    }
+
+    pub fn slot(&self, id: u32) -> Option<&LayoutSlot> {
+        self.slots.iter().find(|s| s.id == id)
+    }
+
+    fn slot_mut(&mut self, id: u32) -> Option<&mut LayoutSlot> {
+        self.slots.iter_mut().find(|s| s.id == id)
+    }
+
+    /// The filesystem that will occupy the slot after the restore.
+    pub fn slot_fs(&self, slot: &LayoutSlot) -> FilesystemKind {
+        if let Some(src) = &slot.source {
+            return self
+                .source_disk
+                .partitions
+                .iter()
+                .find(|p| p.index == src.source_index)
+                .map(|p| p.fs_kind)
+                .unwrap_or(FilesystemKind::Unknown);
+        }
+        slot.existing
+            .as_ref()
+            .map(|p| p.fs_kind)
+            .unwrap_or(FilesystemKind::Unknown)
+    }
+
+    pub fn slot_resizable(&self, id: u32) -> bool {
+        self.slot(id)
+            .map(|s| s.source.is_some() && partition_allows_resize(self.slot_fs(s)))
+            .unwrap_or(false)
     }
 
     pub fn source_used_bytes(&self, source_index: u32) -> u64 {
@@ -165,43 +274,38 @@ impl RestoreLayoutState {
             .unwrap_or(0)
     }
 
-    pub fn apply_full_disk(&mut self, target: &DiskInfo) {
-        self.full_disk = true;
-        self.assignments.clear();
-        let reader_path = self.backup_path.clone();
-        if let Ok(reader) = PhnxReader::open(Path::new(&reader_path)) {
-            let plan =
-                build_full_disk_plan(&self.backup_path, &reader, target.index, target.size_bytes);
-            for (slot, entry) in plan.entries.iter().enumerate() {
-                if let Some(src) = entry.source_partition_index {
-                    self.assignments.insert(
-                        slot as u32,
-                        TargetAssignment {
-                            source_index: src,
-                            offset_bytes: entry.target_offset_bytes,
-                            size_bytes: entry.target_size_bytes,
-                            source_used_bytes: self.source_used_bytes(src),
-                            source_original_size: self.source_original_size(src),
-                        },
-                    );
-                }
-            }
+    fn slot_source(&self, source_index: u32) -> SlotSource {
+        SlotSource {
+            source_index,
+            used_bytes: self.source_used_bytes(source_index),
         }
     }
 
-    pub fn clear_full_disk(&mut self) {
-        self.full_disk = false;
-        self.assignments.clear();
+    /// Last usable byte of the planned layout: GPT reserves its backup header
+    /// tail; MBR can't address past the 32-bit sector horizon.
+    pub fn usable_end(&self) -> u64 {
+        if self.table_gpt {
+            self.target_size
+                .saturating_sub(33 * u64::from(self.target_sector.max(512)))
+        } else {
+            layout_ceiling(self.target_size, false)
+        }
     }
 
-    /// How `source_index` would fit if dropped onto slot `target_part` of the
-    /// current planned `view` (the slot's *planned* geometry, so re-dropping
-    /// onto an already-mapped slot measures against what's on screen).
-    pub fn drop_fit(&self, source_index: u32, view: &DiskInfo, target_part: u32) -> DropFit {
-        let Some(slot) = view.partitions.iter().find(|p| p.index == target_part) else {
-            return DropFit::TooSmall;
-        };
-        let avail = slot.size_bytes + gap_after(view, slot.offset_bytes + slot.size_bytes);
+    /// Contiguous unallocated bytes starting at `end`, bounded by the next
+    /// slot or the usable end of the disk.
+    fn gap_after(&self, end: u64) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| s.offset_bytes)
+            .filter(|&o| o >= end)
+            .min()
+            .unwrap_or(self.usable_end())
+            .max(end)
+            - end
+    }
+
+    fn fit_into(&self, source_index: u32, avail: u64) -> DropFit {
         let original = self.source_original_size(source_index);
         if original == 0 {
             return DropFit::TooSmall;
@@ -216,79 +320,183 @@ impl RestoreLayoutState {
             .find(|p| p.index == source_index)
             .map(|p| partition_allows_resize(p.fs_kind))
             .unwrap_or(false);
-        if can_shrink && align_up(self.source_used_bytes(source_index), self.align_bytes) <= avail {
+        if can_shrink && align_up(self.source_used_bytes(source_index), self.align_bytes) <= avail
+        {
             DropFit::Shrinks(avail)
         } else {
             DropFit::TooSmall
         }
     }
 
-    /// Drop `source_index` onto slot `target_part`, replacing it: same start
-    /// offset, size per [`Self::drop_fit`]. Returns false if the drop refused.
-    pub fn apply_drop(&mut self, source_index: u32, view: &DiskInfo, target_part: u32) -> bool {
-        let size = match self.drop_fit(source_index, view, target_part) {
+    /// How `source_index` would fit if dropped onto slot `slot_id`, replacing
+    /// it: same start offset, own size if it fits in the slot plus the free
+    /// space behind it, shrunk to that room otherwise.
+    pub fn drop_fit(&self, source_index: u32, slot_id: u32) -> DropFit {
+        let Some(slot) = self.slot(slot_id) else {
+            return DropFit::TooSmall;
+        };
+        let avail = slot.size_bytes + self.gap_after(slot.offset_bytes + slot.size_bytes);
+        self.fit_into(source_index, avail)
+    }
+
+    /// Drop `source_index` onto slot `slot_id`. Returns false if refused.
+    pub fn apply_drop(&mut self, source_index: u32, slot_id: u32) -> bool {
+        let size = match self.drop_fit(source_index, slot_id) {
             DropFit::Fits(s) | DropFit::Shrinks(s) => s,
             DropFit::TooSmall => return false,
         };
-        let Some(slot) = view.partitions.iter().find(|p| p.index == target_part) else {
+        let src = self.slot_source(source_index);
+        let Some(slot) = self.slot_mut(slot_id) else {
             return false;
         };
-        self.assignments.insert(
-            target_part,
-            TargetAssignment {
-                source_index,
-                offset_bytes: slot.offset_bytes,
-                size_bytes: size,
-                source_used_bytes: self.source_used_bytes(source_index),
-                source_original_size: self.source_original_size(source_index),
-            },
-        );
+        slot.size_bytes = size;
+        slot.source = Some(src);
         true
     }
 
-    pub fn assignment_label(&self, slot: u32) -> Option<String> {
-        let a = self.assignments.get(&slot)?;
-        let src = self
+    /// Aligned start a gap-drop would use inside the unallocated segment at
+    /// `gap_offset`.
+    fn gap_drop_start(&self, gap_offset: u64) -> u64 {
+        align_up(gap_offset.max(self.align_bytes), self.align_bytes)
+    }
+
+    /// How `source_index` would fit as a NEW slot inside the unallocated
+    /// segment `[gap_offset, gap_offset + gap_len)`.
+    pub fn gap_drop_fit(&self, source_index: u32, gap_offset: u64, gap_len: u64) -> DropFit {
+        // MBR holds at most four primary partitions (no extended support).
+        if !self.table_gpt && self.slots.len() >= 4 {
+            return DropFit::TooSmall;
+        }
+        let start = self.gap_drop_start(gap_offset);
+        let end = gap_offset.saturating_add(gap_len).min(self.usable_end());
+        if end <= start {
+            return DropFit::TooSmall;
+        }
+        self.fit_into(source_index, end - start)
+    }
+
+    /// Drop `source_index` into unallocated space, creating a new slot at the
+    /// gap's (aligned) start. Returns false if refused.
+    pub fn apply_gap_drop(&mut self, source_index: u32, gap_offset: u64, gap_len: u64) -> bool {
+        let size = match self.gap_drop_fit(source_index, gap_offset, gap_len) {
+            DropFit::Fits(s) | DropFit::Shrinks(s) => s,
+            DropFit::TooSmall => return false,
+        };
+        let offset_bytes = self.gap_drop_start(gap_offset);
+        let source = Some(self.slot_source(source_index));
+        let id = self.fresh_id();
+        self.slots.push(LayoutSlot {
+            id,
+            offset_bytes,
+            size_bytes: size,
+            existing: None,
+            source,
+        });
+        true
+    }
+
+    /// Toolbar: remove the selected slot from the planned layout.
+    pub fn delete_selected(&mut self) -> bool {
+        let Some(id) = self.selected_slot.take() else {
+            return false;
+        };
+        let before = self.slots.len();
+        self.slots.retain(|s| s.id != id);
+        self.slots.len() != before
+    }
+
+    /// Toolbar: wipe the planned layout entirely.
+    pub fn blank_layout(&mut self) {
+        self.slots.clear();
+        self.selected_slot = None;
+        self.drag = None;
+        self.full_disk = false;
+        self.reinit_table = true;
+    }
+
+    /// Toolbar: switch the planned partition-table style. Implies a blank
+    /// layout — a style switch re-initializes the table, so nothing on the
+    /// disk survives it anyway.
+    pub fn set_table_style(&mut self, gpt: bool) {
+        if self.table_gpt != gpt {
+            self.table_gpt = gpt;
+            self.blank_layout();
+        }
+    }
+
+    pub fn apply_full_disk(&mut self, target: &DiskInfo) {
+        self.full_disk = true;
+        self.selected_slot = None;
+        self.drag = None;
+        let reader_path = self.backup_path.clone();
+        if let Ok(reader) = PhnxReader::open(Path::new(&reader_path)) {
+            let plan =
+                build_full_disk_plan(&self.backup_path, &reader, target.index, target.size_bytes);
+            self.slots.clear();
+            self.table_gpt = self.source_disk.is_gpt;
+            self.reinit_table = true;
+            for entry in plan.entries.iter().filter(|e| e.restore) {
+                if let Some(src) = entry.source_partition_index {
+                    let source = Some(self.slot_source(src));
+                    let id = self.fresh_id();
+                    self.slots.push(LayoutSlot {
+                        id,
+                        offset_bytes: entry.target_offset_bytes,
+                        size_bytes: entry.target_size_bytes,
+                        existing: None,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn clear_full_disk(&mut self, target: &DiskInfo) {
+        self.rebuild_from_target(target);
+    }
+
+    pub fn assignment_label(&self, slot_id: u32) -> Option<String> {
+        let slot = self.slot(slot_id)?;
+        let src = slot.source.as_ref()?;
+        let p = self
             .source_disk
             .partitions
             .iter()
-            .find(|p| p.index == a.source_index)?;
-        Some(partition_title(src))
+            .find(|p| p.index == src.source_index)?;
+        Some(partition_title(p))
     }
 
-    /// Full-disk restore preview: planned offsets/sizes with source partition labels and FS types.
-    pub fn planned_target_view(&self, target: &DiskInfo) -> DiskInfo {
-        let mut ordered: Vec<&TargetAssignment> = self.assignments.values().collect();
-        ordered.sort_by_key(|a| a.offset_bytes);
-
-        let partitions: Vec<PartitionInfo> = ordered
+    /// The planned layout as a `DiskInfo` for the shared map renderer: mapped
+    /// slots take the source partition's identity, preserved slots keep the
+    /// live target partition's. Partition `index` is the slot id.
+    pub fn target_view(&self, target: &DiskInfo) -> DiskInfo {
+        let mut partitions: Vec<PartitionInfo> = self
+            .slots
             .iter()
-            .enumerate()
-            .filter_map(|(slot, a)| {
-                let src = self
-                    .source_disk
-                    .partitions
-                    .iter()
-                    .find(|p| p.index == a.source_index)?;
-                Some(PartitionInfo {
-                    index: slot as u32,
-                    name: src.name.clone(),
-                    type_guid: src.type_guid,
-                    gpt_attributes: src.gpt_attributes,
-                    offset_bytes: a.offset_bytes,
-                    size_bytes: a.size_bytes,
-                    fs_kind: src.fs_kind,
-                    capture_mode: src.capture_mode,
-                    bitlocker: src.bitlocker,
-                    unique_guid: src.unique_guid,
-                    volume_path: None,
-                    drive_letter: src.drive_letter,
-                    volume_label: src.volume_label.clone(),
-                    usage: src.usage,
-                    sector_size: src.sector_size,
-                })
+            .filter_map(|s| {
+                let mut p = if let Some(src) = &s.source {
+                    let mut p = self
+                        .source_disk
+                        .partitions
+                        .iter()
+                        .find(|p| p.index == src.source_index)?
+                        .clone();
+                    p.usage = Some(PartitionUsage {
+                        total_bytes: s.size_bytes,
+                        free_bytes: s.size_bytes.saturating_sub(src.used_bytes),
+                    });
+                    p
+                } else {
+                    s.existing.clone()?
+                };
+                p.index = s.id;
+                p.offset_bytes = s.offset_bytes;
+                p.size_bytes = s.size_bytes;
+                p.volume_path = None;
+                Some(p)
             })
             .collect();
+        partitions.sort_by_key(|p| p.offset_bytes);
 
         let layout_end = partitions
             .last()
@@ -299,7 +507,7 @@ impl RestoreLayoutState {
             index: target.index,
             path: target.path.clone(),
             size_bytes: target.size_bytes.max(layout_end),
-            is_gpt: target.is_gpt,
+            is_gpt: self.table_gpt,
             disk_guid: target.disk_guid,
             disk_signature: target.disk_signature,
             sector_size: target.sector_size,
@@ -308,101 +516,130 @@ impl RestoreLayoutState {
         }
     }
 
+    /// Build the restore plan straight from the slots — the map IS the plan.
+    /// New slots get target indexes above every live partition's so they can
+    /// never be mistaken for one (the engine looks entries up by index for
+    /// volume locking and preserved-identity).
     pub fn to_restore_plan(&self, target: &DiskInfo) -> RestorePlan {
-        if self.full_disk {
-            if let Ok(reader) = PhnxReader::open(Path::new(&self.backup_path)) {
-                return build_full_disk_plan(
-                    &self.backup_path,
-                    &reader,
-                    target.index,
-                    target.size_bytes,
-                );
-            }
-        }
+        let mut ordered: Vec<&LayoutSlot> = self.slots.iter().collect();
+        ordered.sort_by_key(|s| s.offset_bytes);
 
-        let tuples: Vec<(u32, u32, u64, u64)> = self
-            .assignments
+        let mut next_index = target
+            .partitions
             .iter()
-            .map(|(t, a)| (*t, a.source_index, a.offset_bytes, a.size_bytes))
+            .map(|p| p.index + 1)
+            .max()
+            .unwrap_or(0);
+        let entries: Vec<RestorePlanEntry> = ordered
+            .iter()
+            .map(|s| {
+                let target_partition_index = match &s.existing {
+                    Some(e) => e.index,
+                    None => {
+                        let i = next_index;
+                        next_index += 1;
+                        i
+                    }
+                };
+                RestorePlanEntry {
+                    source_partition_index: s.source.as_ref().map(|src| src.source_index),
+                    target_partition_index,
+                    restore: s.source.is_some(),
+                    target_offset_bytes: s.offset_bytes,
+                    target_size_bytes: s.size_bytes,
+                }
+            })
             .collect();
-        build_partial_plan(&self.backup_path, target.index, target, &tuples)
+
+        RestorePlan {
+            backup_path: self.backup_path.clone(),
+            target_disk_index: target.index,
+            entries,
+            full_disk: self.full_disk,
+            reinit_style: (!self.full_disk && self.reinit_table)
+                .then(|| if self.table_gpt { "gpt" } else { "mbr" }.to_string()),
+        }
     }
 
     pub fn has_restorable_entries(&self) -> bool {
-        !self.assignments.is_empty()
+        self.slots.iter().any(|s| s.source.is_some())
     }
 
-    pub fn target_partition_fs(&self, target: &DiskInfo, target_part: u32) -> FilesystemKind {
-        if self.full_disk {
-            return self
-                .assignments
-                .get(&target_part)
-                .and_then(|a| {
-                    self.source_disk
-                        .partitions
-                        .iter()
-                        .find(|p| p.index == a.source_index)
-                })
-                .map(|p| p.fs_kind)
-                .unwrap_or(FilesystemKind::Unknown);
-        }
-        target
-            .partitions
+    /// Rows for the numeric size editor: (slot id, size, used, offset),
+    /// sorted by offset. Mapped slots only.
+    pub fn size_editor_rows(&self) -> Vec<(u32, u64, u64, u64)> {
+        let mut rows: Vec<(u32, u64, u64, u64)> = self
+            .slots
             .iter()
-            .find(|p| p.index == target_part)
-            .map(|p| p.fs_kind)
-            .unwrap_or(FilesystemKind::Unknown)
+            .filter_map(|s| {
+                let src = s.source.as_ref()?;
+                Some((s.id, s.size_bytes, src.used_bytes, s.offset_bytes))
+            })
+            .collect();
+        rows.sort_by_key(|r| r.3);
+        rows
     }
 
-    pub fn begin_move(&mut self, target_part: u32, pointer_offset: u64) {
-        if let Some(a) = self.assignments.get(&target_part) {
-            let grab = pointer_offset.saturating_sub(a.offset_bytes);
+    pub fn begin_move(&mut self, slot_id: u32, pointer_offset: u64) {
+        if let Some(s) = self.slot(slot_id) {
+            let grab = pointer_offset.saturating_sub(s.offset_bytes);
             self.drag = Some(LayoutDrag::MoveBody {
-                target_part,
+                target_part: slot_id,
                 grab_offset_in_part: grab,
             });
         }
     }
 
-    pub fn begin_resize(&mut self, target_part: u32, left_edge: bool) {
+    pub fn begin_resize(&mut self, slot_id: u32, left_edge: bool) {
         self.drag = Some(if left_edge {
-            LayoutDrag::ResizeLeft { target_part }
+            LayoutDrag::ResizeLeft {
+                target_part: slot_id,
+            }
         } else {
-            LayoutDrag::ResizeRight { target_part }
+            LayoutDrag::ResizeRight {
+                target_part: slot_id,
+            }
         });
     }
 
     /// Advance the active move/resize drag. `pointer_offset` is the pointer's
-    /// byte position on the disk; `snap_bytes` is the resize snap window
-    /// (roughly a dozen pixels worth of bytes — 0 disables snapping).
-    pub fn update_drag(&mut self, layout_disk: &DiskInfo, pointer_offset: u64, snap_bytes: u64) {
+    /// byte position on the disk; `snap_bytes` is the resize snap window.
+    pub fn update_drag(&mut self, pointer_offset: u64, snap_bytes: u64) {
         let Some(drag) = self.drag.clone() else {
             return;
         };
-        let part = drag.target_part();
-        let Some(a) = self.assignments.get(&part).cloned() else {
+        let id = drag.target_part();
+        let Some(slot) = self.slot(id).cloned() else {
             return;
         };
 
-        // Every other slot in the view blocks us — including unmapped target
-        // partitions, which the old overlap check ignored entirely.
-        let mut obstacles: Vec<(u64, u64)> = layout_disk
-            .partitions
+        // Every other slot blocks us, and so does the table region at the
+        // front of the disk (capped at the lowest slot start so legacy
+        // sub-MiB layouts don't wedge the math).
+        let front_reserve = self
+            .slots
             .iter()
-            .filter(|p| p.index != part)
-            .map(|p| (p.offset_bytes, p.offset_bytes + p.size_bytes))
+            .map(|s| s.offset_bytes)
+            .min()
+            .unwrap_or(self.align_bytes)
+            .min(self.align_bytes);
+        let mut obstacles: Vec<(u64, u64)> = self
+            .slots
+            .iter()
+            .filter(|s| s.id != id)
+            .map(|s| (s.offset_bytes, s.offset_bytes + s.size_bytes))
             .collect();
+        if front_reserve > 0 {
+            obstacles.push((0, front_reserve));
+        }
         obstacles.sort_unstable();
-        // A GPT disk's final 33 LBAs hold the backup header + entry array —
-        // nothing may grow or move into them.
-        let disk_end = if layout_disk.is_gpt {
-            layout_disk
-                .size_bytes
-                .saturating_sub(33 * u64::from(layout_disk.sector_size.max(512)))
-        } else {
-            layout_disk.size_bytes
-        };
-        let min_size = align_up(a.source_used_bytes, self.align_bytes).max(self.align_bytes);
+        let disk_end = self.usable_end();
+        let min_size = slot
+            .source
+            .as_ref()
+            .map(|s| align_up(s.used_bytes, self.align_bytes))
+            .unwrap_or(0)
+            .max(self.align_bytes);
 
         match drag {
             LayoutDrag::MoveBody {
@@ -413,52 +650,52 @@ impl RestoreLayoutState {
                 if let Some(new_offset) = move_candidate(
                     &obstacles,
                     disk_end,
-                    a.offset_bytes,
-                    a.size_bytes,
+                    slot.offset_bytes,
+                    slot.size_bytes,
                     pointer_offset,
                     desired,
                     self.align_bytes,
                 ) {
-                    if let Some(slot) = self.assignments.get_mut(&part) {
-                        slot.offset_bytes = new_offset;
+                    if let Some(s) = self.slot_mut(id) {
+                        s.offset_bytes = new_offset;
                     }
                 }
             }
             LayoutDrag::ResizeLeft { .. } => {
-                if !partition_allows_resize(self.target_partition_fs(layout_disk, part)) {
+                if !self.slot_resizable(id) {
                     return;
                 }
-                let end = a.offset_bytes + a.size_bytes;
+                let end = slot.offset_bytes + slot.size_bytes;
                 if let Some(new_offset) = resize_left_candidate(
                     &obstacles,
-                    a.offset_bytes,
+                    slot.offset_bytes,
                     end,
                     min_size,
                     pointer_offset,
                     snap_bytes,
                     self.align_bytes,
                 ) {
-                    if let Some(slot) = self.assignments.get_mut(&part) {
-                        slot.offset_bytes = new_offset;
-                        slot.size_bytes = end - new_offset;
+                    if let Some(s) = self.slot_mut(id) {
+                        s.offset_bytes = new_offset;
+                        s.size_bytes = end - new_offset;
                     }
                 }
             }
             LayoutDrag::ResizeRight { .. } => {
-                if !partition_allows_resize(self.target_partition_fs(layout_disk, part)) {
+                if !self.slot_resizable(id) {
                     return;
                 }
                 if let Some(new_end) = resize_right_candidate(
                     &obstacles,
                     disk_end,
-                    a.offset_bytes,
+                    slot.offset_bytes,
                     min_size,
                     pointer_offset,
                     snap_bytes,
                     self.align_bytes,
                 ) {
-                    if let Some(slot) = self.assignments.get_mut(&part) {
-                        slot.size_bytes = new_end - a.offset_bytes;
+                    if let Some(s) = self.slot_mut(id) {
+                        s.size_bytes = new_end - slot.offset_bytes;
                     }
                 }
             }
@@ -469,56 +706,42 @@ impl RestoreLayoutState {
         self.drag = None;
     }
 
-    /// Aligned minimum size a mapped partition can shrink to (its used data).
-    /// Retained for the P2 resize UX (surfacing the minimum shrink size in the
-    /// layout editor) — see ROADMAP "GUI resize UX revamp".
-    #[allow(dead_code)]
-    pub fn min_size_for(&self, target_part: u32) -> u64 {
-        self.assignments
-            .get(&target_part)
-            .map(|a| align_up(a.source_used_bytes, self.align_bytes))
-            .unwrap_or(0)
-    }
-
-    /// Set a mapped partition's size numerically (a right-edge resize keeping
-    /// the offset fixed). Applies the same constraints as the drag path and
-    /// returns a human-readable error if the size is invalid — this is what the
-    /// numeric size field on the Restore page calls, replacing pixel-precise
-    /// dragging as the primary way to resize.
+    /// Set a mapped slot's size numerically (a right-edge resize keeping the
+    /// offset fixed). Same constraints as the drag path; returns a
+    /// human-readable error if the size is invalid.
     pub fn set_partition_size(
         &mut self,
-        target_part: u32,
+        slot_id: u32,
         new_size: u64,
-        layout_disk: &DiskInfo,
     ) -> std::result::Result<(), String> {
-        let a = self
-            .assignments
-            .get(&target_part)
+        let slot = self
+            .slot(slot_id)
             .cloned()
-            .ok_or_else(|| "partition is not mapped to the target".to_string())?;
-        let fs = self.target_partition_fs(layout_disk, target_part);
-        if !partition_allows_resize(fs) {
+            .ok_or_else(|| "partition is not in the layout".to_string())?;
+        let Some(src) = slot.source.clone() else {
+            return Err("only mapped partitions can be resized".into());
+        };
+        if !partition_allows_resize(self.slot_fs(&slot)) {
             return Err("this filesystem can't be resized (only NTFS/FAT/exFAT)".into());
         }
         // Never below the used data; align like the drag path.
-        let new_size = align_up(new_size.max(a.source_used_bytes), self.align_bytes);
-        let end = a.offset_bytes.saturating_add(new_size);
-        if end > layout_disk.size_bytes {
+        let new_size = align_up(new_size.max(src.used_bytes), self.align_bytes);
+        let end = slot.offset_bytes.saturating_add(new_size);
+        if end > self.usable_end() {
             return Err("size runs past the end of the target disk".into());
         }
-        // Next slot in the view — mapped or not — bounds the growth.
-        let next_start = layout_disk
-            .partitions
+        let next_start = self
+            .slots
             .iter()
-            .filter(|p| p.index != target_part && p.offset_bytes >= a.offset_bytes)
-            .map(|p| p.offset_bytes)
+            .filter(|s| s.id != slot_id && s.offset_bytes >= slot.offset_bytes)
+            .map(|s| s.offset_bytes)
             .min()
-            .unwrap_or(layout_disk.size_bytes);
+            .unwrap_or(self.usable_end());
         if end > next_start {
             return Err("size would overlap the next partition".into());
         }
-        if let Some(slot) = self.assignments.get_mut(&target_part) {
-            slot.size_bytes = new_size;
+        if let Some(s) = self.slot_mut(slot_id) {
+            s.size_bytes = new_size;
         }
         Ok(())
     }
@@ -533,19 +756,6 @@ pub fn partition_title(p: &PartitionInfo) -> String {
     }
 }
 
-/// Contiguous unallocated bytes in `view` starting at `end` — 0 if another
-/// slot begins right there.
-fn gap_after(view: &DiskInfo, end: u64) -> u64 {
-    view.partitions
-        .iter()
-        .map(|p| p.offset_bytes)
-        .filter(|&o| o >= end)
-        .min()
-        .unwrap_or(view.size_bytes)
-        .max(end)
-        - end
-}
-
 fn fs_kind_for_entry(reader: &PhnxReader, e: &PartitionIndexEntry) -> FilesystemKind {
     if e.fs_kind != FilesystemKind::Unknown {
         return e.fs_kind;
@@ -557,41 +767,4 @@ fn fs_kind_for_entry(reader: &PhnxReader, e: &PartitionIndexEntry) -> Filesystem
         .find(|p| p.index == e.index)
         .map(|p| fs_kind_from_string(&p.fs))
         .unwrap_or(FilesystemKind::Unknown)
-}
-
-/// Partial-mode preview of the target disk: mapped slots take their planned
-/// geometry AND the source partition's identity (label, filesystem, usage), so
-/// the map reads as "this is what will replace that" rather than a relabelled
-/// target partition.
-pub fn synthetic_target_view(target: &DiskInfo, layout: &RestoreLayoutState) -> DiskInfo {
-    let mut disk = target.clone();
-    for part in &mut disk.partitions {
-        if let Some(a) = layout.assignments.get(&part.index) {
-            part.offset_bytes = a.offset_bytes;
-            part.size_bytes = a.size_bytes;
-            if let Some(src) = layout
-                .source_disk
-                .partitions
-                .iter()
-                .find(|p| p.index == a.source_index)
-            {
-                part.name = src.name.clone();
-                part.type_guid = src.type_guid;
-                part.gpt_attributes = src.gpt_attributes;
-                part.fs_kind = src.fs_kind;
-                part.capture_mode = src.capture_mode;
-                part.bitlocker = src.bitlocker;
-                part.unique_guid = src.unique_guid;
-                part.volume_path = None;
-                part.drive_letter = src.drive_letter;
-                part.volume_label = src.volume_label.clone();
-                part.usage = Some(PartitionUsage {
-                    total_bytes: a.size_bytes,
-                    free_bytes: a.size_bytes.saturating_sub(a.source_used_bytes),
-                });
-            }
-        }
-    }
-    disk.partitions.sort_by_key(|p| p.offset_bytes);
-    disk
 }

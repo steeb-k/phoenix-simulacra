@@ -1343,21 +1343,13 @@ impl PhoenixApp {
 
                 // Numeric size entry — a precise alternative to edge-dragging.
                 // Only meaningful in partial mode (full-disk auto-sizes).
-                if !layout.full_disk && !layout.assignments.is_empty() {
+                if !layout.full_disk && layout.has_restorable_entries() {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("Partition sizes").color(self.palette.subtle_text),
                     );
                     let align = layout.align_bytes;
-                    // Overlap checks must see planned (not on-disk) geometry
-                    // for mapped neighbours.
-                    let view = restore_layout::synthetic_target_view(&target, layout);
-                    let mut rows: Vec<(u32, u64, u64, u64)> = layout
-                        .assignments
-                        .iter()
-                        .map(|(&slot, a)| (slot, a.size_bytes, a.source_used_bytes, a.offset_bytes))
-                        .collect();
-                    rows.sort_by_key(|r| r.3); // by target offset
+                    let rows = layout.size_editor_rows();
                     let mut size_error: Option<String> = None;
                     const GIB: f64 = (1u64 << 30) as f64;
                     egui::Grid::new("restore_size_editor")
@@ -1380,9 +1372,7 @@ impl PhoenixApp {
                                 );
                                 if resp.changed() {
                                     let new_bytes = (gib * GIB) as u64;
-                                    if let Err(e) =
-                                        layout.set_partition_size(slot, new_bytes, &view)
-                                    {
+                                    if let Err(e) = layout.set_partition_size(slot, new_bytes) {
                                         size_error = Some(e);
                                     }
                                 }

@@ -58,7 +58,7 @@ pub fn row_stride() -> f32 {
 #[derive(Clone, Copy)]
 pub enum SegmentKind<'a> {
     Partition(&'a PartitionInfo),
-    Unallocated { length: u64 },
+    Unallocated { offset: u64, length: u64 },
 }
 
 pub fn build_segments(disk: &DiskInfo) -> Vec<SegmentKind<'_>> {
@@ -70,6 +70,7 @@ pub fn build_segments(disk: &DiskInfo) -> Vec<SegmentKind<'_>> {
     for p in sorted {
         if p.offset_bytes > cursor && p.offset_bytes - cursor >= MIN_GAP_BYTES {
             out.push(SegmentKind::Unallocated {
+                offset: cursor,
                 length: p.offset_bytes - cursor,
             });
         }
@@ -78,6 +79,7 @@ pub fn build_segments(disk: &DiskInfo) -> Vec<SegmentKind<'_>> {
     }
     if disk.size_bytes > cursor && disk.size_bytes - cursor >= MIN_GAP_BYTES {
         out.push(SegmentKind::Unallocated {
+            offset: cursor,
             length: disk.size_bytes - cursor,
         });
     }
@@ -87,7 +89,7 @@ pub fn build_segments(disk: &DiskInfo) -> Vec<SegmentKind<'_>> {
 fn segment_length(seg: &SegmentKind<'_>) -> u64 {
     match seg {
         SegmentKind::Partition(p) => p.size_bytes,
-        SegmentKind::Unallocated { length } => *length,
+        SegmentKind::Unallocated { length, .. } => *length,
     }
 }
 
@@ -227,12 +229,16 @@ pub fn draw_disk_info_card(
     );
 }
 
-pub fn draw_partition_map(
+/// Segment-level map renderer: the callback sees every segment — partitions
+/// AND unallocated gaps — and returns true when it fully handled the drawing.
+/// On false, the default visuals apply (interactive partition segment with
+/// tooltip, plain unallocated block).
+pub fn draw_partition_map_segments(
     ui: &mut Ui,
     rect: Rect,
     disk: &DiskInfo,
     palette: &Palette,
-    mut on_partition: impl FnMut(&mut Ui, u32, &PartitionInfo, Rect) -> bool,
+    mut on_segment: impl FnMut(&mut Ui, &SegmentKind<'_>, Rect) -> bool,
 ) {
     if rect.width() <= 0.0 {
         return;
@@ -253,21 +259,35 @@ pub fn draw_partition_map(
     let mut x = rect.left();
     for (seg, w) in segments.iter().zip(widths.iter()) {
         let seg_rect = Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(*w, rect.height()));
-        match seg {
-            SegmentKind::Partition(p) => {
-                if !on_partition(ui, disk.index, p, seg_rect) {
+        if !on_segment(ui, seg, seg_rect) {
+            match seg {
+                SegmentKind::Partition(p) => {
                     let id = ui.id().with(("partition", disk.index, p.index));
                     let response = ui.interact(seg_rect, id, PARTITION_SENSE);
                     draw_partition_segment_visual(ui, seg_rect, p, palette, response.hovered());
                     response.on_hover_ui_at_pointer(|ui| partition_tooltip(ui, p));
                 }
-            }
-            SegmentKind::Unallocated { length } => {
-                draw_unallocated_segment(ui, seg_rect, *length, palette);
+                SegmentKind::Unallocated { length, .. } => {
+                    draw_unallocated_segment(ui, seg_rect, *length, palette);
+                }
             }
         }
         x += *w + SEGMENT_GUTTER;
     }
+}
+
+pub fn draw_partition_map(
+    ui: &mut Ui,
+    rect: Rect,
+    disk: &DiskInfo,
+    palette: &Palette,
+    mut on_partition: impl FnMut(&mut Ui, u32, &PartitionInfo, Rect) -> bool,
+) {
+    let disk_index = disk.index;
+    draw_partition_map_segments(ui, rect, disk, palette, |ui, seg, seg_rect| match seg {
+        SegmentKind::Partition(p) => on_partition(ui, disk_index, p, seg_rect),
+        SegmentKind::Unallocated { .. } => false,
+    });
 }
 
 pub fn draw_partition_segment_visual(

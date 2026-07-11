@@ -12,6 +12,14 @@ pub struct RestorePlan {
     /// When true, the GUI built a full-disk layout from the backup.
     #[serde(default)]
     pub full_disk: bool,
+    /// `Some("gpt" | "mbr")` when the planned layout no longer derives from
+    /// the target's current partition table (blank layout / style switch in
+    /// the GUI editor): the restore must re-initialize the disk with this
+    /// style before planting the entries. `None` = leave the table style
+    /// alone (the pre-editor behavior, and every plan written before this
+    /// field existed).
+    #[serde(default)]
+    pub reinit_style: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +458,7 @@ pub fn build_full_disk_plan(
         target_disk_index,
         entries,
         full_disk: true,
+        reinit_style: None,
     }
 }
 
@@ -627,6 +636,7 @@ pub fn build_partial_plan(
         target_disk_index,
         entries,
         full_disk: false,
+        reinit_style: None,
     }
 }
 

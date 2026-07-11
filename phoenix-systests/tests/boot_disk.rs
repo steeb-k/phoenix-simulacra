@@ -187,6 +187,7 @@ fn front_pack_plan(
         target_disk_index: target_disk,
         entries,
         full_disk: true,
+        reinit_style: None,
     }
 }
 

@@ -297,6 +297,7 @@ fn real_mbr_restore_shrink() {
         backup_path: backup.to_str().unwrap().to_string(),
         target_disk_index: idx,
         full_disk: true,
+        reinit_style: None,
         entries: vec![
             RestorePlanEntry {
                 source_partition_index: Some(0),
