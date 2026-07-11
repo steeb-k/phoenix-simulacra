@@ -1,3 +1,4 @@
+mod confirm_dialog;
 mod disk_map;
 mod disk_panel;
 mod fonts;
@@ -23,6 +24,7 @@ use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
 use phoenix_core::ProgressHandle;
 use phoenix_restore::restore::RestoreOptions;
 
+use crate::confirm_dialog::{ConfirmAction, ConfirmView};
 use crate::job::{spawn_backup, spawn_clone, spawn_restore, spawn_verify, BackgroundJob, JobKind};
 use crate::sidebar::Page;
 use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView};
@@ -160,6 +162,15 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     guard
 }
 
+/// A validated backup queue parked while the overwrite-confirmation dialog is
+/// up. `queue` is in disk-index order (not yet reversed for the pop-from-back
+/// runner); `existing` is the subset of output paths that already exist on
+/// disk, shown to the user so they know exactly what they'd replace.
+struct PendingOverwrite {
+    queue: Vec<BackupOptions>,
+    existing: Vec<String>,
+}
+
 struct PhoenixApp {
     disks: Vec<DiskInfo>,
     /// Set of `(disk_index, partition_index)` pairs the user has clicked on
@@ -179,6 +190,11 @@ struct PhoenixApp {
     /// in flight. The currently-running job lives in `job`; on completion
     /// we pop the next entry here and spawn it.
     pending_backups: Vec<BackupOptions>,
+    /// A fully-built, validated backup queue that is waiting on the user to
+    /// confirm overwriting one or more existing `.phnx` files. `Some` puts the
+    /// overwrite-confirmation dialog on screen; cleared on confirm (launch) or
+    /// cancel (abort).
+    pending_overwrite: Option<PendingOverwrite>,
     /// Total number of jobs in the current multi-disk run (for "Disk N of M"
     /// status text). Reset to 0 when the queue drains.
     total_backups: usize,
@@ -238,6 +254,7 @@ impl PhoenixApp {
             backup_name: String::new(),
             use_vss: false,
             pending_backups: Vec::new(),
+            pending_overwrite: None,
             total_backups: 0,
             current_backup_index: 0,
             restore_backup_path: String::new(),
@@ -302,7 +319,7 @@ impl PhoenixApp {
     /// True while the blocking status modal is on screen (running job or
     /// finished result awaiting Close).
     fn modal_open(&self) -> bool {
-        self.job.is_some() || self.completed.is_some()
+        self.job.is_some() || self.completed.is_some() || self.pending_overwrite.is_some()
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -590,6 +607,7 @@ impl eframe::App for PhoenixApp {
             });
 
         self.show_status_modal(ctx);
+        self.show_overwrite_dialog(ctx);
     }
 }
 
@@ -629,6 +647,47 @@ impl PhoenixApp {
             ModalAction::Cancel => self.cancel_current_job(),
             ModalAction::Close => self.completed = None,
             ModalAction::None => {}
+        }
+    }
+
+    /// Render the "file already exists" confirmation over a parked backup queue.
+    /// Confirm launches it (overwriting); Cancel drops the queue and leaves the
+    /// backup form untouched so the user can rename and try again.
+    fn show_overwrite_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_overwrite.is_none() {
+            return;
+        }
+        let action = {
+            let pending = self.pending_overwrite.as_ref().unwrap();
+            let count = pending.existing.len();
+            let message = if count == 1 {
+                "A backup file with this name already exists. Overwrite it?".to_string()
+            } else {
+                format!(
+                    "{count} backup files with these names already exist. Overwrite them?"
+                )
+            };
+            let view = ConfirmView {
+                title: "Backup file already exists",
+                message: &message,
+                details: &pending.existing,
+                confirm_label: "Overwrite",
+                cancel_label: "Cancel",
+                confirm_danger: true,
+            };
+            confirm_dialog::show(ctx, &self.palette, &view)
+        };
+
+        match action {
+            ConfirmAction::Confirm => {
+                let pending = self.pending_overwrite.take().expect("dialog was open");
+                self.launch_backup_queue(pending.queue);
+            }
+            ConfirmAction::Cancel => {
+                self.pending_overwrite = None;
+                self.status = "Backup cancelled — choose a different name to keep the old one".into();
+            }
+            ConfirmAction::None => {}
         }
     }
 }
@@ -1100,6 +1159,26 @@ impl PhoenixApp {
             });
         }
 
+        // If any target file already exists, don't silently clobber it — park
+        // the built queue and ask the user first (in-app dialog, not a native
+        // one). Otherwise launch straight away.
+        let existing: Vec<String> = queue
+            .iter()
+            .filter(|o| o.output.exists())
+            .map(|o| o.output.display().to_string())
+            .collect();
+        if existing.is_empty() {
+            self.launch_backup_queue(queue);
+        } else {
+            self.pending_overwrite = Some(PendingOverwrite { queue, existing });
+        }
+    }
+
+    /// Kick off a fully-built backup queue: the first job starts immediately and
+    /// the rest wait in `pending_backups` (drained by `poll_job`). `queue` must
+    /// be in disk-index order — this reverses it internally so the pop-from-back
+    /// runner preserves that order.
+    fn launch_backup_queue(&mut self, mut queue: Vec<BackupOptions>) {
         self.completed = None;
         self.total_backups = queue.len();
         self.current_backup_index = 1;
