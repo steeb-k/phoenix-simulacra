@@ -1,6 +1,7 @@
 //! Carbon Phoenix restore planner and execution.
 
 pub mod grow;
+pub mod layout_edit;
 pub mod partition_table;
 pub mod plan;
 pub mod relocation;

@@ -6,6 +6,7 @@ use std::path::Path;
 use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
 use phoenix_core::disk::{DiskInfo, FilesystemKind, PartitionInfo, PartitionUsage};
 use phoenix_core::manifest::{bitlocker_state_from_manifest, fs_kind_from_string};
+use phoenix_restore::layout_edit::{move_candidate, resize_left_candidate, resize_right_candidate};
 use phoenix_restore::plan::{
     align_up, alignment_bytes, build_full_disk_plan, build_partial_plan, partition_allows_resize,
     RestorePlan,
@@ -32,9 +33,23 @@ pub struct RestoreLayoutState {
     pub full_disk: bool,
     pub assignments: HashMap<u32, TargetAssignment>,
     pub align_bytes: u64,
-    pub dialog_message: Option<String>,
     /// Active edge/body drag: (target_part, edge or body, start offset/size)
     pub drag: Option<LayoutDrag>,
+}
+
+/// How a dragged source partition would fit if dropped onto a target slot,
+/// replacing it. The available room is the slot itself plus any contiguous
+/// unallocated space immediately after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropFit {
+    /// Source keeps its own original size.
+    Fits(u64),
+    /// Source is larger than the available room but its data fits: it shrinks
+    /// to exactly fill the room.
+    Shrinks(u64),
+    /// Even the used data doesn't fit (or the source filesystem can't shrink):
+    /// the drop must be refused.
+    TooSmall,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +64,16 @@ pub enum LayoutDrag {
     ResizeRight {
         target_part: u32,
     },
+}
+
+impl LayoutDrag {
+    pub fn target_part(&self) -> u32 {
+        match self {
+            LayoutDrag::MoveBody { target_part, .. }
+            | LayoutDrag::ResizeLeft { target_part }
+            | LayoutDrag::ResizeRight { target_part } => *target_part,
+        }
+    }
 }
 
 pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
@@ -120,7 +145,6 @@ impl RestoreLayoutState {
             full_disk: false,
             assignments: HashMap::new(),
             align_bytes: alignment_bytes(reader),
-            dialog_message: None,
             drag: None,
         }
     }
@@ -170,55 +194,66 @@ impl RestoreLayoutState {
         self.assignments.clear();
     }
 
-    pub fn try_map_source_to_target(
-        &mut self,
-        source_index: u32,
-        target: &DiskInfo,
-        target_part: u32,
-    ) {
-        let Some(slot) = target.partitions.iter().find(|p| p.index == target_part) else {
-            return;
+    /// How `source_index` would fit if dropped onto slot `target_part` of the
+    /// current planned `view` (the slot's *planned* geometry, so re-dropping
+    /// onto an already-mapped slot measures against what's on screen).
+    pub fn drop_fit(&self, source_index: u32, view: &DiskInfo, target_part: u32) -> DropFit {
+        let Some(slot) = view.partitions.iter().find(|p| p.index == target_part) else {
+            return DropFit::TooSmall;
         };
-        let used = self.source_used_bytes(source_index);
+        let avail = slot.size_bytes + gap_after(view, slot.offset_bytes + slot.size_bytes);
         let original = self.source_original_size(source_index);
-
-        let mut size = slot.size_bytes;
-        if used > size {
-            if used <= max_contiguous_free(target, slot.offset_bytes, slot.size_bytes) {
-                size = align_up(used, self.align_bytes);
-            } else {
-                self.dialog_message = Some(format!(
-                    "Not enough free space to restore partition {source_index} ({used} bytes used)."
-                ));
-                return;
-            }
+        if original == 0 {
+            return DropFit::TooSmall;
         }
+        if original <= avail {
+            return DropFit::Fits(original);
+        }
+        let can_shrink = self
+            .source_disk
+            .partitions
+            .iter()
+            .find(|p| p.index == source_index)
+            .map(|p| partition_allows_resize(p.fs_kind))
+            .unwrap_or(false);
+        if can_shrink && align_up(self.source_used_bytes(source_index), self.align_bytes) <= avail {
+            DropFit::Shrinks(avail)
+        } else {
+            DropFit::TooSmall
+        }
+    }
 
+    /// Drop `source_index` onto slot `target_part`, replacing it: same start
+    /// offset, size per [`Self::drop_fit`]. Returns false if the drop refused.
+    pub fn apply_drop(&mut self, source_index: u32, view: &DiskInfo, target_part: u32) -> bool {
+        let size = match self.drop_fit(source_index, view, target_part) {
+            DropFit::Fits(s) | DropFit::Shrinks(s) => s,
+            DropFit::TooSmall => return false,
+        };
+        let Some(slot) = view.partitions.iter().find(|p| p.index == target_part) else {
+            return false;
+        };
         self.assignments.insert(
             target_part,
             TargetAssignment {
                 source_index,
                 offset_bytes: slot.offset_bytes,
                 size_bytes: size,
-                source_used_bytes: used,
-                source_original_size: original,
+                source_used_bytes: self.source_used_bytes(source_index),
+                source_original_size: self.source_original_size(source_index),
             },
         );
+        true
     }
 
-    pub fn assignment_label(&self, slot: u32, target: &DiskInfo) -> Option<String> {
+    pub fn assignment_label(&self, slot: u32) -> Option<String> {
         let a = self.assignments.get(&slot)?;
         let src = self
             .source_disk
             .partitions
             .iter()
             .find(|p| p.index == a.source_index)?;
-        let src_title = partition_title(src);
-        if self.full_disk {
-            return Some(src_title);
-        }
-        let tgt = target.partitions.iter().find(|p| p.index == slot)?;
-        Some(format!("← {src_title} on {}", partition_title(tgt)))
+        Some(partition_title(src))
     }
 
     /// Full-disk restore preview: planned offsets/sizes with source partition labels and FS types.
@@ -337,82 +372,93 @@ impl RestoreLayoutState {
         });
     }
 
-    pub fn update_drag(&mut self, layout_disk: &DiskInfo, pointer_offset: u64) {
+    /// Advance the active move/resize drag. `pointer_offset` is the pointer's
+    /// byte position on the disk; `snap_bytes` is the resize snap window
+    /// (roughly a dozen pixels worth of bytes — 0 disables snapping).
+    pub fn update_drag(&mut self, layout_disk: &DiskInfo, pointer_offset: u64, snap_bytes: u64) {
         let Some(drag) = self.drag.clone() else {
             return;
         };
+        let part = drag.target_part();
+        let Some(a) = self.assignments.get(&part).cloned() else {
+            return;
+        };
+
+        // Every other slot in the view blocks us — including unmapped target
+        // partitions, which the old overlap check ignored entirely.
+        let mut obstacles: Vec<(u64, u64)> = layout_disk
+            .partitions
+            .iter()
+            .filter(|p| p.index != part)
+            .map(|p| (p.offset_bytes, p.offset_bytes + p.size_bytes))
+            .collect();
+        obstacles.sort_unstable();
+        // A GPT disk's final 33 LBAs hold the backup header + entry array —
+        // nothing may grow or move into them.
+        let disk_end = if layout_disk.is_gpt {
+            layout_disk
+                .size_bytes
+                .saturating_sub(33 * u64::from(layout_disk.sector_size.max(512)))
+        } else {
+            layout_disk.size_bytes
+        };
+        let min_size = align_up(a.source_used_bytes, self.align_bytes).max(self.align_bytes);
+
         match drag {
             LayoutDrag::MoveBody {
-                target_part,
                 grab_offset_in_part,
+                ..
             } => {
-                let new_offset = align_up(
-                    pointer_offset.saturating_sub(grab_offset_in_part),
+                let desired = pointer_offset.saturating_sub(grab_offset_in_part);
+                if let Some(new_offset) = move_candidate(
+                    &obstacles,
+                    disk_end,
+                    a.offset_bytes,
+                    a.size_bytes,
+                    pointer_offset,
+                    desired,
                     self.align_bytes,
-                );
-                let size = self
-                    .assignments
-                    .get(&target_part)
-                    .map(|a| a.size_bytes)
-                    .unwrap_or(0);
-                if size > 0
-                    && new_offset.saturating_add(size) <= layout_disk.size_bytes
-                    && !overlaps_assignments(
-                        &self.assignments,
-                        target_part,
-                        new_offset,
-                        size,
-                        layout_disk.size_bytes,
-                    )
-                {
-                    if let Some(a) = self.assignments.get_mut(&target_part) {
-                        a.offset_bytes = new_offset;
+                ) {
+                    if let Some(slot) = self.assignments.get_mut(&part) {
+                        slot.offset_bytes = new_offset;
                     }
                 }
             }
-            LayoutDrag::ResizeLeft { target_part } => {
-                if let Some(a) = self.assignments.get(&target_part).cloned() {
-                    let fs = self.target_partition_fs(layout_disk, target_part);
-                    if !partition_allows_resize(fs) {
-                        return;
-                    }
-                    let new_offset = align_up(pointer_offset, self.align_bytes);
-                    let end = a.offset_bytes + a.size_bytes;
-                    if new_offset < end {
-                        let new_size = end - new_offset;
-                        if new_size >= a.source_used_bytes {
-                            if let Some(slot) = self.assignments.get_mut(&target_part) {
-                                slot.offset_bytes = new_offset;
-                                slot.size_bytes = new_size;
-                            }
-                        }
+            LayoutDrag::ResizeLeft { .. } => {
+                if !partition_allows_resize(self.target_partition_fs(layout_disk, part)) {
+                    return;
+                }
+                let end = a.offset_bytes + a.size_bytes;
+                if let Some(new_offset) = resize_left_candidate(
+                    &obstacles,
+                    a.offset_bytes,
+                    end,
+                    min_size,
+                    pointer_offset,
+                    snap_bytes,
+                    self.align_bytes,
+                ) {
+                    if let Some(slot) = self.assignments.get_mut(&part) {
+                        slot.offset_bytes = new_offset;
+                        slot.size_bytes = end - new_offset;
                     }
                 }
             }
-            LayoutDrag::ResizeRight { target_part } => {
-                if let Some(a) = self.assignments.get(&target_part).cloned() {
-                    let fs = self.target_partition_fs(layout_disk, target_part);
-                    if !partition_allows_resize(fs) {
-                        return;
-                    }
-                    let new_end = align_up(pointer_offset, self.align_bytes);
-                    if new_end > a.offset_bytes {
-                        let new_size = new_end - a.offset_bytes;
-                        let offset = a.offset_bytes;
-                        if new_size >= a.source_used_bytes
-                            && offset.saturating_add(new_size) <= layout_disk.size_bytes
-                            && !overlaps_assignments(
-                                &self.assignments,
-                                target_part,
-                                offset,
-                                new_size,
-                                layout_disk.size_bytes,
-                            )
-                        {
-                            if let Some(slot) = self.assignments.get_mut(&target_part) {
-                                slot.size_bytes = new_size;
-                            }
-                        }
+            LayoutDrag::ResizeRight { .. } => {
+                if !partition_allows_resize(self.target_partition_fs(layout_disk, part)) {
+                    return;
+                }
+                if let Some(new_end) = resize_right_candidate(
+                    &obstacles,
+                    disk_end,
+                    a.offset_bytes,
+                    min_size,
+                    pointer_offset,
+                    snap_bytes,
+                    self.align_bytes,
+                ) {
+                    if let Some(slot) = self.assignments.get_mut(&part) {
+                        slot.size_bytes = new_end - a.offset_bytes;
                     }
                 }
             }
@@ -456,16 +502,19 @@ impl RestoreLayoutState {
         }
         // Never below the used data; align like the drag path.
         let new_size = align_up(new_size.max(a.source_used_bytes), self.align_bytes);
-        if a.offset_bytes.saturating_add(new_size) > layout_disk.size_bytes {
+        let end = a.offset_bytes.saturating_add(new_size);
+        if end > layout_disk.size_bytes {
             return Err("size runs past the end of the target disk".into());
         }
-        if overlaps_assignments(
-            &self.assignments,
-            target_part,
-            a.offset_bytes,
-            new_size,
-            layout_disk.size_bytes,
-        ) {
+        // Next slot in the view — mapped or not — bounds the growth.
+        let next_start = layout_disk
+            .partitions
+            .iter()
+            .filter(|p| p.index != target_part && p.offset_bytes >= a.offset_bytes)
+            .map(|p| p.offset_bytes)
+            .min()
+            .unwrap_or(layout_disk.size_bytes);
+        if end > next_start {
             return Err("size would overlap the next partition".into());
         }
         if let Some(slot) = self.assignments.get_mut(&target_part) {
@@ -484,44 +533,17 @@ pub fn partition_title(p: &PartitionInfo) -> String {
     }
 }
 
-fn max_contiguous_free(target: &DiskInfo, offset: u64, size: u64) -> u64 {
-    let end = offset + size;
-    let mut free = size;
-    for p in &target.partitions {
-        if p.offset_bytes >= end {
-            break;
-        }
-        if p.offset_bytes + p.size_bytes <= offset {
-            continue;
-        }
-        // overlapping — not truly free
-        if p.offset_bytes < end && p.offset_bytes + p.size_bytes > offset {
-            return size;
-        }
-    }
-    let tail = target.size_bytes.saturating_sub(end);
-    free = free.saturating_add(tail);
-    free
-}
-
-fn overlaps_assignments(
-    assignments: &HashMap<u32, TargetAssignment>,
-    skip: u32,
-    offset: u64,
-    size: u64,
-    disk_size: u64,
-) -> bool {
-    let end = offset.saturating_add(size);
-    if end > disk_size {
-        return true;
-    }
-    assignments.iter().any(|(slot, a)| {
-        if *slot == skip {
-            return false;
-        }
-        let a_end = a.offset_bytes.saturating_add(a.size_bytes);
-        offset < a_end && end > a.offset_bytes
-    })
+/// Contiguous unallocated bytes in `view` starting at `end` — 0 if another
+/// slot begins right there.
+fn gap_after(view: &DiskInfo, end: u64) -> u64 {
+    view.partitions
+        .iter()
+        .map(|p| p.offset_bytes)
+        .filter(|&o| o >= end)
+        .min()
+        .unwrap_or(view.size_bytes)
+        .max(end)
+        - end
 }
 
 fn fs_kind_for_entry(reader: &PhnxReader, e: &PartitionIndexEntry) -> FilesystemKind {
@@ -537,12 +559,37 @@ fn fs_kind_for_entry(reader: &PhnxReader, e: &PartitionIndexEntry) -> Filesystem
         .unwrap_or(FilesystemKind::Unknown)
 }
 
+/// Partial-mode preview of the target disk: mapped slots take their planned
+/// geometry AND the source partition's identity (label, filesystem, usage), so
+/// the map reads as "this is what will replace that" rather than a relabelled
+/// target partition.
 pub fn synthetic_target_view(target: &DiskInfo, layout: &RestoreLayoutState) -> DiskInfo {
     let mut disk = target.clone();
     for part in &mut disk.partitions {
         if let Some(a) = layout.assignments.get(&part.index) {
             part.offset_bytes = a.offset_bytes;
             part.size_bytes = a.size_bytes;
+            if let Some(src) = layout
+                .source_disk
+                .partitions
+                .iter()
+                .find(|p| p.index == a.source_index)
+            {
+                part.name = src.name.clone();
+                part.type_guid = src.type_guid;
+                part.gpt_attributes = src.gpt_attributes;
+                part.fs_kind = src.fs_kind;
+                part.capture_mode = src.capture_mode;
+                part.bitlocker = src.bitlocker;
+                part.unique_guid = src.unique_guid;
+                part.volume_path = None;
+                part.drive_letter = src.drive_letter;
+                part.volume_label = src.volume_label.clone();
+                part.usage = Some(PartitionUsage {
+                    total_bytes: a.size_bytes,
+                    free_bytes: a.size_bytes.saturating_sub(a.source_used_bytes),
+                });
+            }
         }
     }
     disk.partitions.sort_by_key(|p| p.offset_bytes);

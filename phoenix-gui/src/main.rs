@@ -1349,6 +1349,9 @@ impl PhoenixApp {
                         egui::RichText::new("Partition sizes").color(self.palette.subtle_text),
                     );
                     let align = layout.align_bytes;
+                    // Overlap checks must see planned (not on-disk) geometry
+                    // for mapped neighbours.
+                    let view = restore_layout::synthetic_target_view(&target, layout);
                     let mut rows: Vec<(u32, u64, u64, u64)> = layout
                         .assignments
                         .iter()
@@ -1365,7 +1368,7 @@ impl PhoenixApp {
                                 let min = align_up_local(used, align);
                                 ui.label(
                                     layout
-                                        .assignment_label(slot, &target)
+                                        .assignment_label(slot)
                                         .unwrap_or_else(|| format!("Partition {slot}")),
                                 );
                                 let mut gib = size as f64 / GIB;
@@ -1378,7 +1381,7 @@ impl PhoenixApp {
                                 if resp.changed() {
                                     let new_bytes = (gib * GIB) as u64;
                                     if let Err(e) =
-                                        layout.set_partition_size(slot, new_bytes, &target)
+                                        layout.set_partition_size(slot, new_bytes, &view)
                                     {
                                         size_error = Some(e);
                                     }

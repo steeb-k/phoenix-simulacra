@@ -450,6 +450,24 @@ pub fn draw_unallocated_segment(ui: &mut Ui, rect: Rect, length: u64, palette: &
     );
 }
 
+/// Bright multi-stroke halo marking the segment a click or drop would act on.
+/// Painted with the un-clipped painter so the outer strokes can breathe past
+/// the segment rect (the gutters between segments give them the room).
+pub fn draw_segment_glow(ui: &Ui, rect: Rect, color: Color32) {
+    let painter = ui.painter();
+    painter.rect_stroke(rect, Rounding::same(SEGMENT_ROUNDING), Stroke::new(2.0, color));
+    painter.rect_stroke(
+        rect.expand(2.0),
+        Rounding::same(SEGMENT_ROUNDING + 1.0),
+        Stroke::new(2.0, with_alpha(color, 90)),
+    );
+    painter.rect_stroke(
+        rect.expand(4.0),
+        Rounding::same(SEGMENT_ROUNDING + 2.0),
+        Stroke::new(2.0, with_alpha(color, 40)),
+    );
+}
+
 pub fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
