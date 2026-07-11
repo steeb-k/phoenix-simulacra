@@ -227,7 +227,15 @@ mod tests {
         );
         // Snap flush left against the neighbour.
         assert_eq!(
-            resize_left_candidate(obs, 10 * MIB, 30 * MIB, 2 * MIB, 5 * MIB + MIB / 4, snap, MIB),
+            resize_left_candidate(
+                obs,
+                10 * MIB,
+                30 * MIB,
+                2 * MIB,
+                5 * MIB + MIB / 4,
+                snap,
+                MIB
+            ),
             Some(5 * MIB)
         );
         // Dragging past the neighbour clamps — the fix for the old missing

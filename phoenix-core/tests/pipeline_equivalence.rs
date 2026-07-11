@@ -236,7 +236,10 @@ fn parallel_writer_matches_serial_reference() {
     // ---- Full round-trip: verify everything, then byte-compare chunks ----
     reader.verify_all(false).unwrap();
     let sh1 = reader.read_stream_header(&entry1).unwrap();
-    for (chunks, sh) in [(&[&p0e0[..], &p0e1[..]][..], &sh0), (&[&p1e0[..]][..], &sh1)] {
+    for (chunks, sh) in [
+        (&[&p0e0[..], &p0e1[..]][..], &sh0),
+        (&[&p1e0[..]][..], &sh1),
+    ] {
         let all: Vec<&Vec<u8>> = chunks.iter().flat_map(|s| s.iter()).collect();
         for (i, ci) in sh.chunks.clone().iter().enumerate() {
             let data = reader.read_chunk(ci).unwrap();
@@ -410,7 +413,11 @@ fn pipeline_throughput() {
         reader.verify_all(false).unwrap();
         let verify_dt = start.elapsed();
 
-        let label = if workers.is_empty() { "default" } else { workers };
+        let label = if workers.is_empty() {
+            "default"
+        } else {
+            workers
+        };
         println!(
             "workers={label}: write {mb} MiB in {write_dt:?} ({:.0} MB/s), full verify in {verify_dt:?} ({:.0} MB/s)",
             mb as f64 / write_dt.as_secs_f64(),

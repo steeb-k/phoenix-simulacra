@@ -192,13 +192,17 @@ fn restore_raw_parallel_roundtrips_and_stays_in_bounds() {
             .open(&phnx_path)
             .unwrap();
         // Flip a byte in the middle of chunk 1's compressed payload.
-        f.seek(SeekFrom::Start(ci.file_offset + ci.compressed_len as u64 / 2))
-            .unwrap();
+        f.seek(SeekFrom::Start(
+            ci.file_offset + ci.compressed_len as u64 / 2,
+        ))
+        .unwrap();
         let mut b = [0u8; 1];
         use std::io::Read;
         f.read_exact(&mut b).unwrap();
-        f.seek(SeekFrom::Start(ci.file_offset + ci.compressed_len as u64 / 2))
-            .unwrap();
+        f.seek(SeekFrom::Start(
+            ci.file_offset + ci.compressed_len as u64 / 2,
+        ))
+        .unwrap();
         f.write_all(&[b[0] ^ 0xFF]).unwrap();
     }
     let mut reader = PhnxReader::open(&phnx_path).unwrap();

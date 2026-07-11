@@ -247,7 +247,11 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             // none, so derive a non-zero one rather than leaving 0 for
             // Windows to squat a collision dialog on.
             let sig = (reader.header.disk_signature & 0xFFFF_FFFF) as u32;
-            let sig = if sig != 0 { sig } else { fallback_mbr_signature() };
+            let sig = if sig != 0 {
+                sig
+            } else {
+                fallback_mbr_signature()
+            };
             init_target_disk_as_mbr(&disk.path, sig)?;
         }
         None

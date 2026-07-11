@@ -208,7 +208,11 @@ fn draw_layout_toolbar(
 /// when disabled. Returns true on click.
 fn toolbar_button(ui: &mut Ui, palette: &Palette, icon: &str, tip: &str, enabled: bool) -> bool {
     let size = Vec2::splat(TOOLBAR_BTN);
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     let hovered = enabled && response.hovered();

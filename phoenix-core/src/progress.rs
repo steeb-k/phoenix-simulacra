@@ -6,7 +6,12 @@ use std::sync::{Arc, Mutex};
 pub fn format_elapsed(secs: f64) -> String {
     let whole = secs.max(0.0) as u64;
     if whole >= 3600 {
-        format!("{}h {:02}m {:02}s", whole / 3600, (whole % 3600) / 60, whole % 60)
+        format!(
+            "{}h {:02}m {:02}s",
+            whole / 3600,
+            (whole % 3600) / 60,
+            whole % 60
+        )
     } else if whole >= 60 {
         format!("{}m {:02}s", whole / 60, whole % 60)
     } else {

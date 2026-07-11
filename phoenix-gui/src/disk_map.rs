@@ -475,7 +475,11 @@ pub fn draw_unallocated_segment(ui: &mut Ui, rect: Rect, length: u64, palette: &
 /// the segment rect (the gutters between segments give them the room).
 pub fn draw_segment_glow(ui: &Ui, rect: Rect, color: Color32) {
     let painter = ui.painter();
-    painter.rect_stroke(rect, Rounding::same(SEGMENT_ROUNDING), Stroke::new(2.0, color));
+    painter.rect_stroke(
+        rect,
+        Rounding::same(SEGMENT_ROUNDING),
+        Stroke::new(2.0, color),
+    );
     painter.rect_stroke(
         rect.expand(2.0),
         Rounding::same(SEGMENT_ROUNDING + 1.0),

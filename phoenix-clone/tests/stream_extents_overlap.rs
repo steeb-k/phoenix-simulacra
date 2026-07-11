@@ -44,8 +44,7 @@ fn source_image() -> Vec<u8> {
 }
 
 fn target_file(len: usize) -> (std::path::PathBuf, PartitionWriter) {
-    let path =
-        std::env::temp_dir().join(format!("clone-overlap-{}.img", Uuid::new_v4().simple()));
+    let path = std::env::temp_dir().join(format!("clone-overlap-{}.img", Uuid::new_v4().simple()));
     std::fs::write(&path, vec![0x5Au8; len]).unwrap();
     let writer = PartitionWriter::open_disk(path.to_str().unwrap(), 0, 512).unwrap();
     (path, writer)
@@ -70,8 +69,15 @@ fn stream_extents_copies_only_extent_bytes() {
     for verify in [CloneVerify::None, CloneVerify::ReadBack] {
         let mut src = MemoryBlockSource::new(img.clone());
         let (path, mut writer) = target_file(img.len());
-        let copied =
-            stream_extents(&mut src, &mut writer, &extents, None, &opts(verify, None), 0).unwrap();
+        let copied = stream_extents(
+            &mut src,
+            &mut writer,
+            &extents,
+            None,
+            &opts(verify, None),
+            0,
+        )
+        .unwrap();
         drop(writer);
 
         let mut expected_total = 0u64;

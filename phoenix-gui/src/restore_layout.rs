@@ -320,8 +320,7 @@ impl RestoreLayoutState {
             .find(|p| p.index == source_index)
             .map(|p| partition_allows_resize(p.fs_kind))
             .unwrap_or(false);
-        if can_shrink && align_up(self.source_used_bytes(source_index), self.align_bytes) <= avail
-        {
+        if can_shrink && align_up(self.source_used_bytes(source_index), self.align_bytes) <= avail {
             DropFit::Shrinks(avail)
         } else {
             DropFit::TooSmall

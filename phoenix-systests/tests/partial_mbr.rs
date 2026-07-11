@@ -52,8 +52,10 @@ fn backup_mbr_disk(source_mb: u64, seed: u64) -> (PathBuf, FixtureDigest, u32, u
         .unwrap();
     let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
 
-    let backup_path =
-        std::env::temp_dir().join(format!("partial-mbr-{}.phnx", uuid::Uuid::new_v4().simple()));
+    let backup_path = std::env::temp_dir().join(format!(
+        "partial-mbr-{}.phnx",
+        uuid::Uuid::new_v4().simple()
+    ));
     run_backup(BackupOptions {
         disk_index: source.disk_index(),
         partition_indices: parts,

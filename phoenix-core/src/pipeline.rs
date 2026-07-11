@@ -394,10 +394,9 @@ where
     let total = items.len();
 
     std::thread::scope(|scope| -> Result<()> {
-        let (job_tx, job_rx) =
-            sync_channel::<std::result::Result<(usize, DecodeItem, Vec<u8>), PhoenixError>>(
-                workers * 2,
-            );
+        let (job_tx, job_rx) = sync_channel::<
+            std::result::Result<(usize, DecodeItem, Vec<u8>), PhoenixError>,
+        >(workers * 2);
         let (done_tx, done_rx) =
             sync_channel::<std::result::Result<(usize, Vec<u8>), PhoenixError>>(workers * 2);
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -495,7 +494,9 @@ mod tests {
         let mut offset = 0u64;
         for i in 0..40u32 {
             let len = 1000 + (i as usize * 37) % 5000;
-            let data: Vec<u8> = (0..len).map(|j| ((i as usize * 31 + j * 7) % 251) as u8).collect();
+            let data: Vec<u8> = (0..len)
+                .map(|j| ((i as usize * 31 + j * 7) % 251) as u8)
+                .collect();
             let compressed = compress_chunk(&data).unwrap();
             file.write_all(&compressed).unwrap();
             items.push(DecodeItem {

@@ -112,10 +112,8 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
 
                 let cancel = ui.add_sized(
                     button,
-                    egui::Button::new(
-                        RichText::new(view.cancel_label).color(palette.icon_color),
-                    )
-                    .fill(ui.visuals().widgets.inactive.bg_fill),
+                    egui::Button::new(RichText::new(view.cancel_label).color(palette.icon_color))
+                        .fill(ui.visuals().widgets.inactive.bg_fill),
                 );
                 if cancel.clicked() {
                     action = ConfirmAction::Cancel;

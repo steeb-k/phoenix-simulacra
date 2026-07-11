@@ -755,7 +755,11 @@ impl PhnxReader {
     /// the calling thread. Restore uses this so its raw-disk writes stay on
     /// the calling thread; the full-verify tier uses it with a bookkeeping
     /// closure.
-    pub fn process_chunks<F>(&self, items: &[crate::pipeline::DecodeItem], on_chunk: F) -> Result<()>
+    pub fn process_chunks<F>(
+        &self,
+        items: &[crate::pipeline::DecodeItem],
+        on_chunk: F,
+    ) -> Result<()>
     where
         F: FnMut(usize, Vec<u8>) -> Result<()>,
     {
