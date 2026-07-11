@@ -173,8 +173,11 @@ fn volume_disk_extent(guid_path: &[u16]) -> Option<(u32, u64)> {
     if handle == INVALID_HANDLE_VALUE {
         return None;
     }
-    // Room for a few extents; our volumes have exactly one.
-    let mut buf = [0u8; 512];
+    // Room for a few extents; our volumes have exactly one. u64-aligned
+    // because VOLUME_DISK_EXTENTS needs 8-byte alignment — casting a stack
+    // byte buffer here is a misaligned dereference (a non-unwinding panic,
+    // i.e. an abort, in debug builds).
+    let mut buf = [0u64; 64];
     let mut returned = 0u32;
     let ok = unsafe {
         DeviceIoControl(
@@ -183,7 +186,7 @@ fn volume_disk_extent(guid_path: &[u16]) -> Option<(u32, u64)> {
             std::ptr::null(),
             0,
             buf.as_mut_ptr() as *mut _,
-            buf.len() as u32,
+            std::mem::size_of_val(&buf) as u32,
             &mut returned,
             std::ptr::null_mut(),
         )
@@ -219,4 +222,26 @@ fn assign_free_letter(guid_path: &[u16]) -> Result<char> {
     Err(PhoenixError::Disk(
         "no free drive letter available to expose the mounted volume".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Volume enumeration + extent queries are read-only and need no
+    /// elevation, so this exercises the FFI paths (buffer alignment, string
+    /// handling) against the real system volumes. Regression test for the
+    /// misaligned `VOLUME_DISK_EXTENTS` cast that panicked debug builds.
+    #[test]
+    fn enumerate_system_volumes_does_not_panic() {
+        // Disk 0 always exists; whether volumes match doesn't matter — we're
+        // proving the query path is sound for every volume on the system.
+        let vols = volumes_on_disk(0);
+        for v in &vols {
+            assert!(
+                v.guid_path.ends_with(&[0]),
+                "guid path must be NUL-terminated"
+            );
+        }
+    }
 }
