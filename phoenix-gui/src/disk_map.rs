@@ -497,13 +497,80 @@ pub fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
-/// Map a horizontal pixel position inside `map_rect` to a byte offset on the disk.
-pub fn pixel_to_disk_offset(map_rect: Rect, disk_size_bytes: u64, x: f32) -> u64 {
-    if map_rect.width() <= 0.0 || disk_size_bytes == 0 {
-        return 0;
+/// Piecewise pixel↔byte mapping matching the rendered segment layout.
+///
+/// Segments are NOT drawn proportionally — small partitions get log-scaled
+/// minimum widths and huge unallocated spans absorb the squeeze — so a
+/// linear `x / width × disk_size` mapping makes the cursor and a dragged
+/// slice move at wildly different speeds on big disks. This mirrors the
+/// exact per-segment rects the renderer produced, so a pointer position
+/// converts to the byte the user is visually pointing at.
+#[derive(Clone, Debug)]
+pub struct MapScale {
+    /// (byte_start, byte_len, px_start, px_len), in visual order.
+    spans: Vec<(u64, u64, f32, f32)>,
+    disk_size: u64,
+}
+
+pub fn compute_map_scale(rect: Rect, disk: &DiskInfo) -> MapScale {
+    let segments = build_segments(disk);
+    let total_units: u64 = segments.iter().map(segment_length).sum();
+    let total_gutter = SEGMENT_GUTTER * (segments.len().saturating_sub(1) as f32);
+    let usable_width = (rect.width() - total_gutter).max(0.0);
+    let widths = compute_segment_widths(&segments, usable_width, total_units.max(1));
+
+    let mut spans = Vec::with_capacity(segments.len());
+    let mut x = rect.left();
+    for (seg, w) in segments.iter().zip(widths.iter()) {
+        let (byte_start, byte_len) = match seg {
+            SegmentKind::Partition(p) => (p.offset_bytes, p.size_bytes),
+            SegmentKind::Unallocated { offset, length } => (*offset, *length),
+        };
+        spans.push((byte_start, byte_len, x, *w));
+        x += *w + SEGMENT_GUTTER;
     }
-    let frac = ((x - map_rect.left()) / map_rect.width()).clamp(0.0, 1.0);
-    (frac as f64 * disk_size_bytes as f64) as u64
+    MapScale {
+        spans,
+        disk_size: disk.size_bytes,
+    }
+}
+
+impl MapScale {
+    /// The disk byte visually under pixel `x`. Gutters (and the sub-4MiB
+    /// byte gaps they hide) resolve to the next segment's start; outside the
+    /// map clamps to the disk ends.
+    pub fn x_to_offset(&self, x: f32) -> u64 {
+        for &(byte_start, byte_len, px_start, px_len) in &self.spans {
+            if x < px_start {
+                return byte_start;
+            }
+            if x < px_start + px_len {
+                let frac = ((x - px_start) / px_len.max(0.5)) as f64;
+                return byte_start + (frac * byte_len as f64) as u64;
+            }
+        }
+        self.disk_size
+    }
+
+    /// Local bytes-per-pixel around `x` — the scale of the segment under the
+    /// cursor, for converting pixel thresholds (snap windows) into bytes.
+    pub fn bytes_per_px_at(&self, x: f32) -> f64 {
+        let mut nearest: Option<(f32, f64)> = None;
+        for &(_, byte_len, px_start, px_len) in &self.spans {
+            let ratio = byte_len as f64 / px_len.max(0.5) as f64;
+            let dist = if x < px_start {
+                px_start - x
+            } else if x > px_start + px_len {
+                x - (px_start + px_len)
+            } else {
+                return ratio;
+            };
+            if nearest.map(|(d, _)| dist < d).unwrap_or(true) {
+                nearest = Some((dist, ratio));
+            }
+        }
+        nearest.map(|(_, r)| r).unwrap_or(0.0)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

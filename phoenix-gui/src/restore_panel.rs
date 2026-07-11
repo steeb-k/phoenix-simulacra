@@ -5,11 +5,12 @@ use egui::{Align2, CursorIcon, Rect, Rounding, Sense, Ui, Vec2};
 
 use phoenix_core::disk::{DiskInfo, PartitionInfo};
 
+use std::sync::Arc;
+
 use crate::disk_map::{
     self, draw_disk_info_card, draw_partition_map, draw_partition_map_segments,
-    draw_partition_segment_visual_styled, pixel_to_disk_offset, SegmentKind,
-    CHECKBOX_COLUMN_WIDTH, CHECKBOX_GAP, INFO_CARD_GAP, INFO_CARD_WIDTH, ROW_HEIGHT,
-    ROW_VERTICAL_GAP,
+    draw_partition_segment_visual_styled, MapScale, SegmentKind, CHECKBOX_COLUMN_WIDTH,
+    CHECKBOX_GAP, INFO_CARD_GAP, INFO_CARD_WIDTH, ROW_HEIGHT, ROW_VERTICAL_GAP,
 };
 use crate::fonts;
 use crate::restore_layout::{DropFit, LayoutDrag, RestoreLayoutState};
@@ -24,6 +25,27 @@ const TOOLBAR_BTN: f32 = 30.0;
 
 fn drag_source_id() -> egui::Id {
     egui::Id::new("restore_drag_source")
+}
+
+/// Pixel↔byte mapping frozen at the start of a move/resize gesture. Using
+/// the live per-frame mapping would let the layout shift under the cursor
+/// mid-drag (segments re-flow as the slice moves) and feed back into the
+/// conversion; freezing keeps one monotone cursor→byte function per gesture.
+fn gesture_scale_id() -> egui::Id {
+    egui::Id::new("restore_gesture_scale")
+}
+
+fn freeze_gesture_scale(ctx: &egui::Context, scale: &Arc<MapScale>) {
+    ctx.data_mut(|d| d.insert_temp(gesture_scale_id(), scale.clone()));
+}
+
+fn gesture_scale(ctx: &egui::Context, live: &Arc<MapScale>) -> Arc<MapScale> {
+    ctx.data(|d| d.get_temp::<Arc<MapScale>>(gesture_scale_id()))
+        .unwrap_or_else(|| live.clone())
+}
+
+fn clear_gesture_scale(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<Arc<MapScale>>(gesture_scale_id()));
 }
 
 /// The source partition index of the drag in flight, if any.
@@ -362,9 +384,9 @@ fn draw_target_row(
     );
 
     let dragging_source = active_drag(ui.ctx());
-    // The resize snap window (~12 px) expressed in disk bytes.
-    let snap_bytes =
-        (SNAP_PX as f64 / map_rect.width().max(1.0) as f64 * view.size_bytes as f64) as u64;
+    // Pixel↔byte mapping for THIS frame's rendered layout; gestures freeze a
+    // copy at drag start so cursor motion stays 1:1 with the slice.
+    let live_scale = Arc::new(disk_map::compute_map_scale(map_rect, view));
 
     draw_partition_map_segments(ui, map_rect, view, palette, |ui, seg, seg_rect| {
         let p = match seg {
@@ -442,19 +464,23 @@ fn draw_target_row(
 
         if move_body.drag_started() && assigned {
             if let Some(pos) = move_body.interact_pointer_pos() {
-                let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
+                freeze_gesture_scale(ui.ctx(), &live_scale);
+                let off = live_scale.x_to_offset(pos.x);
                 layout.begin_move(part, off);
             }
         }
         if move_body.dragged() && layout.drag.is_some() {
             if let Some(pos) = move_body.interact_pointer_pos() {
-                let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
-                layout.update_drag(off, snap_bytes);
+                let scale = gesture_scale(ui.ctx(), &live_scale);
+                let off = scale.x_to_offset(pos.x);
+                let snap = (SNAP_PX as f64 * scale.bytes_per_px_at(pos.x)) as u64;
+                layout.update_drag(off, snap);
                 changed = true;
             }
         }
         if move_body.drag_stopped() {
             layout.end_drag();
+            clear_gesture_scale(ui.ctx());
         }
 
         let mut edge_hovered = false;
@@ -471,9 +497,11 @@ fn draw_target_row(
             let r = ui.interact(right, id.with("r"), Sense::drag());
             edge_hovered = l.hovered() || r.hovered();
             if l.drag_started() {
+                freeze_gesture_scale(ui.ctx(), &live_scale);
                 layout.begin_resize(part, true);
             }
             if r.drag_started() {
+                freeze_gesture_scale(ui.ctx(), &live_scale);
                 layout.begin_resize(part, false);
             }
             if l.dragged() || r.dragged() {
@@ -481,13 +509,16 @@ fn draw_target_row(
                     .interact_pointer_pos()
                     .or_else(|| r.interact_pointer_pos())
                 {
-                    let off = pixel_to_disk_offset(map_rect, view.size_bytes, pos.x);
-                    layout.update_drag(off, snap_bytes);
+                    let scale = gesture_scale(ui.ctx(), &live_scale);
+                    let off = scale.x_to_offset(pos.x);
+                    let snap = (SNAP_PX as f64 * scale.bytes_per_px_at(pos.x)) as u64;
+                    layout.update_drag(off, snap);
                     changed = true;
                 }
             }
             if l.drag_stopped() || r.drag_stopped() {
                 layout.end_drag();
+                clear_gesture_scale(ui.ctx());
             }
         }
 
