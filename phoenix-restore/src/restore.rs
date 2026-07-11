@@ -349,8 +349,12 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         // mounted and there is nothing to clear. `volume_path` is populated by
         // `enumerate_disks` (drive-letter or `\\?\Volume{GUID}` device); `None`
         // means the slot is already unmounted (raw/empty or a prior restore
-        // left it dismounted) and needs no guard.
-        if mode == RestoreMode::Partial {
+        // left it dismounted) and needs no guard. A table REINIT behaves like
+        // full-disk here: PHASE 1 already wiped the partition table, so the
+        // pre-init volume snapshot is stale (locking a vanished volume fails
+        // with ERROR_NOT_READY) and a fresh slot index can coincidentally
+        // match a partition of the destroyed table — skip the guard entirely.
+        if mode == RestoreMode::Partial && !reinit {
             if let Some(vol) = disk
                 .partitions
                 .iter()
