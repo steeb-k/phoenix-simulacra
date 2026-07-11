@@ -565,21 +565,6 @@ impl RestoreLayoutState {
         self.slots.iter().any(|s| s.source.is_some())
     }
 
-    /// Rows for the numeric size editor: (slot id, size, used, offset),
-    /// sorted by offset. Mapped slots only.
-    pub fn size_editor_rows(&self) -> Vec<(u32, u64, u64, u64)> {
-        let mut rows: Vec<(u32, u64, u64, u64)> = self
-            .slots
-            .iter()
-            .filter_map(|s| {
-                let src = s.source.as_ref()?;
-                Some((s.id, s.size_bytes, src.used_bytes, s.offset_bytes))
-            })
-            .collect();
-        rows.sort_by_key(|r| r.3);
-        rows
-    }
-
     pub fn begin_move(&mut self, slot_id: u32, pointer_offset: u64) {
         if let Some(s) = self.slot(slot_id) {
             let grab = pointer_offset.saturating_sub(s.offset_bytes);
@@ -704,46 +689,6 @@ impl RestoreLayoutState {
 
     pub fn end_drag(&mut self) {
         self.drag = None;
-    }
-
-    /// Set a mapped slot's size numerically (a right-edge resize keeping the
-    /// offset fixed). Same constraints as the drag path; returns a
-    /// human-readable error if the size is invalid.
-    pub fn set_partition_size(
-        &mut self,
-        slot_id: u32,
-        new_size: u64,
-    ) -> std::result::Result<(), String> {
-        let slot = self
-            .slot(slot_id)
-            .cloned()
-            .ok_or_else(|| "partition is not in the layout".to_string())?;
-        let Some(src) = slot.source.clone() else {
-            return Err("only mapped partitions can be resized".into());
-        };
-        if !partition_allows_resize(self.slot_fs(&slot)) {
-            return Err("this filesystem can't be resized (only NTFS/FAT/exFAT)".into());
-        }
-        // Never below the used data; align like the drag path.
-        let new_size = align_up(new_size.max(src.used_bytes), self.align_bytes);
-        let end = slot.offset_bytes.saturating_add(new_size);
-        if end > self.usable_end() {
-            return Err("size runs past the end of the target disk".into());
-        }
-        let next_start = self
-            .slots
-            .iter()
-            .filter(|s| s.id != slot_id && s.offset_bytes >= slot.offset_bytes)
-            .map(|s| s.offset_bytes)
-            .min()
-            .unwrap_or(self.usable_end());
-        if end > next_start {
-            return Err("size would overlap the next partition".into());
-        }
-        if let Some(s) = self.slot_mut(slot_id) {
-            s.size_bytes = new_size;
-        }
-        Ok(())
     }
 }
 
