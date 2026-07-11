@@ -88,21 +88,60 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     let mode = opts.plan.mode();
     let source_was_gpt = reader.manifest.disk.style.eq_ignore_ascii_case("gpt");
 
+    // Partial-mode table re-initialization: the GUI's layout editor sets
+    // `reinit_style` when the planned layout no longer derives from the
+    // target's current table (blank layout / MBR↔GPT switch). Full-disk mode
+    // re-inits from the source style regardless, so the field is ignored
+    // there.
+    let reinit_style = match opts.plan.reinit_style.as_deref() {
+        None => None,
+        Some(s) if s.eq_ignore_ascii_case("gpt") => Some(true),
+        Some(s) if s.eq_ignore_ascii_case("mbr") => Some(false),
+        Some(other) => {
+            return Err(phoenix_core::error::PhoenixError::Plan(format!(
+                "unknown reinit_style {other:?} (expected \"gpt\" or \"mbr\")"
+            )));
+        }
+    };
+    let reinit = mode == RestoreMode::Partial && reinit_style.is_some();
+    // The style of the table this restore will leave on the disk.
+    let table_is_gpt = if mode == RestoreMode::FullDisk {
+        source_was_gpt
+    } else {
+        reinit_style.unwrap_or(disk.is_gpt)
+    };
+
     // MBR entries are 32-bit sector fields: nothing may extend past ~2 TiB.
     // `default_plan_from_backup` already clamps its layout, but a hand-edited
     // plan.toml can still overshoot — and the failure mode is nasty (the data
     // restore succeeds, then the volume never mounts because the on-disk
-    // table can't represent it), so refuse it up front.
-    if !source_was_gpt {
-        for entry in opts.plan.entries.iter().filter(|e| e.restore) {
+    // table can't represent it), so refuse it up front. Partial mode now
+    // rewrites the whole table, so every entry counts, not just restored
+    // ones — and MBR holds at most four primaries (no extended support).
+    if !table_is_gpt {
+        let counted = if mode == RestoreMode::FullDisk {
+            opts.plan.entries.iter().filter(|e| e.restore).count()
+        } else {
+            opts.plan.entries.len()
+        };
+        if counted > 4 {
+            return Err(phoenix_core::error::PhoenixError::Plan(format!(
+                "{counted} partitions planned, but an MBR table holds at most 4 primary \
+                 partitions (extended partitions aren't supported)"
+            )));
+        }
+        for entry in &opts.plan.entries {
+            if mode == RestoreMode::FullDisk && !entry.restore {
+                continue;
+            }
             let end = entry
                 .target_offset_bytes
                 .saturating_add(entry.target_size_bytes);
             if end > crate::plan::MBR_ADDRESSABLE_BYTES {
                 return Err(phoenix_core::error::PhoenixError::Plan(format!(
                     "partition {} would end at byte {end}, past the ~2 TiB limit MBR's \
-                     32-bit sector fields can address; keep the layout below 2 TiB (the \
-                     source image is MBR) or use a GPT-imaged source for larger targets",
+                     32-bit sector fields can address; keep the layout below 2 TiB or \
+                     use a GPT layout for larger targets",
                     entry.target_partition_index
                 )));
             }
@@ -131,9 +170,12 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             })
             .unwrap_or(false)
     });
-    let needs_init = mode == RestoreMode::FullDisk;
-    let writes_layout = mode == RestoreMode::FullDisk
-        || (mode == RestoreMode::Partial && disk.is_gpt && disk.disk_guid.is_some());
+    let needs_init = mode == RestoreMode::FullDisk || reinit;
+    // Partial mode rewrites the table too now (GPT via the existing disk
+    // GUID, MBR via a fresh full-table write), so the layout step is
+    // unconditional; the only silent skip left is a GPT target whose disk
+    // GUID we couldn't read.
+    let writes_layout = needs_init || mode == RestoreMode::Partial;
 
     let mut steps: Vec<String> = Vec::new();
     steps.push("Preparing restore".to_string());
@@ -177,12 +219,17 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
         p.set_step(0);
     }
 
-    let gpt_state: Option<GptInitState> = if mode == RestoreMode::FullDisk && source_was_gpt {
+    let init_as_gpt = (mode == RestoreMode::FullDisk && source_was_gpt) || (reinit && table_is_gpt);
+    let init_as_mbr =
+        (mode == RestoreMode::FullDisk && !source_was_gpt) || (reinit && !table_is_gpt);
+    let gpt_state: Option<GptInitState> = if init_as_gpt {
         if let Some(ref p) = opts.progress {
             if let Some(step) = init_step {
                 p.set_step(step);
             }
         }
+        // A reinit from an MBR-imaged source has no source GPT disk GUID —
+        // `init_target_disk_as_gpt` generates a fresh one in that case.
         let source_disk_guid = parse_disk_guid(reader.manifest.disk.disk_guid.as_deref());
         Some(init_target_disk_as_gpt(
             &disk.path,
@@ -190,13 +237,17 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             source_disk_guid,
         )?)
     } else {
-        if mode == RestoreMode::FullDisk && !source_was_gpt {
+        if init_as_mbr {
             if let Some(ref p) = opts.progress {
                 if let Some(step) = init_step {
                     p.set_step(step);
                 }
             }
+            // Prefer the imaged disk's signature; a GPT-imaged source has
+            // none, so derive a non-zero one rather than leaving 0 for
+            // Windows to squat a collision dialog on.
             let sig = (reader.header.disk_signature & 0xFFFF_FFFF) as u32;
+            let sig = if sig != 0 { sig } else { fallback_mbr_signature() };
             init_target_disk_as_mbr(&disk.path, sig)?;
         }
         None
@@ -421,6 +472,8 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // fires below is real.
     flush_disk(&disk.path);
     if let Some(state) = gpt_state {
+        // Full-disk GPT restore or a partial reinit-as-GPT: the disk was
+        // freshly initialized in PHASE 1, plant the whole table now.
         if let Some(ref p) = opts.progress {
             if let Some(step) = layout_step {
                 p.set_step(step);
@@ -432,30 +485,53 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             p.set_detail("Notifying Windows of the new partition layout".to_string());
         }
         notify_disk_updated(&disk.path);
-    } else if mode == RestoreMode::FullDisk && !source_was_gpt {
+    } else if init_as_mbr {
+        // Full-disk MBR restore or a partial reinit-as-MBR.
         if let Some(ref p) = opts.progress {
             if let Some(step) = layout_step {
                 p.set_step(step);
             }
         }
-        let mbr_entries = build_mbr_layout_entries(&opts.plan, &reader);
+        let mbr_entries = build_mbr_layout_entries(&opts.plan, &reader, &disk, mode);
         write_mbr_partition_layout(&disk.path, &mbr_entries)?;
         notify_disk_updated(&disk.path);
-    } else if mode == RestoreMode::Partial && disk.is_gpt {
-        if let Some(guid_bytes) = disk.disk_guid {
-            if let Some(ref p) = opts.progress {
-                if let Some(step) = layout_step {
-                    p.set_step(step);
-                }
+    } else if mode == RestoreMode::Partial {
+        // Rewrite the existing table in place. Entries deleted from the plan
+        // simply aren't written — but a deleted partition may still carry a
+        // live mounted volume, and partmgr can refuse (or worse, survive) a
+        // table rewrite underneath one, so lock + dismount those first. The
+        // guards join `locked_target_volumes` and drop right after this
+        // phase.
+        lock_removed_target_volumes(&opts.plan, &disk, &mut locked_target_volumes)?;
+        if let Some(ref p) = opts.progress {
+            if let Some(step) = layout_step {
+                p.set_step(step);
             }
-            let disk_guid = bytes_to_guid(guid_bytes);
-            let gpt_entries = build_gpt_layout_entries(&opts.plan, &reader, &disk, mode);
-            update_partition_layout_existing(
-                &disk.path,
-                &gpt_entries,
-                &disk_guid,
-                disk.size_bytes,
-            )?;
+        }
+        if disk.is_gpt {
+            if let Some(guid_bytes) = disk.disk_guid {
+                let disk_guid = bytes_to_guid(guid_bytes);
+                let gpt_entries = build_gpt_layout_entries(&opts.plan, &reader, &disk, mode);
+                update_partition_layout_existing(
+                    &disk.path,
+                    &gpt_entries,
+                    &disk_guid,
+                    disk.size_bytes,
+                )?;
+                notify_disk_updated(&disk.path);
+            } else {
+                warn!(
+                    "target disk GUID unavailable; leaving the GPT partition table untouched \
+                     (restored data is on disk, but moves/resizes/deletes did not reach the \
+                     table)"
+                );
+            }
+        } else {
+            // MBR partial: `set_drive_layout_mbr` leaves the existing disk
+            // signature alone (Signature = 0 on SET means keep), so this is
+            // a pure entry rewrite, exactly like the GPT arm above.
+            let mbr_entries = build_mbr_layout_entries(&opts.plan, &reader, &disk, mode);
+            write_mbr_partition_layout(&disk.path, &mbr_entries)?;
             notify_disk_updated(&disk.path);
         }
     }
@@ -742,17 +818,29 @@ fn build_gpt_layout_entries(
         .collect()
 }
 
-/// Build the per-partition descriptors for the MBR writer. Only
-/// restored entries participate — `update_partition_layout_existing`'s
-/// non-restored case is GPT-only, since we don't currently support
-/// rewriting an MBR partition table during a partial restore.
+/// Build the per-partition descriptors for the MBR writer.
+///
+/// Full-disk mode writes the restored entries only; partial mode writes
+/// EVERY plan entry (the IOCTL is total-rewrite, so preserved partitions
+/// must be re-described too — same contract as the GPT arm). A preserved
+/// entry's type byte is derived from the live partition's probed
+/// filesystem; that loses exotic type bytes like 0x27 (hidden recovery),
+/// which come back as plain 0x07 — logged, not fatal.
 ///
 /// Maps source [`FilesystemKind`] to the MBR partition-type byte. This
 /// fixes the analogue of the GPT type-GUID bug: previously every MBR
 /// partition got stamped 0x07 (NTFS/IFS) regardless of source, so a
 /// restored FAT or EFI partition would mount wrong (or not at all).
-fn build_mbr_layout_entries(plan: &RestorePlan, reader: &PhnxReader) -> Vec<MbrLayoutEntry> {
-    let restoring: Vec<&RestorePlanEntry> = plan.entries.iter().filter(|e| e.restore).collect();
+fn build_mbr_layout_entries(
+    plan: &RestorePlan,
+    reader: &PhnxReader,
+    target_disk: &DiskInfo,
+    mode: RestoreMode,
+) -> Vec<MbrLayoutEntry> {
+    let restoring: Vec<&RestorePlanEntry> = match mode {
+        RestoreMode::FullDisk => plan.entries.iter().filter(|e| e.restore).collect(),
+        RestoreMode::Partial => plan.entries.iter().collect(),
+    };
     // Pick which entry should carry the bootable flag. The backup
     // format doesn't currently record the active-flag, so this is
     // best-effort: prefer the first NTFS partition; if none, prefer
@@ -782,10 +870,23 @@ fn build_mbr_layout_entries(plan: &RestorePlan, reader: &PhnxReader) -> Vec<MbrL
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let idx_entry = entry
-                .source_partition_index
-                .and_then(|src| reader.index.iter().find(|e| e.index == src));
-            let partition_type = mbr_partition_type_for(idx_entry, entry.target_size_bytes);
+            let partition_type = if entry.restore {
+                let idx_entry = entry
+                    .source_partition_index
+                    .and_then(|src| reader.index.iter().find(|e| e.index == src));
+                mbr_partition_type_for(idx_entry, entry.target_size_bytes)
+            } else {
+                // Preserved partition: re-derive its type byte from the live
+                // partition's probed filesystem (the enumerator doesn't
+                // surface the raw MBR type byte).
+                let live_fs = target_disk
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == entry.target_partition_index)
+                    .map(|p| p.fs_kind)
+                    .unwrap_or(FilesystemKind::Unknown);
+                mbr_type_from_fs(live_fs, entry.target_size_bytes)
+            };
             MbrLayoutEntry {
                 offset_bytes: entry.target_offset_bytes,
                 size_bytes: entry.target_size_bytes,
@@ -794,6 +895,82 @@ fn build_mbr_layout_entries(plan: &RestorePlan, reader: &PhnxReader) -> Vec<MbrL
             }
         })
         .collect()
+}
+
+/// [`mbr_partition_type_for`] for a live target partition's probed
+/// filesystem — used to re-describe preserved partitions when a partial
+/// restore rewrites an MBR table.
+fn mbr_type_from_fs(fs: FilesystemKind, size_bytes: u64) -> u8 {
+    match fs {
+        FilesystemKind::Ntfs | FilesystemKind::Exfat | FilesystemKind::Bitlocker => 0x07,
+        FilesystemKind::Fat => {
+            if size_bytes < 32 * 1024 * 1024 {
+                0x06
+            } else {
+                0x0C
+            }
+        }
+        FilesystemKind::Efi => 0xEF,
+        FilesystemKind::Msr | FilesystemKind::Unknown => {
+            warn!(
+                fs = ?fs,
+                "preserved MBR partition has an ambiguous filesystem; writing type 0x07 (IFS)"
+            );
+            0x07
+        }
+    }
+}
+
+/// Non-zero MBR disk signature for a reinit whose source image carries none
+/// (GPT-imaged sources). Derived from the wall clock — uniqueness matters
+/// (Windows dislikes colliding signatures), reproducibility doesn't.
+fn fallback_mbr_signature() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let sig = (now.as_secs() as u32) ^ now.subsec_nanos();
+    if sig != 0 {
+        sig
+    } else {
+        0x5048_4E58 // "PHNX"
+    }
+}
+
+/// Lock + dismount the volume of every live target partition that has NO
+/// entry in the plan — those partitions are being deleted, and the table
+/// rewrite must not race a mounted volume on them. Guards are pushed into
+/// the caller's list and released after the table write.
+fn lock_removed_target_volumes(
+    plan: &RestorePlan,
+    disk: &DiskInfo,
+    guards: &mut Vec<phoenix_core::disk::LockedVolume>,
+) -> Result<()> {
+    for p in &disk.partitions {
+        if plan
+            .entries
+            .iter()
+            .any(|e| e.target_partition_index == p.index)
+        {
+            continue;
+        }
+        let Some(vol) = p.volume_path.clone() else {
+            continue;
+        };
+        let guard = phoenix_core::disk::LockedVolume::acquire(&vol).map_err(|e| {
+            phoenix_core::error::PhoenixError::Disk(format!(
+                "could not clear the volume {vol} on partition {} before removing it from \
+                 the partition table (close any open files/handles on it and retry): {e}",
+                p.index
+            ))
+        })?;
+        info!(
+            volume = vol.as_str(),
+            partition = p.index,
+            "dismounted volume of a partition being deleted by the restore plan"
+        );
+        guards.push(guard);
+    }
+    Ok(())
 }
 
 /// Map source filesystem kind to MBR partition-type byte. The byte
