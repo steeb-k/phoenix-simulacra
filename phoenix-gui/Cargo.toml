@@ -32,8 +32,12 @@ tracing-appender = "0.2.5"
 winreg = "0.52"
 
 [features]
-# Space-efficient WinFsp on-demand mount. Enable for release builds (needs
-# libclang to build + WinFsp installed/bundled at run time).
+# Space-efficient WinFsp on-demand mount. ON by default so dev builds behave
+# like shipped ones — mounting must never materialize a full-size temp VHD.
+# Needs libclang + the WinFsp SDK to build and WinFsp installed at run time;
+# build with --no-default-features on a machine without them (mount then uses
+# the full-size temp-VHD stopgap).
+default = ["winfsp"]
 winfsp = ["phoenix-mount/winfsp", "dep:winfsp"]
 
 [build-dependencies]

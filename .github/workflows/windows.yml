@@ -33,6 +33,12 @@ jobs:
         with:
           arch: ${{ matrix.msvc_arch }}
 
+      # The GUI/CLI build the winfsp feature by default; its bindgen step reads
+      # the WinFsp SDK headers from the install dir (registry InstallDir) and
+      # uses the runner's preinstalled LLVM for libclang.
+      - name: Install WinFsp (SDK for the winfsp feature)
+        run: choco install winfsp -y
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -91,9 +97,11 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64
+      - name: Install WinFsp (SDK for the winfsp feature)
+        run: choco install winfsp -y
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (system tier, single-threaded)
-        run: cargo test -p phoenix-systests -- --ignored --test-threads=1
+        run: cargo test -p phoenix-systests --features winfsp -- --ignored --test-threads=1
       - name: cargo test (gui, elevated)
         run: cargo test -p phoenix-gui

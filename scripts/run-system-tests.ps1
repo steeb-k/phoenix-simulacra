@@ -41,7 +41,13 @@ if (Test-Path $scratch) {
 }
 
 # --- Run ---------------------------------------------------------------------
-$cargoArgs = @("test", "-p", "phoenix-systests")
+# Build with the winfsp feature so the suite exercises the shipping zero-space
+# mount path (needs libclang + WinFsp installed, same as build-release.ps1).
+if (-not $env:LIBCLANG_PATH) {
+    $llvm = "C:\Program Files\LLVM\bin"
+    if (Test-Path (Join-Path $llvm "libclang.dll")) { $env:LIBCLANG_PATH = $llvm }
+}
+$cargoArgs = @("test", "-p", "phoenix-systests", "--features", "winfsp")
 if ($Test -ne "") { $cargoArgs += $Test }
 $cargoArgs += @("--", "--ignored", "--test-threads=1", "--nocapture")
 $cargoArgs += $Extra

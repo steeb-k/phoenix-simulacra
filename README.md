@@ -24,16 +24,17 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
 - VSS support for live Windows backups (`--vss` / GUI checkbox)
 - CLI and egui GUI (WinPE-friendly, no WebView2)
 
-> **Mounting requires WinFsp** and is enabled by the `winfsp` build feature (release
-> builds). It adds no meaningful disk footprint — reads are served on demand from the
-> compressed `.phnx`. Install WinFsp from [winfsp.dev](https://winfsp.dev) (release
-> builds bundle it). A build *without* the `winfsp` feature falls back to
-> materializing a full-size temp VHD — a dev-only stopgap, never used when the
-> feature is on.
+> **Mounting requires WinFsp** — the `winfsp` build feature is **on by default**
+> for the GUI and CLI, so dev and release builds behave the same. It adds no
+> meaningful disk footprint — reads are served on demand from the compressed
+> `.phnx`, and you pick which partition(s) get drive letters. Install WinFsp
+> from [winfsp.dev](https://winfsp.dev) (release builds bundle it). Building
+> with `--no-default-features` drops the feature; mount then falls back to
+> materializing a full-size temp VHD — a dev-only stopgap.
 
 ## Build
 
-Requires Rust 1.70+, Windows, and Visual Studio Build Tools (**Desktop development with C++**, including **x64** and **ARM64** MSVC when building both targets).
+Requires Rust 1.70+, Windows, and Visual Studio Build Tools (**Desktop development with C++**, including **x64** and **ARM64** MSVC when building both targets). The default `winfsp` feature additionally needs LLVM/libclang (set `LIBCLANG_PATH` if LLVM isn't at `C:\Program Files\LLVM`) and WinFsp installed for its SDK headers.
 
 **Release builds (x64 + ARM64):**
 
