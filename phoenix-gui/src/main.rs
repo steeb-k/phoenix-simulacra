@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{Align2, Response, Rounding, Sense, Ui, Vec2};
+use egui::{Align2, Response, Sense, Ui, Vec2};
 use phoenix_capture::backup::BackupOptions;
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
@@ -37,8 +37,14 @@ use crate::util::format_bytes;
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Debounce before auto-loading a `.phnx` path typed into the Restore page.
 const RESTORE_BACKUP_LOAD_DEBOUNCE: Duration = Duration::from_millis(300);
-const REFRESH_BTN_SIZE: f32 = 52.0;
-const REFRESH_ICON_SIZE: f32 = 32.0;
+/// Fixed size of the "Refresh" button: wide enough for the glyph + label
+/// at their fonts, same height as the standard form controls.
+const REFRESH_BTN_W: f32 = 110.0;
+const REFRESH_ICON_SIZE: f32 = 18.0;
+/// Minimum time the click-to-refresh dim/spinner overlay stays up. Disk
+/// enumeration is usually near-instant; holding the overlay for a beat
+/// makes the refresh visibly *happen* instead of flickering.
+const REFRESH_OVERLAY_MIN: Duration = Duration::from_millis(1000);
 /// Form-action button width (Browse…, Run restore, Verify backup).
 /// Tuned to comfortably fit those labels at 16pt so the buttons render
 /// at a consistent width across pages.
@@ -296,6 +302,22 @@ struct PhoenixApp {
     completed: Option<CompletedJob>,
     palette: Palette,
     last_theme_refresh: Instant,
+    /// A Refresh button was clicked this frame: the disk re-enumeration (and
+    /// the clicking page's reset) runs at the START of the next frame, so the
+    /// dim/spinner overlay is already on screen if enumeration blocks.
+    pending_refresh: Option<PendingRefresh>,
+    /// Keeps the dim/spinner overlay up until this deadline (click time +
+    /// [`REFRESH_OVERLAY_MIN`]), even when the refresh itself is instant.
+    refresh_overlay_until: Option<Instant>,
+}
+
+/// Which page's Refresh was clicked — picks the page-reset that runs
+/// alongside the deferred disk re-enumeration.
+#[derive(Clone, Copy)]
+enum PendingRefresh {
+    Backup,
+    Restore,
+    Clone,
 }
 
 impl PhoenixApp {
@@ -361,6 +383,8 @@ impl PhoenixApp {
             completed: None,
             palette,
             last_theme_refresh: Instant::now(),
+            pending_refresh: None,
+            refresh_overlay_until: demo_refresh_overlay_from_args(),
         };
         app.refresh_disks();
         app
@@ -380,6 +404,67 @@ impl PhoenixApp {
             }
             Err(e) => self.status = format!("Disk enumeration failed: {e}"),
         }
+    }
+
+    /// Arm a deferred disk refresh: the dim/spinner overlay goes up this
+    /// frame, and the actual enumeration + page reset run at the start of
+    /// the next one (see the top of `update`), so the overlay is visible
+    /// even if `enumerate_disks` blocks for a while.
+    fn begin_refresh(&mut self, kind: PendingRefresh) {
+        self.pending_refresh = Some(kind);
+        self.refresh_overlay_until = Some(Instant::now() + REFRESH_OVERLAY_MIN);
+    }
+
+    /// Run the disk refresh a Refresh click armed on the previous frame.
+    fn run_pending_refresh(&mut self) {
+        let Some(kind) = self.pending_refresh.take() else {
+            return;
+        };
+        self.refresh_disks();
+        // Refresh doubles as a page reset on every page that has a
+        // Refresh button.
+        match kind {
+            PendingRefresh::Backup => self.clear_backup_ui_state(),
+            PendingRefresh::Restore => self.reset_restore_page(),
+            PendingRefresh::Clone => self.clear_clone_ui_state(),
+        }
+    }
+
+    /// Full-window dim + centered spinner while a refresh is armed or the
+    /// minimum overlay time hasn't elapsed. The backdrop swallows clicks so
+    /// nothing underneath reacts mid-refresh.
+    fn show_refresh_overlay(&mut self, ctx: &egui::Context) {
+        let Some(until) = self.refresh_overlay_until else {
+            return;
+        };
+        if self.pending_refresh.is_none() && Instant::now() >= until {
+            self.refresh_overlay_until = None;
+            return;
+        }
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("refresh_overlay_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.left_top())
+            .interactable(true)
+            .show(ctx, |ui| {
+                let _ = ui.allocate_rect(screen, Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+            });
+        egui::Area::new(egui::Id::new("refresh_overlay_spinner"))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                // White regardless of theme: it sits on the black-dimmed
+                // backdrop, where the light palette's dark icon color would
+                // vanish.
+                ui.add(egui::Spinner::new().size(48.0).color(egui::Color32::WHITE));
+            });
+        // The Spinner only animates on repaint, and the overlay must come
+        // down on time even if nothing else triggers one.
+        ctx.request_repaint();
     }
 
     /// Drop selection entries whose `(disk_index, partition_index)` no
@@ -755,6 +840,10 @@ impl eframe::App for PhoenixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job(ctx);
         self.maybe_refresh_theme(ctx);
+        // Runs the refresh a click armed LAST frame — that frame already
+        // painted the dim/spinner overlay, so it stays on screen while the
+        // enumeration below blocks.
+        self.run_pending_refresh();
         if self.page == Page::Restore {
             self.poll_restore_backup_load();
         }
@@ -841,6 +930,7 @@ impl eframe::App for PhoenixApp {
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
         self.show_demo_confirm_dialog(ctx);
+        self.show_refresh_overlay(ctx);
     }
 }
 
@@ -1269,36 +1359,24 @@ fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str
     ui.add_space(14.0);
 }
 
-/// Large phosphor refresh control for re-enumerating disks.
+/// Bordered "⟳ Refresh" button for re-enumerating disks. A regular egui
+/// button in the same style as Browse… — default hover tint (no accent),
+/// explicit 1px border — so it reads as a normal form control. Callers go
+/// through [`PhoenixApp::begin_refresh`], which dims the window with a
+/// spinner while the refresh runs.
 fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
-    let size = Vec2::splat(REFRESH_BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-
-    let hovered = response.hovered();
-    let painter = ui.painter_at(rect);
-    if hovered {
-        painter.rect_filled(rect, Rounding::same(8.0), palette.sidebar_hover_bg);
-    }
-
-    let icon_color = if hovered {
-        palette.accent
-    } else {
-        palette.icon_color
-    };
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
+    let label = icon_label(
         egui_phosphor::regular::ARROWS_CLOCKWISE,
         fonts::icon(REFRESH_ICON_SIZE),
-        icon_color,
+        "Refresh",
+        fonts::regular(14.0),
+        ui.visuals().widgets.inactive.fg_stroke.color,
     );
-
-    let response = response.on_hover_text("Refresh disks");
-    // This button paints itself directly with the phosphor icon and has no
-    // egui-managed frame, so the global `widgets.active.bg_stroke` focus
-    // bump never applies — add an explicit focus ring here.
-    theme::draw_focus_outline(ui, &response, palette);
-    response
+    ui.add_sized(
+        [REFRESH_BTN_W, ACTION_BUTTON_HEIGHT],
+        egui::Button::new(label).stroke(egui::Stroke::new(1.0, palette.panel_border)),
+    )
+    .on_hover_text("Refresh disks")
 }
 
 impl PhoenixApp {
@@ -1429,8 +1507,7 @@ impl PhoenixApp {
         if self.disks.is_empty() {
             ui.label("No disks found. Run as Administrator.");
             if refresh_disks_button(ui, &self.palette).clicked() {
-                self.refresh_disks();
-                self.clear_backup_ui_state();
+                self.begin_refresh(PendingRefresh::Backup);
             }
             return;
         }
@@ -1439,8 +1516,7 @@ impl PhoenixApp {
             ui.label(egui::RichText::new("Select Source").font(fonts::bold(16.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if refresh_disks_button(ui, &self.palette).clicked() {
-                    self.refresh_disks();
-                    self.clear_backup_ui_state();
+                    self.begin_refresh(PendingRefresh::Backup);
                 }
             });
         });
@@ -1648,8 +1724,7 @@ impl PhoenixApp {
         if self.disks.is_empty() {
             ui.label("No disks found. Run as Administrator.");
             if refresh_disks_button(ui, &self.palette).clicked() {
-                self.refresh_disks();
-                self.reset_restore_page();
+                self.begin_refresh(PendingRefresh::Restore);
             }
             return;
         }
@@ -1659,11 +1734,9 @@ impl PhoenixApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if refresh_disks_button(ui, &self.palette).clicked() {
                     // Refresh doubles as a page reset: forget the chosen
-                    // backup and layout and snap the target to the first
-                    // disk of the fresh enumeration (which also un-strands
-                    // a selection whose disk just vanished).
-                    self.refresh_disks();
-                    self.reset_restore_page();
+                    // backup and layout (which also un-strands a selection
+                    // whose disk just vanished).
+                    self.begin_refresh(PendingRefresh::Restore);
                 }
             });
         });
@@ -1886,8 +1959,7 @@ impl PhoenixApp {
         if self.disks.is_empty() {
             ui.label("No disks detected. Run as Administrator, then refresh.");
             if refresh_disks_button(ui, &self.palette).clicked() {
-                self.refresh_disks();
-                self.clear_clone_ui_state();
+                self.begin_refresh(PendingRefresh::Clone);
             }
             return;
         }
@@ -1908,8 +1980,7 @@ impl PhoenixApp {
         if out.refresh_clicked {
             // Refresh doubles as a page reset: back to two empty dropdowns
             // against the fresh enumeration.
-            self.refresh_disks();
-            self.clear_clone_ui_state();
+            self.begin_refresh(PendingRefresh::Clone);
         }
         if out.selection_changed {
             ui.ctx().request_repaint();
@@ -2363,6 +2434,17 @@ impl PhoenixApp {
 /// staging a real destructive operation.
 fn demo_confirm_from_args() -> bool {
     std::env::args().skip(1).any(|a| a == "--demo-confirm")
+}
+
+/// Debug/verification aid: `--demo-refresh` opens the app with the
+/// click-to-refresh dim/spinner overlay held up for a few seconds, for
+/// eyeballing the overlay styling (a real refresh drops it after a second,
+/// too quick to screenshot deliberately).
+fn demo_refresh_overlay_from_args() -> Option<Instant> {
+    std::env::args()
+        .skip(1)
+        .any(|a| a == "--demo-refresh")
+        .then(|| Instant::now() + Duration::from_secs(5))
 }
 
 /// Debug/verification aid: `--page clone` (etc.) opens the app on that page

@@ -151,8 +151,8 @@ pub fn apply(ctx: &egui::Context, accent: Color32, light_mode: bool) {
 /// widget has keyboard focus. The global `widgets.active.bg_stroke` bump
 /// in [`apply`] already gives buttons and text edits a visible focus
 /// outline through their own frame painting, but widgets that paint
-/// themselves directly (the refresh-disks button) or only paint a tiny
-/// icon (the standard `Checkbox`) have no obvious focus affordance —
+/// themselves directly (the layout-editor toolbar buttons) or only paint a
+/// tiny icon (the standard `Checkbox`) have no obvious focus affordance —
 /// call this helper after creating them to add a uniform Tab indicator.
 pub fn draw_focus_outline(ui: &Ui, response: &Response, palette: &Palette) {
     if !response.has_focus() {

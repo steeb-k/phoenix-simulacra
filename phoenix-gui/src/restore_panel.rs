@@ -219,7 +219,7 @@ pub(crate) fn draw_layout_toolbar(
     changed
 }
 
-/// Icon button in the style of the disk-list refresh button; dimmed and inert
+/// Frameless icon button for the layout-editor toolbar; dimmed and inert
 /// when disabled. Returns true on click.
 fn toolbar_button(ui: &mut Ui, palette: &Palette, icon: &str, tip: &str, enabled: bool) -> bool {
     let size = Vec2::splat(TOOLBAR_BTN);
