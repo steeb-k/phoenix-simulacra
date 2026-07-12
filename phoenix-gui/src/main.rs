@@ -958,7 +958,9 @@ fn backup_path_picker(
 fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
-    ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
+    if !subtitle.is_empty() {
+        ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
+    }
     ui.add_space(14.0);
 }
 
@@ -1903,11 +1905,28 @@ impl PhoenixApp {
     }
 
     fn ui_options(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, &self.palette, "Options", "Application preferences.");
+        page_header(ui, &self.palette, "Options", "");
 
-        // --- Persisted settings ---
         let mut changed = false;
-        ui.heading("Preferences");
+        ui.horizontal(|ui| {
+            ui.label("Theme:");
+            use phoenix_core::appdata::ThemeChoice;
+            for (choice, label) in [
+                (ThemeChoice::System, "System"),
+                (ThemeChoice::Dark, "Dark"),
+                (ThemeChoice::Light, "Light"),
+            ] {
+                if ui
+                    .selectable_label(self.settings.theme == choice, label)
+                    .clicked()
+                {
+                    self.settings.theme = choice;
+                    self.palette = theme::refresh(ui.ctx(), choice);
+                    self.last_theme_refresh = Instant::now();
+                    changed = true;
+                }
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("Default backup folder:");
             let mut dir = self.settings.default_backup_dir.clone().unwrap_or_default();
@@ -1932,25 +1951,6 @@ impl PhoenixApp {
                 "Verify each backup after it completes",
             )
             .changed();
-        ui.horizontal(|ui| {
-            ui.label("Theme:");
-            use phoenix_core::appdata::ThemeChoice;
-            for (choice, label) in [
-                (ThemeChoice::System, "System"),
-                (ThemeChoice::Dark, "Dark"),
-                (ThemeChoice::Light, "Light"),
-            ] {
-                if ui
-                    .selectable_label(self.settings.theme == choice, label)
-                    .clicked()
-                {
-                    self.settings.theme = choice;
-                    self.palette = theme::refresh(ui.ctx(), choice);
-                    self.last_theme_refresh = Instant::now();
-                    changed = true;
-                }
-            }
-        });
         if changed {
             let _ = self.settings.save();
         }
