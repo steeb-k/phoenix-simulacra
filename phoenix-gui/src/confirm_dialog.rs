@@ -11,6 +11,7 @@ use eframe::egui;
 use egui::{Align2, Color32, Order, RichText};
 
 use crate::fonts;
+use crate::stripes;
 use crate::theme::Palette;
 
 /// What the user did with the dialog this frame.
@@ -48,41 +49,20 @@ const TAPE_HEIGHT: f32 = 32.0;
 /// nested frame when the tape needs to bleed to the window edges).
 const BODY_MARGIN: f32 = 22.0;
 
-/// Diagonal yellow/black hazard stripes filling `rect`, drawn procedurally so
-/// they stay crisp at any DPI and tile to any width. 45° stripes as wide as
-/// the strip is tall, with a dark top fade for a bit of tape sheen.
+/// Diagonal yellow/black hazard stripes filling `rect`: stripes as wide as the
+/// strip is tall, with a dark top fade for a bit of tape sheen.
+///
+/// Deliberately still yellow, and deliberately still standing still, while the
+/// progress bar's barber pole (`status_modal`) shares the same geometry in the
+/// accent color and turns. Yellow is what makes this read as *hazard* rather
+/// than as chrome, and the tape marks a decision to stop and think about — the
+/// last thing it should do is draw the eye with movement.
 fn paint_tape(painter: &egui::Painter, rect: egui::Rect) {
     let yellow = Color32::from_rgb(0xF6, 0xC4, 0x00);
     let black = Color32::from_rgb(0x16, 0x16, 0x16);
     painter.rect_filled(rect, 0.0, black);
-
-    let painter = painter.with_clip_rect(rect);
-    let h = rect.height();
-    // Start one slant early so the top edge is covered at the left corner.
-    let mut x = rect.left() - h;
-    while x < rect.right() {
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                egui::pos2(x, rect.bottom()),
-                egui::pos2(x + h, rect.bottom()),
-                egui::pos2(x + h * 2.0, rect.top()),
-                egui::pos2(x + h, rect.top()),
-            ],
-            yellow,
-            egui::Stroke::NONE,
-        ));
-        x += h * 2.0;
-    }
-
-    let mut sheen = egui::Mesh::default();
-    let top = Color32::from_black_alpha(80);
-    sheen.colored_vertex(rect.left_top(), top);
-    sheen.colored_vertex(rect.right_top(), top);
-    sheen.colored_vertex(rect.right_bottom(), Color32::TRANSPARENT);
-    sheen.colored_vertex(rect.left_bottom(), Color32::TRANSPARENT);
-    sheen.add_triangle(0, 1, 2);
-    sheen.add_triangle(0, 2, 3);
-    painter.add(egui::Shape::mesh(sheen));
+    stripes::paint(painter, rect, yellow, rect.height(), 0.0);
+    stripes::sheen(painter, rect, 80);
 }
 
 /// Render the dialog and return the user's action for this frame. Escape maps
@@ -127,60 +107,60 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
         ui.set_width(DIALOG_WIDTH);
 
         ui.label(RichText::new(view.title).font(fonts::bold(18.0)));
-            ui.add_space(12.0);
+        ui.add_space(12.0);
 
-            ui.label(RichText::new(view.message).color(palette.icon_color));
+        ui.label(RichText::new(view.message).color(palette.icon_color));
 
-            if !view.details.is_empty() {
-                ui.add_space(10.0);
-                egui::ScrollArea::vertical()
-                    .max_height(140.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for line in view.details {
-                            ui.label(
-                                RichText::new(line)
-                                    .font(fonts::regular(13.0))
-                                    .color(palette.subtle_text),
-                            );
-                        }
-                    });
+        if !view.details.is_empty() {
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for line in view.details {
+                        ui.label(
+                            RichText::new(line)
+                                .font(fonts::regular(13.0))
+                                .color(palette.subtle_text),
+                        );
+                    }
+                });
+        }
+
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            // Right-align the button pair: Cancel then Confirm, so the
+            // destructive action sits at the far (default-reach) edge but
+            // still needs a deliberate click.
+            let button = egui::vec2(150.0, 38.0);
+            let spacing = ui.spacing().item_spacing.x;
+            let pair_width = button.x * 2.0 + spacing;
+            let pad = (ui.available_width() - pair_width).max(0.0);
+            ui.add_space(pad);
+
+            let cancel = ui.add_sized(
+                button,
+                egui::Button::new(RichText::new(view.cancel_label).color(palette.icon_color))
+                    .fill(ui.visuals().widgets.inactive.bg_fill),
+            );
+            if cancel.clicked() {
+                *action = ConfirmAction::Cancel;
             }
 
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                // Right-align the button pair: Cancel then Confirm, so the
-                // destructive action sits at the far (default-reach) edge but
-                // still needs a deliberate click.
-                let button = egui::vec2(150.0, 38.0);
-                let spacing = ui.spacing().item_spacing.x;
-                let pair_width = button.x * 2.0 + spacing;
-                let pad = (ui.available_width() - pair_width).max(0.0);
-                ui.add_space(pad);
-
-                let cancel = ui.add_sized(
-                    button,
-                    egui::Button::new(RichText::new(view.cancel_label).color(palette.icon_color))
-                        .fill(ui.visuals().widgets.inactive.bg_fill),
-                );
-                if cancel.clicked() {
-                    *action = ConfirmAction::Cancel;
-                }
-
-                let confirm_fill = if view.confirm_danger {
-                    palette.danger
-                } else {
-                    palette.accent
-                };
-                let confirm = ui.add_sized(
-                    button,
-                    egui::Button::new(RichText::new(view.confirm_label).color(Color32::WHITE))
-                        .fill(confirm_fill),
-                );
-                if confirm.clicked() {
-                    *action = ConfirmAction::Confirm;
-                }
-            });
+            let confirm_fill = if view.confirm_danger {
+                palette.danger
+            } else {
+                palette.accent
+            };
+            let confirm = ui.add_sized(
+                button,
+                egui::Button::new(RichText::new(view.confirm_label).color(Color32::WHITE))
+                    .fill(confirm_fill),
+            );
+            if confirm.clicked() {
+                *action = ConfirmAction::Confirm;
+            }
+        });
     };
 
     egui::Window::new("confirm_dialog")
@@ -200,8 +180,8 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
                 let body_spacing = ui.spacing().item_spacing;
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                let (rect, _) = ui
-                    .allocate_exact_size(egui::vec2(width, TAPE_HEIGHT), egui::Sense::hover());
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, TAPE_HEIGHT), egui::Sense::hover());
                 paint_tape(ui.painter(), rect);
 
                 egui::Frame::none()
@@ -211,8 +191,8 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
                         body(ui, &mut action);
                     });
 
-                let (rect, _) = ui
-                    .allocate_exact_size(egui::vec2(width, TAPE_HEIGHT), egui::Sense::hover());
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, TAPE_HEIGHT), egui::Sense::hover());
                 paint_tape(ui.painter(), rect);
             } else {
                 body(ui, &mut action);

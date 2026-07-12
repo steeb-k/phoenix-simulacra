@@ -11,6 +11,7 @@ use eframe::egui;
 use egui::{Align2, Color32, Order, RichText};
 
 use crate::fonts;
+use crate::stripes;
 use crate::theme::{self, Palette};
 use crate::util::format_bytes;
 
@@ -84,6 +85,32 @@ const CANCEL_HOLD_SECS: f32 = 1.5;
 /// Cleared centrally when the finished modal appears so the next job starts fresh.
 const CANCEL_HOLD_START_ID: &str = "status_modal_cancel_hold_start";
 const CANCEL_HOLD_FIRED_ID: &str = "status_modal_cancel_hold_fired";
+
+/// Progress-bar geometry. Taller than egui's default bar so the byte readout
+/// sits comfortably inside the barber pole.
+const BAR_HEIGHT: f32 = 24.0;
+const BAR_ROUNDING: f32 = 6.0;
+/// The bar's unfilled track — the same dark tone in *both* themes, on purpose.
+/// The readout is white everywhere, so what sits under it has to be dark
+/// everywhere; a track that followed the theme would put white text on a
+/// near-white bar the moment the fill fell behind it.
+const BAR_TRACK: Color32 = Color32::from_rgb(0x2B, 0x2B, 0x2B);
+/// The black half of the barber pole's accent/black stripes.
+const BAR_STRIPE: Color32 = Color32::from_rgb(0x16, 0x16, 0x16);
+/// Horizontal run of one stripe; the pole repeats every `2 *` this.
+const BAR_STRIPE_WIDTH: f32 = 13.0;
+/// How fast the pole turns, in pixels/second. Slow enough to read as "turning"
+/// rather than "racing" — it is a heartbeat, not a speedometer.
+const BAR_STRIPE_SPEED: f32 = 26.0;
+/// Offsets the readout is stamped at, in soft black, before being drawn in
+/// white on top: a 1px ring that keeps it legible over any accent.
+const TEXT_HALO: [egui::Vec2; 4] = [
+    egui::vec2(-1.0, -1.0),
+    egui::vec2(1.0, -1.0),
+    egui::vec2(-1.0, 1.0),
+    egui::vec2(1.0, 1.0),
+];
+const HALO_COLOR: Color32 = Color32::from_black_alpha(160);
 
 pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> ModalAction {
     // --- Backdrop: full-screen dim layer above panels, below the dialog.
@@ -228,46 +255,89 @@ fn show_success_banner(ui: &mut egui::Ui, palette: &Palette, banner: &str) {
     });
 }
 
+/// Hand-painted rather than an `egui::ProgressBar`, which has no way to stripe
+/// its fill and takes its text color from the theme (that was the bug: in light
+/// mode it stamped *black* text over a dark accent fill).
 fn show_progress_bar(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
-    match view.outcome {
-        // Finished: a full-width bar tinted by the outcome reads as a clear
-        // status banner regardless of how far the byte counter got.
-        Some(outcome) => {
-            let fill = outcome_color(palette, outcome);
-            ui.add(egui::ProgressBar::new(1.0).fill(fill));
-        }
-        // Running with a known total: live fraction with a breathing fill.
-        None if view.total_bytes > 0 => {
-            let fraction = view.fraction;
-            let fill = if fraction >= 1.0 {
-                palette.accent
-            } else {
-                // ~2s sinusoidal pulse between a desaturated accent/input_bg
-                // blend and the full accent — a calm "this UI is alive" cue.
-                let t = ui.input(|i| i.time) as f32;
-                let pulse = 0.5 + 0.5 * (t * std::f32::consts::PI).sin();
-                let dim_end = theme::tint(palette.accent, 0.7, palette.input_bg);
-                theme::tint(dim_end, pulse, palette.accent)
-            };
-            ui.add(egui::ProgressBar::new(fraction).fill(fill).text(format!(
-                "{} / {} ({:.1}%)",
-                format_bytes(view.current_bytes),
-                format_bytes(view.total_bytes),
-                fraction * 100.0
-            )));
-            if fraction < 1.0 {
-                ui.ctx().request_repaint();
-            }
-        }
-        // Running with no measurable total: indeterminate spinner.
-        None => {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new());
-                ui.label(RichText::new("Working…").color(palette.subtle_text));
-            });
-            ui.ctx().request_repaint();
-        }
+    // Running with no measurable total: nothing to fill a bar with, so an
+    // indeterminate spinner it is.
+    if view.outcome.is_none() && view.total_bytes == 0 {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new());
+            ui.label(RichText::new("Working…").color(palette.subtle_text));
+        });
+        ui.ctx().request_repaint();
+        return;
     }
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), BAR_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let rounding = egui::Rounding::same(BAR_ROUNDING);
+    let time = ui.input(|i| i.time) as f32;
+    let painter = ui.painter();
+
+    let Some(outcome) = view.outcome else {
+        // Running: a dark track, and a filled part that is a barber pole of the
+        // accent striped with black, turning at a constant rate. The turn is
+        // pure liveness — the fraction alone carries the progress — which is why
+        // it doesn't speed up, slow down, or stop short of the end.
+        painter.rect_filled(rect, rounding, BAR_TRACK);
+        let fraction = view.fraction.clamp(0.0, 1.0);
+        let fill = egui::Rect::from_min_size(
+            rect.left_top(),
+            egui::vec2(rect.width() * fraction, rect.height()),
+        );
+        painter.rect_filled(fill, 0.0, palette.accent);
+        stripes::paint(
+            painter,
+            fill,
+            BAR_STRIPE,
+            BAR_STRIPE_WIDTH,
+            time * BAR_STRIPE_SPEED,
+        );
+        // Stripes only clip to a rectangle, so the fill just squared off the
+        // bar's left corners (and, at 100%, its right ones). Carve them back.
+        stripes::patch_rounded_corners(painter, rect, rounding, palette.sidebar_bg);
+
+        let text = format!(
+            "{} / {} ({:.1}%)",
+            format_bytes(view.current_bytes),
+            format_bytes(view.total_bytes),
+            fraction * 100.0
+        );
+        let font = fonts::bold(13.0);
+        // The readout is white over a surface that is dark everywhere — the
+        // track, and the black half of the pole. The accent half is the one
+        // thing here the app doesn't choose (it's whatever the user set in
+        // Windows, and it can be pale), so ring the text in soft black first
+        // and its contrast stops depending on that.
+        for offset in TEXT_HALO {
+            painter.text(
+                rect.center() + offset,
+                Align2::CENTER_CENTER,
+                &text,
+                font.clone(),
+                HALO_COLOR,
+            );
+        }
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            text,
+            font,
+            Color32::WHITE,
+        );
+        // Keep the pole turning.
+        ui.ctx().request_repaint();
+        return;
+    };
+
+    // Finished: a full-width bar tinted by the outcome reads as a clear status
+    // banner regardless of how far the byte counter got. No stripes and no
+    // readout — the job has stopped, so nothing here should still be moving.
+    painter.rect_filled(rect, rounding, outcome_color(palette, outcome));
 }
 
 fn show_steps(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {

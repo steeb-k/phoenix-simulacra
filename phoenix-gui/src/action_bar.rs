@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use eframe::egui;
 use egui::{Color32, Mesh, Pos2, Rect, Rounding, Sense, Shape, Stroke};
 
+use crate::stripes;
 use crate::theme::{tint, Palette};
 use crate::{fonts, icon_label, StartAction, START_BUTTON_HEIGHT};
 
@@ -344,7 +345,7 @@ fn paint_tile_grid(
     }
     painter.with_clip_rect(rect).add(Shape::mesh(mesh));
 
-    paint_sw_corner_patch(painter, rect, rounding.sw, palette.sidebar_bg);
+    stripes::patch_rounded_corners(painter, rect, rounding, palette.sidebar_bg);
 }
 
 /// A tile's fixed head start into the scramble clock, in [0, 1). Staggering
@@ -397,15 +398,10 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Disabled-state fill: diagonal hazard-tape stripes, built the same way
-/// as `confirm_dialog::paint_tape` (45° parallelograms, dark top fade)
-/// but in muted monochrome — black/gray in dark mode, white/light-gray in
-/// light mode — so it signals "blocked until the form is complete"
-/// without borrowing the destructive dialogs' yellow.
-///
-/// The stripes are painted square (they can't be clipped to a rounded
-/// rect), so the pane's rounded bottom-left corner is patched back in
-/// afterwards with the sidebar color.
+/// Disabled-state fill: the app's diagonal stripes (see [`crate::stripes`]) in
+/// muted monochrome — black/gray in dark mode, white/light-gray in light mode —
+/// so the bar signals "blocked until the form is complete" without borrowing
+/// the destructive dialogs' yellow, and without the progress bar's motion.
 fn paint_hazard_tape(painter: &egui::Painter, rect: Rect, rounding: Rounding, palette: &Palette) {
     let (base, stripe) = if palette.light_mode {
         (Color32::WHITE, Color32::from_rgb(0xD9, 0xD9, 0xD9))
@@ -418,67 +414,18 @@ fn paint_hazard_tape(painter: &egui::Painter, rect: Rect, rounding: Rounding, pa
     // Base coat with the rounded silhouette (a flat "gradient").
     paint_vertical_gradient(painter, rect, rounding, base, base);
 
-    // Same construction as the dialog tape: 45° slant (horizontal offset =
-    // strip height), but with a fixed stripe width — height-wide stripes
-    // would turn chunky on a 52px bar.
+    // A fixed stripe width rather than the dialog tape's height-wide stripes,
+    // which would turn chunky on a 52px bar.
     const STRIPE_W: f32 = 22.0;
-    let clipped = painter.with_clip_rect(rect);
-    let h = rect.height();
-    let mut x = rect.left() - h;
-    while x < rect.right() {
-        clipped.add(Shape::convex_polygon(
-            vec![
-                egui::pos2(x, rect.bottom()),
-                egui::pos2(x + STRIPE_W, rect.bottom()),
-                egui::pos2(x + STRIPE_W + h, rect.top()),
-                egui::pos2(x + h, rect.top()),
-            ],
-            stripe,
-            Stroke::NONE,
-        ));
-        x += STRIPE_W * 2.0;
-    }
+    stripes::paint(painter, rect, stripe, STRIPE_W, 0.0);
 
     // The dialogs' tape sheen, toned down: a faint top fade for depth
     // (dark mode only — on white tape it just looks like dirt).
     if !palette.light_mode {
-        let mut sheen = Mesh::default();
-        let top_tint = Color32::from_black_alpha(50);
-        sheen.colored_vertex(rect.left_top(), top_tint);
-        sheen.colored_vertex(rect.right_top(), top_tint);
-        sheen.colored_vertex(rect.right_bottom(), Color32::TRANSPARENT);
-        sheen.colored_vertex(rect.left_bottom(), Color32::TRANSPARENT);
-        sheen.add_triangle(0, 1, 2);
-        sheen.add_triangle(0, 2, 3);
-        clipped.add(Shape::mesh(sheen));
+        stripes::sheen(painter, rect, 50);
     }
 
-    // Restore the rounded bottom-left corner: repaint the spandrel between
-    // the corner square and the quarter-circle arc in the sidebar color the
-    // cutout is supposed to show.
-    paint_sw_corner_patch(painter, rect, rounding.sw, palette.sidebar_bg);
-}
-
-/// Fill the region of the bottom-left corner square that lies OUTSIDE the
-/// rounded corner's quarter-circle arc. Non-convex, but star-shaped from
-/// the corner point, so a triangle fan from there covers it exactly.
-fn paint_sw_corner_patch(painter: &egui::Painter, rect: Rect, radius: f32, fill: Color32) {
-    use std::f32::consts::{FRAC_PI_2, PI};
-    const ARC_STEPS: usize = 8;
-    let center = egui::pos2(rect.left() + radius, rect.bottom() - radius);
-    let mut mesh = Mesh::default();
-    mesh.colored_vertex(egui::pos2(rect.left(), rect.bottom()), fill);
-    for i in 0..=ARC_STEPS {
-        let a = FRAC_PI_2 + (PI - FRAC_PI_2) * (i as f32 / ARC_STEPS as f32);
-        mesh.colored_vertex(
-            egui::pos2(center.x + radius * a.cos(), center.y + radius * a.sin()),
-            fill,
-        );
-    }
-    for i in 1..=ARC_STEPS as u32 {
-        mesh.add_triangle(0, i, i + 1);
-    }
-    painter.add(Shape::mesh(mesh));
+    stripes::patch_rounded_corners(painter, rect, rounding, palette.sidebar_bg);
 }
 
 /// Fill a rounded rect with a top→bottom gradient. egui has no gradient

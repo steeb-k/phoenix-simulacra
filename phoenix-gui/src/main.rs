@@ -11,6 +11,7 @@ mod restore_layout;
 mod restore_panel;
 mod sidebar;
 mod status_modal;
+mod stripes;
 mod theme;
 mod titlebar;
 mod util;
@@ -255,6 +256,9 @@ struct PhoenixApp {
     pending_restore: Option<PendingRestore>,
     /// `--demo-confirm`: show a fake wipe-confirmation dialog for styling work.
     demo_confirm: bool,
+    /// `--demo-progress`: show the status modal mid-job, its bar sweeping on a
+    /// loop, for styling work on the progress bar without running a real job.
+    demo_progress: bool,
     /// Total number of jobs in the current multi-disk run (for "Disk N of M"
     /// status text). Reset to 0 when the queue drains.
     total_backups: usize,
@@ -368,6 +372,7 @@ impl PhoenixApp {
             pending_clone: None,
             pending_restore: None,
             demo_confirm: demo_confirm_from_args(),
+            demo_progress: demo_progress_from_args(),
             total_backups: 0,
             current_backup_index: 0,
             restore_backup_path: String::new(),
@@ -1077,6 +1082,7 @@ impl eframe::App for PhoenixApp {
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
         self.show_demo_confirm_dialog(ctx);
+        self.show_demo_progress_modal(ctx);
         self.show_close_dialog(ctx);
         self.show_refresh_overlay(ctx);
     }
@@ -1349,6 +1355,41 @@ impl PhoenixApp {
         if confirm_dialog::show(ctx, &self.palette, &view) != ConfirmAction::None {
             self.demo_confirm = false;
         }
+    }
+
+    /// `--demo-progress` styling aid: the status modal mid-backup, its bar
+    /// sweeping 0→100% on a loop so the barber pole and the byte readout can be
+    /// eyeballed at every fill level (and in both themes) without a real job.
+    fn show_demo_progress_modal(&mut self, ctx: &egui::Context) {
+        if !self.demo_progress {
+            return;
+        }
+        const SWEEP_SECS: f64 = 12.0;
+        const TOTAL: u64 = 931_500_000_000;
+        let fraction = ((ctx.input(|i| i.time) % SWEEP_SECS) / SWEEP_SECS) as f32;
+
+        let steps = vec![
+            "Reading partition table".to_string(),
+            "Capturing partition 1 (EFI System, 260 MB)".to_string(),
+            "Capturing partition 2 (Basic data, 931.2 GB)".to_string(),
+            "Verifying backup".to_string(),
+        ];
+        let view = ModalView {
+            title: "Backing up",
+            steps: &steps,
+            current_step: 2,
+            detail: "Writing chunk 4,182 of 14,206…",
+            fraction,
+            current_bytes: (TOTAL as f64 * fraction as f64) as u64,
+            total_bytes: TOTAL,
+            outcome: None,
+            success_banner: None,
+            offer_verify: false,
+        };
+        if status_modal::show(ctx, &self.palette, &view) != ModalAction::None {
+            self.demo_progress = false;
+        }
+        ctx.request_repaint();
     }
 }
 
@@ -2580,6 +2621,13 @@ impl PhoenixApp {
 /// staging a real destructive operation.
 fn demo_confirm_from_args() -> bool {
     std::env::args().skip(1).any(|a| a == "--demo-confirm")
+}
+
+/// Debug/verification aid: `--demo-progress` opens the app with the status
+/// modal up and its progress bar sweeping on a loop, for eyeballing the barber
+/// pole and the byte readout without running a real backup.
+fn demo_progress_from_args() -> bool {
+    std::env::args().skip(1).any(|a| a == "--demo-progress")
 }
 
 /// Debug/verification aid: `--demo-refresh` opens the app with the
