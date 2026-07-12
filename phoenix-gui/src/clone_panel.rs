@@ -24,7 +24,6 @@ use crate::restore_panel::{
 use crate::theme::Palette;
 
 pub struct ClonePanelOutput {
-    pub refresh_clicked: bool,
     /// A different source/target disk was picked this frame; the caller
     /// rebuilds the layout state before the next frame renders.
     pub selection_changed: bool,
@@ -42,7 +41,6 @@ pub fn show(
     viewport_width: f32,
 ) -> ClonePanelOutput {
     let mut out = ClonePanelOutput {
-        refresh_clicked: false,
         selection_changed: false,
     };
 
@@ -53,17 +51,10 @@ pub fn show(
     }
 
     // ---- Source dropdown ----
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Choose a source and target drive for cloning.")
-                .color(palette.subtle_text),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if crate::refresh_disks_button(ui, palette).clicked() {
-                out.refresh_clicked = true;
-            }
-        });
-    });
+    ui.label(
+        egui::RichText::new("Choose a source and target drive for cloning.")
+            .color(palette.subtle_text),
+    );
     ui.add_space(6.0);
 
     let source_disk = source_index.and_then(|s| disks.iter().find(|d| d.index == s));

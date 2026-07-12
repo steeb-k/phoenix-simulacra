@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{Align2, Response, Sense, Ui, Vec2};
+use egui::{Align2, Sense, Vec2};
 use phoenix_capture::backup::BackupOptions;
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
@@ -40,10 +40,6 @@ use crate::util::format_bytes;
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Debounce before auto-loading a `.phnx` path typed into the Restore page.
 const RESTORE_BACKUP_LOAD_DEBOUNCE: Duration = Duration::from_millis(300);
-/// Fixed size of the "Refresh" button: wide enough for the glyph + label
-/// at their fonts, same height as the standard form controls.
-const REFRESH_BTN_W: f32 = 110.0;
-const REFRESH_ICON_SIZE: f32 = 18.0;
 /// Minimum time the click-to-refresh dim/spinner overlay stays up. Disk
 /// enumeration is usually near-instant; holding the overlay for a beat
 /// makes the refresh visibly *happen* instead of flickering.
@@ -318,22 +314,14 @@ struct PhoenixApp {
     completed: Option<CompletedJob>,
     palette: Palette,
     last_theme_refresh: Instant,
-    /// A Refresh button was clicked this frame: the disk re-enumeration (and
-    /// the clicking page's reset) runs at the START of the next frame, so the
-    /// dim/spinner overlay is already on screen if enumeration blocks.
-    pending_refresh: Option<PendingRefresh>,
+    /// The titlebar's Refresh button was clicked this frame, on this page:
+    /// the disk re-enumeration (and that page's reset) runs at the START of
+    /// the next frame, so the dim/spinner overlay is already on screen if
+    /// enumeration blocks.
+    pending_refresh: Option<Page>,
     /// Keeps the dim/spinner overlay up until this deadline (click time +
     /// [`REFRESH_OVERLAY_MIN`]), even when the refresh itself is instant.
     refresh_overlay_until: Option<Instant>,
-}
-
-/// Which page's Refresh was clicked — picks the page-reset that runs
-/// alongside the deferred disk re-enumeration.
-#[derive(Clone, Copy)]
-enum PendingRefresh {
-    Backup,
-    Restore,
-    Clone,
 }
 
 impl PhoenixApp {
@@ -429,23 +417,25 @@ impl PhoenixApp {
     /// frame, and the actual enumeration + page reset run at the start of
     /// the next one (see the top of `update`), so the overlay is visible
     /// even if `enumerate_disks` blocks for a while.
-    fn begin_refresh(&mut self, kind: PendingRefresh) {
-        self.pending_refresh = Some(kind);
+    fn begin_refresh(&mut self) {
+        self.pending_refresh = Some(self.page);
         self.refresh_overlay_until = Some(Instant::now() + REFRESH_OVERLAY_MIN);
     }
 
-    /// Run the disk refresh a Refresh click armed on the previous frame.
+    /// Run the disk refresh the titlebar's Refresh click armed on the
+    /// previous frame, and reset whichever page was showing when it was
+    /// clicked (the pages with no state to drop just get the fresh disks).
     fn run_pending_refresh(&mut self) {
-        let Some(kind) = self.pending_refresh.take() else {
+        let Some(page) = self.pending_refresh.take() else {
             return;
         };
         self.refresh_disks();
-        // Refresh doubles as a page reset on every page that has a
-        // Refresh button.
-        match kind {
-            PendingRefresh::Backup => self.clear_backup_ui_state(),
-            PendingRefresh::Restore => self.reset_restore_page(),
-            PendingRefresh::Clone => self.clear_clone_ui_state(),
+        match page {
+            Page::Backup => self.clear_backup_ui_state(),
+            Page::Restore => self.reset_restore_page(),
+            Page::Clone => self.clear_clone_ui_state(),
+            Page::History => self.history = phoenix_core::appdata::History::load(),
+            Page::Verify | Page::Mount | Page::Options => {}
         }
     }
 
@@ -980,9 +970,16 @@ impl eframe::App for PhoenixApp {
         let modal_open = self.modal_open();
         // The sidebar owns the full window height; its brand block doubles
         // as a drag handle for the chromeless window, so the rect is handed
-        // to `titlebar::show` along with the floating control box overlay.
+        // to `titlebar::show` along with the floating corner pill. That pill
+        // hosts the app's one Refresh button — live only when the window is
+        // otherwise idle (no job, no modal, no refresh already in flight).
         let brand_rect = sidebar::show(ctx, &mut self.page, &self.palette, modal_open);
-        titlebar::show(ctx, &self.palette, brand_rect);
+        let can_refresh = !busy && !modal_open && self.refresh_overlay_until.is_none();
+        let refresh_key = ctx.input(|i| i.key_pressed(egui::Key::F5));
+        let refresh_clicked = titlebar::show(ctx, &self.palette, brand_rect, can_refresh);
+        if refresh_clicked || (can_refresh && refresh_key) {
+            self.begin_refresh();
+        }
 
         // Slim bottom status line for idle/non-job messages (disk count,
         // "Loaded backup…", load errors, "Ready"). While a job runs or its
@@ -1570,26 +1567,6 @@ fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str
     ui.add_space(14.0);
 }
 
-/// Bordered "⟳ Refresh" button for re-enumerating disks. A regular egui
-/// button in the same style as Browse… — default hover tint (no accent),
-/// explicit 1px border — so it reads as a normal form control. Callers go
-/// through [`PhoenixApp::begin_refresh`], which dims the window with a
-/// spinner while the refresh runs.
-fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
-    let label = icon_label(
-        egui_phosphor::regular::ARROWS_CLOCKWISE,
-        fonts::icon(REFRESH_ICON_SIZE),
-        "Refresh",
-        fonts::regular(14.0),
-        ui.visuals().widgets.inactive.fg_stroke.color,
-    );
-    ui.add_sized(
-        [REFRESH_BTN_W, ACTION_BUTTON_HEIGHT],
-        egui::Button::new(label).stroke(egui::Stroke::new(1.0, palette.panel_border)),
-    )
-    .on_hover_text("Refresh disks")
-}
-
 impl PhoenixApp {
     fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
         // Whole-page scroll: when the window is too short, the entire backup
@@ -1676,21 +1653,11 @@ impl PhoenixApp {
         ui.add_space(16.0);
 
         if self.disks.is_empty() {
-            ui.label("No disks found. Run as Administrator.");
-            if refresh_disks_button(ui, &self.palette).clicked() {
-                self.begin_refresh(PendingRefresh::Backup);
-            }
+            ui.label("No disks found. Run as Administrator, then hit Refresh.");
             return;
         }
 
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Select Source").font(fonts::bold(16.0)));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if refresh_disks_button(ui, &self.palette).clicked() {
-                    self.begin_refresh(PendingRefresh::Backup);
-                }
-            });
-        });
+        ui.label(egui::RichText::new("Select Source").font(fonts::bold(16.0)));
         ui.label(
             egui::RichText::new("Choose the partitions you want to back up.")
                 .color(self.palette.subtle_text),
@@ -1859,37 +1826,20 @@ impl PhoenixApp {
         });
     }
 
-    /// "Select target" header + disk dropdown + refresh button on the
-    /// Restore page. Mirrors the layout of the Backup page's "Select
-    /// Source" header (header label on the left, refresh affordance on
-    /// the right) and binds the dropdown directly to
-    /// `self.target_disk_index` so the existing restore plumbing — which
-    /// already keys off that field — works unchanged.
+    /// "Select target" header + disk dropdown on the Restore page. Binds the
+    /// dropdown directly to `self.target_disk_index` so the existing restore
+    /// plumbing — which already keys off that field — works unchanged.
     ///
     /// When `self.disks` is empty (typically because we're not running
-    /// elevated or `enumerate_disks` failed), the dropdown is replaced
-    /// with the same "No disks found / Refresh" affordance the Backup
-    /// page shows in that situation.
+    /// elevated or `enumerate_disks` failed), the dropdown is replaced with
+    /// the same "no disks / Refresh" note the Backup page shows.
     fn ui_restore_target_picker(&mut self, ui: &mut egui::Ui) {
         if self.disks.is_empty() {
-            ui.label("No disks found. Run as Administrator.");
-            if refresh_disks_button(ui, &self.palette).clicked() {
-                self.begin_refresh(PendingRefresh::Restore);
-            }
+            ui.label("No disks found. Run as Administrator, then hit Refresh.");
             return;
         }
 
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Select target").font(fonts::bold(16.0)));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if refresh_disks_button(ui, &self.palette).clicked() {
-                    // Refresh doubles as a page reset: forget the chosen
-                    // backup and layout (which also un-strands a selection
-                    // whose disk just vanished).
-                    self.begin_refresh(PendingRefresh::Restore);
-                }
-            });
-        });
+        ui.label(egui::RichText::new("Select target").font(fonts::bold(16.0)));
         let selected_disk = self
             .target_disk_index
             .and_then(|t| self.disks.iter().find(|d| d.index == t));
@@ -2072,10 +2022,7 @@ impl PhoenixApp {
         page_header(ui, &self.palette, "Clone", "");
 
         if self.disks.is_empty() {
-            ui.label("No disks detected. Run as Administrator, then refresh.");
-            if refresh_disks_button(ui, &self.palette).clicked() {
-                self.begin_refresh(PendingRefresh::Clone);
-            }
+            ui.label("No disks detected. Run as Administrator, then hit Refresh.");
             return;
         }
 
@@ -2092,11 +2039,6 @@ impl PhoenixApp {
             &self.palette,
             viewport_width,
         );
-        if out.refresh_clicked {
-            // Refresh doubles as a page reset: back to two empty dropdowns
-            // against the fresh enumeration.
-            self.begin_refresh(PendingRefresh::Clone);
-        }
         if out.selection_changed {
             ui.ctx().request_repaint();
         }
