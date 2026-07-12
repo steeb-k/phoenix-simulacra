@@ -53,11 +53,11 @@ const CENTRAL_PANEL_MARGIN_X: f32 = 24.0;
 /// edge, so every element ends on the same vertical line. The page-level
 /// vertical scrollbar rides the window edge inside this gutter.
 const PAGE_RIGHT_MARGIN: f32 = 15.0;
-/// Oversized Start button used by every page's primary action (Start
-/// backup, Run restore, Verify backup, Clone disk) — rendered with a play
-/// glyph and deliberately bigger than the standard `FORM_BUTTON_W` ×
-/// `ACTION_BUTTON_HEIGHT` form controls.
-const START_BUTTON_SIZE: egui::Vec2 = egui::vec2(190.0, 52.0);
+/// Height of the oversized Start button used by every page's primary
+/// action (Start backup, Run restore, Verify backup, Clone disk) —
+/// rendered full-panel-width with a play glyph, deliberately bigger than
+/// the standard `FORM_BUTTON_W` × `ACTION_BUTTON_HEIGHT` form controls.
+const START_BUTTON_HEIGHT: f32 = 52.0;
 
 /// Decode the embedded application icon for the OS window chrome (title
 /// bar / taskbar / Alt-Tab thumbnail). This is intentionally a *separate*
@@ -1108,17 +1108,22 @@ fn icon_label(
 /// calls [`PhoenixApp::cancel_current_job`]), so this row no longer renders
 /// a per-page Cancel control.
 ///
-/// All buttons land at `size`. Disabled colored buttons stay tinted
-/// (faded, via `Palette::dim`) instead of going fully grey so the user
-/// still recognizes the Go control.
+/// The buttons split the full panel width evenly at `height`, labels
+/// centered (`add_sized` lays the button out centered-and-justified).
+/// Disabled colored buttons stay tinted (faded, via `Palette::dim`)
+/// instead of going fully grey so the user still recognizes the Go
+/// control.
 fn action_row(
     ui: &mut egui::Ui,
     palette: &Palette,
-    size: egui::Vec2,
+    height: f32,
     starts: &[StartAction<'_>],
 ) -> Option<usize> {
     let mut clicked_start: Option<usize> = None;
     ui.horizontal(|ui| {
+        let spacing = ui.spacing().item_spacing.x;
+        let n = starts.len() as f32;
+        let button_w = ((ui.available_width() - spacing * (n - 1.0)) / n).max(0.0);
         for (idx, start) in starts.iter().enumerate() {
             let fill = if start.enabled {
                 palette.success
@@ -1127,15 +1132,16 @@ fn action_row(
             };
             let text: egui::WidgetText = match start.icon {
                 Some(icon) => {
-                    icon_label(icon, 20.0, start.label, 16.0, egui::Color32::WHITE).into()
+                    icon_label(icon, 30.0, start.label, 24.0, egui::Color32::WHITE).into()
                 }
                 None => egui::RichText::new(start.label)
+                    .font(fonts::regular(24.0))
                     .color(egui::Color32::WHITE)
                     .into(),
             };
             let resp = ui
                 .add_enabled_ui(start.enabled, |ui| {
-                    ui.add_sized(size, egui::Button::new(text).fill(fill))
+                    ui.add_sized([button_w, height], egui::Button::new(text).fill(fill))
                 })
                 .inner;
             let resp = match start.disabled_hint {
@@ -1305,7 +1311,7 @@ impl PhoenixApp {
         }];
         // Oversized relative to the standard action row — this is the
         // page's primary action.
-        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
+        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
             self.start_backup();
         }
     }
@@ -1584,7 +1590,7 @@ impl PhoenixApp {
                 "Map at least one partition onto the target"
             }),
         }];
-        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
+        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
             self.start_restore();
         }
     }
@@ -1798,7 +1804,7 @@ impl PhoenixApp {
             enabled: !busy && path_filled,
             disabled_hint: Some(disabled_hint),
         }];
-        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
+        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
             self.start_verify();
         }
     }
@@ -1918,7 +1924,7 @@ impl PhoenixApp {
             enabled: !busy && plan_ready,
             disabled_hint: Some(disabled_hint),
         }];
-        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
+        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
             self.start_clone();
         }
     }
