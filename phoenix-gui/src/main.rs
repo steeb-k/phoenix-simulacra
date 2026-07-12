@@ -376,6 +376,30 @@ impl PhoenixApp {
         self.restore_layout = None;
     }
 
+    /// Reset the Backup page to its untouched default: nothing selected,
+    /// empty name, the settings-default folder, VSS off. The refresh button
+    /// doubles as a page reset on every page that has one.
+    fn clear_backup_ui_state(&mut self) {
+        self.selections.clear();
+        self.backup_name.clear();
+        self.use_vss = false;
+        self.backup_folder = self
+            .settings
+            .default_backup_dir
+            .clone()
+            .unwrap_or_else(default_backup_folder);
+    }
+
+    /// Reset the Restore page to its default: no backup chosen, no layout,
+    /// target snapped back to the first enumerated disk.
+    fn reset_restore_page(&mut self) {
+        self.restore_backup_path.clear();
+        self.clear_restore_ui_state();
+        if let Some(first) = self.disks.first() {
+            self.target_disk_index = first.index;
+        }
+    }
+
     /// Reset the Clone page to its untouched default (no disks picked, no
     /// plan). Called on every terminal clone outcome — success, failure, or
     /// cancel — so the page can never show a stale, already-executed plan
@@ -1258,6 +1282,7 @@ impl PhoenixApp {
             ui.label("No disks found. Run as Administrator.");
             if refresh_disks_button(ui, &self.palette).clicked() {
                 self.refresh_disks();
+                self.clear_backup_ui_state();
             }
             return;
         }
@@ -1267,6 +1292,7 @@ impl PhoenixApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if refresh_disks_button(ui, &self.palette).clicked() {
                     self.refresh_disks();
+                    self.clear_backup_ui_state();
                 }
             });
         });
@@ -1476,6 +1502,7 @@ impl PhoenixApp {
             ui.label("No disks found. Run as Administrator.");
             if refresh_disks_button(ui, &self.palette).clicked() {
                 self.refresh_disks();
+                self.reset_restore_page();
             }
             return;
         }
@@ -1484,18 +1511,12 @@ impl PhoenixApp {
             ui.label(egui::RichText::new("Select target").font(fonts::bold(16.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if refresh_disks_button(ui, &self.palette).clicked() {
+                    // Refresh doubles as a page reset: forget the chosen
+                    // backup and layout and snap the target to the first
+                    // disk of the fresh enumeration (which also un-strands
+                    // a selection whose disk just vanished).
                     self.refresh_disks();
-                    // After a refresh the previously-selected disk may
-                    // have vanished (drive yanked, virtual disk
-                    // unmounted). Snap to the first disk in the new list
-                    // so the dropdown's `selected_text` always reflects
-                    // a real entry rather than stranding the user on a
-                    // ghost index.
-                    if !self.disks.iter().any(|d| d.index == self.target_disk_index) {
-                        if let Some(first) = self.disks.first() {
-                            self.target_disk_index = first.index;
-                        }
-                    }
+                    self.reset_restore_page();
                 }
             });
         });
@@ -1704,6 +1725,7 @@ impl PhoenixApp {
             ui.label("No disks detected. Run as Administrator, then refresh.");
             if refresh_disks_button(ui, &self.palette).clicked() {
                 self.refresh_disks();
+                self.clear_clone_ui_state();
             }
             return;
         }
@@ -1722,11 +1744,10 @@ impl PhoenixApp {
             viewport_width,
         );
         if out.refresh_clicked {
+            // Refresh doubles as a page reset: back to two empty dropdowns
+            // against the fresh enumeration.
             self.refresh_disks();
-            // The layout holds a snapshot of both disks; anything may have
-            // changed under it, so rebuild from the fresh enumeration.
-            self.clone_layout = None;
-            self.clone_layout_for = None;
+            self.clear_clone_ui_state();
         }
         if out.selection_changed {
             ui.ctx().request_repaint();
@@ -1805,22 +1826,39 @@ impl PhoenixApp {
         };
         if self.clone_layout_for != Some((s, t)) || self.clone_layout.is_none() {
             self.clone_layout_for = Some((s, t));
-            self.reseed_full_disk_clone();
+            self.reseed_clone_layout_default();
         }
     }
 
-    /// Build (or rebuild) the clone editor as the default full-disk plan for
-    /// the currently selected source/target pair.
-    fn reseed_full_disk_clone(&mut self) {
+    fn clone_layout_disks(&self) -> Option<(DiskInfo, DiskInfo)> {
         let source = self
             .clone_source_index
             .and_then(|i| self.disks.iter().find(|d| d.index == i))
-            .cloned();
+            .cloned()?;
         let target = self
             .clone_target_index
             .and_then(|i| self.disks.iter().find(|d| d.index == i))
-            .cloned();
-        let (Some(source), Some(target)) = (source, target) else {
+            .cloned()?;
+        Some((source, target))
+    }
+
+    /// Build (or rebuild) the clone editor for the selected pair in its
+    /// default mode: an individual-partitions plan seeded from the target's
+    /// live layout, waiting for a source partition to be dragged down.
+    fn reseed_clone_layout_default(&mut self) {
+        let Some((source, target)) = self.clone_layout_disks() else {
+            self.clone_layout = None;
+            return;
+        };
+        let mut layout = restore_layout::RestoreLayoutState::from_live_disk(&source);
+        layout.rebuild_from_target(&target);
+        self.clone_layout = Some(layout);
+    }
+
+    /// Rebuild the clone editor as a full-disk plan (the "Entire disk" mode's
+    /// expand-option toggle re-previews the grown layout through this).
+    fn reseed_full_disk_clone(&mut self) {
+        let Some((source, target)) = self.clone_layout_disks() else {
             self.clone_layout = None;
             return;
         };

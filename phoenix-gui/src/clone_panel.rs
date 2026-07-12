@@ -150,46 +150,46 @@ pub fn show(
             }
         });
     });
-    let mode_caption = match layout.as_deref() {
-        Some(l) if l.full_disk => Some(
-            "Full-disk clone — the target's entire contents are replaced with the source \
-             layout. Drag a partition down from the source to clone only that partition.",
-        ),
-        Some(_) => Some(
-            "Partial clone — drag a source partition onto a target partition to replace it, \
-             or into empty space to add it. Drag edges to resize, the body to move; click to \
-             select. Unmapped partitions are preserved.",
-        ),
-        None => None,
-    };
-    if let Some(caption) = mode_caption {
-        ui.label(egui::RichText::new(caption).color(palette.subtle_text));
-    }
-
-    // Mode switch, shown once both ends are picked.
+    // Mode switch, shown once both ends are picked, with the explainer for
+    // the active mode directly beneath it.
     if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {
         if !out.selection_changed {
             let source_disk = source_index.and_then(|s| disks.iter().find(|d| d.index == s));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Clone").color(palette.subtle_text));
-                if ui
-                    .selectable_label(layout.full_disk, "Entire disk")
-                    .clicked()
-                    && !layout.full_disk
+                if mode_button(
+                    ui,
+                    egui_phosphor::regular::HARD_DRIVE,
+                    "Entire disk",
+                    layout.full_disk,
+                    palette,
+                ) && !layout.full_disk
                 {
                     if let Some(source) = source_disk {
                         layout.seed_full_disk_clone(source, target, expand);
                     }
                 }
-                if ui
-                    .selectable_label(!layout.full_disk, "Individual partitions")
-                    .clicked()
-                    && layout.full_disk
+                if mode_button(
+                    ui,
+                    egui_phosphor::regular::PUZZLE_PIECE,
+                    "Individual partitions",
+                    !layout.full_disk,
+                    palette,
+                ) && layout.full_disk
                 {
                     layout.clear_full_disk(target);
                 }
             });
+            ui.add_space(2.0);
+            let caption = if layout.full_disk {
+                "Full-disk clone — the target's entire contents are replaced with the source \
+                 layout."
+            } else {
+                "Drag a source partition onto a target partition to replace it, or into empty \
+                 space to add it. Drag edges to resize, the body to move; click to select. \
+                 Unmapped partitions are preserved."
+            };
+            ui.label(egui::RichText::new(caption).color(palette.subtle_text));
 
             // Delete key mirrors the toolbar's delete button (partial only).
             if !layout.full_disk
@@ -369,6 +369,28 @@ fn dropdown_chevron(ui: &mut Ui, height: f32, popup_id: egui::Id, palette: &Pale
         color,
     );
     let response = response.on_hover_text("Choose a disk");
+    crate::theme::draw_focus_outline(ui, &response, palette);
+    response.clicked()
+}
+
+/// Bordered mode-switch button with a leading icon; the active mode gets an
+/// accent border and tinted fill so the pair reads as a two-state control.
+fn mode_button(ui: &mut Ui, icon: &str, label: &str, selected: bool, palette: &Palette) -> bool {
+    // Text stays at full contrast in both states — the accent border and
+    // tinted fill carry the selection; accent-colored text on the accent
+    // tint would be hard to read.
+    let text = crate::icon_label(icon, 16.0, label, 14.0, palette.icon_color);
+    let fill = if selected {
+        disk_map::blend(palette.content_card_bg, palette.accent, 0.18)
+    } else {
+        palette.content_card_bg
+    };
+    let stroke = if selected {
+        Stroke::new(1.5, palette.accent)
+    } else {
+        Stroke::new(1.0, disk_map::with_alpha(palette.subtle_text, 90))
+    };
+    let response = ui.add(egui::Button::new(text).fill(fill).stroke(stroke));
     crate::theme::draw_focus_outline(ui, &response, palette);
     response.clicked()
 }
