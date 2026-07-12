@@ -134,7 +134,8 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         "phoenix_core=info,phoenix_gui=info,phoenix_capture=info,\
-             phoenix_restore=info,phoenix_vss=info,phoenix_build=info,warn"
+             phoenix_restore=info,phoenix_vss=info,phoenix_build=info,\
+             phoenix_mount=info,phoenix_clone=info,warn"
             .into()
     });
 
