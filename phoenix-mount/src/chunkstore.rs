@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use blake3;
-use phoenix_core::container::{ChunkIndex, PhnxReader, CHUNK_SIZE, EXTENT_LBA_BYTES};
+use phoenix_core::container::{ChunkIndex, PhnxReader, EXTENT_LBA_BYTES};
 use phoenix_core::error::{PhoenixError, Result};
 
 /// Placement of one partition on the synthesized disk.
@@ -29,8 +29,20 @@ pub struct PartitionSpan {
 struct ExtentSpan {
     start: u64,
     end: u64,
-    /// chunk ordinal within the extent -> chunk table entry.
-    chunks: Vec<ChunkIndex>,
+    /// Chunks in stream order with their cumulative byte offset within the
+    /// extent. Chunks are contiguous from extent byte 0 but can be ANY
+    /// length — capture emits a short chunk whenever a source read returns
+    /// short (observed on locked USB volumes) — so chunk lookup must go by
+    /// these offsets, never by a fixed `CHUNK_SIZE` stride.
+    chunks: Vec<PlacedChunk>,
+}
+
+/// One chunk placed at its byte offset within its extent.
+#[derive(Debug, Clone)]
+struct PlacedChunk {
+    /// Byte offset within the extent where this chunk's data begins.
+    start: u64,
+    chunk: ChunkIndex,
 }
 
 struct PartitionIndex {
@@ -89,11 +101,18 @@ impl ChunkStore {
             for (ei, ext) in stream.extents.iter().enumerate() {
                 let start = ext.start_sector * EXTENT_LBA_BYTES as u64;
                 let end = start + ext.sector_count * EXTENT_LBA_BYTES as u64;
-                extents.push(ExtentSpan {
-                    start,
-                    end,
-                    chunks: by_extent.remove(&(ei as u32)).unwrap_or_default(),
-                });
+                let mut at = 0u64;
+                let chunks = by_extent
+                    .remove(&(ei as u32))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|chunk| {
+                        let placed = PlacedChunk { start: at, chunk };
+                        at += placed.chunk.uncompressed_len as u64;
+                        placed
+                    })
+                    .collect();
+                extents.push(ExtentSpan { start, end, chunks });
             }
             extents.sort_by_key(|e| e.start);
 
@@ -189,23 +208,24 @@ impl ChunkStore {
             return Ok(want.min(gap_len as usize).max(1).min(want));
         };
 
-        // Locate the chunk within the extent.
+        // Locate the chunk covering `rel` by its cumulative offset within the
+        // extent (chunks can be any length, see `ExtentSpan::chunks`).
         let in_extent = rel - extent.start;
-        let chunk_ord = (in_extent / CHUNK_SIZE as u64) as usize;
-        let chunk =
-            extent
-                .chunks
-                .get(chunk_ord)
-                .cloned()
-                .ok_or_else(|| PhoenixError::TableCorrupt {
-                    what: format!(
-                        "partition {}: extent covering byte {} is missing chunk ordinal {}",
-                        self.partitions[pi].span.partition_index, rel, chunk_ord
-                    ),
-                })?;
-        let off_in_chunk = (in_extent - chunk_ord as u64 * CHUNK_SIZE as u64) as usize;
+        let at = extent.chunks.partition_point(|c| c.start <= in_extent);
+        let placed = at
+            .checked_sub(1)
+            .and_then(|i| extent.chunks.get(i))
+            .filter(|c| in_extent < c.start + c.chunk.uncompressed_len as u64)
+            .cloned()
+            .ok_or_else(|| PhoenixError::TableCorrupt {
+                what: format!(
+                    "partition {}: no chunk covers extent byte {} (absolute byte {})",
+                    self.partitions[pi].span.partition_index, in_extent, rel
+                ),
+            })?;
+        let off_in_chunk = (in_extent - placed.start) as usize;
 
-        let data = self.load_chunk(pi, &chunk)?;
+        let data = self.load_chunk(pi, &placed.chunk)?;
         let avail = data.len().saturating_sub(off_in_chunk);
         let n = want.min(avail);
         if n == 0 {
@@ -374,6 +394,103 @@ mod tests {
         let mut buf3 = vec![0xFFu8; 512];
         store.read_at(0, &mut buf3).unwrap();
         assert!(buf3.iter().all(|&b| b == 0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression test for the RAW-volume mount bug: capture emits a chunk
+    /// SHORTER than `CHUNK_SIZE` mid-extent whenever a source read returns
+    /// short (observed on locked USB volumes — `capture_ntfs` writes
+    /// `&buf[..n]`). Chunk lookup must therefore go by cumulative chunk
+    /// lengths; the old fixed-stride `offset / CHUNK_SIZE` math shifted every
+    /// chunk after the short one, serving wrong bytes / hash mismatches.
+    #[test]
+    fn short_mid_extent_chunk_reads_correctly() {
+        let path = std::env::temp_dir().join(format!("cs_{}.phnx", Uuid::new_v4()));
+        let backup_id = Uuid::new_v4();
+        let header = Header {
+            version: FORMAT_VERSION,
+            flags: 1,
+            timestamp: 1,
+            backup_id,
+            disk_signature: 1,
+            partition_count: 1,
+        };
+        // One 128 KiB extent captured as a SHORT 48 KiB chunk + an 80 KiB rest.
+        let part_bytes = 128 * 1024u64;
+        let short_len = 48 * 1024usize;
+        let extents = vec![Extent {
+            start_sector: 0,
+            sector_count: part_bytes / EXTENT_LBA_BYTES as u64,
+        }];
+        let mut w = PhnxWriter::create(&path, header).unwrap();
+        let mut s = w
+            .begin_partition_stream(
+                0,
+                [0; 16],
+                "P".into(),
+                part_bytes,
+                FilesystemKind::Ntfs,
+                CaptureMode::UsedBlocks,
+                EXTENT_LBA_BYTES,
+                0,
+                &extents,
+                4096,
+            )
+            .unwrap();
+        s.write_chunk(&vec![0x11u8; short_len]).unwrap();
+        s.write_chunk(&vec![0x22u8; part_bytes as usize - short_len])
+            .unwrap();
+        let (chunks, _) = s.finish().unwrap();
+        let manifest = BackupManifest {
+            format_version: 1,
+            backup_id,
+            parent_backup_id: None,
+            hostname: "T".into(),
+            disk: DiskManifest {
+                style: "mbr".into(),
+                disk_guid: None,
+                sector_size: 512,
+            },
+            partitions: vec![PartitionManifest {
+                index: 0,
+                name: "P".into(),
+                type_guid: None,
+                fs: "ntfs".into(),
+                capture_mode: "used-blocks".into(),
+                original_size: part_bytes,
+                used_bytes: part_bytes,
+                bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
+                chunks,
+                bitmap_hash: None,
+            }],
+        };
+        w.finalize(&manifest).unwrap();
+
+        let reader = PhnxReader::open(&path).unwrap();
+        let (layout, disk_size) = plan_layout(&reader, 1024 * 1024);
+        let poff = layout[0].disk_offset;
+        let mut store = ChunkStore::new(reader, layout, disk_size).unwrap();
+
+        // Read the whole partition in one go and check both chunk regions,
+        // then a small read straddling the short-chunk boundary.
+        let mut buf = vec![0u8; part_bytes as usize];
+        store.read_at(poff, &mut buf).unwrap();
+        assert!(
+            buf[..short_len].iter().all(|&b| b == 0x11),
+            "short chunk data wrong"
+        );
+        assert!(
+            buf[short_len..].iter().all(|&b| b == 0x22),
+            "data after the short chunk must come from the NEXT chunk"
+        );
+
+        let mut straddle = vec![0u8; 8192];
+        store.read_at(poff + short_len as u64 - 4096, &mut straddle).unwrap();
+        assert!(straddle[..4096].iter().all(|&b| b == 0x11));
+        assert!(straddle[4096..].iter().all(|&b| b == 0x22));
 
         std::fs::remove_file(&path).ok();
     }
