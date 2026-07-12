@@ -20,11 +20,11 @@ pub fn install(ctx: &egui::Context) {
 
     fonts.font_data.insert(
         REGULAR.into(),
-        FontData::from_static(include_bytes!("../../Inter-Regular.ttf")),
+        FontData::from_static(include_bytes!("../../assets/Inter-Regular.ttf")),
     );
     fonts.font_data.insert(
         BOLD.into(),
-        FontData::from_static(include_bytes!("../../Inter-Bold.ttf")),
+        FontData::from_static(include_bytes!("../../assets/Inter-Bold.ttf")),
     );
 
     fonts

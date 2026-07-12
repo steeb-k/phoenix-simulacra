@@ -72,9 +72,9 @@ const START_BUTTON_HEIGHT: f32 = 52.0;
 /// to look right at 16x16/32x32/256x256 against the taskbar/title bar,
 /// while the in-app icons are vector glyphs tinted by the active theme.
 fn app_icon() -> egui::IconData {
-    let bytes = include_bytes!("../../carbon-phoenix_appIcon.ico");
-    let image =
-        image::load_from_memory(bytes).expect("failed to decode carbon-phoenix_appIcon.ico");
+    let bytes = include_bytes!("../../assets/carbon-phoenix-appicon-256px.png");
+    let image = image::load_from_memory(bytes)
+        .expect("failed to decode carbon-phoenix-appicon-256px.png");
     let image = image.into_rgba8();
     let (width, height) = image.dimensions();
     egui::IconData {

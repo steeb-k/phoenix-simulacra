@@ -198,7 +198,7 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
 fn draw_brand(ui: &mut Ui) {
     ui.vertical_centered(|ui| {
         ui.add(
-            egui::Image::new(egui::include_image!("../../carbon-phoenix-sidebar.png"))
+            egui::Image::new(egui::include_image!("../../assets/carbon-phoenix-sidebar.png"))
                 .fit_to_exact_size(Vec2::splat(LOGO_SIZE)),
         );
         ui.add_space(BRAND_IMAGE_TRAILER);
