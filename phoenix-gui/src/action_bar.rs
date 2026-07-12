@@ -47,51 +47,52 @@ pub fn show(
                 },
             );
 
-            // Vertical gradient: lit at the top, settling darker at the
-            // bottom. Hover lifts the whole surface; press flattens it
-            // dark; disabled keeps the dimmed hue `action_row` used so
-            // the Go control stays recognizable.
-            let base = palette.success;
-            let (top, bottom) = if !action.enabled {
-                let dimmed = palette.dim(base);
-                (
-                    tint(dimmed, 0.05, Color32::WHITE),
-                    tint(dimmed, 0.08, Color32::BLACK),
-                )
-            } else if interactable && response.is_pointer_button_down_on() {
-                (
-                    tint(base, 0.16, Color32::BLACK),
-                    tint(base, 0.04, Color32::BLACK),
-                )
-            } else if interactable && response.hovered() {
-                (
-                    tint(base, 0.24, Color32::WHITE),
-                    tint(base, 0.02, Color32::WHITE),
-                )
-            } else {
-                (
-                    tint(base, 0.15, Color32::WHITE),
-                    tint(base, 0.15, Color32::BLACK),
-                )
-            };
             let rounding = Rounding {
                 sw: CORNER_RADIUS,
                 ..Rounding::ZERO
             };
-            paint_vertical_gradient(ui.painter(), rect, rounding, top, bottom);
-
-            // 1px sheen along the top edge sells the gradient as a lit
-            // surface instead of a flat banner.
             if action.enabled {
+                // Vertical gradient: lit at the top, settling darker at
+                // the bottom. Hover lifts the whole surface; press
+                // flattens it dark.
+                let base = palette.success;
+                let (top, bottom) = if interactable && response.is_pointer_button_down_on() {
+                    (
+                        tint(base, 0.16, Color32::BLACK),
+                        tint(base, 0.04, Color32::BLACK),
+                    )
+                } else if interactable && response.hovered() {
+                    (
+                        tint(base, 0.24, Color32::WHITE),
+                        tint(base, 0.02, Color32::WHITE),
+                    )
+                } else {
+                    (
+                        tint(base, 0.15, Color32::WHITE),
+                        tint(base, 0.15, Color32::BLACK),
+                    )
+                };
+                paint_vertical_gradient(ui.painter(), rect, rounding, top, bottom);
+
+                // 1px sheen along the top edge sells the gradient as a
+                // lit surface instead of a flat banner.
                 ui.painter().hline(
                     rect.x_range(),
                     rect.top() + 0.5,
                     Stroke::new(1.0, Color32::from_white_alpha(36)),
                 );
+            } else {
+                // Not armed yet: monochrome hazard tape (same procedural
+                // stripes as the disk-wipe dialogs, minus the shouting
+                // yellow) until the page's selections complete and the
+                // bar turns its normal green.
+                paint_hazard_tape(ui.painter(), rect, rounding, palette);
             }
 
             let text_color = if action.enabled {
                 Color32::WHITE
+            } else if palette.light_mode {
+                Color32::from_rgb(0x50, 0x50, 0x50)
             } else {
                 Color32::from_white_alpha(170)
             };
@@ -151,6 +152,90 @@ pub fn show(
             (clicked, rect)
         })
         .inner
+}
+
+/// Disabled-state fill: diagonal hazard-tape stripes, built the same way
+/// as `confirm_dialog::paint_tape` (45° parallelograms, dark top fade)
+/// but in muted monochrome — black/gray in dark mode, white/light-gray in
+/// light mode — so it signals "blocked until the form is complete"
+/// without borrowing the destructive dialogs' yellow.
+///
+/// The stripes are painted square (they can't be clipped to a rounded
+/// rect), so the pane's rounded bottom-left corner is patched back in
+/// afterwards with the sidebar color.
+fn paint_hazard_tape(painter: &egui::Painter, rect: Rect, rounding: Rounding, palette: &Palette) {
+    let (base, stripe) = if palette.light_mode {
+        (Color32::WHITE, Color32::from_rgb(0xD9, 0xD9, 0xD9))
+    } else {
+        (
+            Color32::from_rgb(0x16, 0x16, 0x16),
+            Color32::from_rgb(0x3A, 0x3A, 0x3A),
+        )
+    };
+    // Base coat with the rounded silhouette (a flat "gradient").
+    paint_vertical_gradient(painter, rect, rounding, base, base);
+
+    // Same construction as the dialog tape: 45° slant (horizontal offset =
+    // strip height), but with a fixed stripe width — height-wide stripes
+    // would turn chunky on a 52px bar.
+    const STRIPE_W: f32 = 22.0;
+    let clipped = painter.with_clip_rect(rect);
+    let h = rect.height();
+    let mut x = rect.left() - h;
+    while x < rect.right() {
+        clipped.add(Shape::convex_polygon(
+            vec![
+                egui::pos2(x, rect.bottom()),
+                egui::pos2(x + STRIPE_W, rect.bottom()),
+                egui::pos2(x + STRIPE_W + h, rect.top()),
+                egui::pos2(x + h, rect.top()),
+            ],
+            stripe,
+            Stroke::NONE,
+        ));
+        x += STRIPE_W * 2.0;
+    }
+
+    // The dialogs' tape sheen, toned down: a faint top fade for depth
+    // (dark mode only — on white tape it just looks like dirt).
+    if !palette.light_mode {
+        let mut sheen = Mesh::default();
+        let top_tint = Color32::from_black_alpha(50);
+        sheen.colored_vertex(rect.left_top(), top_tint);
+        sheen.colored_vertex(rect.right_top(), top_tint);
+        sheen.colored_vertex(rect.right_bottom(), Color32::TRANSPARENT);
+        sheen.colored_vertex(rect.left_bottom(), Color32::TRANSPARENT);
+        sheen.add_triangle(0, 1, 2);
+        sheen.add_triangle(0, 2, 3);
+        clipped.add(Shape::mesh(sheen));
+    }
+
+    // Restore the rounded bottom-left corner: repaint the spandrel between
+    // the corner square and the quarter-circle arc in the sidebar color the
+    // cutout is supposed to show.
+    paint_sw_corner_patch(painter, rect, rounding.sw, palette.sidebar_bg);
+}
+
+/// Fill the region of the bottom-left corner square that lies OUTSIDE the
+/// rounded corner's quarter-circle arc. Non-convex, but star-shaped from
+/// the corner point, so a triangle fan from there covers it exactly.
+fn paint_sw_corner_patch(painter: &egui::Painter, rect: Rect, radius: f32, fill: Color32) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    const ARC_STEPS: usize = 8;
+    let center = egui::pos2(rect.left() + radius, rect.bottom() - radius);
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(egui::pos2(rect.left(), rect.bottom()), fill);
+    for i in 0..=ARC_STEPS {
+        let a = FRAC_PI_2 + (PI - FRAC_PI_2) * (i as f32 / ARC_STEPS as f32);
+        mesh.colored_vertex(
+            egui::pos2(center.x + radius * a.cos(), center.y + radius * a.sin()),
+            fill,
+        );
+    }
+    for i in 1..=ARC_STEPS as u32 {
+        mesh.add_triangle(0, i, i + 1);
+    }
+    painter.add(Shape::mesh(mesh));
 }
 
 /// Fill a rounded rect with a top→bottom gradient. egui has no gradient

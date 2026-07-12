@@ -1256,9 +1256,9 @@ fn disabled_when<R>(ui: &mut egui::Ui, busy: bool, body: impl FnOnce(&mut egui::
 }
 
 /// A page's primary "start" affordance, rendered by the sticky bottom
-/// action bar (`action_bar::show`): green gradient bar, disabled-and-dimmed
-/// when `enabled` is false, with an optional `disabled_hint` shown on hover
-/// when the user cannot click it.
+/// action bar (`action_bar::show`): green gradient bar when armed,
+/// monochrome hazard tape while `enabled` is false, with an optional
+/// `disabled_hint` shown on hover when the user cannot click it.
 pub struct StartAction<'a> {
     pub label: &'a str,
     /// Optional phosphor glyph rendered before the label (e.g.
