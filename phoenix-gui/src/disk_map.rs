@@ -178,6 +178,20 @@ pub fn min_disk_row_width(disk: &DiskInfo) -> f32 {
         + gutter_total
 }
 
+/// Accent border for a selected card. A stroke centered on the card edge gets
+/// its straight runs halved by the square clip while the corner arcs escape it
+/// and bulge past the rounded fill, reading as dark corner wedges. Inset by
+/// half the stroke width (radius reduced to match, keeping the same corner
+/// center) so the stroke's outer edge lands exactly on the fill's silhouette.
+fn draw_selection_stroke(painter: &egui::Painter, rect: Rect, palette: &Palette) {
+    let w = 2.0;
+    painter.rect_stroke(
+        rect.shrink(w / 2.0),
+        Rounding::same(SEGMENT_ROUNDING - w / 2.0),
+        Stroke::new(w, palette.accent),
+    );
+}
+
 pub fn draw_disk_info_card(
     ui: &mut Ui,
     rect: Rect,
@@ -193,11 +207,7 @@ pub fn draw_disk_info_card(
     };
     painter.rect_filled(rect, Rounding::same(SEGMENT_ROUNDING), bg);
     if selected {
-        painter.rect_stroke(
-            rect,
-            Rounding::same(SEGMENT_ROUNDING),
-            Stroke::new(2.0, palette.accent),
-        );
+        draw_selection_stroke(&painter, rect, palette);
     }
 
     let text_x = rect.left() + 14.0;
@@ -317,15 +327,15 @@ pub fn draw_partition_segment_visual_styled(
     };
     painter.rect_filled(rect, Rounding::same(SEGMENT_ROUNDING), bg);
 
-    let track_rect = Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), FILL_BAR_HEIGHT));
-    painter.rect_filled(
-        track_rect,
-        Rounding {
-            nw: SEGMENT_ROUNDING,
-            ne: SEGMENT_ROUNDING,
-            sw: 0.0,
-            se: 0.0,
-        },
+    // The fill bar is shorter than the corner radius, so a standalone rounded
+    // rect gets its radius clamped to bar_height/2 and pokes past the card's
+    // corner curve. Paint the full card shape instead, clipped to the bar
+    // strip, so the corner geometry matches the background exactly.
+    let track_clip =
+        Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), FILL_BAR_HEIGHT));
+    painter.with_clip_rect(track_clip).rect_filled(
+        rect,
+        Rounding::same(SEGMENT_ROUNDING),
         with_alpha(palette.subtle_text, 60),
     );
 
@@ -339,29 +349,16 @@ pub fn draw_partition_segment_visual_styled(
     };
     let usage_w = (rect.width() * usage_frac).max(0.0);
     if usage_w > 0.5 {
-        let usage_rect = Rect::from_min_size(rect.left_top(), Vec2::new(usage_w, FILL_BAR_HEIGHT));
-        painter.rect_filled(
-            usage_rect,
-            Rounding {
-                nw: SEGMENT_ROUNDING,
-                ne: if (usage_w - rect.width()).abs() < 0.5 {
-                    SEGMENT_ROUNDING
-                } else {
-                    0.0
-                },
-                sw: 0.0,
-                se: 0.0,
-            },
+        let usage_clip = Rect::from_min_size(rect.left_top(), Vec2::new(usage_w, FILL_BAR_HEIGHT));
+        painter.with_clip_rect(usage_clip).rect_filled(
+            rect,
+            Rounding::same(SEGMENT_ROUNDING),
             with_alpha(palette.accent, usage_alpha),
         );
     }
 
     if selected {
-        painter.rect_stroke(
-            rect,
-            Rounding::same(SEGMENT_ROUNDING),
-            Stroke::new(2.0, palette.accent),
-        );
+        draw_selection_stroke(&painter, rect, palette);
     }
 
     // All three lines are always drawn; `painter_at(rect)` clips them to the
