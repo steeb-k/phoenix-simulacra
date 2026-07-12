@@ -141,7 +141,14 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
 
             if !view.detail.is_empty() {
                 ui.add_space(10.0);
-                ui.label(RichText::new(view.detail).color(palette.subtle_text));
+                let detail = RichText::new(view.detail).color(palette.subtle_text);
+                if success_banner(view).is_some() {
+                    // Everything on the checkmark screen is centered; keep the
+                    // result line ("Backup completed: <path>") in step with it.
+                    ui.vertical_centered(|ui| ui.label(detail));
+                } else {
+                    ui.label(detail);
+                }
             }
 
             ui.add_space(18.0);
