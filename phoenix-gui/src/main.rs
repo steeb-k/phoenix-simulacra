@@ -762,16 +762,17 @@ impl PhoenixApp {
         verified_backup: bool,
         verify_target: Option<std::path::PathBuf>,
     ) {
-        // A successful backup swaps the progress bar + checklist for a big
-        // green checkmark; the banner text records whether the verify pass ran.
-        let success_banner =
-            (kind == JobKind::Backup && outcome == JobOutcome::Success).then(|| {
-                if verified_backup {
-                    "Completed and verified.".to_string()
-                } else {
-                    "Completed. Unverified.".to_string()
-                }
-            });
+        // A successful backup or verify swaps the progress bar + checklist for
+        // a big green checkmark. For a backup the banner text also records
+        // whether the verify pass ran.
+        let success_banner = (outcome == JobOutcome::Success)
+            .then(|| match kind {
+                JobKind::Backup if verified_backup => Some("Completed and verified.".to_string()),
+                JobKind::Backup => Some("Completed. Unverified.".to_string()),
+                JobKind::Verify => Some("Backup verified.".to_string()),
+                _ => None,
+            })
+            .flatten();
         self.completed = Some(CompletedJob {
             title: kind.noun().to_string(),
             steps: snap.steps.clone(),

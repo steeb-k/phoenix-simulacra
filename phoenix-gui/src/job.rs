@@ -241,8 +241,9 @@ pub fn spawn_verify(path: PathBuf, quick: bool) -> BackgroundJob {
         } else {
             "Full verify OK"
         };
+        let display = path.display().to_string();
         verify_backup_with_progress(&path, quick, Some(progress_worker))
-            .map(|()| label.to_string())
+            .map(|()| format!("{label}: {display}"))
             .map_err(|e| e.to_string())
     })
 }

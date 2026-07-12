@@ -32,8 +32,9 @@ pub struct CompletedJob {
     pub outcome: JobOutcome,
     pub message: String,
     /// When set (successful backups: "Completed and verified." /
-    /// "Completed. Unverified."), the finished modal replaces the progress
-    /// bar and step checklist with a big green checkmark over this text.
+    /// "Completed. Unverified."; successful standalone verifies: "Backup
+    /// verified."), the finished modal replaces the progress bar and step
+    /// checklist with a big green checkmark over this text.
     pub success_banner: Option<String>,
     /// The `.phnx` file this (successful, unverified, single-disk) backup
     /// wrote. When set, the finished modal offers a "Verify?" button that
@@ -131,8 +132,8 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
             ui.add_space(12.0);
 
             if let Some(banner) = success_banner(view) {
-                // Successful backup: the play-by-play (bar + checklist) has
-                // served its purpose — replace it with one unambiguous verdict.
+                // Successful backup/verify: the play-by-play (bar + checklist)
+                // has served its purpose — replace it with one unambiguous verdict.
                 show_success_banner(ui, palette, banner);
             } else {
                 show_progress_bar(ui, palette, view);
@@ -189,9 +190,10 @@ fn success_banner<'a>(view: &ModalView<'a>) -> Option<&'a str> {
     }
 }
 
-/// The completion screen for a successful backup: a filled green circle with
-/// a white checkmark, over the bold verdict text ("Completed and verified." /
-/// "Completed. Unverified."). Replaces the progress bar and step checklist.
+/// The completion screen for a successful backup or verify: a filled green
+/// circle with a white checkmark, over the bold verdict text ("Completed and
+/// verified." / "Completed. Unverified." / "Backup verified."). Replaces the
+/// progress bar and step checklist.
 fn show_success_banner(ui: &mut egui::Ui, palette: &Palette, banner: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(10.0);
