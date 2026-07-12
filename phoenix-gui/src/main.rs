@@ -376,6 +376,18 @@ impl PhoenixApp {
         self.restore_layout = None;
     }
 
+    /// Reset the Clone page to its untouched default (no disks picked, no
+    /// plan). Called on every terminal clone outcome — success, failure, or
+    /// cancel — so the page can never show a stale, already-executed plan
+    /// that leaves the user second-guessing whether they started it.
+    fn clear_clone_ui_state(&mut self) {
+        self.clone_source_index = None;
+        self.clone_target_index = None;
+        self.clone_expand = false;
+        self.clone_layout = None;
+        self.clone_layout_for = None;
+    }
+
     fn try_load_restore_backup(&mut self) {
         let path_str = self.restore_backup_path.trim();
         if path_str.is_empty() {
@@ -502,6 +514,9 @@ impl PhoenixApp {
                         if job_kind == JobKind::Restore {
                             self.clear_restore_ui_state();
                         }
+                        if job_kind == JobKind::Clone {
+                            self.clear_clone_ui_state();
+                        }
                         self.total_backups = 0;
                         self.current_backup_index = 0;
                         self.record_job(
@@ -560,6 +575,12 @@ impl PhoenixApp {
                     };
                     self.record_job(job_kind, rec_outcome, &final_snap);
                     self.job_started = None;
+                    // A finished clone — success, failure, or cancel — resets
+                    // the Clone page to its default view so a stale plan can't
+                    // sit there looking like it still needs to be started.
+                    if job_kind == JobKind::Clone {
+                        self.clear_clone_ui_state();
+                    }
                     self.finish_modal(job_kind, &final_snap, outcome, job_verified, None);
                 }
             }
