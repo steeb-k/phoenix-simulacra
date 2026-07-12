@@ -907,18 +907,26 @@ impl PhoenixApp {
                     }),
                 }
             }
-            Page::Mount => StartAction {
-                label: "Mount (Read-Only)",
-                icon: Some(egui_phosphor::fill::PLAY),
-                enabled: !busy && self.mount_source.is_some() && !self.mount_selection.is_empty(),
-                disabled_hint: Some(if busy {
-                    "A job is already running"
-                } else if self.mount_source.is_none() {
-                    "Choose a backup file first"
-                } else {
-                    "Select at least one partition to mount"
-                }),
-            },
+            Page::Mount => {
+                let already_mounted = self.selected_backup_already_mounted();
+                StartAction {
+                    label: "Mount (Read-Only)",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy
+                        && !already_mounted
+                        && self.mount_source.is_some()
+                        && !self.mount_selection.is_empty(),
+                    disabled_hint: Some(if busy {
+                        "A job is already running"
+                    } else if already_mounted {
+                        "That backup is already mounted — see Active mounts below"
+                    } else if self.mount_source.is_none() {
+                        "Choose a backup file first"
+                    } else {
+                        "Select at least one partition to mount"
+                    }),
+                }
+            }
             Page::History | Page::Options => return None,
         };
         Some(action)
@@ -2223,10 +2231,16 @@ impl PhoenixApp {
 
             if let Some(source) = self.mount_source.clone() {
                 ui.add_space(8.0);
-                ui.label(
+                // The action bar's hover hint says this too, but a taped-over
+                // bar with no visible reason is a puzzle — say it on the page.
+                let hint = if self.selected_backup_already_mounted() {
+                    egui::RichText::new("This backup is already mounted — see Active mounts below.")
+                        .color(self.palette.warning)
+                } else {
                     egui::RichText::new("Choose the partition(s) to mount.")
-                        .color(self.palette.subtle_text),
-                );
+                        .color(self.palette.subtle_text)
+                };
+                ui.label(hint);
                 ui.add_space(4.0);
                 // Same width discipline as the Backup page: capture the real
                 // viewport width before the ScrollArea virtualizes it.
@@ -2261,6 +2275,11 @@ impl PhoenixApp {
             .mounts
             .iter()
             .map(|m| mount_table::MountRow {
+                folder: m
+                    .backup_path()
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
                 name: m
                     .backup_path()
                     .file_name()
@@ -2392,7 +2411,26 @@ impl PhoenixApp {
         }
     }
 
+    /// True when the path the Mount page currently has loaded is already
+    /// attached. A second mount of the same `.phnx` would hand out a second set
+    /// of drive letters for identical read-only content — never what anyone
+    /// wants — so the action bar refuses it (and `start_mount` re-checks, since
+    /// the bar is not the only way in).
+    fn selected_backup_already_mounted(&self) -> bool {
+        let chosen = self.mount_backup_path.trim();
+        if chosen.is_empty() {
+            return false;
+        }
+        self.mounts
+            .iter()
+            .any(|m| same_file_path(m.backup_path(), Path::new(chosen)))
+    }
+
     fn start_mount(&mut self) {
+        if self.selected_backup_already_mounted() {
+            self.status = "That backup is already mounted".into();
+            return;
+        }
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
         let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
         let selected: Vec<u32> = self.mount_selection.iter().map(|&(_, part)| part).collect();
@@ -2413,6 +2451,14 @@ impl PhoenixApp {
                         .unwrap_or_default()
                 );
                 self.mounts.push(session);
+                // The backup has moved from "being picked" to "mounted", and
+                // the table below is now the place it lives: reset the picker
+                // so the page is ready for the next one instead of sitting
+                // there re-offering what was just mounted.
+                self.mount_backup_path.clear();
+                self.mount_loaded_path.clear();
+                self.mount_source = None;
+                self.mount_selection.clear();
             }
             Err(e) => {
                 self.status = format!("Mount failed: {e}");
@@ -2557,11 +2603,13 @@ fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
     }
     vec![
         mount_table::MountRow {
+            folder: r"D:\Backups".into(),
             name: "fdBU.phnx".into(),
             size: 30_800_000_000,
             letters: vec!['I', 'J'],
         },
         mount_table::MountRow {
+            folder: r"\\nas\archive\carbon-phoenix\weekly\workstation\2026\july".into(),
             name: "workstation-2026-07-12.phnx".into(),
             size: 512_110_190_592,
             letters: vec!['K'],
@@ -2595,6 +2643,19 @@ fn default_backup_folder() -> String {
         return format!(r"{profile}\Documents");
     }
     String::new()
+}
+
+/// Whether two paths name the same backup, compared case-insensitively the way
+/// Windows itself would. Deliberately not `fs::canonicalize`: this is called
+/// every frame to gate the Mount action, and canonicalizing opens the file —
+/// once per frame against a backup sitting on a NAS is a real stall. The paths
+/// being compared are the ones the picker produced, so they match verbatim in
+/// every case that matters; an exotic spelling of an already-mounted path is
+/// caught by Windows at attach time, not silently double-mounted.
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
 }
 
 /// Short per-partition exposure summary for an active mount, e.g.

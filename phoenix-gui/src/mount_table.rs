@@ -6,8 +6,8 @@
 //! letter gets its own Explore button:
 //!
 //! ```text
-//! fdBU.phnx     30.8 GB     I:   [Explore]
-//!                                            [Unmount]
+//! D:\Backups                I:   [Explore]
+//! fdBU.phnx     30.8 GB                      [Unmount]
 //!                           J:   [Explore]
 //! ```
 //!
@@ -28,6 +28,9 @@ use crate::{fonts, icon_label};
 /// `phoenix_mount` types).
 #[derive(Clone)]
 pub struct MountRow {
+    /// Folder the mounted `.phnx` lives in, shown dimmed above the name and
+    /// spelled out in full on hover when it's too long for the column.
+    pub folder: String,
     /// File name of the mounted `.phnx`.
     pub name: String,
     /// Size of the virtual disk the backup exposes.
@@ -65,6 +68,8 @@ const UNMOUNT_W: f32 = 112.0;
 const NAME_MIN_W: f32 = 130.0;
 const BTN_H: f32 = 30.0;
 const BTN_ROUNDING: f32 = 6.0;
+/// Leading between the dimmed folder line and the backup's name below it.
+const FOLDER_GAP: f32 = 1.0;
 
 /// Narrowest the table renders at. Callers size it to
 /// `max(viewport, min_width())` — the same discipline the disk maps use —
@@ -186,7 +191,16 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
     let cols = columns(rect);
 
     // Name and size are properties of the whole mount, so they sit centered
-    // against the full card height rather than against the first letter.
+    // against the full card height rather than against the first letter. The
+    // folder rides above the name, dimmed: two mounts can share a file name,
+    // and the only thing telling them apart is where they came from.
+    let folder = elided(
+        ui,
+        &row.folder,
+        fonts::regular(11.5),
+        palette.subtle_text,
+        cols.name_w,
+    );
     let name = elided(
         ui,
         &row.name,
@@ -194,9 +208,22 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
         palette.icon_color,
         cols.name_w,
     );
+    let block_h = folder.size().y + FOLDER_GAP + name.size().y;
+    let block_top = rect.center().y - block_h * 0.5;
+    let folder_pos = egui::pos2(cols.name_x, block_top);
+    ui.painter()
+        .galley(folder_pos, folder.clone(), palette.subtle_text);
+    // The folder is the one cell that routinely doesn't fit, so hovering it
+    // spells the path out in full.
+    ui.interact(
+        Rect::from_min_size(folder_pos, folder.size()),
+        ui.id().with(("mount_folder", index)),
+        Sense::hover(),
+    )
+    .on_hover_text(&row.folder);
     let painter = ui.painter();
     painter.galley(
-        egui::pos2(cols.name_x, rect.center().y - name.size().y * 0.5),
+        egui::pos2(cols.name_x, block_top + folder.size().y + FOLDER_GAP),
         name,
         palette.icon_color,
     );
