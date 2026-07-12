@@ -655,8 +655,20 @@ impl PhoenixApp {
             action = status_modal::show(ctx, &self.palette, &view);
         } else if let Some(job) = &self.job {
             let snap = job.progress.snapshot();
+            // A verifying backup is no longer "Backing up": the verify pass is
+            // the last step of the plan (only present when verify-after is on),
+            // so the headline flips once the job reaches it.
+            let title = if job.kind == JobKind::Backup
+                && job.verify_after
+                && !snap.steps.is_empty()
+                && snap.current_step + 1 == snap.steps.len()
+            {
+                "Verifying"
+            } else {
+                job.kind.title()
+            };
             let view = ModalView {
-                title: job.kind.title(),
+                title,
                 steps: &snap.steps,
                 current_step: snap.current_step,
                 detail: &snap.detail,
