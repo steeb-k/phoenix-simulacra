@@ -10,8 +10,6 @@ use phoenix_core::disk::DiskInfo;
 use crate::disk_map;
 use crate::theme::Palette;
 
-pub use disk_map::row_stride;
-
 /// Render every disk as a row of `[checkbox | info card | partition map]`.
 pub fn show(
     ui: &mut Ui,

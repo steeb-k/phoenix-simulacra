@@ -37,9 +37,9 @@ const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const RESTORE_BACKUP_LOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 const REFRESH_BTN_SIZE: f32 = 52.0;
 const REFRESH_ICON_SIZE: f32 = 32.0;
-/// Form-action button width on the Backup page (Browse, Start backup).
-/// Tuned to comfortably fit "Start backup" at 16pt so both buttons render
-/// at the same width.
+/// Form-action button width (Browse…, Run restore, Verify backup).
+/// Tuned to comfortably fit those labels at 16pt so the buttons render
+/// at a consistent width across pages.
 const FORM_BUTTON_W: f32 = 130.0;
 /// Padding added back to a `TextEdit::singleline` response rect to recover
 /// its outer visible height — `TextEdit::ui` subtracts its margin from
@@ -52,6 +52,17 @@ const INPUT_MARGIN_RESTORE: f32 = 16.0;
 /// (Restore, Verify). Tuned to match the Backup page's computed
 /// `input_height` (roughly 16pt text + 2×8px TextEdit margin).
 const ACTION_BUTTON_HEIGHT: f32 = 36.0;
+/// Horizontal inner margin of the central panel — every page's content
+/// starts this far from the panel edges.
+const CENTRAL_PANEL_MARGIN_X: f32 = 24.0;
+/// Right-hand buffer between the Backup page's controls and the window
+/// edge, so every element ends on the same vertical line. The page-level
+/// vertical scrollbar rides the window edge inside this gutter.
+const PAGE_RIGHT_MARGIN: f32 = 15.0;
+/// Oversized Start button on the Backup page — the page's primary action,
+/// rendered with a play glyph and deliberately bigger than the standard
+/// `FORM_BUTTON_W` × `ACTION_BUTTON_HEIGHT` action row.
+const START_BACKUP_BUTTON_SIZE: egui::Vec2 = egui::vec2(190.0, 52.0);
 
 /// Decode the embedded application icon for the OS window chrome (title
 /// bar / taskbar / Alt-Tab thumbnail). This is intentionally a *separate*
@@ -698,7 +709,7 @@ impl eframe::App for PhoenixApp {
         let central = egui::CentralPanel::default()
             .frame(
                 egui::Frame::central_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(24.0, 20.0))
+                    .inner_margin(egui::Margin::symmetric(CENTRAL_PANEL_MARGIN_X, 20.0))
                     .rounding(panel_rounding),
             )
             .show(ctx, |ui| {
@@ -865,6 +876,9 @@ fn disabled_when<R>(ui: &mut egui::Ui, busy: bool, body: impl FnOnce(&mut egui::
 /// `disabled_hint` shown on hover when the user cannot click it.
 pub struct StartAction<'a> {
     pub label: &'a str,
+    /// Optional phosphor glyph rendered before the label (e.g.
+    /// [`egui_phosphor::regular::PLAY`] on the Start backup button).
+    pub icon: Option<&'a str>,
     pub enabled: bool,
     pub disabled_hint: Option<&'a str>,
 }
@@ -895,6 +909,40 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Inline "<phosphor glyph> label" button text. Needs a `LayoutJob`
+/// because the glyph must resolve through the phosphor font family while
+/// the label stays in Inter — a single `RichText` can only carry one font.
+fn icon_label(
+    icon: &str,
+    icon_size: f32,
+    label: &str,
+    label_size: f32,
+    color: egui::Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        icon,
+        0.0,
+        egui::TextFormat {
+            font_id: fonts::icon(icon_size),
+            color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job.append(
+        label,
+        8.0,
+        egui::TextFormat {
+            font_id: fonts::regular(label_size),
+            color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job
+}
+
 /// Render `starts` (one or more green Start-style buttons) in a row.
 /// Returns `Some(start_idx)` when one of them was clicked, `None` otherwise.
 ///
@@ -902,13 +950,13 @@ fn truncate(s: &str, max: usize) -> String {
 /// calls [`PhoenixApp::cancel_current_job`]), so this row no longer renders
 /// a per-page Cancel control.
 ///
-/// All buttons land at `FORM_BUTTON_W` × `height`. Disabled colored
-/// buttons stay tinted (faded, via `Palette::dim`) instead of going
-/// fully grey so the user still recognizes the Go control.
+/// All buttons land at `size`. Disabled colored buttons stay tinted
+/// (faded, via `Palette::dim`) instead of going fully grey so the user
+/// still recognizes the Go control.
 fn action_row(
     ui: &mut egui::Ui,
     palette: &Palette,
-    height: f32,
+    size: egui::Vec2,
     starts: &[StartAction<'_>],
 ) -> Option<usize> {
     let mut clicked_start: Option<usize> = None;
@@ -919,15 +967,17 @@ fn action_row(
             } else {
                 palette.dim(palette.success)
             };
+            let text: egui::WidgetText = match start.icon {
+                Some(icon) => {
+                    icon_label(icon, 20.0, start.label, 16.0, egui::Color32::WHITE).into()
+                }
+                None => egui::RichText::new(start.label)
+                    .color(egui::Color32::WHITE)
+                    .into(),
+            };
             let resp = ui
                 .add_enabled_ui(start.enabled, |ui| {
-                    ui.add_sized(
-                        [FORM_BUTTON_W, height],
-                        egui::Button::new(
-                            egui::RichText::new(start.label).color(egui::Color32::WHITE),
-                        )
-                        .fill(fill),
-                    )
+                    ui.add_sized(size, egui::Button::new(text).fill(fill))
                 })
                 .inner;
             let resp = match start.disabled_hint {
@@ -1051,40 +1101,42 @@ fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
 impl PhoenixApp {
     fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
         // Whole-page scroll: when the window is too short, the entire backup
-        // page (header, drive list, path field, options, buttons) scrolls as
-        // a unit. The inner drive list still has its own scroll area capped
-        // at ~3.5 rows so the rest of the controls stay close at hand.
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.ui_backup_inner(ui, busy);
-            });
+        // page (header, fields, drive list, options, buttons) scrolls as a
+        // unit. The drive list only scrolls horizontally — vertical overflow
+        // is this page-level scroll area's job.
+        // Reclaim the central panel's right margin so the scroll area — and
+        // therefore its scrollbar — reaches the window edge. Content is then
+        // padded `PAGE_RIGHT_MARGIN` inside the scroll area, which puts every
+        // control on one vertical line with the scrollbar riding the window
+        // edge in that gutter (instead of floating mid-panel).
+        let mut full_rect = ui.max_rect();
+        full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin {
+                            right: PAGE_RIGHT_MARGIN,
+                            ..egui::Margin::ZERO
+                        })
+                        .show(ui, |ui| self.ui_backup_inner(ui, busy));
+                });
+        });
     }
 
     fn ui_backup_inner(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_header(
-            ui,
-            &self.palette,
-            "Create Backup",
-            "Create a disk or partition image backup with optional compression and verification.",
-        );
+        page_header(ui, &self.palette, "Create Backup", "");
 
         // Compute name_missing OUTSIDE the disabled scope so the action
         // row below can still gate Start on it.
         let name_missing = self.backup_name.trim().is_empty();
 
-        // We need to fish the Backup name TextEdit's response out of an
-        // `add_enabled_ui` scope so the rest of the page can size buttons
-        // to match its height. `ui.add_enabled_ui` returns `InnerResponse`,
-        // so we just bubble the inner closure value back up.
-        let name_response = ui
-            .add_enabled_ui(!busy, |ui| self.ui_backup_form(ui, name_missing))
-            .inner;
-
-        let input_height = name_response.rect.height() + INPUT_MARGIN_RESTORE;
+        ui.add_enabled_ui(!busy, |ui| self.ui_backup_form(ui, name_missing));
 
         let starts = [StartAction {
             label: "Start backup",
+            icon: Some(egui_phosphor::regular::PLAY),
             enabled: !busy && !name_missing,
             disabled_hint: Some(if busy {
                 "A backup is already running"
@@ -1092,65 +1144,91 @@ impl PhoenixApp {
                 "Enter a backup name first"
             }),
         }];
-        if action_row(ui, &self.palette, input_height, &starts) == Some(0) {
+        // Oversized relative to the standard action row — this is the
+        // page's primary action.
+        if action_row(ui, &self.palette, START_BACKUP_BUTTON_SIZE, &starts) == Some(0) {
             self.start_backup();
         }
     }
 
     /// The greyed-when-busy portion of the Backup page: name field,
-    /// folder field, disk list, and VSS toggle. Returns the Backup-name
-    /// `TextEdit` response so the caller can use its height to size the
-    /// action row's buttons.
-    fn ui_backup_form(&mut self, ui: &mut egui::Ui, name_missing: bool) -> egui::Response {
-        ui.label(egui::RichText::new("Backup name").font(fonts::bold(14.0)));
-
-        let name_response = ui
-            .scope(|ui| {
-                if name_missing {
-                    let error_stroke = egui::Stroke::new(1.5, self.palette.danger);
-                    ui.visuals_mut().widgets.inactive.bg_stroke = error_stroke;
-                    ui.visuals_mut().widgets.hovered.bg_stroke = error_stroke;
-                    ui.visuals_mut().widgets.active.bg_stroke = error_stroke;
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.backup_name)
-                        .desired_width(f32::INFINITY)
-                        .font(fonts::regular(16.0))
-                        .hint_text_font(fonts::regular(16.0))
-                        .margin(egui::Margin::symmetric(10.0, 8.0))
-                        .hint_text("e.g. workstation-2026-05-23"),
-                )
-            })
-            .inner;
-
-        if name_missing {
-            ui.label(
-                egui::RichText::new("Required")
-                    .color(self.palette.danger)
-                    .size(12.0),
+    /// target folder row, disk list, and VSS toggle.
+    fn ui_backup_form(&mut self, ui: &mut egui::Ui, name_missing: bool) {
+        ui.scope(|ui| {
+            if name_missing {
+                // Dull-red field background until a name is entered —
+                // this is the page's only "required" affordance.
+                ui.visuals_mut().extreme_bg_color = self.palette.dim(self.palette.danger);
+            }
+            // Explicit hint styling: the default weak text color all but
+            // vanishes against the dull-red "required" fill (the hint is
+            // only ever visible while that fill is shown), but it must
+            // stay a step dimmer than typed text — italic + subtle_text
+            // reads as a placeholder rather than a value.
+            ui.add(
+                egui::TextEdit::singleline(&mut self.backup_name)
+                    .desired_width(f32::INFINITY)
+                    .font(fonts::regular(16.0))
+                    .hint_text_font(fonts::regular(16.0))
+                    .margin(egui::Margin::symmetric(10.0, 8.0))
+                    .hint_text(
+                        egui::RichText::new("Backup name")
+                            .color(self.palette.subtle_text)
+                            .italics(),
+                    ),
             );
-        }
+        });
 
-        // Single source of truth for the visible outer height of an input
-        // on this page. Reused for the Browse button so every form widget
-        // sits on a consistent baseline.
-        let input_height = name_response.rect.height() + INPUT_MARGIN_RESTORE;
+        // Breathing room so the fields' focus rings don't graze each other.
+        ui.add_space(10.0);
 
-        ui.label(
-            egui::RichText::new(
-                "Used as the base filename. `.phnx` is added automatically, and a \
-                 `-disk<N>` suffix is inserted when multiple disks are selected.",
-            )
-            .color(self.palette.subtle_text),
-        );
-        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Target").font(fonts::bold(14.0)));
+
+            // Reserve fixed width for the Browse button on the right so the
+            // field can't push it past the page edge. Field and button are
+            // both forced into equal-height boxes via `add_sized`, so the
+            // row's vertical centering lines them up exactly.
+            let spacing = ui.spacing().item_spacing.x;
+            let text_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
+
+            ui.add_sized(
+                [text_w, ACTION_BUTTON_HEIGHT],
+                egui::TextEdit::singleline(&mut self.backup_folder)
+                    .desired_width(f32::INFINITY)
+                    .font(fonts::regular(16.0))
+                    .hint_text_font(fonts::regular(16.0))
+                    .margin(egui::Margin::symmetric(10.0, 8.0))
+                    .hint_text(r"e.g. D:\Backups"),
+            );
+
+            let browse_label = icon_label(
+                egui_phosphor::regular::FOLDER,
+                16.0,
+                "Browse…",
+                14.0,
+                ui.visuals().widgets.inactive.fg_stroke.color,
+            );
+            if ui
+                .add_sized(
+                    [FORM_BUTTON_W, ACTION_BUTTON_HEIGHT],
+                    egui::Button::new(browse_label),
+                )
+                .clicked()
+            {
+                if let Some(path) = pick_backup_save_folder(&self.backup_folder) {
+                    self.backup_folder = path.display().to_string();
+                }
+            }
+        });
+        ui.add_space(16.0);
 
         if self.disks.is_empty() {
             ui.label("No disks found. Run as Administrator.");
             if refresh_disks_button(ui, &self.palette).clicked() {
                 self.refresh_disks();
             }
-            return name_response;
+            return;
         }
 
         ui.horizontal(|ui| {
@@ -1168,18 +1246,19 @@ impl PhoenixApp {
         ui.add_space(8.0);
 
         // Capture the visible viewport width BEFORE entering the inner
-        // ScrollArea::both — inside `both()` `available_width()` is virtual
+        // horizontal ScrollArea — inside it `available_width()` is virtual
         // and would push rows arbitrarily wide. We use this to size each
         // drive row to `max(viewport, natural_min)` so:
         //   * wide window → rows fit, no horizontal scroll;
         //   * narrow window → rows overflow horizontally rather than
         //     squishing partition labels into illegibility.
+        //
+        // Horizontal-only: the drive list renders at its full natural
+        // height and the page-level vertical ScrollArea handles overflow.
         let viewport_width = ui.available_width();
-        let drive_pane_max_height = disk_panel::row_stride() * 3.5;
 
-        egui::ScrollArea::both()
+        egui::ScrollArea::horizontal()
             .id_salt("backup_drive_list")
-            .max_height(drive_pane_max_height)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 disk_panel::show(
@@ -1192,41 +1271,6 @@ impl PhoenixApp {
             });
 
         ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        ui.label(egui::RichText::new("Save backup to folder").font(fonts::bold(14.0)));
-        ui.horizontal(|ui| {
-            // Reserve fixed width for the Browse button on the right so it
-            // always fits inside the central panel, then let the TextEdit
-            // fill the remainder. Without this reservation, the field's
-            // `desired_width(f32::INFINITY)` consumed everything in the
-            // horizontal row and pushed Browse off the right edge of the
-            // window at every window size.
-            let spacing = ui.spacing().item_spacing.x;
-            let text_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
-
-            ui.add(
-                egui::TextEdit::singleline(&mut self.backup_folder)
-                    .desired_width(text_w)
-                    .font(fonts::regular(16.0))
-                    .hint_text_font(fonts::regular(16.0))
-                    .margin(egui::Margin::symmetric(10.0, 8.0))
-                    .hint_text(r"e.g. D:\Backups"),
-            );
-
-            if ui
-                .add_sized(
-                    [FORM_BUTTON_W, input_height],
-                    egui::Button::new(egui::RichText::new("Browse…").font(fonts::regular(16.0))),
-                )
-                .clicked()
-            {
-                if let Some(path) = pick_backup_save_folder(&self.backup_folder) {
-                    self.backup_folder = path.display().to_string();
-                }
-            }
-        });
 
         let grouped = self.group_selections();
         if grouped.len() > 1 {
@@ -1241,8 +1285,6 @@ impl PhoenixApp {
 
         let vss_response = ui.checkbox(&mut self.use_vss, "Use VSS (live Windows)");
         theme::draw_focus_outline(ui, &vss_response, &self.palette);
-
-        name_response
     }
 
     /// Group the current selection set by disk index, returning a sorted map
@@ -1374,6 +1416,7 @@ impl PhoenixApp {
             .is_some_and(|l| l.has_restorable_entries());
         let starts = [StartAction {
             label: "Run restore",
+            icon: None,
             enabled: !busy && plan_ready,
             disabled_hint: Some(if busy {
                 "A restore is already running"
@@ -1381,7 +1424,13 @@ impl PhoenixApp {
                 "Choose a backup file first"
             }),
         }];
-        if action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts) == Some(0) {
+        if action_row(
+            ui,
+            &self.palette,
+            egui::vec2(FORM_BUTTON_W, ACTION_BUTTON_HEIGHT),
+            &starts,
+        ) == Some(0)
+        {
             self.start_restore();
         }
     }
@@ -1581,10 +1630,17 @@ impl PhoenixApp {
         };
         let starts = [StartAction {
             label: "Verify backup",
+            icon: None,
             enabled: !busy && path_filled,
             disabled_hint: Some(disabled_hint),
         }];
-        if action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts) == Some(0) {
+        if action_row(
+            ui,
+            &self.palette,
+            egui::vec2(FORM_BUTTON_W, ACTION_BUTTON_HEIGHT),
+            &starts,
+        ) == Some(0)
+        {
             self.start_verify();
         }
     }
