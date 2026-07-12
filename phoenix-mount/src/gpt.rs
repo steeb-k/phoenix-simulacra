@@ -15,6 +15,16 @@ pub const LEADING_SECTORS: u64 = 34;
 /// 32 LBAs of backup entries + 1 backup header = 33 trailing sectors.
 pub const TRAILING_SECTORS: u64 = 33;
 
+/// Basic Data partition type GUID (EBD0A0A2-B9E5-4433-87C0-68B6B72699C7) in
+/// on-disk byte order. Backups of MBR disks record an all-zero type GUID
+/// (MBR has type bytes, not GUIDs), but a zero type GUID marks a GPT entry
+/// as UNUSED — Windows would see an empty table and surface no volumes. Fall
+/// back to Basic Data instead, mirroring the restore path's
+/// `BASIC_DATA_PARTITION_TYPE` fallback.
+pub const BASIC_DATA_TYPE_GUID: [u8; 16] = [
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+];
+
 /// One partition to describe in the GPT.
 #[derive(Debug, Clone)]
 pub struct GptPart {

@@ -55,8 +55,15 @@ impl SyntheticVhd {
             .iter()
             .map(|s| {
                 let entry = reader.index.iter().find(|e| e.index == s.partition_index);
+                // MBR-source backups store an all-zero type GUID; in GPT that
+                // means "unused entry", so substitute Basic Data (as restore
+                // does) or Windows presents the disk as blank.
+                let type_guid = match entry.map(|e| e.type_guid) {
+                    Some(g) if g != [0u8; 16] => g,
+                    _ => gpt::BASIC_DATA_TYPE_GUID,
+                };
                 GptPart {
-                    type_guid: entry.map(|e| e.type_guid).unwrap_or([0; 16]),
+                    type_guid,
                     unique_guid: derive_guid(&disk_guid, s.partition_index),
                     first_lba: s.disk_offset / SECTOR,
                     last_lba: (s.disk_offset + s.size) / SECTOR - 1,
@@ -167,6 +174,10 @@ mod tests {
     use uuid::Uuid;
 
     fn build_backup() -> std::path::PathBuf {
+        build_backup_with_type_guid([0x11; 16])
+    }
+
+    fn build_backup_with_type_guid(type_guid: [u8; 16]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("synth_{}.phnx", Uuid::new_v4()));
         let backup_id = Uuid::new_v4();
         let header = Header {
@@ -186,7 +197,7 @@ mod tests {
         let mut s = w
             .begin_partition_stream(
                 0,
-                [0x11; 16],
+                type_guid,
                 "Vol".into(),
                 ext_bytes,
                 FilesystemKind::Ntfs,
@@ -262,6 +273,35 @@ mod tests {
         vhd.read_at(16 * 512, &mut straddle).unwrap(); // sector 16, inside leading region+gap
                                                        // (No panic / no error is the assertion; content is GPT-or-zero.)
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// GPT type GUID at entry `i` of the entry array (LBA 2 onward).
+    fn entry_type_guid(vhd: &mut SyntheticVhd, i: usize) -> [u8; 16] {
+        let mut entry = [0u8; 128];
+        vhd.read_at(2 * SECTOR + i as u64 * 128, &mut entry).unwrap();
+        entry[0..16].try_into().unwrap()
+    }
+
+    /// Regression test: backups of MBR disks record an all-zero type GUID,
+    /// which in GPT marks the entry as UNUSED — Windows saw a blank disk and
+    /// mounted no volumes. The synthesized GPT must substitute Basic Data.
+    #[test]
+    fn zero_type_guid_falls_back_to_basic_data() {
+        let path = build_backup_with_type_guid([0u8; 16]);
+        let reader = PhnxReader::open(&path).unwrap();
+        let mut vhd = SyntheticVhd::build(reader).unwrap();
+        assert_eq!(entry_type_guid(&mut vhd, 0), gpt::BASIC_DATA_TYPE_GUID);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A real (GPT-source) type GUID must pass through untouched.
+    #[test]
+    fn nonzero_type_guid_is_preserved() {
+        let path = build_backup();
+        let reader = PhnxReader::open(&path).unwrap();
+        let mut vhd = SyntheticVhd::build(reader).unwrap();
+        assert_eq!(entry_type_guid(&mut vhd, 0), [0x11; 16]);
         std::fs::remove_file(&path).ok();
     }
 }
