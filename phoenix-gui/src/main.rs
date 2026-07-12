@@ -79,12 +79,16 @@ fn app_icon() -> egui::IconData {
 /// allowed window size.
 const STATUS_BAR_HEIGHT_ESTIMATE: f32 = 40.0;
 const MIN_WINDOW_WIDTH: f32 = 640.0;
+/// Width of the frame strip along the right window edge, closing the
+/// titlebar/sidebar/status-bar frame around the central panel.
+const BUMPER_WIDTH: f32 = 10.0;
 
 fn main() -> eframe::Result<()> {
     let _log_guard = init_logging();
 
-    let min_height =
-        sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE + titlebar::TITLEBAR_HEIGHT;
+    // The sidebar spans the full window height (its brand sits in the
+    // caption band), so the titlebar height doesn't stack on top.
+    let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
     let options = eframe::NativeOptions {
         // Chromeless: the OS titlebar is replaced by `titlebar::show` (custom
         // caption strip + Win11-style control box) and, on Windows, a wndproc
@@ -644,8 +648,8 @@ impl PhoenixApp {
 impl eframe::App for PhoenixApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Sidebar color, not panel_fill: the central panel's rounded
-        // bottom-left corner exposes the clear color, and it must read as
-        // part of the sidebar/status-bar L.
+        // corners expose the clear color, and it must read as part of the
+        // titlebar/sidebar/status-bar frame.
         self.palette.sidebar_bg.to_normalized_gamma_f32()
     }
 
@@ -667,11 +671,13 @@ impl eframe::App for PhoenixApp {
 
         let busy = self.busy();
         let modal_open = self.modal_open();
-        // Custom caption strip first so it spans the full window width; the
-        // sidebar and status bar share its fill, extending the L-shaped
-        // surface into a frame around the central panel.
-        titlebar::show(ctx, &self.palette);
+        // Sidebar first so it owns the full window height — its brand rides
+        // up into the caption band (dragging still works there via the NC
+        // hit-test). The titlebar strip, status bar, and right bumper then
+        // claim the remaining edges, closing the frame all the way around
+        // the central panel.
         sidebar::show(ctx, &mut self.page, &self.palette, modal_open);
+        titlebar::show(ctx, &self.palette);
 
         // Slim bottom status line for idle/non-job messages (disk count,
         // "Loaded backup…", load errors, "Ready"). While a job runs or its
@@ -689,15 +695,19 @@ impl eframe::App for PhoenixApp {
                 });
             });
 
-        // The left corners are rounded: they nestle into the frame formed by
-        // the titlebar, sidebar, and status bar. The right edge still sits on
-        // the window edge and stays square. The cutouts show through to
-        // `clear_color` (sidebar_bg).
-        let panel_rounding = egui::Rounding {
-            nw: 10.0,
-            sw: 10.0,
-            ..egui::Rounding::ZERO
-        };
+        // Slim bumper along the right edge so the frame wraps all the way
+        // around the central panel instead of letting it bleed off-window.
+        egui::SidePanel::right("right_bumper")
+            .resizable(false)
+            .show_separator_line(false)
+            .exact_width(BUMPER_WIDTH)
+            .frame(egui::Frame::none().fill(self.palette.sidebar_bg))
+            .show(ctx, |_ui| {});
+
+        // The central panel floats inside the titlebar/sidebar/status-bar/
+        // bumper frame, so all four corners are rounded. The cutouts show
+        // through to `clear_color` (sidebar_bg).
+        let panel_rounding = egui::Rounding::same(10.0);
         let central = egui::CentralPanel::default()
             .frame(
                 egui::Frame::central_panel(&ctx.style())
@@ -719,19 +729,12 @@ impl eframe::App for PhoenixApp {
                 });
             });
 
-        // 1px outline along the panel's edge against the titlebar/sidebar/
-        // status-bar frame. Drawn by hand rather than via `Frame::stroke`
-        // because the right side sits on the window edge and must stay
-        // line-free: pushing that side 1px past the screen clips its stroke
-        // away, leaving the top, left, and bottom edges and the rounded
-        // corners.
+        // 1px outline along the panel's edge against the surrounding frame.
+        // Drawn by hand rather than via `Frame::stroke` so it lands on the
+        // background layer, under the panel's own widgets.
         let rect = central.response.rect;
-        let border_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x, rect.min.y),
-            egui::pos2(rect.max.x + 1.0, rect.max.y),
-        );
         ctx.layer_painter(egui::LayerId::background()).rect_stroke(
-            border_rect,
+            rect,
             panel_rounding,
             egui::Stroke::new(1.0, self.palette.panel_border),
         );

@@ -1,10 +1,11 @@
 //! Custom titlebar for the chromeless main window.
 //!
 //! The OS titlebar is turned off (`ViewportBuilder::with_decorations(false)`)
-//! and this module draws the replacement: a 32px strip with the app icon,
-//! window title, and a minimize/maximize/close control box styled like the
+//! and this module draws the replacement: a 32px strip to the right of the
+//! sidebar holding a minimize/maximize/close control box styled like the
 //! native Windows 11 one (same 46×32 buttons, same Segoe Fluent glyphs, same
-//! hover/press colors).
+//! hover/press colors). There's no icon/title text — the sidebar brand sits
+//! in the caption band instead, and the whole top strip drags the window.
 //!
 //! On Windows the window procedure is additionally subclassed (see [`nc`])
 //! to answer `WM_NCHITTEST` with real non-client hit codes, so everything
@@ -19,7 +20,7 @@
 //! that only sees events when the subclass isn't installed.
 
 use eframe::egui;
-use egui::{Align2, Color32, Context, Rect, Sense, Ui, Vec2, ViewportCommand};
+use egui::{Align2, Color32, Context, Rect, Sense, Ui, ViewportCommand};
 
 use crate::fonts;
 use crate::theme::{self, Palette};
@@ -43,8 +44,9 @@ enum Caption {
     Close = 2,
 }
 
-/// Render the titlebar strip across the top of the window. Call before any
-/// other panel so it spans the full width.
+/// Render the titlebar strip. Call after the sidebar so the strip only
+/// spans the remaining width — the drag band still covers the full window
+/// top on Windows because the NC hit-test uses y alone (see [`nc`]).
 pub fn show(ctx: &Context, palette: &Palette) {
     egui::TopBottomPanel::top("titlebar")
         .exact_height(TITLEBAR_HEIGHT)
@@ -72,8 +74,10 @@ fn draw(ui: &mut Ui, palette: &Palette) {
     }
 
     // Everything left of the control box doubles as the drag strip
-    // (fallback path — on Windows the subclass reports HTCAPTION here and
-    // the native move loop handles dragging before egui ever sees it).
+    // (fallback path — on Windows the subclass reports HTCAPTION for the
+    // whole caption band, sidebar top included, and the native move loop
+    // handles dragging before egui ever sees it). No icon or title text:
+    // the sidebar brand rides up into this band instead.
     let drag_rect = Rect::from_min_max(rect.min, egui::pos2(right, rect.bottom()));
     let drag = ui.interact(
         drag_rect,
@@ -86,28 +90,6 @@ fn draw(ui: &mut Ui, palette: &Palette) {
     } else if drag.drag_started_by(egui::PointerButton::Primary) {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
-
-    // App icon + window title at the left, like a decorated window. The
-    // title dims when the window loses focus, exactly as native chrome does.
-    let icon_rect = Rect::from_center_size(
-        egui::pos2(rect.left() + 12.0 + 8.0, rect.center().y),
-        Vec2::splat(16.0),
-    );
-    egui::Image::new(egui::include_image!("../../carbon-phoenix-icon.png"))
-        .fit_to_exact_size(Vec2::splat(16.0))
-        .paint_at(ui, icon_rect);
-    let title_color = if focused {
-        palette.icon_color
-    } else {
-        palette.icon_color.gamma_multiply(0.4)
-    };
-    ui.painter().text(
-        egui::pos2(icon_rect.right() + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        "Carbon Phoenix",
-        fonts::regular(12.0),
-        title_color,
-    );
 
     nc::publish_geometry(ui.ctx(), rect, &button_rects);
 }
