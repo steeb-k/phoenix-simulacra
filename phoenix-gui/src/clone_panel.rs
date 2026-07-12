@@ -141,7 +141,11 @@ pub fn show(
     // ---- Target dropdown ----
     let target_disk = target_index.and_then(|t| disks.iter().find(|d| d.index == t));
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("The disk to clone onto.").color(palette.subtle_text));
+        // The descriptor only earns its keep while the dropdown is empty;
+        // once a disk row is showing, what it is is self-evident.
+        if target_disk.is_none() {
+            ui.label(egui::RichText::new("The disk to clone onto.").color(palette.subtle_text));
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {
                 if !out.selection_changed {

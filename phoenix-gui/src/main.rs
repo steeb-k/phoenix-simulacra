@@ -190,6 +190,38 @@ struct PendingOverwrite {
     existing: Vec<String>,
 }
 
+/// A validated, ready-to-run clone parked while its confirmation dialog is
+/// up. The dialog restates the target disk's number/size/model so the user
+/// gets one last chance to catch a wrong-disk pick before anything is
+/// written.
+struct PendingClone {
+    opts: phoenix_clone::CloneOptions,
+    message: String,
+    details: Vec<String>,
+}
+
+/// A validated, ready-to-run restore parked while its confirmation dialog
+/// is up. Same final wrong-disk check as [`PendingClone`].
+struct PendingRestore {
+    opts: RestoreOptions,
+    details: Vec<String>,
+}
+
+/// The `Disk number / Size / Model` lines both confirmation dialogs show.
+fn disk_confirm_details(disk: &DiskInfo) -> Vec<String> {
+    vec![
+        format!("Disk number:   {}", disk.index),
+        format!("Size:   {}", format_bytes(disk.size_bytes)),
+        format!(
+            "Model:   {}",
+            disk.model
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .unwrap_or("(unknown)")
+        ),
+    ]
+}
+
 struct PhoenixApp {
     disks: Vec<DiskInfo>,
     /// Set of `(disk_index, partition_index)` pairs the user has clicked on
@@ -214,6 +246,10 @@ struct PhoenixApp {
     /// overwrite-confirmation dialog on screen; cleared on confirm (launch) or
     /// cancel (abort).
     pending_overwrite: Option<PendingOverwrite>,
+    /// Clone waiting on its confirm-the-target dialog.
+    pending_clone: Option<PendingClone>,
+    /// Restore waiting on its confirm-the-target dialog.
+    pending_restore: Option<PendingRestore>,
     /// Total number of jobs in the current multi-disk run (for "Disk N of M"
     /// status text). Reset to 0 when the queue drains.
     total_backups: usize,
@@ -298,6 +334,8 @@ impl PhoenixApp {
             use_vss: false,
             pending_backups: Vec::new(),
             pending_overwrite: None,
+            pending_clone: None,
+            pending_restore: None,
             total_backups: 0,
             current_backup_index: 0,
             restore_backup_path: String::new(),
@@ -366,7 +404,11 @@ impl PhoenixApp {
     /// True while the blocking status modal is on screen (running job or
     /// finished result awaiting Close).
     fn modal_open(&self) -> bool {
-        self.job.is_some() || self.completed.is_some() || self.pending_overwrite.is_some()
+        self.job.is_some()
+            || self.completed.is_some()
+            || self.pending_overwrite.is_some()
+            || self.pending_clone.is_some()
+            || self.pending_restore.is_some()
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -800,6 +842,8 @@ impl eframe::App for PhoenixApp {
 
         self.show_status_modal(ctx);
         self.show_overwrite_dialog(ctx);
+        self.show_clone_confirm_dialog(ctx);
+        self.show_restore_confirm_dialog(ctx);
     }
 }
 
@@ -914,6 +958,72 @@ impl PhoenixApp {
                 self.pending_overwrite = None;
                 self.status =
                     "Backup cancelled — choose a different name to keep the old one".into();
+            }
+            ConfirmAction::None => {}
+        }
+    }
+
+    /// Final confirm-the-target dialog over a parked clone: restates the
+    /// target disk's number/size/model so a wrong-disk pick is caught before
+    /// the first byte is written. Confirm launches the worker; Cancel drops
+    /// the parked plan and leaves the page untouched.
+    fn show_clone_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_clone.as_ref() else {
+            return;
+        };
+        let view = ConfirmView {
+            title: "Confirm clone target",
+            message: &pending.message,
+            details: &pending.details,
+            confirm_label: "Clone disk",
+            cancel_label: "Cancel",
+            confirm_danger: true,
+        };
+        match confirm_dialog::show(ctx, &self.palette, &view) {
+            ConfirmAction::Confirm => {
+                let pending = self.pending_clone.take().expect("dialog was open");
+                self.completed = None;
+                self.status = format!(
+                    "Cloning disk {} → disk {}…",
+                    pending.opts.source_disk_index, pending.opts.target_disk_index
+                );
+                self.job = Some(spawn_clone(pending.opts));
+            }
+            ConfirmAction::Cancel => {
+                self.pending_clone = None;
+                self.status = "Clone cancelled — no changes were made".into();
+            }
+            ConfirmAction::None => {}
+        }
+    }
+
+    /// The restore counterpart of [`show_clone_confirm_dialog`].
+    fn show_restore_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_restore.as_ref() else {
+            return;
+        };
+        let view = ConfirmView {
+            title: "Confirm restore target",
+            message: "This will PERMANENTLY OVERWRITE the planned partitions on the target \
+                      disk with the backup's contents. Verify this is the right disk:",
+            details: &pending.details,
+            confirm_label: "Run restore",
+            cancel_label: "Cancel",
+            confirm_danger: true,
+        };
+        match confirm_dialog::show(ctx, &self.palette, &view) {
+            ConfirmAction::Confirm => {
+                let pending = self.pending_restore.take().expect("dialog was open");
+                // Surfaces while `run_restore` does its pre-flight work
+                // (opening the .phnx, validating, enumerating disks) before
+                // the worker's first `set_phase` takes over the status text.
+                self.completed = None;
+                self.status = "Restoring, please wait…".into();
+                self.job = Some(spawn_restore(pending.opts));
+            }
+            ConfirmAction::Cancel => {
+                self.pending_restore = None;
+                self.status = "Restore cancelled — no changes were made".into();
             }
             ConfirmAction::None => {}
         }
@@ -1631,23 +1741,20 @@ impl PhoenixApp {
                 return;
             }
         }
-        let progress = ProgressHandle::new();
-        // Surfaces while `run_restore` is doing its pre-flight work
-        // (opening the .phnx, validating the plan, enumerating disks,
-        // and on a GPT source initializing the target via
-        // CREATE_DISK + SET_DRIVE_LAYOUT_EX) before the first
-        // `set_phase` call inside the worker thread takes over the
-        // status text.
-        self.completed = None;
-        self.status = "Restoring, please wait…".into();
-        self.job = Some(spawn_restore(RestoreOptions {
-            backup_path,
-            plan,
-            // Read-back verification is CLI-only; the image's chunk hashes
-            // were already checked while decompressing.
-            verify_on_restore: false,
-            progress: Some(progress),
-        }));
+        // Park the validated restore behind the same final confirm-the-target
+        // dialog the Clone page uses, so a wrong-disk pick gets caught before
+        // the worker writes anything.
+        self.pending_restore = Some(PendingRestore {
+            opts: RestoreOptions {
+                backup_path,
+                plan,
+                // Read-back verification is CLI-only; the image's chunk hashes
+                // were already checked while decompressing.
+                verify_on_restore: false,
+                progress: Some(ProgressHandle::new()),
+            },
+            details: disk_confirm_details(target),
+        });
     }
 
     fn ui_verify(&mut self, ui: &mut egui::Ui, busy: bool) {
@@ -1888,16 +1995,33 @@ impl PhoenixApp {
             self.status = format!("Cannot clone: {e}");
             return;
         }
-        self.completed = None;
-        self.status = format!("Cloning disk {src} → disk {tgt}…");
-        self.job = Some(spawn_clone(phoenix_clone::CloneOptions {
-            source_disk_index: src,
-            target_disk_index: tgt,
-            plan,
-            verify: phoenix_clone::CloneVerify::None,
-            use_vss: true,
-            progress: None,
-        }));
+        // Nothing on the page has touched a disk yet — park the validated
+        // plan behind a final confirm-the-target dialog before the worker
+        // gets to write.
+        let message = if layout.full_disk {
+            format!(
+                "This will PERMANENTLY ERASE everything on the target disk and replace it \
+                 with the contents of disk {src}. Verify this is the right disk:"
+            )
+        } else {
+            format!(
+                "This will PERMANENTLY OVERWRITE the mapped partitions on the target disk \
+                 with the contents of disk {src} (unmapped partitions are preserved). Verify \
+                 this is the right disk:"
+            )
+        };
+        self.pending_clone = Some(PendingClone {
+            opts: phoenix_clone::CloneOptions {
+                source_disk_index: src,
+                target_disk_index: tgt,
+                plan,
+                verify: phoenix_clone::CloneVerify::None,
+                use_vss: true,
+                progress: None,
+            },
+            message,
+            details: disk_confirm_details(&target),
+        });
     }
 
     fn ui_mount(&mut self, ui: &mut egui::Ui) {
