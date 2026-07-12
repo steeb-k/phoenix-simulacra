@@ -43,13 +43,19 @@ struct PlacedChunk {
     /// Byte offset within the extent where this chunk's data begins.
     start: u64,
     chunk: ChunkIndex,
+    /// Expected BLAKE3 (hex) from the manifest record paired with this chunk.
+    /// Pairing is POSITIONAL (`paired_chunks`, same as verify/restore): the
+    /// stream table numbers `chunk_index` per extent while manifest records
+    /// number it globally across the partition, so a key join on
+    /// `(extent_index, chunk_index)` pairs the wrong records — that bug
+    /// surfaced as hash-mismatch read errors on every multi-extent partition
+    /// and Windows mounting the volume as RAW.
+    blake3: String,
 }
 
 struct PartitionIndex {
     span: PartitionSpan,
     extents: Vec<ExtentSpan>,
-    /// Expected BLAKE3 (hex) per (extent_index, chunk_index within extent).
-    hashes: HashMap<(u32, u32), String>,
 }
 
 pub struct ChunkStore {
@@ -88,44 +94,38 @@ impl ChunkStore {
                 .map(|p| p.chunks.clone())
                 .ok_or_else(|| PhoenixError::Manifest("partition manifest missing".into()))?;
 
-            // Group chunks by extent, ordered by within-extent chunk_index.
-            let mut by_extent: HashMap<u32, Vec<ChunkIndex>> = HashMap::new();
-            for c in &stream.chunks {
-                by_extent.entry(c.extent_index).or_default().push(c.clone());
-            }
-            for v in by_extent.values_mut() {
-                v.sort_by_key(|c| c.chunk_index);
+            // Pair each stream chunk with its manifest record positionally
+            // (the only pairing the format guarantees — see `PlacedChunk`),
+            // then group by extent in stream order. Chunks fill their extent
+            // contiguously from byte 0, so cumulative lengths place them.
+            let mut by_extent: HashMap<u32, Vec<PlacedChunk>> = HashMap::new();
+            for (chunk, rec) in phoenix_core::container::paired_chunks(
+                &stream.chunks,
+                &records,
+                span.partition_index,
+            )? {
+                let placed = by_extent.entry(chunk.extent_index).or_default();
+                let at = placed
+                    .last()
+                    .map(|p| p.start + p.chunk.uncompressed_len as u64)
+                    .unwrap_or(0);
+                placed.push(PlacedChunk {
+                    start: at,
+                    chunk: chunk.clone(),
+                    blake3: rec.blake3.clone(),
+                });
             }
 
             let mut extents = Vec::with_capacity(stream.extents.len());
             for (ei, ext) in stream.extents.iter().enumerate() {
                 let start = ext.start_sector * EXTENT_LBA_BYTES as u64;
                 let end = start + ext.sector_count * EXTENT_LBA_BYTES as u64;
-                let mut at = 0u64;
-                let chunks = by_extent
-                    .remove(&(ei as u32))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|chunk| {
-                        let placed = PlacedChunk { start: at, chunk };
-                        at += placed.chunk.uncompressed_len as u64;
-                        placed
-                    })
-                    .collect();
+                let chunks = by_extent.remove(&(ei as u32)).unwrap_or_default();
                 extents.push(ExtentSpan { start, end, chunks });
             }
             extents.sort_by_key(|e| e.start);
 
-            let mut hashes = HashMap::new();
-            for rec in &records {
-                hashes.insert((rec.extent_index, rec.chunk_index), rec.blake3.clone());
-            }
-
-            partitions.push(PartitionIndex {
-                span,
-                extents,
-                hashes,
-            });
+            partitions.push(PartitionIndex { span, extents });
         }
         partitions.sort_by_key(|p| p.span.disk_offset);
 
@@ -225,7 +225,7 @@ impl ChunkStore {
             })?;
         let off_in_chunk = (in_extent - placed.start) as usize;
 
-        let data = self.load_chunk(pi, &placed.chunk)?;
+        let data = self.load_chunk(pi, &placed)?;
         let avail = data.len().saturating_sub(off_in_chunk);
         let n = want.min(avail);
         if n == 0 {
@@ -241,23 +241,19 @@ impl ChunkStore {
     }
 
     /// Decompress + BLAKE3-verify a chunk (using the cache when possible).
-    fn load_chunk(&mut self, pi: usize, chunk: &ChunkIndex) -> Result<Vec<u8>> {
+    fn load_chunk(&mut self, pi: usize, placed: &PlacedChunk) -> Result<Vec<u8>> {
+        let chunk = &placed.chunk;
         if let Some(cached) = self.cache.get(&chunk.file_offset) {
             return Ok(cached.clone());
         }
         let data = self.reader.read_chunk(chunk)?;
-        // Verify against the manifest hash for this (extent, chunk) slot.
-        if let Some(expected) = self.partitions[pi]
-            .hashes
-            .get(&(chunk.extent_index, chunk.chunk_index))
-        {
-            let got = blake3::hash(&data).to_hex().to_string();
-            if &got != expected {
-                return Err(PhoenixError::HashMismatch {
-                    partition_index: self.partitions[pi].span.partition_index,
-                    chunk_index: chunk.chunk_index,
-                });
-            }
+        // Verify against the manifest record paired with this chunk.
+        let got = blake3::hash(&data).to_hex().to_string();
+        if got != placed.blake3 {
+            return Err(PhoenixError::HashMismatch {
+                partition_index: self.partitions[pi].span.partition_index,
+                chunk_index: chunk.chunk_index,
+            });
         }
         // Insert into the LRU cache.
         if self.cache_order.len() >= self.cache_cap {
@@ -302,7 +298,7 @@ fn align_up(v: u64, a: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phoenix_core::container::{Extent, Header, PhnxWriter, FORMAT_VERSION};
+    use phoenix_core::container::{Extent, Header, PhnxWriter, CHUNK_SIZE, FORMAT_VERSION};
     use phoenix_core::disk::{CaptureMode, FilesystemKind};
     use phoenix_core::manifest::{BackupManifest, DiskManifest, PartitionManifest};
     use uuid::Uuid;
@@ -394,6 +390,119 @@ mod tests {
         let mut buf3 = vec![0xFFu8; 512];
         store.read_at(0, &mut buf3).unwrap();
         assert!(buf3.iter().all(|&b| b == 0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression test for the RAW-volume mount bug (the real 32GB-USB
+    /// repro): the stream table numbers `chunk_index` per extent while the
+    /// manifest numbers it globally across the partition, so pairing hashes
+    /// by `(extent_index, chunk_index)` key verified extent 1+ chunks
+    /// against the wrong records — every read of a multi-extent partition
+    /// failed with a hash mismatch and Windows surfaced the NTFS volume as
+    /// RAW. Pairing must be positional (`paired_chunks`), like verify and
+    /// restore. This writes through the real `set_extent`/`write_chunk`
+    /// path, which produces exactly that numbering divergence.
+    #[test]
+    fn multi_extent_backup_reads_correctly() {
+        let path = std::env::temp_dir().join(format!("cs_{}.phnx", Uuid::new_v4()));
+        let backup_id = Uuid::new_v4();
+        let header = Header {
+            version: FORMAT_VERSION,
+            flags: 1,
+            timestamp: 1,
+            backup_id,
+            disk_signature: 1,
+            partition_count: 1,
+        };
+        // Extent 0: one 64 KiB chunk. Extent 1 (at 16 MiB): a full 4 MiB
+        // chunk + a 64 KiB tail chunk. Stream numbering: (0,0) (1,0) (1,1);
+        // manifest numbering: (0,0) (1,1) (1,2) — the keys overlap on (1,1)
+        // with DIFFERENT data, which is what made the key join blow up.
+        let e0_bytes = 64 * 1024u64;
+        let e1_bytes = (CHUNK_SIZE + 64 * 1024) as u64;
+        let part_bytes = 32 * 1024 * 1024u64;
+        let extents = vec![
+            Extent {
+                start_sector: 0,
+                sector_count: e0_bytes / EXTENT_LBA_BYTES as u64,
+            },
+            Extent {
+                start_sector: (16 * 1024 * 1024) / EXTENT_LBA_BYTES as u64,
+                sector_count: e1_bytes / EXTENT_LBA_BYTES as u64,
+            },
+        ];
+        let mut w = PhnxWriter::create(&path, header).unwrap();
+        let mut s = w
+            .begin_partition_stream(
+                0,
+                [0; 16],
+                "P".into(),
+                part_bytes,
+                FilesystemKind::Ntfs,
+                CaptureMode::UsedBlocks,
+                EXTENT_LBA_BYTES,
+                0,
+                &extents,
+                4096,
+            )
+            .unwrap();
+        s.set_extent(0);
+        s.write_chunk(&vec![0x33u8; e0_bytes as usize]).unwrap();
+        s.set_extent(1);
+        s.write_chunk(&vec![0x44u8; CHUNK_SIZE]).unwrap();
+        s.write_chunk(&vec![0x55u8; 64 * 1024]).unwrap();
+        let (chunks, _) = s.finish().unwrap();
+        let manifest = BackupManifest {
+            format_version: 1,
+            backup_id,
+            parent_backup_id: None,
+            hostname: "T".into(),
+            disk: DiskManifest {
+                style: "mbr".into(),
+                disk_guid: None,
+                sector_size: 512,
+            },
+            partitions: vec![PartitionManifest {
+                index: 0,
+                name: "P".into(),
+                type_guid: None,
+                fs: "ntfs".into(),
+                capture_mode: "used-blocks".into(),
+                original_size: part_bytes,
+                used_bytes: e0_bytes + e1_bytes,
+                bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
+                chunks,
+                bitmap_hash: None,
+            }],
+        };
+        w.finalize(&manifest).unwrap();
+
+        let reader = PhnxReader::open(&path).unwrap();
+        let (layout, disk_size) = plan_layout(&reader, 1024 * 1024);
+        let poff = layout[0].disk_offset;
+        let mut store = ChunkStore::new(reader, layout, disk_size).unwrap();
+
+        // Extent 0 data.
+        let mut buf = vec![0u8; e0_bytes as usize];
+        store.read_at(poff, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x33), "extent 0 data wrong");
+
+        // Extent 1: read across the whole extent (both chunks) — this is the
+        // read that used to fail with a hash mismatch.
+        let e1_off = poff + 16 * 1024 * 1024;
+        let mut buf1 = vec![0u8; e1_bytes as usize];
+        store.read_at(e1_off, &mut buf1).unwrap();
+        assert!(
+            buf1[..CHUNK_SIZE].iter().all(|&b| b == 0x44),
+            "extent 1 chunk 0 data wrong"
+        );
+        assert!(
+            buf1[CHUNK_SIZE..].iter().all(|&b| b == 0x55),
+            "extent 1 chunk 1 data wrong"
+        );
 
         std::fs::remove_file(&path).ok();
     }
