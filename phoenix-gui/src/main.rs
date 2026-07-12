@@ -1,3 +1,4 @@
+mod clone_panel;
 mod confirm_dialog;
 mod disk_map;
 mod disk_panel;
@@ -230,6 +231,12 @@ struct PhoenixApp {
     clone_source_index: Option<u32>,
     clone_target_index: Option<u32>,
     clone_expand: bool,
+    /// The clone plan editor (shared machinery with the Restore page).
+    /// `Some` only while both a source and a target disk are picked.
+    clone_layout: Option<restore_layout::RestoreLayoutState>,
+    /// `(source_index, target_index)` the layout was seeded from, so a
+    /// selection change rebuilds it.
+    clone_layout_for: Option<(u32, u32)>,
     /// Mount page: chosen .phnx and the currently-attached read-only mounts.
     mount_backup_path: String,
     /// Path whose layout is currently shown on the Mount page (skip
@@ -301,6 +308,8 @@ impl PhoenixApp {
             clone_source_index: None,
             clone_target_index: None,
             clone_expand: false,
+            clone_layout: None,
+            clone_layout_for: None,
             mount_backup_path: String::new(),
             mount_loaded_path: String::new(),
             mount_source: None,
@@ -310,7 +319,7 @@ impl PhoenixApp {
             history: phoenix_core::appdata::History::load(),
             job_started: None,
             status: "Ready".into(),
-            page: Page::Backup,
+            page: start_page_from_args().unwrap_or(Page::Backup),
             job: None,
             completed: None,
             palette,
@@ -1657,6 +1666,27 @@ impl PhoenixApp {
     }
 
     fn ui_clone(&mut self, ui: &mut egui::Ui) {
+        // Same shell as the Backup page: the whole page scrolls vertically,
+        // with content padded off the window edge so the scrollbar rides the
+        // edge gutter; the drive lists scroll horizontally on their own.
+        let mut full_rect = ui.max_rect();
+        full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("clone_page")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin {
+                            right: PAGE_RIGHT_MARGIN,
+                            ..egui::Margin::ZERO
+                        })
+                        .show(ui, |ui| self.ui_clone_inner(ui));
+                });
+        });
+    }
+
+    fn ui_clone_inner(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
             &self.palette,
@@ -1673,87 +1703,131 @@ impl PhoenixApp {
             return;
         }
 
-        // Build a stable list of (index, label) for the dropdowns.
-        let disk_labels: Vec<(u32, String)> = self
-            .disks
-            .iter()
-            .map(|d| {
-                (
-                    d.index,
-                    format!(
-                        "Disk {} — {} ({})",
-                        d.index,
-                        d.model.as_deref().unwrap_or("disk"),
-                        format_bytes(d.size_bytes)
-                    ),
-                )
-            })
-            .collect();
+        self.sync_clone_layout();
 
-        ui.add_enabled_ui(!busy, |ui| {
-            egui::Grid::new("clone_grid").num_columns(2).show(ui, |ui| {
-                ui.label("Source disk:");
-                let src_label = self
-                    .clone_source_index
-                    .and_then(|i| disk_labels.iter().find(|(d, _)| *d == i))
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_else(|| "Choose…".into());
-                egui::ComboBox::from_id_salt("clone_src")
-                    .selected_text(src_label)
-                    .show_ui(ui, |ui| {
-                        for (idx, label) in &disk_labels {
-                            ui.selectable_value(&mut self.clone_source_index, Some(*idx), label);
-                        }
-                    });
-                ui.end_row();
-
-                ui.label("Target disk:");
-                let tgt_label = self
-                    .clone_target_index
-                    .and_then(|i| disk_labels.iter().find(|(d, _)| *d == i))
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_else(|| "Choose…".into());
-                egui::ComboBox::from_id_salt("clone_tgt")
-                    .selected_text(tgt_label)
-                    .show_ui(ui, |ui| {
-                        for (idx, label) in &disk_labels {
-                            // Never offer the source as a target.
-                            if Some(*idx) != self.clone_source_index {
-                                ui.selectable_value(
-                                    &mut self.clone_target_index,
-                                    Some(*idx),
-                                    label,
-                                );
-                            }
-                        }
-                    });
-                ui.end_row();
-            });
-
-            ui.checkbox(
-                &mut self.clone_expand,
-                "Expand the last NTFS partition to fill a larger target",
-            );
-        });
-
-        ui.add_space(8.0);
-        let ready = !busy
-            && self.clone_source_index.is_some()
-            && self.clone_target_index.is_some()
-            && self.clone_source_index != self.clone_target_index;
-
-        if let Some(tgt) = self.clone_target_index {
-            ui.colored_label(
-                self.palette.warning,
-                format!("⚠ Cloning will PERMANENTLY ERASE all data on disk {tgt}."),
-            );
+        let viewport_width = ui.available_width();
+        let out = clone_panel::show(
+            ui,
+            &self.disks,
+            &mut self.clone_source_index,
+            &mut self.clone_target_index,
+            self.clone_layout.as_mut(),
+            self.clone_expand,
+            &self.palette,
+            viewport_width,
+        );
+        if out.refresh_clicked {
+            self.refresh_disks();
+            // The layout holds a snapshot of both disks; anything may have
+            // changed under it, so rebuild from the fresh enumeration.
+            self.clone_layout = None;
+            self.clone_layout_for = None;
+        }
+        if out.selection_changed {
+            ui.ctx().request_repaint();
         }
 
-        ui.add_enabled_ui(ready, |ui| {
-            if ui.button("Clone disk").clicked() {
-                self.start_clone();
+        // Options + warning + action, driven by the current plan shape.
+        if let Some(layout) = &self.clone_layout {
+            let full_disk = layout.full_disk;
+            if full_disk
+                && ui
+                    .checkbox(
+                        &mut self.clone_expand,
+                        "Expand the last NTFS partition to fill a larger target",
+                    )
+                    .changed()
+            {
+                // Re-seed so the target map previews the grown layout.
+                self.reseed_full_disk_clone();
             }
-        });
+            ui.add_space(8.0);
+            if let Some(tgt) = self.clone_target_index {
+                let warning = if full_disk {
+                    format!("⚠ Cloning will PERMANENTLY ERASE all data on disk {tgt}.")
+                } else {
+                    format!(
+                        "⚠ Cloning will PERMANENTLY ERASE the target partitions it covers on \
+                         disk {tgt} (and remove any deleted from the layout). Unmapped \
+                         partitions are preserved."
+                    )
+                };
+                ui.colored_label(self.palette.warning, warning);
+            }
+        }
+        ui.add_space(8.0);
+
+        let plan_ready = self
+            .clone_layout
+            .as_ref()
+            .is_some_and(|l| l.has_restorable_entries());
+        let disabled_hint = if busy {
+            "A job is already running"
+        } else if self.clone_layout.is_none() {
+            "Choose a source and a target disk first"
+        } else {
+            "Drag at least one source partition onto the target"
+        };
+        let starts = [StartAction {
+            label: "Clone disk",
+            icon: None,
+            enabled: !busy && plan_ready,
+            disabled_hint: Some(disabled_hint),
+        }];
+        if action_row(
+            ui,
+            &self.palette,
+            egui::vec2(FORM_BUTTON_W, ACTION_BUTTON_HEIGHT),
+            &starts,
+        ) == Some(0)
+        {
+            self.start_clone();
+        }
+    }
+
+    /// Keep the clone layout in step with the source/target selection: drop
+    /// ghost selections after a refresh, and (re)seed a full-disk clone plan
+    /// whenever the selected pair changes.
+    fn sync_clone_layout(&mut self) {
+        if let Some(s) = self.clone_source_index {
+            if !self.disks.iter().any(|d| d.index == s) {
+                self.clone_source_index = None;
+            }
+        }
+        if let Some(t) = self.clone_target_index {
+            if !self.disks.iter().any(|d| d.index == t) || self.clone_source_index == Some(t) {
+                self.clone_target_index = None;
+            }
+        }
+        let (Some(s), Some(t)) = (self.clone_source_index, self.clone_target_index) else {
+            self.clone_layout = None;
+            self.clone_layout_for = None;
+            return;
+        };
+        if self.clone_layout_for != Some((s, t)) || self.clone_layout.is_none() {
+            self.clone_layout_for = Some((s, t));
+            self.reseed_full_disk_clone();
+        }
+    }
+
+    /// Build (or rebuild) the clone editor as the default full-disk plan for
+    /// the currently selected source/target pair.
+    fn reseed_full_disk_clone(&mut self) {
+        let source = self
+            .clone_source_index
+            .and_then(|i| self.disks.iter().find(|d| d.index == i))
+            .cloned();
+        let target = self
+            .clone_target_index
+            .and_then(|i| self.disks.iter().find(|d| d.index == i))
+            .cloned();
+        let (Some(source), Some(target)) = (source, target) else {
+            self.clone_layout = None;
+            return;
+        };
+        let mut layout = restore_layout::RestoreLayoutState::from_live_disk(&source);
+        layout.seed_full_disk_clone(&source, &target, self.clone_expand);
+        self.clone_layout = Some(layout);
     }
 
     fn start_clone(&mut self) {
@@ -1766,15 +1840,18 @@ impl PhoenixApp {
             self.status = "Selected disk no longer present; refresh".into();
             return;
         };
-        let plan = if self.clone_expand {
-            phoenix_clone::ClonePlan::expand_to_fill(&source, &target)
-        } else {
-            phoenix_clone::ClonePlan::identity(&source)
+        let Some(layout) = self.clone_layout.as_ref() else {
+            return;
         };
+        // The map IS the plan: full-disk mode re-initializes the target with
+        // the source's layout; a partial layout updates the existing table
+        // in place around the dropped partition(s).
+        let plan = layout.to_clone_plan();
         if let Err(e) = plan.validate(&source, &target) {
             self.status = format!("Cannot clone: {e}");
             return;
         }
+        self.completed = None;
         self.status = format!("Cloning disk {src} → disk {tgt}…");
         self.job = Some(spawn_clone(phoenix_clone::CloneOptions {
             source_disk_index: src,
@@ -2063,6 +2140,27 @@ impl PhoenixApp {
             let _ = self.settings.save();
         }
     }
+}
+
+/// Debug/verification aid: `--page clone` (etc.) opens the app on that page
+/// instead of Backup. Unknown or absent values fall back to the default.
+fn start_page_from_args() -> Option<Page> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--page" {
+            return match args.next()?.to_ascii_lowercase().as_str() {
+                "backup" => Some(Page::Backup),
+                "clone" => Some(Page::Clone),
+                "restore" => Some(Page::Restore),
+                "verify" => Some(Page::Verify),
+                "mount" => Some(Page::Mount),
+                "history" => Some(Page::History),
+                "options" => Some(Page::Options),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn default_backup_folder() -> String {

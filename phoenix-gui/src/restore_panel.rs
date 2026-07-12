@@ -23,7 +23,10 @@ const SNAP_PX: f32 = 12.0;
 const GHOST_SIZE: Vec2 = Vec2::new(160.0, 72.0);
 const TOOLBAR_BTN: f32 = 30.0;
 
-fn drag_source_id() -> egui::Id {
+/// Shared with the Clone page's panel: both pages run the same
+/// drag-a-source-partition-onto-the-target-layout gesture, and only one page
+/// is on screen at a time, so one context-data slot serves both.
+pub(crate) fn drag_source_id() -> egui::Id {
     egui::Id::new("restore_drag_source")
 }
 
@@ -49,11 +52,11 @@ fn clear_gesture_scale(ctx: &egui::Context) {
 }
 
 /// The source partition index of the drag in flight, if any.
-fn active_drag(ctx: &egui::Context) -> Option<u32> {
+pub(crate) fn active_drag(ctx: &egui::Context) -> Option<u32> {
     ctx.data(|d| d.get_temp::<u32>(drag_source_id()))
 }
 
-fn clear_drag(ctx: &egui::Context) {
+pub(crate) fn clear_drag(ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove::<u32>(drag_source_id()));
 }
 
@@ -112,14 +115,29 @@ pub fn show(
 
     let target_view = layout.target_view(target);
     let target_row_width = viewport_width.max(disk_map::min_disk_row_width(&target_view));
-    if draw_target_row(ui, target_row_width, layout, &target_view, palette) {
+    if draw_target_row(
+        ui,
+        target_row_width,
+        CHECKBOX_COLUMN_WIDTH + CHECKBOX_GAP,
+        layout,
+        &target_view,
+        palette,
+    ) {
         out.plan_entries_updated = true;
     }
 
-    // Drag lifecycle: the ghost follows the pointer while the drag is live;
-    // any release ends the drag (the target row's drop handler has already run
-    // this frame, so a release over a valid spot mapped before we clear).
-    let ctx = ui.ctx().clone();
+    drag_lifecycle(ui.ctx(), layout, palette);
+
+    ui.add_space(ROW_VERTICAL_GAP);
+    out
+}
+
+/// Drag lifecycle, run once per frame after every row that can start or
+/// receive a drop: the ghost follows the pointer while the drag is live; any
+/// release ends the drag (the drop handlers have already run this frame, so
+/// a release over a valid spot mapped before we clear).
+pub(crate) fn drag_lifecycle(ctx: &egui::Context, layout: &RestoreLayoutState, palette: &Palette) {
+    let ctx = ctx.clone();
     if let Some(src_index) = active_drag(&ctx) {
         if ctx.input(|i| i.pointer.any_released() || !i.pointer.any_down()) {
             clear_drag(&ctx);
@@ -132,16 +150,13 @@ pub fn show(
             draw_drag_ghost(&ctx, palette, src);
         }
     }
-
-    ui.add_space(ROW_VERTICAL_GAP);
-    out
 }
 
 /// The row of layout-editing actions: table style switch, blank layout,
 /// delete selected, reset. Laid out right-to-left (callers wrap us in a
 /// right-to-left layout), so buttons are added in reverse visual order.
 /// Returns true when the planned layout changed.
-fn draw_layout_toolbar(
+pub(crate) fn draw_layout_toolbar(
     ui: &mut Ui,
     layout: &mut RestoreLayoutState,
     target: &DiskInfo,
@@ -362,9 +377,14 @@ fn draw_full_disk_checkbox(
     }
 }
 
-fn draw_target_row(
+/// The editable planned-layout row: info card + segment map with drop,
+/// move, resize, and select interactions. `inset` is dead space reserved at
+/// the row's left edge (the Restore page uses it to stay column-aligned
+/// with the source row's full-disk checkbox; the Clone page passes 0).
+pub(crate) fn draw_target_row(
     ui: &mut Ui,
     row_width: f32,
+    inset: f32,
     layout: &mut RestoreLayoutState,
     view: &DiskInfo,
     palette: &Palette,
@@ -374,10 +394,7 @@ fn draw_target_row(
     let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
 
     let info_rect = Rect::from_min_size(
-        egui::pos2(
-            row_rect.left() + CHECKBOX_COLUMN_WIDTH + CHECKBOX_GAP,
-            row_rect.top(),
-        ),
+        egui::pos2(row_rect.left() + inset, row_rect.top()),
         Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT),
     );
     draw_disk_info_card(ui, info_rect, view, palette, false);

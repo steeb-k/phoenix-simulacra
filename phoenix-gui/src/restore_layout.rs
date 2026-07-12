@@ -43,9 +43,10 @@ pub struct LayoutSlot {
 
 #[derive(Debug, Clone)]
 pub struct RestoreLayoutState {
+    /// Path of the `.phnx` the source layout came from; empty when the
+    /// source is a live disk (the Clone page).
     pub backup_path: String,
     pub source_disk: DiskInfo,
-    pub index: Vec<PartitionIndexEntry>,
     pub full_disk: bool,
     pub align_bytes: u64,
     /// Active edge/body drag.
@@ -171,9 +172,30 @@ impl RestoreLayoutState {
         Self {
             backup_path: path.to_string(),
             source_disk: backup_to_disk_info(reader),
-            index: reader.index.clone(),
             full_disk: false,
             align_bytes: alignment_bytes(reader),
+            drag: None,
+            slots: Vec::new(),
+            table_gpt: false,
+            reinit_table: false,
+            selected_slot: None,
+            next_slot_id: 0,
+            target_key: None,
+            target_size: 0,
+            target_sector: 512,
+        }
+    }
+
+    /// Layout editor over a LIVE source disk (the Clone page). Per-partition
+    /// used/original sizes come from the enumerated `DiskInfo` instead of a
+    /// backup index; everything else — slots, drops, move/resize, plan
+    /// generation — behaves exactly as on the Restore page.
+    pub fn from_live_disk(source: &DiskInfo) -> Self {
+        Self {
+            backup_path: String::new(),
+            source_disk: source.clone(),
+            full_disk: false,
+            align_bytes: 1024 * 1024,
             drag: None,
             slots: Vec::new(),
             table_gpt: false,
@@ -258,19 +280,26 @@ impl RestoreLayoutState {
             .unwrap_or(false)
     }
 
+    /// Used bytes of a source partition, from `source_disk`'s usage info
+    /// (baked from the backup index by [`backup_to_disk_info`], or live
+    /// volume stats on the Clone page). Unknown usage falls back to the full
+    /// partition size — conservative, so an unreadable volume can never be
+    /// shrunk below its data.
     pub fn source_used_bytes(&self, source_index: u32) -> u64 {
-        self.index
+        self.source_disk
+            .partitions
             .iter()
-            .find(|e| e.index == source_index)
-            .map(|e| e.used_bytes)
+            .find(|p| p.index == source_index)
+            .map(|p| p.usage.map(|u| u.used_bytes()).unwrap_or(p.size_bytes))
             .unwrap_or(0)
     }
 
     pub fn source_original_size(&self, source_index: u32) -> u64 {
-        self.index
+        self.source_disk
+            .partitions
             .iter()
-            .find(|e| e.index == source_index)
-            .map(|e| e.original_size)
+            .find(|p| p.index == source_index)
+            .map(|p| p.size_bytes)
             .unwrap_or(0)
     }
 
@@ -452,6 +481,82 @@ impl RestoreLayoutState {
 
     pub fn clear_full_disk(&mut self, target: &DiskInfo) {
         self.rebuild_from_target(target);
+    }
+
+    /// Seed the slots for a full-disk CLONE of `source` onto `target`
+    /// (identity layout, or [`phoenix_clone::ClonePlan::expand_to_fill`]
+    /// when `expand` is set). The editor is locked while `full_disk` is on;
+    /// dragging a source partition flips to partial mode via
+    /// [`clear_full_disk`].
+    pub fn seed_full_disk_clone(&mut self, source: &DiskInfo, target: &DiskInfo, expand: bool) {
+        self.target_key = Some((target.index, target.size_bytes));
+        self.target_size = target.size_bytes;
+        self.target_sector = target.sector_size;
+        self.full_disk = true;
+        self.selected_slot = None;
+        self.drag = None;
+        self.table_gpt = source.is_gpt;
+        self.reinit_table = true;
+        self.slots.clear();
+        let plan = if expand {
+            phoenix_clone::ClonePlan::expand_to_fill(source, target)
+        } else {
+            phoenix_clone::ClonePlan::identity(source)
+        };
+        for e in &plan.entries {
+            let slot_source = Some(self.slot_source(e.source_partition_index));
+            let id = self.fresh_id();
+            self.slots.push(LayoutSlot {
+                id,
+                offset_bytes: e.target_offset_bytes,
+                size_bytes: e.target_size_bytes,
+                existing: None,
+                source: slot_source,
+            });
+        }
+    }
+
+    /// Build the clone plan straight from the slots — like
+    /// [`to_restore_plan`](Self::to_restore_plan), the map IS the plan.
+    /// Full-disk mode re-initializes the target with the source's table
+    /// style; a partial layout updates the existing table in place,
+    /// preserving the unmapped slots; blank-layout / style-switch edits
+    /// re-initialize with the chosen style.
+    pub fn to_clone_plan(&self) -> phoenix_clone::ClonePlan {
+        let mut ordered: Vec<&LayoutSlot> = self.slots.iter().collect();
+        ordered.sort_by_key(|s| s.offset_bytes);
+
+        let entries = ordered
+            .iter()
+            .filter_map(|s| {
+                s.source.as_ref().map(|src| phoenix_clone::CloneEntry {
+                    source_partition_index: src.source_index,
+                    target_offset_bytes: s.offset_bytes,
+                    target_size_bytes: s.size_bytes,
+                })
+            })
+            .collect();
+
+        let table_mode = if self.full_disk {
+            phoenix_clone::CloneTableMode::ReinitMatchSource
+        } else if self.reinit_table {
+            phoenix_clone::CloneTableMode::ReinitAs {
+                gpt: self.table_gpt,
+            }
+        } else {
+            phoenix_clone::CloneTableMode::UpdateExisting {
+                preserved_target_indices: ordered
+                    .iter()
+                    .filter(|s| s.source.is_none())
+                    .filter_map(|s| s.existing.as_ref().map(|p| p.index))
+                    .collect(),
+            }
+        };
+
+        phoenix_clone::ClonePlan {
+            entries,
+            table_mode,
+        }
     }
 
     pub fn assignment_label(&self, slot_id: u32) -> Option<String> {
