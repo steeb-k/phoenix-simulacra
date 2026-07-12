@@ -237,6 +237,19 @@ pub fn update_partition_layout_existing(
     res
 }
 
+/// [`update_partition_layout_existing`] taking the disk GUID as the raw
+/// little-endian byte layout `DiskInfo::disk_guid` carries, so callers
+/// outside this crate (phoenix-clone's partial clone) don't need a
+/// `windows-sys` dependency just to convert it.
+pub fn update_partition_layout_existing_bytes(
+    disk_path: &str,
+    entries: &[GptEntry],
+    disk_guid: [u8; 16],
+    disk_size_bytes: u64,
+) -> Result<()> {
+    update_partition_layout_existing(disk_path, entries, &bytes_to_guid(disk_guid), disk_size_bytes)
+}
+
 /// Explicit `FlushFileBuffers` on the disk handle. Called from
 /// [`run_restore`](crate::restore::run_restore) right before the
 /// partition table goes down, so any cached writes from

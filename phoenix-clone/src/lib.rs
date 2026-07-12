@@ -25,12 +25,13 @@ use phoenix_capture::{
 use phoenix_restore::grow::extend_ntfs_volume;
 use phoenix_restore::partition_table::{
     bring_disk_online, flush_disk, init_target_disk_as_gpt, init_target_disk_as_mbr,
-    notify_disk_updated, write_mbr_partition_layout, write_partition_layout, GptEntry, MbrEntry,
+    notify_disk_updated, update_partition_layout_existing_bytes, write_mbr_partition_layout,
+    write_partition_layout, GptEntry, MbrEntry,
 };
 use phoenix_restore::relocation::build_relocation_map;
 
 pub mod plan;
-pub use plan::{CloneEntry, ClonePlan};
+pub use plan::{CloneEntry, ClonePlan, CloneTableMode};
 
 /// Whether to read each written region back off the target and compare it to
 /// the source before moving on.
@@ -161,16 +162,64 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     // Same rationale as restore: defer the partition entries until after the
     // data is written so mountmgr can't lazy-mount empty volumes and bounce
     // our raw writes with ERROR_ACCESS_DENIED.
-    let gpt_state = if source.is_gpt {
+    //
+    // UpdateExisting (partial clone) skips the init entirely — the target's
+    // table stays live while data lands, so instead the covering volumes are
+    // locked + dismounted below, exactly like a partial restore.
+    let table_gpt = match &opts.plan.table_mode {
+        CloneTableMode::ReinitMatchSource => source.is_gpt,
+        CloneTableMode::ReinitAs { gpt } => *gpt,
+        CloneTableMode::UpdateExisting { .. } => target.is_gpt,
+    };
+    let reinit = !matches!(opts.plan.table_mode, CloneTableMode::UpdateExisting { .. });
+    let gpt_state = if reinit && table_gpt {
         Some(init_target_disk_as_gpt(
             &target.path,
             target.size_bytes,
-            source.disk_guid,
+            // A style switch from an MBR source has no source GUID to carry
+            // over; a fresh one is generated.
+            source.disk_guid.filter(|_| source.is_gpt),
         )?)
-    } else {
+    } else if reinit {
         init_target_disk_as_mbr(&target.path, source.disk_signature as u32)?;
         None
+    } else {
+        None
     };
+
+    // Partial clone writes into slots of a live partition table: any target
+    // partition that is NOT preserved is either overwritten by a planned
+    // entry or dropped from the table afterwards, and either way a mounted
+    // volume on it must be locked + dismounted first or the raw writes (and
+    // the in-place table rewrite) bounce with ERROR_ACCESS_DENIED. The
+    // guards drop after the table is re-stamped so the grown-NTFS pass can
+    // remount and extend.
+    let mut locked_target_volumes: Vec<phoenix_core::disk::LockedVolume> = Vec::new();
+    if let CloneTableMode::UpdateExisting {
+        preserved_target_indices,
+    } = &opts.plan.table_mode
+    {
+        for p in &target.partitions {
+            if preserved_target_indices.contains(&p.index) {
+                continue;
+            }
+            if let Some(vol) = &p.volume_path {
+                let guard = phoenix_core::disk::LockedVolume::acquire(vol).map_err(|e| {
+                    PhoenixError::Disk(format!(
+                        "could not clear the volume {vol} occupying target partition {} before \
+                         cloning over it (close any open files/handles on it and retry): {e}",
+                        p.index
+                    ))
+                })?;
+                info!(
+                    volume = vol.as_str(),
+                    partition = p.index,
+                    "dismounted live target-slot volume for partial clone"
+                );
+                locked_target_volumes.push(guard);
+            }
+        }
+    }
 
     let mut bytes_done = 0u64;
     let mut grown_ntfs: Vec<(u64, u64)> = Vec::new(); // (target_offset, target_size)
@@ -207,7 +256,61 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     if let Some(ref p) = opts.progress {
         p.set_step(opts.plan.entries.len() + 1);
     }
-    if let Some(state) = gpt_state {
+    if let CloneTableMode::UpdateExisting {
+        preserved_target_indices,
+    } = &opts.plan.table_mode
+    {
+        // In-place rewrite of the existing table: cloned entries carry the
+        // source partition's identity, preserved entries keep the live
+        // target partition's, and everything else falls off the table.
+        if target.is_gpt {
+            let mut entries = build_gpt_entries(source, &opts.plan);
+            entries.extend(
+                target
+                    .partitions
+                    .iter()
+                    .filter(|p| preserved_target_indices.contains(&p.index))
+                    .map(|p| GptEntry {
+                        offset_bytes: p.offset_bytes,
+                        size_bytes: p.size_bytes,
+                        type_guid: p.type_guid,
+                        unique_guid: p.unique_guid,
+                        attributes: p.gpt_attributes,
+                        name: p.name.clone(),
+                    }),
+            );
+            entries.sort_by_key(|e| e.offset_bytes);
+            let disk_guid = target.disk_guid.ok_or_else(|| {
+                PhoenixError::Disk(
+                    "target disk GUID unavailable; cannot update its GPT in place".into(),
+                )
+            })?;
+            update_partition_layout_existing_bytes(
+                &target.path,
+                &entries,
+                disk_guid,
+                target.size_bytes,
+            )?;
+        } else {
+            // MBR: the IOCTL is total-rewrite but leaves the disk signature
+            // alone, so this too is a pure entry rewrite.
+            let mut entries = build_mbr_entries(source, &opts.plan);
+            entries.extend(
+                target
+                    .partitions
+                    .iter()
+                    .filter(|p| preserved_target_indices.contains(&p.index))
+                    .map(|p| MbrEntry {
+                        offset_bytes: p.offset_bytes,
+                        size_bytes: p.size_bytes,
+                        partition_type: mbr_type_for(p.fs_kind),
+                        bootable: false,
+                    }),
+            );
+            entries.sort_by_key(|e| e.offset_bytes);
+            write_mbr_partition_layout(&target.path, &entries)?;
+        }
+    } else if let Some(state) = gpt_state {
         let entries = build_gpt_entries(source, &opts.plan);
         write_partition_layout(&target.path, &entries, &state)?;
     } else {
@@ -216,6 +319,11 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     }
     notify_disk_updated(&target.path);
     bring_disk_online(&target.path);
+
+    // Layout is stamped: release the partial-clone volume locks so Windows
+    // remounts the slots fresh (re-reading the boot sectors just written)
+    // and the grown-NTFS pass below can extend mounted volumes.
+    drop(locked_target_volumes);
 
     // --- Grow NTFS volumes that were cloned into a larger partition ---
     for (offset, size) in grown_ntfs {

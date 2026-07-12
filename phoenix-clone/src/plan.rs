@@ -13,9 +13,32 @@ pub struct CloneEntry {
     pub target_size_bytes: u64,
 }
 
+/// What happens to the target's partition table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CloneTableMode {
+    /// Wipe the target and re-initialize it with the SOURCE's table style,
+    /// then plant the planned entries — the classic full-disk clone.
+    #[default]
+    ReinitMatchSource,
+    /// Wipe the target and re-initialize it with the given style (the GUI's
+    /// blank-layout / table-style-switch editor actions), then plant the
+    /// planned entries.
+    ReinitAs { gpt: bool },
+    /// Keep the target's existing partition table and update it in place:
+    /// planned entries are written (replacing whatever they land on), the
+    /// listed live target partitions survive untouched, and any live
+    /// partition in neither set is removed from the table. This is the
+    /// partial-clone analogue of a partial restore.
+    UpdateExisting {
+        /// `PartitionInfo::index` values of the live target partitions to keep.
+        preserved_target_indices: Vec<u32>,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClonePlan {
     pub entries: Vec<CloneEntry>,
+    pub table_mode: CloneTableMode,
 }
 
 impl ClonePlan {
@@ -32,7 +55,10 @@ impl ClonePlan {
                 target_size_bytes: p.size_bytes,
             })
             .collect();
-        ClonePlan { entries }
+        ClonePlan {
+            entries,
+            table_mode: CloneTableMode::ReinitMatchSource,
+        }
     }
 
     /// Like [`identity`](Self::identity) but grows the last NTFS partition to
@@ -102,10 +128,29 @@ impl ClonePlan {
 
     /// Validate the plan against the real source and target disks: every
     /// referenced source partition exists, each target size holds the source's
-    /// used data, and the layout neither overlaps nor runs off the target.
+    /// used data, and the layout — including preserved live partitions in
+    /// [`CloneTableMode::UpdateExisting`] — neither overlaps nor runs off the
+    /// target.
     pub fn validate(&self, source: &DiskInfo, target: &DiskInfo) -> Result<()> {
         if self.entries.is_empty() {
             return Err(PhoenixError::Plan("clone plan has no partitions".into()));
+        }
+        if let CloneTableMode::UpdateExisting {
+            preserved_target_indices,
+        } = &self.table_mode
+        {
+            for idx in preserved_target_indices {
+                if !target.partitions.iter().any(|p| p.index == *idx) {
+                    return Err(PhoenixError::Plan(format!(
+                        "preserved target partition {idx} not found on the target disk"
+                    )));
+                }
+            }
+            if target.is_gpt && target.disk_guid.is_none() {
+                return Err(PhoenixError::Plan(
+                    "target disk GUID unavailable; cannot update its GPT in place".into(),
+                ));
+            }
         }
         for e in &self.entries {
             let src = source
@@ -128,7 +173,8 @@ impl ClonePlan {
             }
         }
 
-        // Overlap / bounds check.
+        // Overlap / bounds check. Preserved live partitions occupy the disk
+        // too, so an update-existing plan must not overlap them either.
         let mut spans: Vec<(u64, u64, u32)> = self
             .entries
             .iter()
@@ -140,6 +186,18 @@ impl ClonePlan {
                 )
             })
             .collect();
+        if let CloneTableMode::UpdateExisting {
+            preserved_target_indices,
+        } = &self.table_mode
+        {
+            spans.extend(
+                target
+                    .partitions
+                    .iter()
+                    .filter(|p| preserved_target_indices.contains(&p.index))
+                    .map(|p| (p.offset_bytes, p.offset_bytes + p.size_bytes, p.index)),
+            );
+        }
         spans.sort_by_key(|s| s.0);
         for w in spans.windows(2) {
             if w[0].1 > w[1].0 {
@@ -241,6 +299,46 @@ mod tests {
             .expect("expanded plan should validate");
         // It actually grew (target size > source size).
         assert!(plan.entries[0].target_size_bytes > 255 * MIB);
+    }
+
+    #[test]
+    fn update_existing_overlap_with_preserved_is_rejected() {
+        // Clone a 100 MiB partition to offset 1 MiB on a target whose
+        // preserved partition occupies 50..150 MiB: the plan must be refused
+        // even though the planned entries alone don't overlap anything.
+        let src = disk(0, 256 * MIB, vec![ntfs_part(0, MIB, 100 * MIB, 10 * MIB)]);
+        let tgt = disk(1, 256 * MIB, vec![ntfs_part(3, 50 * MIB, 100 * MIB, MIB)]);
+        let mut plan = ClonePlan::identity(&src);
+        plan.table_mode = CloneTableMode::UpdateExisting {
+            preserved_target_indices: vec![3],
+        };
+        let err = plan.validate(&src, &tgt).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "got: {err}");
+    }
+
+    #[test]
+    fn update_existing_missing_preserved_partition_is_rejected() {
+        let src = disk(0, 256 * MIB, vec![ntfs_part(0, MIB, 100 * MIB, 10 * MIB)]);
+        let tgt = disk(1, 256 * MIB, vec![]);
+        let mut plan = ClonePlan::identity(&src);
+        plan.table_mode = CloneTableMode::UpdateExisting {
+            preserved_target_indices: vec![7],
+        };
+        let err = plan.validate(&src, &tgt).unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn update_existing_beside_preserved_passes() {
+        // Planned entry at 1..101 MiB, preserved partition at 150..250 MiB:
+        // no overlap, plan is valid.
+        let src = disk(0, 256 * MIB, vec![ntfs_part(0, MIB, 100 * MIB, 10 * MIB)]);
+        let tgt = disk(1, 512 * MIB, vec![ntfs_part(2, 150 * MIB, 100 * MIB, MIB)]);
+        let mut plan = ClonePlan::identity(&src);
+        plan.table_mode = CloneTableMode::UpdateExisting {
+            preserved_target_indices: vec![2],
+        };
+        plan.validate(&src, &tgt).expect("plan should validate");
     }
 
     #[test]
