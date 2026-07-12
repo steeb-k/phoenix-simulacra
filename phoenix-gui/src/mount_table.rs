@@ -1,13 +1,13 @@
 //! "Active mounts" table on the Mount page.
 //!
 //! One card per mounted backup, one sub-row per exposed drive letter. The
-//! backup's name, size and Unmount button belong to the whole card (a
-//! two-letter mount unmounts as a unit) and sit centered against it, while each
-//! letter gets its own Explore button:
+//! backup's folder, name, size and Unmount button belong to the whole card (a
+//! two-letter mount unmounts as a unit) and align with its first letter, while
+//! each letter gets its own Explore button:
 //!
 //! ```text
-//! D:\Backups                I:   [Explore]
-//! fdBU.phnx     30.8 GB                      [Unmount]
+//! D:\Backups
+//! fdBU.phnx     30.8 GB     I:   [Explore]   [Unmount]
 //!                           J:   [Explore]
 //! ```
 //!
@@ -190,10 +190,19 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
         .rect_filled(rect, Rounding::same(CARD_ROUNDING), palette.content_card_bg);
     let cols = columns(rect);
 
-    // Name and size are properties of the whole mount, so they sit centered
-    // against the full card height rather than against the first letter. The
-    // folder rides above the name, dimmed: two mounts can share a file name,
-    // and the only thing telling them apart is where they came from.
+    let sub_row_rect = |k: usize| {
+        let top = rect.top() + CARD_PAD_Y + k as f32 * SUB_ROW_H;
+        Rect::from_min_size(
+            egui::pos2(rect.left(), top),
+            Vec2::new(rect.width(), SUB_ROW_H),
+        )
+    };
+    // Name, size and Unmount belong to the mount as a whole, but they line up
+    // with its FIRST drive letter rather than floating in the middle of the
+    // card: on a two-letter mount, centering left them hanging between the
+    // rows. The folder rides above the name, dimmed — two mounts can share a
+    // file name, and where they came from is the only thing telling them apart.
+    let top_line = sub_row_rect(0);
     let folder = elided(
         ui,
         &row.folder,
@@ -209,7 +218,7 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
         cols.name_w,
     );
     let block_h = folder.size().y + FOLDER_GAP + name.size().y;
-    let block_top = rect.center().y - block_h * 0.5;
+    let block_top = top_line.center().y - block_h * 0.5;
     let folder_pos = egui::pos2(cols.name_x, block_top);
     ui.painter()
         .galley(folder_pos, folder.clone(), palette.subtle_text);
@@ -228,7 +237,7 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
         palette.icon_color,
     );
     painter.text(
-        egui::pos2(cols.size_x, rect.center().y),
+        egui::pos2(cols.size_x, top_line.center().y),
         Align2::LEFT_CENTER,
         format_bytes(row.size),
         fonts::regular(14.0),
@@ -236,14 +245,6 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
     );
 
     let mut action = None;
-    let sub_row_rect = |k: usize| {
-        let top = rect.top() + CARD_PAD_Y + k as f32 * SUB_ROW_H;
-        Rect::from_min_size(
-            egui::pos2(rect.left(), top),
-            Vec2::new(rect.width(), SUB_ROW_H),
-        )
-    };
-
     for (k, &letter) in row.letters.iter().enumerate() {
         let line = sub_row_rect(k);
         ui.painter().text(
@@ -282,10 +283,9 @@ fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette
     }
 
     // One Unmount for the whole backup — it takes down the attached disk,
-    // letters and all — so it sits centered against the card rather than on any
-    // one letter's line.
+    // letters and all — parked on the top line with the name and size.
     let unmount = Rect::from_min_size(
-        egui::pos2(cols.unmount_x, rect.center().y - BTN_H * 0.5),
+        egui::pos2(cols.unmount_x, top_line.center().y - BTN_H * 0.5),
         Vec2::new(UNMOUNT_W, BTN_H),
     );
     if table_button(
