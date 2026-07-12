@@ -5,6 +5,7 @@ mod disk_dropdown;
 mod disk_map;
 mod disk_panel;
 mod fonts;
+mod history_table;
 mod job;
 mod mount_table;
 mod restore_layout;
@@ -198,6 +199,7 @@ struct PendingClone {
     opts: phoenix_clone::CloneOptions,
     message: String,
     details: Vec<String>,
+    subject: JobSubject,
 }
 
 /// A validated, ready-to-run restore parked while its confirmation dialog
@@ -205,6 +207,35 @@ struct PendingClone {
 struct PendingRestore {
     opts: RestoreOptions,
     details: Vec<String>,
+    subject: JobSubject,
+}
+
+/// The two ends of the running job, named the way a person would name them
+/// ("Samsung SSD 990 PRO (Disk 1)", `D:\Backups\work.phnx`).
+///
+/// Captured when the job is *spawned*, because that is the last moment the
+/// context still exists: by the time the worker finishes, the page that chose
+/// the disk and the file has usually been reset, and the record would have
+/// nothing left to describe. `poll_job` hands this to the history record.
+#[derive(Clone, Default)]
+struct JobSubject {
+    source: String,
+    target: String,
+    /// The `.phnx` the job wrote or read, stat'd when the job ends for the
+    /// size the History page shows next to it. `None` for a clone.
+    image_path: Option<PathBuf>,
+}
+
+impl JobSubject {
+    /// On-disk size of the job's `.phnx`, or 0 if it has none (or the file is
+    /// gone — a cancelled backup deletes its half-written image).
+    fn image_bytes(&self) -> u64 {
+        self.image_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
 }
 
 /// The `Disk number / Size / Model` lines both confirmation dialogs show.
@@ -303,8 +334,20 @@ struct PhoenixApp {
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
+    /// `--demo-history`: the history is a canned set of rows for styling work,
+    /// and must never be written back over the real one.
+    demo_history: bool,
+    /// The history entry the user clicked ✕ on, waiting on its confirmation
+    /// dialog. An index into `history.records`.
+    pending_history_delete: Option<usize>,
     /// Wall-clock start of the currently-running job, for the history record.
     job_started: Option<Instant>,
+    /// When the running backup's verify-after pass began (it is the last step
+    /// of the same worker). Splits the job into the two history entries the
+    /// user asked for: the capture, then the verify that followed it.
+    verify_started: Option<Instant>,
+    /// What the running job is acting on — see [`JobSubject`].
+    job_subject: JobSubject,
     status: String,
     page: Page,
     job: Option<BackgroundJob>,
@@ -345,6 +388,9 @@ impl PhoenixApp {
 
         let settings = phoenix_core::appdata::Settings::load();
         let palette = theme::refresh(&cc.egui_ctx, settings.theme);
+        let demo_history = demo_history_from_args();
+        let is_demo_history = demo_history.is_some();
+        let history = demo_history.unwrap_or_else(phoenix_core::appdata::History::load);
         let backup_folder = settings
             .default_backup_dir
             .clone()
@@ -382,8 +428,12 @@ impl PhoenixApp {
             demo_mounts: demo_mount_rows_from_args(),
             pending_close: false,
             settings,
-            history: phoenix_core::appdata::History::load(),
+            history,
+            demo_history: is_demo_history,
+            pending_history_delete: None,
             job_started: None,
+            verify_started: None,
+            job_subject: JobSubject::default(),
             status: "Ready".into(),
             page: start_page_from_args().unwrap_or(Page::Backup),
             job: None,
@@ -434,7 +484,11 @@ impl PhoenixApp {
             Page::Backup => self.clear_backup_ui_state(),
             Page::Restore => self.reset_restore_page(),
             Page::Clone => self.clear_clone_ui_state(),
-            Page::History => self.history = phoenix_core::appdata::History::load(),
+            // Re-read the log from disk (but never over the demo rows).
+            Page::History if !self.demo_history => {
+                self.history = phoenix_core::appdata::History::load()
+            }
+            Page::History => {}
             Page::Verify | Page::Mount | Page::Options => {}
         }
     }
@@ -501,6 +555,7 @@ impl PhoenixApp {
             || self.pending_overwrite.is_some()
             || self.pending_clone.is_some()
             || self.pending_restore.is_some()
+            || self.pending_history_delete.is_some()
             || self.pending_close
     }
 
@@ -594,31 +649,71 @@ impl PhoenixApp {
         }
     }
 
-    /// Append a completed-job record to the persistent history (best-effort).
+    /// Write the finished job into the persistent history (best-effort).
+    ///
+    /// A backup that ran with verify-after-backup lands as TWO entries, back to
+    /// back: the capture, then the verify pass the same worker ran after it.
+    /// That is how the user thinks of it — and it means a verify that fails on
+    /// a backup whose capture completed says exactly that, instead of a single
+    /// "backup failed" row that hides which half broke.
     fn record_job(
         &mut self,
         kind: JobKind,
         outcome: phoenix_core::appdata::JobOutcome,
         snap: &phoenix_core::ProgressSnapshot,
+        verify_after: bool,
     ) {
-        use phoenix_core::appdata::{JobKindTag, JobRecord};
+        use phoenix_core::appdata::{now_unix, JobKindTag, JobOutcome as Rec, JobRecord};
+
         let tag = match kind {
             JobKind::Backup => JobKindTag::Backup,
             JobKind::Restore => JobKindTag::Restore,
             JobKind::Verify => JobKindTag::Verify,
             JobKind::Clone => JobKindTag::Clone,
         };
-        let duration = self.job_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-        let rec = JobRecord::now(
-            tag,
-            duration,
-            String::new(),
-            self.status.clone(),
-            None,
-            outcome,
-            snap.total,
+        let total = self.job_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+        let ended = now_unix();
+        let started = ended - total as i64;
+        // How far into the job its verify pass began, if it got that far.
+        let verify_at = self
+            .verify_started
+            .take()
+            .zip(self.job_started)
+            .map(|(v, s)| v.duration_since(s).as_secs());
+        self.job_started = None;
+
+        let subject = std::mem::take(&mut self.job_subject);
+        let image_bytes = subject.image_bytes();
+
+        let Some(verify_at) = verify_at.filter(|_| kind == JobKind::Backup && verify_after) else {
+            let _ = self.history.append(
+                JobRecord::new(tag, outcome, started, total)
+                    .with_source(subject.source)
+                    .with_target(subject.target)
+                    .with_bytes(snap.total, image_bytes),
+            );
+            return;
+        };
+
+        // The worker reached the verify step, so the capture itself finished and
+        // the image was written — whatever the job's overall outcome, that half
+        // succeeded. Any failure or cancel from here belongs to the verify.
+        let _ = self.history.append(
+            JobRecord::new(JobKindTag::Backup, Rec::Success, started, verify_at)
+                .with_source(subject.source)
+                .with_target(subject.target.clone())
+                .with_bytes(snap.total, image_bytes),
         );
-        let _ = self.history.append(rec);
+        let _ = self.history.append(
+            JobRecord::new(
+                JobKindTag::Verify,
+                outcome,
+                started + verify_at as i64,
+                total.saturating_sub(verify_at),
+            )
+            .with_source(subject.target)
+            .with_bytes(snap.total, image_bytes),
+        );
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -631,118 +726,137 @@ impl PhoenixApp {
         let job_kind = job.kind;
         let job_verified = job.verify_after;
         let job_output = job.output.clone();
-        if let Some(result) = job.poll() {
-            // Capture the final step list before dropping the job so the
-            // modal can keep showing it (with a Close button) after the
-            // worker thread is gone.
-            let final_snap = job.progress.snapshot();
-            self.job = None;
-            match result {
-                Ok(msg) => {
-                    if job_kind == JobKind::Verify && self.completed.is_some() {
-                        // The follow-up "Verify?" of a just-completed backup:
-                        // upgrade the parked completion modal in place instead
-                        // of replacing it with the verify job's own step list.
-                        self.status = msg;
-                        self.record_job(
-                            job_kind,
-                            phoenix_core::appdata::JobOutcome::Success,
-                            &final_snap,
-                        );
-                        self.job_started = None;
-                        if let Some(completed) = self.completed.as_mut() {
-                            completed.success_banner = Some("Completed and verified.".to_string());
-                        }
-                    } else if let Some(next) = self.pending_backups.pop() {
-                        self.current_backup_index += 1;
-                        let path_display = next.output.display().to_string();
-                        self.status = format!(
-                            "Backing up disk {} of {} to {}…",
-                            self.current_backup_index, self.total_backups, path_display
-                        );
-                        self.job = Some(spawn_backup(next));
-                    } else {
-                        let multi = self.total_backups > 1;
-                        self.status = if multi {
-                            format!("All {} backups completed", self.total_backups)
-                        } else {
-                            msg
-                        };
-                        if job_kind == JobKind::Restore {
-                            self.clear_restore_ui_state();
-                        }
-                        if job_kind == JobKind::Clone {
-                            self.clear_clone_ui_state();
-                        }
-                        self.total_backups = 0;
-                        self.current_backup_index = 0;
-                        self.record_job(
-                            job_kind,
-                            phoenix_core::appdata::JobOutcome::Success,
-                            &final_snap,
-                        );
-                        self.job_started = None;
-                        // Offer "Verify?" only for a single unverified backup:
-                        // for a multi-disk run the parked modal represents the
-                        // whole queue, but the job only knows its own file.
-                        let verify_target =
-                            (job_kind == JobKind::Backup && !job_verified && !multi)
-                                .then_some(job_output)
-                                .flatten();
-                        self.finish_modal(
-                            job_kind,
-                            &final_snap,
-                            JobOutcome::Success,
-                            job_verified,
-                            verify_target,
-                        );
+        // A verify-after-backup is the last step of the backup worker's own
+        // plan; note when it starts so the two history entries the job produces
+        // get honest, non-overlapping timestamps.
+        let verifying = job_kind == JobKind::Backup && job_verified && {
+            let snap = job.progress.snapshot();
+            !snap.steps.is_empty() && snap.current_step + 1 == snap.steps.len()
+        };
+        let result = job.poll();
+        // Capture the final step list before dropping the job so the modal can
+        // keep showing it (with a Close button) after the worker thread is gone.
+        let final_snap = result.is_some().then(|| job.progress.snapshot());
+
+        if verifying && self.verify_started.is_none() {
+            self.verify_started = Some(Instant::now());
+        }
+        let (Some(result), Some(final_snap)) = (result, final_snap) else {
+            ctx.request_repaint();
+            return;
+        };
+        self.job = None;
+
+        match result {
+            Ok(msg) => {
+                if job_kind == JobKind::Verify && self.completed.is_some() {
+                    // The follow-up "Verify?" of a just-completed backup:
+                    // upgrade the parked completion modal in place instead
+                    // of replacing it with the verify job's own step list.
+                    self.status = msg;
+                    self.record_job(
+                        job_kind,
+                        phoenix_core::appdata::JobOutcome::Success,
+                        &final_snap,
+                        false,
+                    );
+                    if let Some(completed) = self.completed.as_mut() {
+                        completed.success_banner = Some("Completed and verified.".to_string());
                     }
-                }
-                Err(e) => {
-                    // `phoenix-core` returns `PhoenixError::Cancelled` with this
-                    // exact Display string — match on it so the status reads as
-                    // a clean "Backup cancelled" instead of "Error: operation
-                    // cancelled by user". Cross-checking the kind from the job
-                    // keeps the wording accurate even if the user has navigated
-                    // to another page while the worker was winding down.
-                    let cancelled = e.contains("cancelled by user");
-                    let outcome = if cancelled {
-                        JobOutcome::Warning
+                } else if let Some(next) = self.pending_backups.pop() {
+                    // One disk of a multi-disk run finished: record it, then
+                    // re-aim the subject at the next disk before spawning it.
+                    self.record_job(
+                        job_kind,
+                        phoenix_core::appdata::JobOutcome::Success,
+                        &final_snap,
+                        job_verified,
+                    );
+                    self.current_backup_index += 1;
+                    let path_display = next.output.display().to_string();
+                    self.status = format!(
+                        "Backing up disk {} of {} to {}…",
+                        self.current_backup_index, self.total_backups, path_display
+                    );
+                    self.job_subject = self.backup_subject(&next);
+                    self.job = Some(spawn_backup(next));
+                } else {
+                    let multi = self.total_backups > 1;
+                    self.status = if multi {
+                        format!("All {} backups completed", self.total_backups)
                     } else {
-                        JobOutcome::Failure
+                        msg
                     };
-                    if cancelled {
-                        self.status = job_kind.cancelled_message().to_string();
-                        self.pending_backups.clear();
-                    } else if !self.pending_backups.is_empty() {
-                        self.status = format!(
-                            "Error on disk {} of {}: {e}. Remaining jobs cancelled.",
-                            self.current_backup_index, self.total_backups
-                        );
-                        self.pending_backups.clear();
-                    } else {
-                        self.status = format!("Error: {e}");
+                    if job_kind == JobKind::Restore {
+                        self.clear_restore_ui_state();
                     }
-                    self.total_backups = 0;
-                    self.current_backup_index = 0;
-                    let rec_outcome = if cancelled {
-                        phoenix_core::appdata::JobOutcome::Cancelled
-                    } else {
-                        phoenix_core::appdata::JobOutcome::Failed(e.clone())
-                    };
-                    self.record_job(job_kind, rec_outcome, &final_snap);
-                    self.job_started = None;
-                    // A finished clone — success, failure, or cancel — resets
-                    // the Clone page to its default view so a stale plan can't
-                    // sit there looking like it still needs to be started.
                     if job_kind == JobKind::Clone {
                         self.clear_clone_ui_state();
                     }
-                    self.finish_modal(job_kind, &final_snap, outcome, job_verified, None);
+                    self.total_backups = 0;
+                    self.current_backup_index = 0;
+                    self.record_job(
+                        job_kind,
+                        phoenix_core::appdata::JobOutcome::Success,
+                        &final_snap,
+                        job_verified,
+                    );
+                    // Offer "Verify?" only for a single unverified backup:
+                    // for a multi-disk run the parked modal represents the
+                    // whole queue, but the job only knows its own file.
+                    let verify_target = (job_kind == JobKind::Backup && !job_verified && !multi)
+                        .then_some(job_output)
+                        .flatten();
+                    self.finish_modal(
+                        job_kind,
+                        &final_snap,
+                        JobOutcome::Success,
+                        job_verified,
+                        verify_target,
+                    );
                 }
             }
-        } else {
-            ctx.request_repaint();
+            Err(e) => {
+                // `phoenix-core` returns `PhoenixError::Cancelled` with this
+                // exact Display string — match on it so the status reads as
+                // a clean "Backup cancelled" instead of "Error: operation
+                // cancelled by user". Cross-checking the kind from the job
+                // keeps the wording accurate even if the user has navigated
+                // to another page while the worker was winding down.
+                let cancelled = e.contains("cancelled by user");
+                let outcome = if cancelled {
+                    JobOutcome::Warning
+                } else {
+                    JobOutcome::Failure
+                };
+                if cancelled {
+                    self.status = job_kind.cancelled_message().to_string();
+                    self.pending_backups.clear();
+                } else if !self.pending_backups.is_empty() {
+                    self.status = format!(
+                        "Error on disk {} of {}: {e}. Remaining jobs cancelled.",
+                        self.current_backup_index, self.total_backups
+                    );
+                    self.pending_backups.clear();
+                } else {
+                    self.status = format!("Error: {e}");
+                }
+                self.total_backups = 0;
+                self.current_backup_index = 0;
+                let rec_outcome = if cancelled {
+                    phoenix_core::appdata::JobOutcome::Cancelled
+                } else {
+                    phoenix_core::appdata::JobOutcome::Failed(e.clone())
+                };
+                self.record_job(job_kind, rec_outcome, &final_snap, job_verified);
+                // A finished clone — success, failure, or cancel — resets
+                // the Clone page to its default view so a stale plan can't
+                // sit there looking like it still needs to be started.
+                if job_kind == JobKind::Clone {
+                    self.clear_clone_ui_state();
+                }
+                self.finish_modal(job_kind, &final_snap, outcome, job_verified, None);
+            }
         }
     }
 
@@ -794,6 +908,11 @@ impl PhoenixApp {
         completed.steps.push("Verifying backup".to_string());
         completed.current_step = completed.steps.len() - 1;
         self.status = format!("Verifying {}…", path.display());
+        self.job_subject = JobSubject {
+            source: path.display().to_string(),
+            target: String::new(),
+            image_path: Some(path.clone()),
+        };
         self.job = Some(spawn_verify(path, false));
         self.job_started = None;
     }
@@ -1078,6 +1197,7 @@ impl eframe::App for PhoenixApp {
         self.show_overwrite_dialog(ctx);
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
+        self.show_history_delete_dialog(ctx);
         self.show_demo_confirm_dialog(ctx);
         self.show_demo_progress_modal(ctx);
         self.show_close_dialog(ctx);
@@ -1237,6 +1357,7 @@ impl PhoenixApp {
                     "Cloning disk {} → disk {}…",
                     pending.opts.source_disk_index, pending.opts.target_disk_index
                 );
+                self.job_subject = pending.subject;
                 self.job = Some(spawn_clone(pending.opts));
             }
             ConfirmAction::Cancel => {
@@ -1270,6 +1391,7 @@ impl PhoenixApp {
                 // the worker's first `set_phase` takes over the status text.
                 self.completed = None;
                 self.status = "Restoring, please wait…".into();
+                self.job_subject = pending.subject;
                 self.job = Some(spawn_restore(pending.opts));
             }
             ConfirmAction::Cancel => {
@@ -1409,29 +1531,44 @@ pub struct StartAction<'a> {
     pub disabled_hint: Option<&'a str>,
 }
 
-/// Format a duration in seconds as a compact "N units ago" string for the
-/// history list.
-fn relative_time(secs_ago: i64) -> String {
-    let s = secs_ago.max(0);
-    if s < 60 {
-        "just now".to_string()
-    } else if s < 3600 {
-        format!("{} min ago", s / 60)
-    } else if s < 86_400 {
-        format!("{} hr ago", s / 3600)
-    } else {
-        format!("{} days ago", s / 86_400)
+/// A recorded job's start time as local wall-clock: `2026-07-12 14:32:07`.
+/// Deliberately absolute — "3 hours ago" tells you nothing the next time you
+/// open the app, and a backup's date is exactly what you came to the History
+/// page to find out.
+fn format_timestamp(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// The Action column: what the job was.
+fn job_action_label(kind: phoenix_core::appdata::JobKindTag) -> &'static str {
+    use phoenix_core::appdata::JobKindTag as K;
+    match kind {
+        K::Backup => "Backup",
+        K::Restore => "Restore",
+        K::Verify => "Verify",
+        K::Clone => "Clone",
     }
 }
 
-/// Truncate a string to `max` chars with an ellipsis.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
+/// The Details column: what the job did, to what, and — when a `.phnx` was
+/// involved — how big it ended up.
+fn describe_job(rec: &phoenix_core::appdata::JobRecord) -> String {
+    use phoenix_core::appdata::JobKindTag as K;
+    let size = match rec.image_bytes {
+        0 => String::new(),
+        n => format!(" ({})", format_bytes(n)),
+    };
+    match rec.kind {
+        K::Backup => format!("Imaged {} → {}{size}", rec.source, rec.target),
+        K::Verify => format!("Fully verified {}{size}", rec.source),
+        K::Restore => format!("Restored {} → {}", rec.source, rec.target),
+        K::Clone => format!("Cloned {} → {}", rec.source, rec.target),
     }
 }
 
@@ -1706,6 +1843,33 @@ impl PhoenixApp {
         theme::draw_focus_outline(ui, &vss_response, &self.palette);
     }
 
+    /// How a disk is named in the history: its model plus the number Windows
+    /// knows it by, because two identical drives are otherwise indistinguishable
+    /// — and a disk number alone means nothing a month later.
+    fn disk_label(&self, index: u32) -> String {
+        let model = self
+            .disks
+            .iter()
+            .find(|d| d.index == index)
+            .and_then(|d| d.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty());
+        match model {
+            Some(m) => format!("{m} (Disk {index})"),
+            None => format!("Disk {index}"),
+        }
+    }
+
+    /// The history subject for one queued backup: the disk it reads, the
+    /// `.phnx` it writes.
+    fn backup_subject(&self, opts: &BackupOptions) -> JobSubject {
+        JobSubject {
+            source: self.disk_label(opts.disk_index),
+            target: opts.output.display().to_string(),
+            image_path: Some(opts.output.clone()),
+        }
+    }
+
     /// Group the current selection set by disk index, returning a sorted map
     /// of `disk_index -> Vec<partition_index>` (partition indices sorted).
     fn group_selections(&self) -> BTreeMap<u32, Vec<u32>> {
@@ -1805,6 +1969,7 @@ impl PhoenixApp {
         queue.reverse();
         let first = queue.pop().expect("queue non-empty");
         self.pending_backups = queue;
+        self.job_subject = self.backup_subject(&first);
         let path_display = first.output.display().to_string();
         self.status = if self.total_backups > 1 {
             format!(
@@ -1972,7 +2137,13 @@ impl PhoenixApp {
         // Park the validated restore behind the same final confirm-the-target
         // dialog the Clone page uses, so a wrong-disk pick gets caught before
         // the worker writes anything.
+        let subject = JobSubject {
+            source: backup_path.display().to_string(),
+            target: self.disk_label(target.index),
+            image_path: Some(backup_path.clone()),
+        };
         self.pending_restore = Some(PendingRestore {
+            subject,
             opts: RestoreOptions {
                 backup_path,
                 plan,
@@ -2008,6 +2179,11 @@ impl PhoenixApp {
         self.restore_backup_path = path.display().to_string();
         self.completed = None;
         self.status = "Verify in progress…".into();
+        self.job_subject = JobSubject {
+            source: path.display().to_string(),
+            target: String::new(),
+            image_path: Some(path.clone()),
+        };
         self.job = Some(spawn_verify(path, false));
     }
 
@@ -2173,6 +2349,12 @@ impl PhoenixApp {
             )
         };
         self.pending_clone = Some(PendingClone {
+            subject: JobSubject {
+                source: self.disk_label(src),
+                target: self.disk_label(tgt),
+                // A clone writes no file — nothing to size.
+                image_path: None,
+            },
             opts: phoenix_clone::CloneOptions {
                 source_disk_index: src,
                 target_disk_index: tgt,
@@ -2451,58 +2633,98 @@ impl PhoenixApp {
     }
 
     fn ui_history(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            &self.palette,
-            "History",
-            "",
-        );
+        // Same shell as every other page: content fills the pane and scrolls
+        // vertically as a unit. (The old list didn't, which is why the page
+        // read as half-width.)
+        page_scroll_shell(ui, "history_page", |ui| {
+            page_header(ui, &self.palette, "History", "");
 
-        if self.history.records.is_empty() {
-            ui.label("No jobs recorded yet.");
-            return;
-        }
+            let rows = self.history_rows();
+            let palette = self.palette;
+            // The table fills the pane and shrinks with it; below its minimum
+            // the columns stop collapsing and this scroller takes over.
+            let viewport_width = ui.available_width();
+            let table_width = viewport_width.max(history_table::min_width());
+            let action = egui::ScrollArea::horizontal()
+                .id_salt("history_table")
+                .auto_shrink([false, true])
+                .show(ui, |ui| history_table::show(ui, table_width, &rows, &palette))
+                .inner;
 
-        ui.horizontal(|ui| {
-            if ui.button("Clear history").clicked() {
-                self.history.records.clear();
-                let _ = self.history.save();
+            if let history_table::HistoryAction::Remove(row) = action {
+                // Rows run newest-first; the log runs oldest-first.
+                self.pending_history_delete = Some(self.history.records.len() - 1 - row);
             }
         });
-        ui.add_space(6.0);
+    }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+    /// Flatten the log into table rows, newest first.
+    fn history_rows(&self) -> Vec<history_table::HistoryRow> {
+        use history_table::{HistoryRow, RowStatus};
+        use phoenix_core::appdata::JobOutcome;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Newest first.
-            for rec in self.history.records.iter().rev() {
-                let (label, color) = match &rec.outcome {
-                    phoenix_core::appdata::JobOutcome::Success => ("OK", self.palette.success),
-                    phoenix_core::appdata::JobOutcome::Cancelled => {
-                        ("Cancelled", self.palette.warning)
-                    }
-                    phoenix_core::appdata::JobOutcome::Failed(_) => {
-                        ("Failed", egui::Color32::from_rgb(0xD3, 0x2F, 0x2F))
-                    }
+        self.history
+            .records
+            .iter()
+            .rev()
+            .map(|rec| {
+                let (status, error) = match &rec.outcome {
+                    JobOutcome::Success => (RowStatus::Ok, None),
+                    JobOutcome::Cancelled => (RowStatus::Cancelled, None),
+                    JobOutcome::Failed(msg) => (RowStatus::Failed, Some(msg.clone())),
                 };
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, format!("[{label}]"));
-                    ui.label(format!("{:?}", rec.kind));
-                    ui.label(relative_time(now - rec.started_unix));
-                    ui.label(format!("{}s", rec.duration_secs));
-                    ui.label(format_bytes(rec.bytes_processed));
-                    if let phoenix_core::appdata::JobOutcome::Failed(msg) = &rec.outcome {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xD3, 0x2F, 0x2F),
-                            truncate(msg, 60),
-                        );
-                    }
-                });
+                HistoryRow {
+                    status,
+                    action: job_action_label(rec.kind).to_string(),
+                    time: format_timestamp(rec.started_unix),
+                    details: describe_job(rec),
+                    error,
+                }
+            })
+            .collect()
+    }
+
+    /// The ✕ on a history row. Confirming a removal that sits next to a
+    /// backup's file name deserves one sentence saying what is NOT about to
+    /// happen — the file stays exactly where it is.
+    fn show_history_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_history_delete else {
+            return;
+        };
+        let Some(rec) = self.history.records.get(index) else {
+            self.pending_history_delete = None;
+            return;
+        };
+        let details = vec![
+            format!(
+                "{}  —  {}",
+                job_action_label(rec.kind),
+                format_timestamp(rec.started_unix)
+            ),
+            describe_job(rec),
+        ];
+        let view = ConfirmView {
+            title: "Remove from history",
+            message: "Remove this entry from the job history? This forgets the entry only — \
+                      the backup file itself is not touched.",
+            details: &details,
+            confirm_label: "Remove",
+            cancel_label: "Cancel",
+            confirm_danger: true,
+            // Taped: the entry is gone for good once removed, and it is the
+            // only record that the backup it names was ever made.
+            hazard_tape: true,
+        };
+        match confirm_dialog::show(ctx, &self.palette, &view) {
+            ConfirmAction::Confirm => {
+                self.pending_history_delete = None;
+                if self.history.remove(index) && !self.demo_history {
+                    let _ = self.history.save();
+                }
             }
-        });
+            ConfirmAction::Cancel => self.pending_history_delete = None,
+            ConfirmAction::None => {}
+        }
     }
 
     fn ui_options(&mut self, ui: &mut egui::Ui) {
@@ -2606,6 +2828,53 @@ fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
             letters: vec!['K'],
         },
     ]
+}
+
+/// Debug/verification aid: `--demo-history` fills the History page with canned
+/// entries — a verified backup's two rows, a cancel, a failure with a long
+/// error, a clone — so the table's columns, striping, elision and remove flow
+/// can all be eyeballed without running (and failing) real jobs first. The rows
+/// stand in for the real log and are never written back over it.
+fn demo_history_from_args() -> Option<phoenix_core::appdata::History> {
+    if !std::env::args().skip(1).any(|a| a == "--demo-history") {
+        return None;
+    }
+    use phoenix_core::appdata::{now_unix, History, JobKindTag as K, JobOutcome as O, JobRecord};
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+    let now = now_unix();
+
+    // Oldest first — the page renders them newest first.
+    let records = vec![
+        JobRecord::new(K::Clone, O::Success, now - 6 * DAY, 4_512)
+            .with_source("Samsung SSD 990 PRO 2TB (Disk 1)")
+            .with_target("WDC WD10EZEX-08WN4A0 (Disk 2)")
+            .with_bytes(931_500_000_000, 0),
+        JobRecord::new(
+            K::Restore,
+            O::Failed("the device is not ready (os error 21)".into()),
+            now - 3 * DAY,
+            18,
+        )
+        .with_source(r"\\nas\archive\carbon-phoenix\weekly\workstation-2026-07-06.phnx")
+        .with_target("SanDisk Extreme USB (Disk 3)")
+        .with_bytes(0, 512_110_190_592),
+        JobRecord::new(K::Backup, O::Cancelled, now - DAY, 340)
+            .with_source("SanDisk Extreme USB (Disk 3)")
+            .with_target(r"D:\Backups\usb-stick.phnx")
+            .with_bytes(12_000_000_000, 0),
+        JobRecord::new(K::Backup, O::Success, now - 2 * HOUR, 1_284)
+            .with_source("Samsung SSD 990 PRO 2TB (Disk 1)")
+            .with_target(r"D:\Backups\workstation.phnx")
+            .with_bytes(65_700_000_000, 61_240_000_000),
+        JobRecord::new(K::Verify, O::Success, now - 2 * HOUR + 1_284, 402)
+            .with_source(r"D:\Backups\workstation.phnx")
+            .with_bytes(65_700_000_000, 61_240_000_000),
+    ];
+    Some(History {
+        records,
+        ..History::default()
+    })
 }
 
 /// Debug/verification aid: `--demo-armed` opens the Backup page with a name

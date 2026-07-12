@@ -2356,6 +2356,7 @@ name = "phoenix-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "eframe",
  "egui",
  "egui-phosphor",

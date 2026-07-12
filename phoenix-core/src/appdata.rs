@@ -29,6 +29,15 @@ fn settings_path() -> PathBuf {
     appdata_dir().join("settings.json")
 }
 
+/// Seconds since the Unix epoch, right now. Timestamps are stored as plain
+/// integers so the on-disk format doesn't depend on a datetime crate version.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Kind of operation a history record describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKindTag {
@@ -36,7 +45,6 @@ pub enum JobKindTag {
     Restore,
     Verify,
     Clone,
-    Mount,
 }
 
 /// Terminal outcome of a recorded job.
@@ -48,80 +56,126 @@ pub enum JobOutcome {
 }
 
 /// One completed operation, appended to the history log.
+///
+/// `source` and `target` are the two ends of the job, already phrased for a
+/// human — the History page pairs them with the kind to write its Details
+/// line ("Imaged Samsung SSD 990 PRO (Disk 1) → D:\Backups\work.phnx"). They
+/// are captured when the job is spawned, because by the time it finishes the
+/// page that named them has usually been reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub id: Uuid,
     pub kind: JobKindTag,
-    /// Start time as a Unix timestamp (seconds). Stored as an integer so the
-    /// format doesn't depend on a particular datetime crate version.
+    /// Start time as a Unix timestamp (seconds).
     pub started_unix: i64,
     pub duration_secs: u64,
+    /// What the job read: the disk a backup captured or a clone copied, or
+    /// the `.phnx` a restore or verify opened.
     pub source: String,
+    /// What the job wrote: the `.phnx` a backup produced, or the disk a
+    /// restore or clone landed on. Empty for a verify — it has no target.
     pub target: String,
-    pub backup_id: Option<Uuid>,
     pub outcome: JobOutcome,
+    /// Bytes the job moved (captured, restored, cloned, or hashed).
     pub bytes_processed: u64,
+    /// On-disk size of the `.phnx` this job wrote or read; 0 when the job has
+    /// no backup file (a clone). This is the size the History page shows next
+    /// to the file name.
+    pub image_bytes: u64,
 }
 
 impl JobRecord {
-    /// Build a record for a job that just finished `duration_secs` ago, filling
-    /// in a fresh id and computing `started_unix` from the current time.
-    #[allow(clippy::too_many_arguments)]
-    pub fn now(
+    /// A finished job that ran for `duration_secs` starting at `started_unix`.
+    /// The ends of the job and its byte counts go on via the `with_*` builders.
+    pub fn new(
         kind: JobKindTag,
-        duration_secs: u64,
-        source: String,
-        target: String,
-        backup_id: Option<Uuid>,
         outcome: JobOutcome,
-        bytes_processed: u64,
+        started_unix: i64,
+        duration_secs: u64,
     ) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         Self {
             id: Uuid::new_v4(),
             kind,
-            started_unix: now - duration_secs as i64,
+            started_unix,
             duration_secs,
-            source,
-            target,
-            backup_id,
+            source: String::new(),
+            target: String::new(),
             outcome,
-            bytes_processed,
+            bytes_processed: 0,
+            image_bytes: 0,
         }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
+    }
+
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = target.into();
+        self
+    }
+
+    pub fn with_bytes(mut self, processed: u64, image: u64) -> Self {
+        self.bytes_processed = processed;
+        self.image_bytes = image;
+        self
     }
 }
 
+/// Bumped whenever [`JobRecord`] changes shape. A history file written under
+/// an older schema is set aside on load rather than shown: pre-v2 records
+/// stored only a status line — no disk, no file, no size — so there is nothing
+/// the History page could put in its columns.
+pub const HISTORY_SCHEMA: u32 = 2;
+
 /// The rolling history log. Capped so it can't grow without bound.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct History {
+    pub schema: u32,
     pub records: Vec<JobRecord>,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            schema: HISTORY_SCHEMA,
+            records: Vec::new(),
+        }
+    }
 }
 
 /// Keep at most this many records (newest kept).
 pub const HISTORY_CAP: usize = 500;
 
 impl History {
-    /// Load from `%LOCALAPPDATA%`. A missing file yields an empty history; a
-    /// corrupt file is renamed to `history.json.corrupt` and an empty history
-    /// is returned so the app never crashes on bad data.
+    /// Load from `%LOCALAPPDATA%`. A missing file yields an empty history; an
+    /// outdated or corrupt file is renamed aside and an empty history returned,
+    /// so neither bad data nor a format bump can take the app down.
     pub fn load() -> Self {
         Self::load_from(&history_path())
     }
 
     fn load_from(path: &Path) -> Self {
-        match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<History>(&bytes) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return History::default();
+        };
+        // Two different kinds of unusable file, kept apart so a format bump
+        // doesn't look like data loss: a file from an older schema is simply
+        // *old* (set aside as `.json.old`), while one we can't parse at all is
+        // *corrupt* (`.json.corrupt`). Either way the app starts a fresh log
+        // rather than failing to open.
+        let aside = |ext: &str| {
+            let _ = std::fs::rename(path, path.with_extension(ext));
+            History::default()
+        };
+        match file_schema(&bytes) {
+            Some(HISTORY_SCHEMA) => match serde_json::from_slice::<History>(&bytes) {
                 Ok(h) => h,
-                Err(_) => {
-                    let aside = path.with_extension("json.corrupt");
-                    let _ = std::fs::rename(path, aside);
-                    History::default()
-                }
+                Err(_) => aside("json.corrupt"),
             },
-            Err(_) => History::default(),
+            Some(_) => aside("json.old"),
+            None => aside("json.corrupt"),
         }
     }
 
@@ -135,10 +189,36 @@ impl History {
         self.save()
     }
 
+    /// Drop the record at `index`, returning whether one was there. Does NOT
+    /// persist — the caller decides (the GUI's `--demo-history` rows must never
+    /// reach the real history file). Out-of-range is a no-op: the History
+    /// page's rows can outlive the record they point at by a frame.
+    pub fn remove(&mut self, index: usize) -> bool {
+        if index >= self.records.len() {
+            return false;
+        }
+        self.records.remove(index);
+        true
+    }
+
     /// Persist to disk atomically (write temp + rename).
     pub fn save(&self) -> std::io::Result<()> {
         save_atomic(&history_path(), self)
     }
+}
+
+/// The `schema` a history file declares, or `None` if it isn't even JSON.
+/// Read on its own — before the records — so a schema bump doesn't have to
+/// keep every old record shape deserializable just to find out it's old.
+fn file_schema(bytes: &[u8]) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        schema: u32,
+    }
+    serde_json::from_slice::<Probe>(bytes)
+        .ok()
+        .map(|p| p.schema)
 }
 
 /// How the GUI should choose its theme.
@@ -209,17 +289,10 @@ mod tests {
     use super::*;
 
     fn rec(i: u32) -> JobRecord {
-        JobRecord {
-            id: Uuid::new_v4(),
-            kind: JobKindTag::Backup,
-            started_unix: i as i64,
-            duration_secs: 1,
-            source: "src".into(),
-            target: "dst".into(),
-            backup_id: None,
-            outcome: JobOutcome::Success,
-            bytes_processed: 100,
-        }
+        JobRecord::new(JobKindTag::Backup, JobOutcome::Success, i as i64, 1)
+            .with_source("Samsung SSD 990 PRO (Disk 1)")
+            .with_target(r"D:\Backups\work.phnx")
+            .with_bytes(100, 60)
     }
 
     #[test]
@@ -230,6 +303,41 @@ mod tests {
         let json = serde_json::to_vec(&h).unwrap();
         let back: History = serde_json::from_slice(&json).unwrap();
         assert_eq!(back.records.len(), 2);
+        assert_eq!(back.schema, HISTORY_SCHEMA);
+        assert_eq!(back.records[0], h.records[0]);
+    }
+
+    #[test]
+    fn older_schema_is_set_aside_not_shown() {
+        let dir = std::env::temp_dir().join(format!("cphist_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        // A v1 file: valid JSON, records in the old shape, no `schema` field.
+        std::fs::write(
+            &path,
+            br#"{"records":[{"id":"00000000-0000-0000-0000-000000000001","kind":"Backup",
+                "started_unix":1,"duration_secs":2,"source":"","target":"Backup completed",
+                "backup_id":null,"outcome":"Success","bytes_processed":10}]}"#,
+        )
+        .unwrap();
+        let h = History::load_from(&path);
+        assert!(h.records.is_empty());
+        assert_eq!(h.schema, HISTORY_SCHEMA);
+        // Kept, not destroyed.
+        assert!(path.with_extension("json.old").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_drops_one_record_and_ignores_bad_index() {
+        let mut h = History::default();
+        h.records.extend([rec(1), rec(2), rec(3)]);
+        let kept = (h.records[0].id, h.records[2].id);
+        assert!(h.remove(1));
+        assert_eq!(h.records.len(), 2);
+        assert_eq!((h.records[0].id, h.records[1].id), kept);
+        assert!(!h.remove(9));
+        assert_eq!(h.records.len(), 2);
     }
 
     #[test]
