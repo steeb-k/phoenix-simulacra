@@ -32,6 +32,13 @@ pub struct BackupOptions {
     /// Done while the VSS snapshot / volume lock is still held so the source
     /// can't have changed. Defaults to on; roughly doubles source read time.
     pub verify_after: bool,
+    /// With `verify_after`: instead of re-reading the source, decompress and
+    /// BLAKE3-check every chunk of the written image against the manifest
+    /// (the same check as a standalone full verify). Proves the backup file
+    /// holds exactly what capture read, without touching the source again —
+    /// the source snapshot/locks are released before hashing starts. The GUI
+    /// uses this; the CLI and tests keep the stronger source comparison.
+    pub verify_image: bool,
     pub progress: Option<ProgressHandle>,
 }
 
@@ -485,7 +492,53 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     // capture). Verify the IMAGE instead — decompress and BLAKE3-check every
     // chunk of those partitions against the manifest, proving the backup
     // file faithfully holds what capture read.
-    if opts.verify_after {
+    //
+    // `verify_image` skips the source comparison entirely and runs the image
+    // check over every partition (with per-chunk progress) — the source
+    // locks/snapshot are released first so the volumes come back while the
+    // hash pass runs.
+    if opts.verify_after && opts.verify_image {
+        let verify_start = std::time::Instant::now();
+        drop(prepared);
+        drop(vss);
+        if let Some(ref progress) = opts.progress {
+            // Last step in the plan: "Verifying backup". Restart the byte
+            // counter over the bytes we're about to hash so the progress
+            // bar tracks the verify pass instead of sitting pinned at 100%.
+            progress.set_step(partition_count + 2);
+            progress.begin(captured_bytes.max(1), "Verifying backup");
+            progress.set_detail("Verifying backup image…".to_string());
+        }
+        let mut image_reader = phoenix_core::container::PhnxReader::open(&opts.output)?;
+        let total_chunks: u64 = manifest
+            .partitions
+            .iter()
+            .map(|p| p.chunks.len() as u64)
+            .sum();
+        let mut done = (0u64, 0u64);
+        for pm in &manifest.partitions {
+            done = image_reader
+                .verify_partition_with_progress(
+                    pm.index,
+                    opts.progress.as_ref(),
+                    done,
+                    total_chunks,
+                )
+                .map_err(|e| match e {
+                    PhoenixError::Cancelled => PhoenixError::Cancelled,
+                    e => phoenix_core::error::PhoenixError::Other(format!(
+                        "image-integrity verify failed for partition {}: {e}",
+                        pm.index
+                    )),
+                })?;
+        }
+        let verify_secs = verify_start.elapsed().as_secs_f64();
+        info!(
+            "verify-after-backup (image hash): all partitions verified — {} in {}",
+            phoenix_core::progress::format_rate(captured_bytes, verify_secs),
+            phoenix_core::progress::format_elapsed(verify_secs),
+        );
+    } else if opts.verify_after {
         let verify_start = std::time::Instant::now();
         if let Some(ref progress) = opts.progress {
             // Last step in the plan: "Verifying backup". Restart the byte

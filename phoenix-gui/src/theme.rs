@@ -22,8 +22,8 @@ pub struct Palette {
     /// Subtle fill for disk-map cards and segment wells on the main content
     /// pane (distinct from sidebar hover tints).
     pub content_card_bg: Color32,
-    /// Fill for "go" action buttons (Start backup, Run restore, Quick/Full
-    /// verify, …). Picked from Material green 800 for high contrast against
+    /// Fill for "go" action buttons (Start backup, Run restore, Verify
+    /// backup, …). Picked from Material green 800 for high contrast against
     /// white button text in both light and dark themes.
     pub success: Color32,
     /// Fill for "stop" action buttons (Cancel backup/restore/verify).

@@ -41,6 +41,7 @@ fn backup_to(path: &std::path::Path, disk_index: u32) {
         output: path.to_path_buf(),
         use_vss: false,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");

@@ -387,6 +387,7 @@ fn boot_a_capture_image() {
         output: image.clone(),
         use_vss: true,
         verify_after: true,
+        verify_image: false,
         progress: Some(progress.handle()),
     })
     .expect("live VSS capture of the source disk failed");

@@ -60,6 +60,7 @@ fn gpt_identity_preserved_when_source_absent() {
         output: backup_path.clone(),
         use_vss: false,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");

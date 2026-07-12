@@ -1050,8 +1050,11 @@ impl PhnxReader {
     }
 
     /// `done` is the running `(bytes, chunks)` pair across the whole verify;
-    /// bytes drive the progress bar, chunks drive the detail string.
-    fn verify_partition_with_progress(
+    /// bytes drive the progress bar, chunks drive the detail string. The
+    /// caller owns the progress plan (`begin` with the total byte count) —
+    /// this only advances it, so it composes with verify_all's plan or with
+    /// the backup engine's verify-after-backup step.
+    pub fn verify_partition_with_progress(
         &mut self,
         partition_index: u32,
         progress: Option<&ProgressHandle>,

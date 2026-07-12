@@ -53,6 +53,7 @@ fn ntfs_backup_restore_roundtrip_same_size() {
         output: backup_path.clone(),
         use_vss: false, // volume is idle; no snapshot needed
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");

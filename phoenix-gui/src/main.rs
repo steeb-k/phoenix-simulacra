@@ -213,7 +213,6 @@ struct PhoenixApp {
     clone_source_index: Option<u32>,
     clone_target_index: Option<u32>,
     clone_expand: bool,
-    clone_verify: bool,
     /// Mount page: chosen .phnx and the currently-attached read-only mounts.
     mount_backup_path: String,
     /// Path whose layout is currently shown on the Mount page (skip
@@ -253,8 +252,6 @@ impl PhoenixApp {
             .default_backup_dir
             .clone()
             .unwrap_or_else(default_backup_folder);
-        let clone_verify = settings.clone_readback_verify;
-
         let mut app = Self {
             disks: Vec::new(),
             selections: HashSet::new(),
@@ -274,7 +271,6 @@ impl PhoenixApp {
             clone_source_index: None,
             clone_target_index: None,
             clone_expand: false,
-            clone_verify,
             mount_backup_path: String::new(),
             mount_loaded_path: String::new(),
             mount_source: None,
@@ -1256,6 +1252,9 @@ impl PhoenixApp {
                 output,
                 use_vss: self.use_vss,
                 verify_after: self.settings.verify_after_backup,
+                // Full BLAKE3 hash of the written image — the GUI never runs
+                // the source read-back comparison (CLI-only).
+                verify_image: true,
                 progress: Some(ProgressHandle::new()),
             });
         }
@@ -1491,7 +1490,9 @@ impl PhoenixApp {
         self.job = Some(spawn_restore(RestoreOptions {
             backup_path,
             plan,
-            verify_on_restore: true,
+            // Read-back verification is CLI-only; the image's chunk hashes
+            // were already checked while decompressing.
+            verify_on_restore: false,
             progress: Some(progress),
         }));
     }
@@ -1501,8 +1502,7 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "Verify Backup",
-            "Quick: structure + integrity checks and a sampled chunk hash. Full: BLAKE3 of every \
-             chunk.",
+            "Checks the backup's structure, then decompresses and BLAKE3-checks every chunk.",
         );
 
         ui.add_enabled_ui(!busy, |ui| {
@@ -1521,38 +1521,25 @@ impl PhoenixApp {
         } else {
             "Choose a backup file first"
         };
-        let starts = [
-            StartAction {
-                label: "Quick verify",
-                enabled: !busy && path_filled,
-                disabled_hint: Some(disabled_hint),
-            },
-            StartAction {
-                label: "Full verify",
-                enabled: !busy && path_filled,
-                disabled_hint: Some(disabled_hint),
-            },
-        ];
-        match action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts) {
-            Some(0) => self.start_verify(true),
-            Some(1) => self.start_verify(false),
-            _ => {}
+        let starts = [StartAction {
+            label: "Verify backup",
+            enabled: !busy && path_filled,
+            disabled_hint: Some(disabled_hint),
+        }];
+        if action_row(ui, &self.palette, ACTION_BUTTON_HEIGHT, &starts) == Some(0) {
+            self.start_verify();
         }
     }
 
-    fn start_verify(&mut self, quick: bool) {
+    fn start_verify(&mut self) {
         let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
             self.status = "Verify cancelled — no backup file chosen".into();
             return;
         };
         self.restore_backup_path = path.display().to_string();
         self.completed = None;
-        self.status = if quick {
-            "Quick verify in progress…".into()
-        } else {
-            "Full verify in progress…".into()
-        };
-        self.job = Some(spawn_verify(path, quick));
+        self.status = "Verify in progress…".into();
+        self.job = Some(spawn_verify(path, false));
     }
 
     fn ui_clone(&mut self, ui: &mut egui::Ui) {
@@ -1633,10 +1620,6 @@ impl PhoenixApp {
                 &mut self.clone_expand,
                 "Expand the last NTFS partition to fill a larger target",
             );
-            ui.checkbox(
-                &mut self.clone_verify,
-                "Verify every written block by reading it back (slower, safer)",
-            );
         });
 
         ui.add_space(8.0);
@@ -1678,17 +1661,12 @@ impl PhoenixApp {
             self.status = format!("Cannot clone: {e}");
             return;
         }
-        let verify = if self.clone_verify {
-            phoenix_clone::CloneVerify::ReadBack
-        } else {
-            phoenix_clone::CloneVerify::None
-        };
         self.status = format!("Cloning disk {src} → disk {tgt}…");
         self.job = Some(spawn_clone(phoenix_clone::CloneOptions {
             source_disk_index: src,
             target_disk_index: tgt,
             plan,
-            verify,
+            verify: phoenix_clone::CloneVerify::None,
             use_vss: true,
             progress: None,
         }));
@@ -1953,18 +1931,6 @@ impl PhoenixApp {
             .checkbox(
                 &mut self.settings.verify_after_backup,
                 "Verify each backup after it completes",
-            )
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.settings.default_verify_quick,
-                "Default the Verify page to Quick verify",
-            )
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.settings.clone_readback_verify,
-                "Default clone to read-back verification",
             )
             .changed();
         ui.horizontal(|ui| {

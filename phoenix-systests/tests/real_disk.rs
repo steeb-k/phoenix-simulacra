@@ -54,6 +54,7 @@ fn backup_all(idx: u32) -> std::path::PathBuf {
         output: backup.clone(),
         use_vss: false,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");
@@ -163,6 +164,7 @@ fn multifs_roundtrip(disk: &RealDisk, gpt: bool) {
         output: backup.clone(),
         use_vss: false,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");
@@ -658,6 +660,7 @@ fn real_vss_backup_roundtrip() {
         output: backup.clone(),
         use_vss: true,
         verify_after: true,
+        verify_image: false,
         progress: None,
     });
 
@@ -692,6 +695,7 @@ fn real_vss_backup_roundtrip() {
             output: backup.clone(),
             use_vss: true,
             verify_after: true,
+            verify_image: false,
             progress: None,
         })
         .expect("fallback (locked) backup failed");

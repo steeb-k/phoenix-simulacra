@@ -70,6 +70,7 @@ fn winfsp_mount_and_browse_files() {
         output: backup_path.clone(),
         use_vss: false,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");
@@ -168,6 +169,7 @@ fn winfsp_mount_selected_partition_only() {
         output: backup_path.clone(),
         use_vss: false,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .expect("run_backup");

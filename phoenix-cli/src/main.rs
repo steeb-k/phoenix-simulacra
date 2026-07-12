@@ -141,6 +141,7 @@ fn main() -> anyhow::Result<()> {
                 output,
                 use_vss: vss,
                 verify_after: !no_verify,
+                verify_image: false,
                 progress: None,
             })?;
         }

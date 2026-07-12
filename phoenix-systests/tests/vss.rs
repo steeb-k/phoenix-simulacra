@@ -90,6 +90,7 @@ fn backup_disk(disk_index: u32, use_vss: bool) -> phoenix_core::error::Result<st
         output: backup_path.clone(),
         use_vss,
         verify_after: true,
+        verify_image: false,
         progress: None,
     })
     .map(|_| backup_path)
