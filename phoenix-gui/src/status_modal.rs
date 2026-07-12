@@ -31,6 +31,10 @@ pub struct CompletedJob {
     pub current_step: usize,
     pub outcome: JobOutcome,
     pub message: String,
+    /// When set (successful backups: "Completed and verified." /
+    /// "Completed. Unverified."), the finished modal replaces the progress
+    /// bar and step checklist with a big green checkmark over this text.
+    pub success_banner: Option<String>,
 }
 
 /// What the user did with the modal this frame.
@@ -54,6 +58,9 @@ pub struct ModalView<'a> {
     pub total_bytes: u64,
     /// `None` while running, `Some(outcome)` once the job has finished.
     pub outcome: Option<JobOutcome>,
+    /// See [`CompletedJob::success_banner`]. Only honored together with
+    /// `Some(JobOutcome::Success)`.
+    pub success_banner: Option<&'a str>,
 }
 
 const MODAL_WIDTH: f32 = 460.0;
@@ -113,18 +120,24 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
             ui.label(RichText::new(view.title).font(fonts::bold(18.0)));
             ui.add_space(12.0);
 
-            show_progress_bar(ui, palette, view);
-            ui.add_space(14.0);
+            if let Some(banner) = success_banner(view) {
+                // Successful backup: the play-by-play (bar + checklist) has
+                // served its purpose — replace it with one unambiguous verdict.
+                show_success_banner(ui, palette, banner);
+            } else {
+                show_progress_bar(ui, palette, view);
+                ui.add_space(14.0);
 
-            // Cap the checklist height so a many-partition job (e.g. a verify
-            // across a dozen partitions) scrolls instead of growing the modal
-            // taller than the window.
-            egui::ScrollArea::vertical()
-                .max_height(300.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    show_steps(ui, palette, view);
-                });
+                // Cap the checklist height so a many-partition job (e.g. a
+                // verify across a dozen partitions) scrolls instead of growing
+                // the modal taller than the window.
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        show_steps(ui, palette, view);
+                    });
+            }
 
             if !view.detail.is_empty() {
                 ui.add_space(10.0);
@@ -142,6 +155,58 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
     }
 
     action
+}
+
+/// Deliberately not a palette color: this is the one place in the app that
+/// says "your data is safe", and it should read as green regardless of the
+/// Windows accent. Legible on both the light and dark sidebar_bg fills.
+const SUCCESS_GREEN: Color32 = Color32::from_rgb(22, 154, 73);
+
+/// The banner text for the "big green checkmark" completion screen, or `None`
+/// when the normal bar + checklist layout should render. Requires a Success
+/// outcome so a Warning/Failure can never be dressed up as a green check.
+fn success_banner<'a>(view: &ModalView<'a>) -> Option<&'a str> {
+    match view.outcome {
+        Some(JobOutcome::Success) => view.success_banner,
+        _ => None,
+    }
+}
+
+/// The completion screen for a successful backup: a filled green circle with
+/// a white checkmark, over the bold verdict text ("Completed and verified." /
+/// "Completed. Unverified."). Replaces the progress bar and step checklist.
+fn show_success_banner(ui: &mut egui::Ui, palette: &Palette, banner: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(10.0);
+        let radius = 36.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(radius * 2.0, radius * 2.0), egui::Sense::hover());
+        let center = rect.center();
+        let painter = ui.painter();
+        painter.circle_filled(center, radius, SUCCESS_GREEN);
+        // Checkmark as a polyline; the small end/joint dots round off the
+        // square line caps egui strokes would otherwise leave.
+        let points = vec![
+            center + egui::vec2(-0.42 * radius, 0.02 * radius),
+            center + egui::vec2(-0.10 * radius, 0.34 * radius),
+            center + egui::vec2(0.45 * radius, -0.28 * radius),
+        ];
+        let stroke_width = 0.18 * radius;
+        for &p in &points {
+            painter.circle_filled(p, stroke_width / 2.0, Color32::WHITE);
+        }
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(stroke_width, Color32::WHITE),
+        ));
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new(banner)
+                .font(fonts::bold(17.0))
+                .color(palette.icon_color),
+        );
+        ui.add_space(4.0);
+    });
 }
 
 fn show_progress_bar(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
@@ -274,12 +339,19 @@ fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> Mo
                 d.remove::<f64>(egui::Id::new(CANCEL_HOLD_START_ID));
                 d.remove::<bool>(egui::Id::new(CANCEL_HOLD_FIRED_ID));
             });
+            // On the green-checkmark completion screen the button follows the
+            // checkmark's green rather than the blue accent, so the whole
+            // modal reads as one verdict.
+            let fill = if success_banner(view).is_some() {
+                SUCCESS_GREEN
+            } else {
+                outcome_color(palette, outcome)
+            };
             let resp = ui
                 .push_id(egui::Id::new(CLOSE_BUTTON_ID), |ui| {
                     ui.add_sized(
                         [160.0, 38.0],
-                        egui::Button::new(RichText::new("Close").color(Color32::WHITE))
-                            .fill(outcome_color(palette, outcome)),
+                        egui::Button::new(RichText::new("Close").color(Color32::WHITE)).fill(fill),
                     )
                 })
                 .inner;

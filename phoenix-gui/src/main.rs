@@ -424,6 +424,7 @@ impl PhoenixApp {
             return;
         };
         let job_kind = job.kind;
+        let job_verified = job.verify_after;
         if let Some(result) = job.poll() {
             // Capture the final step list before dropping the job so the
             // modal can keep showing it (with a Close button) after the
@@ -457,7 +458,7 @@ impl PhoenixApp {
                             &final_snap,
                         );
                         self.job_started = None;
-                        self.finish_modal(job_kind, &final_snap, JobOutcome::Success);
+                        self.finish_modal(job_kind, &final_snap, JobOutcome::Success, job_verified);
                     }
                 }
                 Err(e) => {
@@ -494,7 +495,7 @@ impl PhoenixApp {
                     };
                     self.record_job(job_kind, rec_outcome, &final_snap);
                     self.job_started = None;
-                    self.finish_modal(job_kind, &final_snap, outcome);
+                    self.finish_modal(job_kind, &final_snap, outcome, job_verified);
                 }
             }
         } else {
@@ -510,13 +511,25 @@ impl PhoenixApp {
         kind: JobKind,
         snap: &phoenix_core::ProgressSnapshot,
         outcome: JobOutcome,
+        verified_backup: bool,
     ) {
+        // A successful backup swaps the progress bar + checklist for a big
+        // green checkmark; the banner text records whether the verify pass ran.
+        let success_banner =
+            (kind == JobKind::Backup && outcome == JobOutcome::Success).then(|| {
+                if verified_backup {
+                    "Completed and verified.".to_string()
+                } else {
+                    "Completed. Unverified.".to_string()
+                }
+            });
         self.completed = Some(CompletedJob {
             title: kind.noun().to_string(),
             steps: snap.steps.clone(),
             current_step: snap.current_step,
             outcome,
             message: self.status.clone(),
+            success_banner,
         });
     }
 
@@ -637,6 +650,7 @@ impl PhoenixApp {
                 current_bytes: 0,
                 total_bytes: 0,
                 outcome: Some(completed.outcome),
+                success_banner: completed.success_banner.as_deref(),
             };
             action = status_modal::show(ctx, &self.palette, &view);
         } else if let Some(job) = &self.job {
@@ -650,6 +664,7 @@ impl PhoenixApp {
                 current_bytes: snap.current,
                 total_bytes: snap.total,
                 outcome: None,
+                success_banner: None,
             };
             action = status_modal::show(ctx, &self.palette, &view);
         }

@@ -56,6 +56,10 @@ impl JobKind {
 
 pub struct BackgroundJob {
     pub kind: JobKind,
+    /// Whether this job is a backup running with verify-after-backup enabled.
+    /// Drives the "Completed and verified." vs "Completed. Unverified."
+    /// success screen in the status modal. Always false for non-backup jobs.
+    pub verify_after: bool,
     pub progress: ProgressHandle,
     rx: mpsc::Receiver<JobResult>,
     /// Kept so we can `join()` the worker and recover its panic payload if
@@ -125,6 +129,7 @@ where
     });
     BackgroundJob {
         kind,
+        verify_after: false,
         progress,
         rx,
         handle: Some(handle),
@@ -136,12 +141,13 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
     let progress = opts.progress.clone().unwrap_or_default();
     let progress_worker = progress.clone();
 
+    let verify_after = opts.verify_after;
     let output_path = opts.output.clone();
     let output_display = output_path.display().to_string();
     let disk_index = opts.disk_index;
     let partitions = opts.partition_indices.clone();
     let use_vss = opts.use_vss;
-    make_job(JobKind::Backup, progress, move || {
+    let mut job = make_job(JobKind::Backup, progress, move || {
         // Anchor-point logs: every backup run leaves a clear START / END
         // pair in the log so an operator scrolling a multi-run log can
         // locate "the run that produced C-Backup-N.phnx" by output path
@@ -200,7 +206,9 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
         result
             .map(|()| format!("Backup completed: {output_display}"))
             .map_err(|e| e.to_string())
-    })
+    });
+    job.verify_after = verify_after;
+    job
 }
 
 pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {

@@ -144,9 +144,10 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 
     // Declare the full ordered step plan up front so the GUI can render
     // upcoming steps grayed out: prepare → one step per partition →
-    // finalize. The per-partition `set_step` calls below walk this list.
+    // finalize → verify (when enabled). The per-partition `set_step` calls
+    // below walk this list.
     if let Some(ref progress) = opts.progress {
-        let mut steps = Vec::with_capacity(partition_count + 2);
+        let mut steps = Vec::with_capacity(partition_count + 3);
         steps.push("Preparing volumes".to_string());
         for (idx, part) in selected.iter().enumerate() {
             steps.push(format!(
@@ -157,6 +158,9 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             ));
         }
         steps.push("Finalizing backup file".to_string());
+        if opts.verify_after {
+            steps.push("Verifying backup".to_string());
+        }
         progress.set_steps(steps);
         progress.begin(total_bytes.max(1), "Backup");
         progress.set_step(0);
@@ -484,9 +488,14 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
     if opts.verify_after {
         let verify_start = std::time::Instant::now();
         if let Some(ref progress) = opts.progress {
+            // Last step in the plan: "Verifying backup". Restart the byte
+            // counter over the bytes we're about to re-read so the progress
+            // bar tracks the verify pass instead of sitting pinned at 100%.
+            progress.set_step(partition_count + 2);
+            progress.begin(captured_bytes.max(1), "Verifying backup");
             progress.set_detail("Verifying backup against source…".to_string());
         }
-        let mut image_verify: Vec<u32> = Vec::new();
+        let mut image_verify: Vec<(u32, u64)> = Vec::new();
         for (prep, pm) in prepared.iter_mut().zip(manifest.partitions.iter()) {
             if let Some(ref progress) = opts.progress {
                 if progress.is_cancelled() {
@@ -494,7 +503,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 }
             }
             if !prep.frozen {
-                image_verify.push(prep.part.index);
+                image_verify.push((prep.part.index, pm.used_bytes));
                 continue;
             }
             verify_partition_against_source(
@@ -502,12 +511,14 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 &prep.extents,
                 prep.capture_mode,
                 &pm.chunks,
+                opts.progress.as_ref(),
             )
-            .map_err(|e| {
-                phoenix_core::error::PhoenixError::Other(format!(
+            .map_err(|e| match e {
+                PhoenixError::Cancelled => PhoenixError::Cancelled,
+                e => phoenix_core::error::PhoenixError::Other(format!(
                     "verify-after-backup failed for partition {}: {e}",
                     prep.part.index
-                ))
+                )),
             })?;
         }
         if !image_verify.is_empty() {
@@ -521,7 +532,7 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                     .set_detail("Verifying image integrity for unfrozen partitions…".to_string());
             }
             let mut image_reader = phoenix_core::container::PhnxReader::open(&opts.output)?;
-            for idx in image_verify {
+            for (idx, used_bytes) in image_verify {
                 if let Some(ref progress) = opts.progress {
                     if progress.is_cancelled() {
                         return Err(phoenix_core::error::PhoenixError::Cancelled);
@@ -532,6 +543,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                         "image-integrity verify failed for partition {idx}: {e}"
                     ))
                 })?;
+                if let Some(ref progress) = opts.progress {
+                    // Coarse (per-partition) credit for the image-verified
+                    // bytes; the source-verify path bumps per chunk.
+                    progress.bump(used_bytes);
+                }
             }
         }
         let verify_secs = verify_start.elapsed().as_secs_f64();
@@ -564,6 +580,7 @@ fn verify_partition_against_source(
     extents: &[Extent],
     capture_mode: CaptureMode,
     expected: &[phoenix_core::manifest::ChunkRecord],
+    progress: Option<&ProgressHandle>,
 ) -> Result<()> {
     // Count of proven-transient torn reads (each one WARN-logged and
     // re-read-confirmed against the recorded hash — direct proof the image
@@ -579,6 +596,11 @@ fn verify_partition_against_source(
     let mut cur_extent: Option<u32> = None;
     let mut offset = 0u64;
     for rec in expected {
+        if let Some(p) = progress {
+            if p.is_cancelled() {
+                return Err(PhoenixError::Cancelled);
+            }
+        }
         let len = rec.uncompressed_len as usize;
         if len == 0 || len > CHUNK_SIZE {
             return Err(PhoenixError::Other(format!(
@@ -658,6 +680,9 @@ fn verify_partition_against_source(
                      (re-read matches the recorded hash); continuing"
                 );
                 offset += len as u64;
+                if let Some(p) = progress {
+                    p.bump(len as u64);
+                }
                 continue;
             }
 
@@ -674,6 +699,9 @@ fn verify_partition_against_source(
             )));
         }
         offset += len as u64;
+        if let Some(p) = progress {
+            p.bump(len as u64);
+        }
     }
     if torn_reads > 0 {
         info!(
