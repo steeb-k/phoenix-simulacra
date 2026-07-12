@@ -104,13 +104,16 @@ pub fn min_content_height() -> f32 {
 /// item. While `busy` is true, items remain visible but click-through is
 /// disabled while the status modal is up so navigation can't interrupt a job.
 ///
+/// Returns the brand block's rect — the chromeless window uses it as a
+/// drag handle (see `titlebar::show`).
+///
 /// Layout is three vertically-stacked regions:
 ///   * fixed top — brand/logo;
 ///   * scrollable middle — the primary nav (Backup, Clone, Restore, Verify,
 ///     Mount). Scrolls when the window is short;
 ///   * fixed bottom — History and Options, always pinned in view so they
 ///     don't disappear as the user shrinks the window.
-pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bool) {
+pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bool) -> Rect {
     // Alt+<first letter> jumps straight to a page. Consumed here (before any
     // widget sees the key) but only while navigation is allowed, mirroring
     // the click gating below. `consume_key` requires Alt to be the only
@@ -134,8 +137,9 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
         )
         .show(ctx, |ui| {
             ui.add_enabled_ui(!busy, |ui| {
-                // Fixed brand block at the top.
-                egui::TopBottomPanel::top("sidebar_brand")
+                // Fixed brand block at the top. Its rect is bubbled back out
+                // as the window's drag handle.
+                let brand_rect = egui::TopBottomPanel::top("sidebar_brand")
                     .resizable(false)
                     .show_separator_line(false)
                     .frame(egui::Frame::none().inner_margin(Margin {
@@ -146,7 +150,9 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                     }))
                     .show_inside(ui, |ui| {
                         draw_brand(ui);
-                    });
+                    })
+                    .response
+                    .rect;
 
                 // Fixed bottom nav (History + Options) — pinned, always
                 // visible. Declared before the central panel so the
@@ -181,8 +187,12 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                                 }
                             });
                     });
-            });
-        });
+
+                brand_rect
+            })
+            .inner
+        })
+        .inner
 }
 
 fn draw_brand(ui: &mut Ui) {

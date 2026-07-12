@@ -1,15 +1,16 @@
-//! Custom titlebar for the chromeless main window.
+//! Floating window controls for the chromeless main window.
 //!
 //! The OS titlebar is turned off (`ViewportBuilder::with_decorations(false)`)
-//! and this module draws the replacement: a 32px strip to the right of the
-//! sidebar holding a minimize/maximize/close control box styled like the
-//! native Windows 11 one (same 46×32 buttons, same Segoe Fluent glyphs, same
-//! hover/press colors). There's no icon/title text — the sidebar brand sits
-//! in the caption band instead, and the whole top strip drags the window.
+//! and there is no replacement bar: the minimize/maximize/close control box
+//! floats directly over the top-right corner of the window, styled like the
+//! native Windows 11 one (46×32 buttons, Segoe Fluent glyphs, `#C42B1C`
+//! close hover) but transparent until hovered. Dragging the window works
+//! from an invisible caption band along the top of the window and from the
+//! sidebar's brand block.
 //!
 //! On Windows the window procedure is additionally subclassed (see [`nc`])
 //! to answer `WM_NCHITTEST` with real non-client hit codes, so everything
-//! *behaves* native too: edge drag-resize with the proper cursors, titlebar
+//! *behaves* native too: edge drag-resize with the proper cursors, caption
 //! drag with Aero Snap/Shake, double-click to maximize, right-click system
 //! menu, and the Windows 11 Snap Layouts flyout on the maximize button
 //! (which only appears when the button reports `HTMAXBUTTON`). Because those
@@ -25,9 +26,9 @@ use egui::{Align2, Color32, Context, Rect, Sense, Ui, ViewportCommand};
 use crate::fonts;
 use crate::theme::{self, Palette};
 
-/// Height of the titlebar strip in logical points — the Windows 11 standard
-/// caption height.
-pub const TITLEBAR_HEIGHT: f32 = 32.0;
+/// Height of the invisible drag band along the top of the window (and of
+/// the caption buttons) in logical points — the Windows 11 caption height.
+const CAPTION_BAND_HEIGHT: f32 = 32.0;
 /// Caption button size (Windows 11 standard: 46×32 per button).
 const BUTTON_WIDTH: f32 = 46.0;
 /// Invisible resize band inside the window edges, logical points. A
@@ -44,54 +45,51 @@ enum Caption {
     Close = 2,
 }
 
-/// Render the titlebar strip. Call after the sidebar so the strip only
-/// spans the remaining width — the drag band still covers the full window
-/// top on Windows because the NC hit-test uses y alone (see [`nc`]).
-pub fn show(ctx: &Context, palette: &Palette) {
-    egui::TopBottomPanel::top("titlebar")
-        .exact_height(TITLEBAR_HEIGHT)
-        .show_separator_line(false)
-        .frame(egui::Frame::none().fill(palette.sidebar_bg))
-        .show(ctx, |ui| draw(ui, palette));
+/// Render the floating control box and register the drag zones.
+/// `brand_rect` is the sidebar's brand block, which doubles as a drag
+/// handle. Drawn in a foreground `Area` so the buttons sit on top of
+/// whatever page content reaches the window's top edge.
+pub fn show(ctx: &Context, palette: &Palette, brand_rect: Rect) {
+    egui::Area::new(egui::Id::new("caption-controls"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(0.0, 0.0))
+        .show(ctx, |ui| draw(ui, palette, brand_rect));
 }
 
-fn draw(ui: &mut Ui, palette: &Palette) {
-    let rect = ui.max_rect();
+fn draw(ui: &mut Ui, palette: &Palette, brand_rect: Rect) {
+    let screen = ui.ctx().screen_rect();
     let focused = ui.input(|i| i.viewport().focused.unwrap_or(true));
     let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
 
-    // Control box, right-aligned and flush with the window corner.
-    let mut right = rect.right();
+    // Control box, flush with the window's top-right corner.
+    let mut right = screen.right();
     let mut button_rects = [Rect::NOTHING; 3]; // indexed by `Caption as usize`
     for which in [Caption::Close, Caption::Maximize, Caption::Minimize] {
         let r = Rect::from_min_max(
-            egui::pos2(right - BUTTON_WIDTH, rect.top()),
-            egui::pos2(right, rect.bottom()),
+            egui::pos2(right - BUTTON_WIDTH, screen.top()),
+            egui::pos2(right, screen.top() + CAPTION_BAND_HEIGHT),
         );
         button_rects[which as usize] = r;
         right = r.left();
         caption_button(ui, r, which, palette, focused, maximized);
     }
 
-    // Everything left of the control box doubles as the drag strip
-    // (fallback path — on Windows the subclass reports HTCAPTION for the
-    // whole caption band, sidebar top included, and the native move loop
-    // handles dragging before egui ever sees it). No icon or title text:
-    // the sidebar brand rides up into this band instead.
-    let drag_rect = Rect::from_min_max(rect.min, egui::pos2(right, rect.bottom()));
-    let drag = ui.interact(
-        drag_rect,
-        ui.id().with("titlebar-drag"),
-        Sense::click_and_drag(),
-    );
-    if drag.double_clicked() {
-        ui.ctx()
-            .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-    } else if drag.drag_started_by(egui::PointerButton::Primary) {
-        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    // Drag zones: the invisible band along the window top (minus the
+    // control box) and the sidebar brand block. Fallback path — on Windows
+    // the subclass reports HTCAPTION for both and the native move loop
+    // handles dragging before egui ever sees it.
+    let band = Rect::from_min_max(screen.min, egui::pos2(right, screen.top() + CAPTION_BAND_HEIGHT));
+    for (i, zone) in [band, brand_rect].into_iter().enumerate() {
+        let drag = ui.interact(zone, ui.id().with(("drag-zone", i)), Sense::click_and_drag());
+        if drag.double_clicked() {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+        } else if drag.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        }
     }
 
-    nc::publish_geometry(ui.ctx(), rect, &button_rects);
+    nc::publish_geometry(ui.ctx(), &button_rects, brand_rect);
 }
 
 fn caption_button(
@@ -120,8 +118,9 @@ fn caption_button(
     let pressed =
         (nc_hover && nc::pressed() == Some(which)) || resp.is_pointer_button_down_on();
 
-    // Win11 styling: subtle overlay for minimize/maximize, fixed red for
-    // close. Native pressed states are *fainter* than hover, not stronger.
+    // Win11 styling: fully transparent at rest, subtle overlay for
+    // minimize/maximize, fixed red for close. Native pressed states are
+    // *fainter* than hover, not stronger.
     let subtle = |alpha: u8| {
         if palette.light_mode {
             Color32::from_black_alpha(alpha)
@@ -213,19 +212,23 @@ mod nc {
     static HOVER: AtomicU32 = AtomicU32::new(0);
     static PRESSED: AtomicU32 = AtomicU32::new(0);
 
-    /// Titlebar geometry in *physical client pixels*. Republished by egui
+    /// Caption geometry in *physical client pixels*. Republished by egui
     /// every frame so window resizes and DPI changes are always current.
     #[derive(Clone, Copy)]
     struct Geometry {
-        titlebar_h: i32,
+        /// Invisible drag band height along the window top.
+        band_h: i32,
         border: i32,
         /// (left, top, right, bottom), indexed by `Caption as usize`.
         buttons: [(i32, i32, i32, i32); 3],
+        /// Sidebar brand block — the second drag zone.
+        brand: (i32, i32, i32, i32),
     }
     static GEOMETRY: Mutex<Geometry> = Mutex::new(Geometry {
-        titlebar_h: 0,
+        band_h: 0,
         border: 0,
         buttons: [(0, 0, 0, 0); 3],
+        brand: (0, 0, 0, 0),
     });
     static CONTEXT: OnceLock<Context> = OnceLock::new();
 
@@ -259,15 +262,18 @@ mod nc {
         }
     }
 
-    pub(super) fn publish_geometry(ctx: &Context, titlebar: Rect, buttons: &[Rect; 3]) {
+    pub(super) fn publish_geometry(ctx: &Context, buttons: &[Rect; 3], brand: Rect) {
         let ppp = ctx.pixels_per_point();
         let px = |v: f32| (v * ppp).round() as i32;
+        let rect_px =
+            |r: Rect| (px(r.left()), px(r.top()), px(r.right()), px(r.bottom()));
         let mut geo = GEOMETRY.lock().unwrap();
-        geo.titlebar_h = px(titlebar.bottom());
+        geo.band_h = px(super::CAPTION_BAND_HEIGHT);
         geo.border = px(super::RESIZE_BORDER).max(4);
         for (i, r) in buttons.iter().enumerate() {
-            geo.buttons[i] = (px(r.left()), px(r.top()), px(r.right()), px(r.bottom()));
+            geo.buttons[i] = rect_px(*r);
         }
+        geo.brand = rect_px(brand);
     }
 
     pub(super) fn hovered() -> Option<Caption> {
@@ -325,7 +331,7 @@ mod nc {
             WM_NCMOUSEMOVE => {
                 set_hover(caption_ht(wparam as u32));
                 // Ask for WM_NCMOUSELEAVE so the hover highlight clears when
-                // the pointer leaves the window through the titlebar.
+                // the pointer leaves the window through the caption band.
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE | TME_NONCLIENT,
@@ -399,8 +405,9 @@ mod nc {
 
     /// Map a screen-space `WM_NCHITTEST` point to our hit codes: resize
     /// borders first (they win over the buttons at the very edge, matching
-    /// native precedence), then caption buttons, then the drag strip.
-    /// `None` falls through to the default (`HTCLIENT` inside the window).
+    /// native precedence), then caption buttons, then the drag zones (top
+    /// band + sidebar brand block). `None` falls through to the default
+    /// (`HTCLIENT` inside the window).
     unsafe fn hit_test(hwnd: HWND, lparam: LPARAM) -> Option<u32> {
         let mut pt = POINT {
             x: (lparam & 0xFFFF) as i16 as i32,
@@ -423,10 +430,10 @@ mod nc {
             return None;
         }
 
-        // try_lock: never block the wndproc. Zero height means egui hasn't
-        // published a frame yet — behave like a plain client area.
+        // try_lock: never block the wndproc. Zero band height means egui
+        // hasn't published a frame yet — behave like a plain client area.
         let geo = *GEOMETRY.try_lock().ok()?;
-        if geo.titlebar_h == 0 {
+        if geo.band_h == 0 {
             return None;
         }
 
@@ -462,19 +469,22 @@ mod nc {
             }
         }
 
-        if pt.y < geo.titlebar_h {
-            for (i, (l, t, r, btm)) in geo.buttons.iter().copied().enumerate() {
-                if pt.x >= l && pt.x < r && pt.y >= t && pt.y < btm {
-                    return Some([HTMINBUTTON, HTMAXBUTTON, HTCLOSE][i]);
-                }
+        let in_rect = |r: (i32, i32, i32, i32)| {
+            pt.x >= r.0 && pt.x < r.2 && pt.y >= r.1 && pt.y < r.3
+        };
+        for (i, r) in geo.buttons.iter().copied().enumerate() {
+            if in_rect(r) {
+                return Some([HTMINBUTTON, HTMAXBUTTON, HTCLOSE][i]);
             }
+        }
+        if pt.y < geo.band_h || in_rect(geo.brand) {
             return Some(HTCAPTION);
         }
         None
     }
 
-    /// Right-click on the titlebar: the standard system menu, dispatched
-    /// through WM_SYSCOMMAND exactly like a decorated window's.
+    /// Right-click on a drag zone: the standard system menu, dispatched
+    /// through WM_SYSCOMMAND exactly like a decorated window's titlebar.
     unsafe fn show_system_menu(hwnd: HWND, lparam: LPARAM) {
         let menu = GetSystemMenu(hwnd, 0);
         if menu.is_null() {
@@ -505,7 +515,7 @@ mod nc {
 
     use super::Caption;
 
-    pub(super) fn publish_geometry(_: &Context, _: Rect, _: &[Rect; 3]) {}
+    pub(super) fn publish_geometry(_: &Context, _: &[Rect; 3], _: Rect) {}
 
     pub(super) fn hovered() -> Option<Caption> {
         None
