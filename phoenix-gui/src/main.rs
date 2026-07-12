@@ -245,9 +245,8 @@ impl PhoenixApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         fonts::install(&cc.egui_ctx);
 
-        let palette = theme::refresh(&cc.egui_ctx);
-
         let settings = phoenix_core::appdata::Settings::load();
+        let palette = theme::refresh(&cc.egui_ctx, settings.theme);
         let backup_folder = settings
             .default_backup_dir
             .clone()
@@ -597,10 +596,15 @@ impl PhoenixApp {
         self.status = "Cancelling…".into();
     }
 
+    /// Poll Windows for theme changes (accent color always; light/dark only
+    /// while the theme choice is System — `theme::refresh` resolves that).
+    /// `update` only runs when something triggers a repaint, so ask for one
+    /// at the poll interval to keep tracking Windows while the app is idle.
     fn maybe_refresh_theme(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(THEME_REFRESH_INTERVAL);
         if self.last_theme_refresh.elapsed() >= THEME_REFRESH_INTERVAL {
             let running_job_modal = self.job.is_some();
-            self.palette = theme::refresh(ctx);
+            self.palette = theme::refresh(ctx, self.settings.theme);
             self.last_theme_refresh = Instant::now();
             // Only surrender keyboard focus while a job is actively running.
             // Doing so on the finished "Close" modal can interfere with
@@ -1899,12 +1903,7 @@ impl PhoenixApp {
     }
 
     fn ui_options(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            &self.palette,
-            "Options",
-            "Application preferences and live theme info.",
-        );
+        page_header(ui, &self.palette, "Options", "Application preferences.");
 
         // --- Persisted settings ---
         let mut changed = false;
@@ -1946,49 +1945,14 @@ impl PhoenixApp {
                     .clicked()
                 {
                     self.settings.theme = choice;
+                    self.palette = theme::refresh(ui.ctx(), choice);
+                    self.last_theme_refresh = Instant::now();
                     changed = true;
                 }
             }
         });
         if changed {
             let _ = self.settings.save();
-        }
-
-        ui.add_space(12.0);
-        ui.heading("Theme (live)");
-        ui.horizontal(|ui| {
-            ui.label("Accent color:");
-            let (r, g, b, _) = self.palette.accent.to_tuple();
-            let swatch_size = egui::vec2(20.0, 20.0);
-            let (rect, _) = ui.allocate_exact_size(swatch_size, egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, egui::Rounding::same(4.0), self.palette.accent);
-            ui.monospace(format!("#{:02X}{:02X}{:02X}", r, g, b));
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Theme:");
-            ui.label(if self.palette.light_mode {
-                "Light"
-            } else {
-                "Dark"
-            });
-        });
-
-        ui.add_space(8.0);
-        if ui.button("Refresh theme from Windows").clicked() {
-            let running_job_modal = self.job.is_some();
-            let ctx = ui.ctx().clone();
-            self.palette = theme::refresh(ui.ctx());
-            self.last_theme_refresh = Instant::now();
-            self.status = "Theme refreshed from Windows settings".into();
-            if running_job_modal {
-                ctx.memory_mut(|mem| {
-                    if let Some(id) = mem.focused() {
-                        mem.surrender_focus(id);
-                    }
-                });
-            }
         }
     }
 }

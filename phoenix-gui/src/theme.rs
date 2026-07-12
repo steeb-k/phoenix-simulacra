@@ -1,5 +1,6 @@
 use eframe::egui;
 use egui::{Color32, Response, Rounding, Stroke, Ui, Visuals};
+use phoenix_core::appdata::ThemeChoice;
 
 /// Default Windows / WinUI accent (used when the live registry read fails).
 const FALLBACK_ACCENT: Color32 = Color32::from_rgb(0x00, 0x78, 0xD4);
@@ -46,11 +47,16 @@ impl Palette {
     }
 }
 
-/// Read the current Windows accent + light/dark mode and apply them to `ctx`.
-/// Returns the [`Palette`] used by the sidebar widget.
-pub fn refresh(ctx: &egui::Context) -> Palette {
+/// Read the current Windows accent color, resolve light/dark from `choice`
+/// (following Windows only for [`ThemeChoice::System`]), and apply both to
+/// `ctx`. Returns the [`Palette`] used by the sidebar widget.
+pub fn refresh(ctx: &egui::Context, choice: ThemeChoice) -> Palette {
     let accent = read_accent_color();
-    let light_mode = read_apps_use_light_theme();
+    let light_mode = match choice {
+        ThemeChoice::System => read_apps_use_light_theme(),
+        ThemeChoice::Light => true,
+        ThemeChoice::Dark => false,
+    };
     apply(ctx, accent, light_mode);
     palette_for(accent, light_mode)
 }
