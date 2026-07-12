@@ -1697,12 +1697,7 @@ impl PhoenixApp {
     }
 
     fn ui_clone_inner(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            &self.palette,
-            "Clone",
-            "Copy one disk directly to another without going through a backup file.",
-        );
+        page_header(ui, &self.palette, "Clone", "");
 
         let busy = self.busy();
         if self.disks.is_empty() {

@@ -70,14 +70,13 @@ pub fn show(
 
     // ---- Source dropdown ----
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Source disk").font(fonts::bold(16.0)));
+        ui.label(egui::RichText::new("The disk to clone from.").color(palette.subtle_text));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::refresh_disks_button(ui, palette).clicked() {
                 out.refresh_clicked = true;
             }
         });
     });
-    ui.label(egui::RichText::new("The disk to clone from.").color(palette.subtle_text));
     ui.add_space(6.0);
 
     let source_disk = source_index.and_then(|s| disks.iter().find(|d| d.index == s));
@@ -142,7 +141,7 @@ pub fn show(
     // ---- Target dropdown ----
     let target_disk = target_index.and_then(|t| disks.iter().find(|d| d.index == t));
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Target disk").font(fonts::bold(16.0)));
+        ui.label(egui::RichText::new("The disk to clone onto.").color(palette.subtle_text));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {
                 if !out.selection_changed {
@@ -152,18 +151,20 @@ pub fn show(
         });
     });
     let mode_caption = match layout.as_deref() {
-        Some(l) if l.full_disk => {
+        Some(l) if l.full_disk => Some(
             "Full-disk clone — the target's entire contents are replaced with the source \
-             layout. Drag a partition down from the source to clone only that partition."
-        }
-        Some(_) => {
+             layout. Drag a partition down from the source to clone only that partition.",
+        ),
+        Some(_) => Some(
             "Partial clone — drag a source partition onto a target partition to replace it, \
              or into empty space to add it. Drag edges to resize, the body to move; click to \
-             select. Unmapped partitions are preserved."
-        }
-        None => "The disk to clone onto.",
+             select. Unmapped partitions are preserved.",
+        ),
+        None => None,
     };
-    ui.label(egui::RichText::new(mode_caption).color(palette.subtle_text));
+    if let Some(caption) = mode_caption {
+        ui.label(egui::RichText::new(caption).color(palette.subtle_text));
+    }
 
     // Mode switch, shown once both ends are picked.
     if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {
