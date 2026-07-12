@@ -621,8 +621,11 @@ impl PhoenixApp {
 }
 
 impl eframe::App for PhoenixApp {
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        visuals.panel_fill.to_normalized_gamma_f32()
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Sidebar color, not panel_fill: the central panel's rounded
+        // bottom-left corner exposes the clear color, and it must read as
+        // part of the sidebar/status-bar L.
+        self.palette.sidebar_bg.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -649,6 +652,7 @@ impl eframe::App for PhoenixApp {
         // "Loaded backup…", load errors, "Ready"). While a job runs or its
         // result modal is up, the blocking modal overlays this bar.
         egui::TopBottomPanel::bottom("status")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::none()
                     .fill(self.palette.sidebar_bg)
@@ -660,10 +664,18 @@ impl eframe::App for PhoenixApp {
                 });
             });
 
-        egui::CentralPanel::default()
+        // Only the bottom-left corner is rounded: it nestles into the L
+        // formed by the sidebar and status bar. The cutout shows through to
+        // `clear_color` (sidebar_bg).
+        let panel_rounding = egui::Rounding {
+            sw: 10.0,
+            ..egui::Rounding::ZERO
+        };
+        let central = egui::CentralPanel::default()
             .frame(
                 egui::Frame::central_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(24.0, 20.0)),
+                    .inner_margin(egui::Margin::symmetric(24.0, 20.0))
+                    .rounding(panel_rounding),
             )
             .show(ctx, |ui| {
                 // Pages handle `busy` themselves so Start stays gated while
@@ -679,6 +691,22 @@ impl eframe::App for PhoenixApp {
                     Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
                 });
             });
+
+        // 1px outline along the panel's edge against the sidebar/status-bar
+        // L. Drawn by hand rather than via `Frame::stroke` because the top
+        // and right sides sit on the window edge and must stay line-free:
+        // pushing those sides 1px past the screen clips their stroke away,
+        // leaving only the left edge, bottom edge, and the rounded corner.
+        let rect = central.response.rect;
+        let border_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, rect.min.y - 1.0),
+            egui::pos2(rect.max.x + 1.0, rect.max.y),
+        );
+        ctx.layer_painter(egui::LayerId::background()).rect_stroke(
+            border_rect,
+            panel_rounding,
+            egui::Stroke::new(1.0, self.palette.panel_border),
+        );
 
         self.show_status_modal(ctx);
         self.show_overwrite_dialog(ctx);

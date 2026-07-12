@@ -125,6 +125,7 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
 
     egui::SidePanel::left("sidebar")
         .resizable(false)
+        .show_separator_line(false)
         .exact_width(SIDEBAR_WIDTH)
         .frame(
             egui::Frame::none()
