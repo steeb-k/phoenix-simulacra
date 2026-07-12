@@ -19,7 +19,7 @@ use crate::disk_dropdown::{disk_dropdown, draw_disk_list_row, draw_empty_face, m
 use crate::disk_map;
 use crate::restore_layout::RestoreLayoutState;
 use crate::restore_panel::{
-    active_drag, drag_lifecycle, drag_source_id, draw_layout_toolbar, draw_target_row,
+    active_drag, drag_lifecycle, drag_source_id, draw_layout_toolbar, draw_target_row, TOOLBAR_BTN,
 };
 use crate::theme::Palette;
 
@@ -54,7 +54,10 @@ pub fn show(
 
     // ---- Source dropdown ----
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("The disk to clone from.").color(palette.subtle_text));
+        ui.label(
+            egui::RichText::new("Choose a source and target drive for cloning.")
+                .color(palette.subtle_text),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::refresh_disks_button(ui, palette).clicked() {
                 out.refresh_clicked = true;
@@ -120,24 +123,26 @@ pub fn show(
     }
 
     // ---- Flow arrow ----
+    // The layout toolbar occupies a row between the arrow and the target
+    // dropdown once a target is picked; mirroring that row's height above
+    // the arrow keeps it equidistant from the two dropdowns either way.
+    let target_disk = target_index.and_then(|t| disks.iter().find(|d| d.index == t));
+    let show_toolbar = layout.is_some() && target_disk.is_some() && !out.selection_changed;
+    if show_toolbar {
+        ui.add_space(TOOLBAR_BTN + ui.spacing().item_spacing.y);
+    }
     draw_flow_arrow(ui, palette, viewport_width);
 
     // ---- Target dropdown ----
-    let target_disk = target_index.and_then(|t| disks.iter().find(|d| d.index == t));
-    ui.horizontal(|ui| {
-        // The descriptor only earns its keep while the dropdown is empty;
-        // once a disk row is showing, what it is is self-evident.
-        if target_disk.is_none() {
-            ui.label(egui::RichText::new("The disk to clone onto.").color(palette.subtle_text));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {
-                if !out.selection_changed {
+    if show_toolbar {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {
                     draw_layout_toolbar(ui, layout, target, palette);
                 }
-            }
+            });
         });
-    });
+    }
     // Mode switch, shown once both ends are picked, with the explainer for
     // the active mode directly beneath it.
     if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk) {

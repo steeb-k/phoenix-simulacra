@@ -21,7 +21,7 @@ const EDGE_HANDLE_PX: f32 = 8.0;
 const SNAP_PX: f32 = 12.0;
 /// Ghost segment that follows the cursor during a source-partition drag.
 const GHOST_SIZE: Vec2 = Vec2::new(160.0, 72.0);
-const TOOLBAR_BTN: f32 = 30.0;
+pub(crate) const TOOLBAR_BTN: f32 = 30.0;
 
 /// Shared with the Clone page's panel: both pages run the same
 /// drag-a-source-partition-onto-the-target-layout gesture, and only one page

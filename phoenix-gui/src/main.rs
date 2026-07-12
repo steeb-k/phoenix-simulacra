@@ -1890,7 +1890,7 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "Verify Backup",
-            "Checks the backup's structure, then decompresses and BLAKE3-checks every chunk.",
+            "",
         );
 
         ui.add_enabled_ui(!busy, |ui| {
@@ -2155,7 +2155,7 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "Mount",
-            "Attach a backup read-only so its files are browsable in Explorer.",
+            "",
         );
 
         let path_before = self.mount_backup_path.clone();
@@ -2326,7 +2326,7 @@ impl PhoenixApp {
             ui,
             &self.palette,
             "History",
-            "Previous backups, restores, clones, and verification runs from this machine.",
+            "",
         );
 
         if self.history.records.is_empty() {
