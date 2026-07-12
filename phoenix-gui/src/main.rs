@@ -361,7 +361,7 @@ impl PhoenixApp {
             disks: Vec::new(),
             selections: HashSet::new(),
             backup_folder,
-            backup_name: String::new(),
+            backup_name: demo_backup_name_from_args(),
             use_vss: false,
             pending_backups: Vec::new(),
             pending_overwrite: None,
@@ -2616,6 +2616,17 @@ fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
             letters: vec!['K'],
         },
     ]
+}
+
+/// Debug/verification aid: `--demo-armed` opens the Backup page with a name
+/// already typed in, which is all it takes to arm the sticky action bar — so
+/// its enabled styling (the scrambling green mosaic) can be eyeballed without
+/// synthesizing keystrokes into an elevated window, which UIPI forbids.
+fn demo_backup_name_from_args() -> String {
+    match std::env::args().skip(1).any(|a| a == "--demo-armed") {
+        true => "demo-backup".into(),
+        false => String::new(),
+    }
 }
 
 /// Debug/verification aid: `--page clone` (etc.) opens the app on that page
