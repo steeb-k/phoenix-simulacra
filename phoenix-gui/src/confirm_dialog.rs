@@ -36,8 +36,9 @@ pub struct ConfirmView<'a> {
     /// `palette.accent` (neutral).
     pub confirm_danger: bool,
     /// Paint hazard-tape strips across the top and bottom edges. Reserved for
-    /// the disk-wipe confirmations, so the tape stays a "data will be
-    /// destroyed" signal rather than generic dialog chrome.
+    /// the confirmations that yank something out from under the user — the
+    /// disk wipes, and closing the app with backups still mounted — so the
+    /// tape keeps its meaning instead of becoming generic dialog chrome.
     pub hazard_tape: bool,
 }
 

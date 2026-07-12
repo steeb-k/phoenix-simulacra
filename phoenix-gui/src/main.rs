@@ -6,6 +6,7 @@ mod disk_map;
 mod disk_panel;
 mod fonts;
 mod job;
+mod mount_table;
 mod restore_layout;
 mod restore_panel;
 mod sidebar;
@@ -291,6 +292,14 @@ struct PhoenixApp {
     /// synthesized source disk always renders as disk 0).
     mount_selection: HashSet<(u32, u32)>,
     mounts: Vec<phoenix_mount::ActiveMount>,
+    /// `--demo-mounts`: canned table rows that stand in for real mounts, so the
+    /// Active-mounts table and the close-with-mounts dialog can be eyeballed
+    /// without an elevated session and a `.phnx` to attach. Empty in normal
+    /// runs; where it matters, the page treats these exactly like `mounts`.
+    demo_mounts: Vec<mount_table::MountRow>,
+    /// A window close was intercepted because backups are still mounted: the
+    /// "these will be unmounted" dialog is up, waiting for the user.
+    pending_close: bool,
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
@@ -377,6 +386,8 @@ impl PhoenixApp {
             mount_source: None,
             mount_selection: HashSet::new(),
             mounts: Vec::new(),
+            demo_mounts: demo_mount_rows_from_args(),
+            pending_close: false,
             settings,
             history: phoenix_core::appdata::History::load(),
             job_started: None,
@@ -495,6 +506,7 @@ impl PhoenixApp {
             || self.pending_overwrite.is_some()
             || self.pending_clone.is_some()
             || self.pending_restore.is_some()
+            || self.pending_close
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -895,7 +907,19 @@ impl PhoenixApp {
                     }),
                 }
             }
-            Page::Mount | Page::History | Page::Options => return None,
+            Page::Mount => StartAction {
+                label: "Mount (Read-Only)",
+                icon: Some(egui_phosphor::fill::PLAY),
+                enabled: !busy && self.mount_source.is_some() && !self.mount_selection.is_empty(),
+                disabled_hint: Some(if busy {
+                    "A job is already running"
+                } else if self.mount_source.is_none() {
+                    "Choose a backup file first"
+                } else {
+                    "Select at least one partition to mount"
+                }),
+            },
+            Page::History | Page::Options => return None,
         };
         Some(action)
     }
@@ -918,6 +942,15 @@ impl eframe::App for PhoenixApp {
         self.run_pending_refresh();
         if self.page == Page::Restore {
             self.poll_restore_backup_load();
+        }
+
+        // A close request (titlebar X, Alt+F4, taskbar) while backups are
+        // mounted is held back: the mounts have to come down with the app, and
+        // the user gets told so before it happens. `pending_close` counts as a
+        // modal below, so the page behind the dialog goes inert.
+        if ctx.input(|i| i.viewport().close_requested()) && self.anything_mounted() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_close = true;
         }
 
         let focus_regained = ctx.input(|i| {
@@ -968,6 +1001,7 @@ impl eframe::App for PhoenixApp {
                     Page::Restore => self.start_restore(),
                     Page::Verify => self.start_verify(),
                     Page::Clone => self.start_clone(),
+                    Page::Mount => self.start_mount(),
                     _ => {}
                 }
             }
@@ -1034,7 +1068,17 @@ impl eframe::App for PhoenixApp {
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
         self.show_demo_confirm_dialog(ctx);
+        self.show_close_dialog(ctx);
         self.show_refresh_overlay(ctx);
+    }
+
+    /// Last chance to tear the mounts down: a mount outlives its `ActiveMount`
+    /// only as a stuck drive letter and a detached-but-attached virtual disk,
+    /// so the app never exits while one is up. Covers the paths that skip the
+    /// close dialog (a mount can only exist there if the user confirmed, but
+    /// `on_exit` also runs on OS session-end).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.unmount_all();
     }
 }
 
@@ -1220,6 +1264,55 @@ impl PhoenixApp {
                 self.pending_restore = None;
                 self.status = "Restore cancelled — no changes were made".into();
             }
+            ConfirmAction::None => {}
+        }
+    }
+
+    /// Closing with backups still mounted: the mounts cannot outlive the
+    /// process (their drive letters and virtual disks are owned by it), so the
+    /// close is held until the user accepts that they come down. Hazard tape
+    /// because a live drive letter can have open files behind it, and Windows
+    /// pulling it out from under Explorer is exactly the kind of surprise the
+    /// tape is for.
+    fn show_close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.pending_close {
+            return;
+        }
+        // Nothing left to warn about (the last mount was unmounted while the
+        // dialog was up): let the close through.
+        if !self.anything_mounted() {
+            self.pending_close = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        let details = self.mount_summaries();
+        let message = format!(
+            "Closing Carbon Phoenix unmounts {} and removes {} drive letters. \
+             Any open files or Explorer windows on those drives will be disconnected.",
+            if details.len() == 1 {
+                "the mounted backup".to_string()
+            } else {
+                format!("all {} mounted backups", details.len())
+            },
+            if details.len() == 1 { "its" } else { "their" },
+        );
+        let view = ConfirmView {
+            title: "Backups are still mounted",
+            message: &message,
+            details: &details,
+            confirm_label: "Unmount & Close",
+            cancel_label: "Keep Open",
+            confirm_danger: false,
+            hazard_tape: true,
+        };
+        match confirm_dialog::show(ctx, &self.palette, &view) {
+            ConfirmAction::Confirm => {
+                self.pending_close = false;
+                self.unmount_all();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ConfirmAction::Cancel => self.pending_close = false,
             ConfirmAction::None => {}
         }
     }
@@ -2102,105 +2195,160 @@ impl PhoenixApp {
     }
 
     fn ui_mount(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            &self.palette,
-            "Mount",
-            "",
-        );
+        // Same shell as every other page: the content scrolls vertically as a
+        // unit (the Active-mounts table included) under the sticky
+        // "Mount (Read-Only)" action bar.
+        page_scroll_shell(ui, "mount_page", |ui| {
+            page_header(ui, &self.palette, "Mount", "");
 
-        let path_before = self.mount_backup_path.clone();
-        let mut path_edited = false;
-        ui.add_enabled_ui(self.job.is_none(), |ui| {
-            let browsed = backup_path_picker(
-                ui,
-                "Backup file",
-                "Path to .phnx file",
-                &mut self.mount_backup_path,
-                Some(&mut || path_edited = true),
-            );
-            path_edited |= browsed;
-        });
-        let path_changed = path_edited && self.mount_backup_path != path_before;
-        if path_changed
-            || (self.mount_source.is_none()
-                && self.mount_loaded_path != self.mount_backup_path.trim())
-        {
-            self.try_load_mount_backup();
-        }
-
-        if let Some(source) = self.mount_source.clone() {
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Choose the partition(s) to mount.")
-                    .color(self.palette.subtle_text),
-            );
-            ui.add_space(4.0);
-            // Same width discipline as the Backup page: capture the real
-            // viewport width before ScrollArea::both virtualizes it.
-            let viewport_width = ui.available_width();
-            let row_width = viewport_width.max(disk_map::min_disk_row_width(&source));
-            egui::ScrollArea::both()
-                .id_salt("mount_partition_map")
-                .max_height(disk_map::row_stride() * 1.5)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    disk_map::draw_backup_disk_row(
-                        ui,
-                        row_width,
-                        &source,
-                        &mut self.mount_selection,
-                        &self.palette,
-                    );
-                });
-
-            let any_selected = !self.mount_selection.is_empty();
-            ui.add_space(4.0);
-            ui.add_enabled_ui(any_selected, |ui| {
-                if ui.button("Mount selected read-only").clicked() {
-                    self.start_mount();
-                }
+            let path_before = self.mount_backup_path.clone();
+            let mut path_edited = false;
+            ui.add_enabled_ui(self.job.is_none(), |ui| {
+                let browsed = backup_path_picker(
+                    ui,
+                    "Backup file",
+                    "Path to .phnx file",
+                    &mut self.mount_backup_path,
+                    Some(&mut || path_edited = true),
+                );
+                path_edited |= browsed;
             });
-            if !any_selected {
+            let path_changed = path_edited && self.mount_backup_path != path_before;
+            if path_changed
+                || (self.mount_source.is_none()
+                    && self.mount_loaded_path != self.mount_backup_path.trim())
+            {
+                self.try_load_mount_backup();
+            }
+
+            if let Some(source) = self.mount_source.clone() {
+                ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("Select at least one partition above.")
+                    egui::RichText::new("Choose the partition(s) to mount.")
                         .color(self.palette.subtle_text),
                 );
+                ui.add_space(4.0);
+                // Same width discipline as the Backup page: capture the real
+                // viewport width before the ScrollArea virtualizes it.
+                let viewport_width = ui.available_width();
+                let row_width = viewport_width.max(disk_map::min_disk_row_width(&source));
+                egui::ScrollArea::horizontal()
+                    .id_salt("mount_partition_map")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        disk_map::draw_backup_disk_row(
+                            ui,
+                            row_width,
+                            &source,
+                            &mut self.mount_selection,
+                            &self.palette,
+                        );
+                    });
             }
-        }
 
-        if !self.mounts.is_empty() {
-            ui.add_space(12.0);
-            ui.heading("Active mounts");
-            let mut unmount_idx: Option<usize> = None;
-            for (i, m) in self.mounts.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        m.backup_path()
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "backup".into()),
-                    );
-                    ui.label(format!("({:.1} GB)", m.disk_size() as f64 / 1e9));
-                    ui.label(describe_mounted_volumes(m));
-                    let first_letter = m.volumes().iter().find_map(|v| v.drive_letter);
-                    if let Some(l) = first_letter {
-                        if ui.button("Open in Explorer").clicked() {
-                            let _ = std::process::Command::new("explorer.exe")
-                                .arg(format!("{l}:\\"))
-                                .spawn();
-                        }
-                    }
-                    if ui.button("Unmount").clicked() {
-                        unmount_idx = Some(i);
-                    }
-                });
+            ui.add_space(18.0);
+            ui.label(egui::RichText::new("Active mounts").font(fonts::bold(16.0)));
+            ui.add_space(6.0);
+            self.ui_active_mounts(ui);
+        });
+    }
+
+    /// The Active-mounts table. Always on the page — empty and greyed out when
+    /// nothing is mounted — so the section never appears and disappears under
+    /// the user.
+    fn ui_active_mounts(&mut self, ui: &mut egui::Ui) {
+        let mut rows: Vec<mount_table::MountRow> = self
+            .mounts
+            .iter()
+            .map(|m| mount_table::MountRow {
+                name: m
+                    .backup_path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "backup".into()),
+                size: m.disk_size(),
+                letters: m.volumes().iter().filter_map(|v| v.drive_letter).collect(),
+            })
+            .collect();
+        // The demo rows sit after the real ones, so `Unmount(i)` still indexes
+        // `mounts` for every real row.
+        let real_rows = rows.len();
+        rows.extend(self.demo_mounts.iter().map(mount_table::MountRow::clone));
+
+        // The table fills the pane and shrinks with it; below its minimum the
+        // columns stop collapsing and this scroller takes over. Vertical
+        // overflow belongs to the page shell, not to a scrollbar of its own.
+        let palette = self.palette;
+        let viewport_width = ui.available_width();
+        let table_width = viewport_width.max(mount_table::min_width());
+        let action = egui::ScrollArea::horizontal()
+            .id_salt("active_mounts")
+            .auto_shrink([false, true])
+            .show(ui, |ui| mount_table::show(ui, table_width, &rows, &palette))
+            .inner;
+
+        match action {
+            // Guarded so a `--demo-mounts` letter (which nothing is attached to)
+            // can't send Explorer off to a drive that doesn't exist.
+            mount_table::MountAction::Explore(letter) if self.is_mounted_letter(letter) => {
+                let _ = std::process::Command::new("explorer.exe")
+                    .arg(format!("{letter}:\\"))
+                    .spawn();
             }
-            if let Some(i) = unmount_idx {
-                self.mounts.remove(i); // Drop removes letters, detaches, cleans up
-                self.status = "Unmounted".into();
+            mount_table::MountAction::Explore(letter) => {
+                self.status = format!("{letter}: is a demo row — nothing is mounted there");
             }
+            mount_table::MountAction::Unmount(i) if i < real_rows => {
+                // Drop removes the drive letters, detaches the disk, and
+                // cleans up the scratch state.
+                let m = self.mounts.remove(i);
+                self.status = format!("Unmounted {}", m.backup_path().display());
+            }
+            mount_table::MountAction::Unmount(i) => {
+                self.demo_mounts.remove(i - real_rows);
+            }
+            mount_table::MountAction::None => {}
         }
+    }
+
+    /// Tear down every active mount (each `ActiveMount`'s `Drop` releases its
+    /// drive letters and detaches the virtual disk). Called on Unmount-all and
+    /// on the way out of the app — a leaked mount would leave a dead drive
+    /// letter behind after the process exits.
+    fn unmount_all(&mut self) {
+        self.mounts.clear();
+        self.demo_mounts.clear();
+    }
+
+    /// True while any backup is mounted (or standing in for one under
+    /// `--demo-mounts`) — the app must not exit in that state without asking.
+    fn anything_mounted(&self) -> bool {
+        !self.mounts.is_empty() || !self.demo_mounts.is_empty()
+    }
+
+    /// True if `letter` is a drive letter one of the live mounts exposes.
+    fn is_mounted_letter(&self, letter: char) -> bool {
+        self.mounts
+            .iter()
+            .any(|m| m.volumes().iter().any(|v| v.drive_letter == Some(letter)))
+    }
+
+    /// Every mount the close dialog has to warn about — the real ones, plus any
+    /// `--demo-mounts` stand-ins so the dialog can be exercised without one.
+    fn mount_summaries(&self) -> Vec<String> {
+        let real = self.mounts.iter().map(|m| {
+            let name = m
+                .backup_path()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "backup".into());
+            format!("{name}  —  {}", describe_mounted_volumes(m))
+        });
+        let demo = self.demo_mounts.iter().map(|r| {
+            let letters: Vec<String> = r.letters.iter().map(|l| format!("{l}:")).collect();
+            format!("{}  —  {}", r.name, letters.join(", "))
+        });
+        real.chain(demo).collect()
     }
 
     /// (Re)load the chosen backup's partition layout for the mount map. All
@@ -2396,6 +2544,29 @@ fn demo_refresh_overlay_from_args() -> Option<Instant> {
         .skip(1)
         .any(|a| a == "--demo-refresh")
         .then(|| Instant::now() + Duration::from_secs(5))
+}
+
+/// Debug/verification aid: `--demo-mounts` seeds the Active-mounts table with
+/// canned rows — a two-letter mount and a single-letter one — so the table's
+/// multi-letter layout, its buttons, and the close-with-mounts dialog can all be
+/// eyeballed without an elevated session and a real `.phnx` to attach. The rows
+/// are inert: Explore reports instead of opening Explorer.
+fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
+    if !std::env::args().skip(1).any(|a| a == "--demo-mounts") {
+        return Vec::new();
+    }
+    vec![
+        mount_table::MountRow {
+            name: "fdBU.phnx".into(),
+            size: 30_800_000_000,
+            letters: vec!['I', 'J'],
+        },
+        mount_table::MountRow {
+            name: "workstation-2026-07-12.phnx".into(),
+            size: 512_110_190_592,
+            letters: vec!['K'],
+        },
+    ]
 }
 
 /// Debug/verification aid: `--page clone` (etc.) opens the app on that page

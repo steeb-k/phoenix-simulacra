@@ -1,8 +1,8 @@
 //! Sticky full-width primary-action bar pinned to the bottom of the
 //! central pane.
 //!
-//! Every page with a Start action (Backup, Restore, Verify, Clone — Mount
-//! soon) renders it here instead of at the end of its scrollable content:
+//! Every page with a Start action (Backup, Restore, Verify, Clone, Mount)
+//! renders it here instead of at the end of its scrollable content:
 //! the page scrolls, the action never moves. The bar is flush with the
 //! pane edges and carries the pane's rounded bottom-left corner, so it
 //! reads as the bottom cap of the central panel rather than a floating
