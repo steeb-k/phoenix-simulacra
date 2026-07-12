@@ -6,6 +6,7 @@ const REGULAR: &str = "inter-regular";
 const BOLD: &str = "inter-bold";
 const PHOSPHOR: &str = "phosphor";
 const PHOSPHOR_FILL: &str = "phosphor-fill";
+const PHOSPHOR_BOLD: &str = "phosphor-bold";
 const CAPTION: &str = "caption-icons";
 
 /// Whether the system caption-glyph font (Segoe Fluent Icons / Segoe MDL2
@@ -81,6 +82,18 @@ pub fn install(ctx: &egui::Context) {
         vec![PHOSPHOR_FILL.into(), REGULAR.into()],
     );
 
+    // Heavy-stroke phosphor variant, to pair an icon with Inter Bold (the
+    // titlebar's Refresh button). Every variant maps the same codepoints, so
+    // the weight is chosen purely by which family the `FontId` names.
+    fonts.font_data.insert(
+        PHOSPHOR_BOLD.into(),
+        egui_phosphor::Variant::Bold.font_data(),
+    );
+    fonts.families.insert(
+        FontFamily::Name(PHOSPHOR_BOLD.into()),
+        vec![PHOSPHOR_BOLD.into(), BOLD.into()],
+    );
+
     ctx.set_fonts(fonts);
 
     let bold_family = FontFamily::Name(BOLD.into());
@@ -134,6 +147,12 @@ pub fn icon(size: f32) -> FontId {
 /// Solid (filled) phosphor glyphs — pair with `egui_phosphor::fill::*`.
 pub fn icon_fill(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(PHOSPHOR_FILL.into()))
+}
+
+/// Heavy-stroke phosphor glyphs — pair with `egui_phosphor::bold::*` (and
+/// with [`bold`] text).
+pub fn icon_bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(PHOSPHOR_BOLD.into()))
 }
 
 /// FontId for the native Windows caption glyphs, or `None` when no system

@@ -127,10 +127,13 @@ fn draw(ui: &mut Ui, palette: &Palette, brand_rect: Rect, refresh_enabled: bool)
     refreshed
 }
 
+/// Bold throughout — icon included, which is why the phosphor Bold variant is
+/// registered as its own family (all variants share codepoints, so weight is
+/// chosen by family, not by glyph).
 fn refresh_fonts() -> (FontId, FontId) {
     (
-        fonts::icon(REFRESH_ICON_SIZE),
-        fonts::regular(REFRESH_TEXT_SIZE),
+        fonts::icon_bold(REFRESH_ICON_SIZE),
+        fonts::bold(REFRESH_TEXT_SIZE),
     )
 }
 
@@ -141,7 +144,7 @@ fn refresh_width(ui: &Ui) -> f32 {
         ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE).size().x)
     };
     REFRESH_PAD_X * 2.0
-        + measure(egui_phosphor::regular::ARROWS_CLOCKWISE, icon_font)
+        + measure(egui_phosphor::bold::ARROWS_CLOCKWISE, icon_font)
         + REFRESH_ICON_GAP
         + measure(REFRESH_LABEL, text_font)
 }
@@ -177,7 +180,7 @@ fn refresh_button(ui: &mut Ui, rect: Rect, palette: &Palette, enabled: bool) -> 
     let (icon_font, text_font) = refresh_fonts();
     let icon_w = ui.fonts(|f| {
         f.layout_no_wrap(
-            egui_phosphor::regular::ARROWS_CLOCKWISE.to_owned(),
+            egui_phosphor::bold::ARROWS_CLOCKWISE.to_owned(),
             icon_font.clone(),
             fg,
         )
@@ -199,7 +202,7 @@ fn refresh_button(ui: &mut Ui, rect: Rect, palette: &Palette, enabled: bool) -> 
     painter.text(
         egui::pos2(left, mid),
         Align2::LEFT_CENTER,
-        egui_phosphor::regular::ARROWS_CLOCKWISE,
+        egui_phosphor::bold::ARROWS_CLOCKWISE,
         icon_font,
         fg,
     );
