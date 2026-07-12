@@ -250,7 +250,13 @@ fn mode_button(ui: &mut Ui, icon: &str, label: &str, selected: bool, palette: &P
     // Text stays at full contrast in both states — the accent border and
     // tinted fill carry the selection; accent-colored text on the accent
     // tint would be hard to read.
-    let text = crate::icon_label(icon, 16.0, label, 14.0, palette.icon_color);
+    let text = crate::icon_label(
+        icon,
+        crate::fonts::icon(16.0),
+        label,
+        crate::fonts::regular(14.0),
+        palette.icon_color,
+    );
     let fill = if selected {
         disk_map::blend(palette.content_card_bg, palette.accent, 0.18)
     } else {

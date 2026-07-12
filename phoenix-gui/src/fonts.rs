@@ -5,6 +5,7 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyl
 const REGULAR: &str = "inter-regular";
 const BOLD: &str = "inter-bold";
 const PHOSPHOR: &str = "phosphor";
+const PHOSPHOR_FILL: &str = "phosphor-fill";
 const CAPTION: &str = "caption-icons";
 
 /// Whether the system caption-glyph font (Segoe Fluent Icons / Segoe MDL2
@@ -68,6 +69,18 @@ pub fn install(ctx: &egui::Context) {
         vec![PHOSPHOR.into(), REGULAR.into()],
     );
 
+    // Solid (filled) phosphor variant, used by the primary action buttons.
+    // `egui_phosphor::add_to_fonts` always registers under the "phosphor"
+    // key, so a second variant has to be added by hand.
+    fonts.font_data.insert(
+        PHOSPHOR_FILL.into(),
+        egui_phosphor::Variant::Fill.font_data(),
+    );
+    fonts.families.insert(
+        FontFamily::Name(PHOSPHOR_FILL.into()),
+        vec![PHOSPHOR_FILL.into(), REGULAR.into()],
+    );
+
     ctx.set_fonts(fonts);
 
     let bold_family = FontFamily::Name(BOLD.into());
@@ -116,6 +129,11 @@ pub fn regular(size: f32) -> FontId {
 
 pub fn icon(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(PHOSPHOR.into()))
+}
+
+/// Solid (filled) phosphor glyphs — pair with `egui_phosphor::fill::*`.
+pub fn icon_fill(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(PHOSPHOR_FILL.into()))
 }
 
 /// FontId for the native Windows caption glyphs, or `None` when no system

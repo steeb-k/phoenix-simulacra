@@ -1072,9 +1072,9 @@ fn truncate(s: &str, max: usize) -> String {
 /// the label stays in Inter — a single `RichText` can only carry one font.
 fn icon_label(
     icon: &str,
-    icon_size: f32,
+    icon_font: egui::FontId,
     label: &str,
-    label_size: f32,
+    label_font: egui::FontId,
     color: egui::Color32,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
@@ -1082,7 +1082,7 @@ fn icon_label(
         icon,
         0.0,
         egui::TextFormat {
-            font_id: fonts::icon(icon_size),
+            font_id: icon_font,
             color,
             valign: egui::Align::Center,
             ..Default::default()
@@ -1092,7 +1092,7 @@ fn icon_label(
         label,
         8.0,
         egui::TextFormat {
-            font_id: fonts::regular(label_size),
+            font_id: label_font,
             color,
             valign: egui::Align::Center,
             ..Default::default()
@@ -1131,11 +1131,16 @@ fn action_row(
                 palette.dim(palette.success)
             };
             let text: egui::WidgetText = match start.icon {
-                Some(icon) => {
-                    icon_label(icon, 30.0, start.label, 24.0, egui::Color32::WHITE).into()
-                }
+                Some(icon) => icon_label(
+                    icon,
+                    fonts::icon_fill(30.0),
+                    start.label,
+                    fonts::bold(24.0),
+                    egui::Color32::WHITE,
+                )
+                .into(),
                 None => egui::RichText::new(start.label)
-                    .font(fonts::regular(24.0))
+                    .font(fonts::bold(24.0))
                     .color(egui::Color32::WHITE)
                     .into(),
             };
@@ -1196,9 +1201,9 @@ fn backup_path_picker(
 
         let browse_label = icon_label(
             egui_phosphor::regular::FOLDER,
-            16.0,
+            fonts::icon(16.0),
             "Browse…",
-            14.0,
+            fonts::regular(14.0),
             ui.visuals().widgets.inactive.fg_stroke.color,
         );
         let mut browsed = false;
@@ -1300,8 +1305,8 @@ impl PhoenixApp {
         ui.add_enabled_ui(!busy, |ui| self.ui_backup_form(ui, name_missing));
 
         let starts = [StartAction {
-            label: "Start backup",
-            icon: Some(egui_phosphor::regular::PLAY),
+            label: "Start Backup",
+            icon: Some(egui_phosphor::fill::PLAY),
             enabled: !busy && !name_missing,
             disabled_hint: Some(if busy {
                 "A backup is already running"
@@ -1369,9 +1374,9 @@ impl PhoenixApp {
 
             let browse_label = icon_label(
                 egui_phosphor::regular::FOLDER,
-                16.0,
+                fonts::icon(16.0),
                 "Browse…",
-                14.0,
+                fonts::regular(14.0),
                 ui.visuals().widgets.inactive.fg_stroke.color,
             );
             if ui
@@ -1577,8 +1582,8 @@ impl PhoenixApp {
             .as_ref()
             .is_some_and(|l| l.has_restorable_entries());
         let starts = [StartAction {
-            label: "Run restore",
-            icon: Some(egui_phosphor::regular::PLAY),
+            label: "Run Restore",
+            icon: Some(egui_phosphor::fill::PLAY),
             enabled: !busy && plan_ready,
             disabled_hint: Some(if busy {
                 "A restore is already running"
@@ -1799,8 +1804,8 @@ impl PhoenixApp {
             "Choose a backup file first"
         };
         let starts = [StartAction {
-            label: "Verify backup",
-            icon: Some(egui_phosphor::regular::PLAY),
+            label: "Verify Backup",
+            icon: Some(egui_phosphor::fill::PLAY),
             enabled: !busy && path_filled,
             disabled_hint: Some(disabled_hint),
         }];
@@ -1919,8 +1924,8 @@ impl PhoenixApp {
             "Drag at least one source partition onto the target"
         };
         let starts = [StartAction {
-            label: "Clone disk",
-            icon: Some(egui_phosphor::regular::PLAY),
+            label: "Clone Disk",
+            icon: Some(egui_phosphor::fill::PLAY),
             enabled: !busy && plan_ready,
             disabled_hint: Some(disabled_hint),
         }];
