@@ -1,3 +1,4 @@
+mod action_bar;
 mod clone_panel;
 mod confirm_dialog;
 mod disk_dropdown;
@@ -59,10 +60,11 @@ const CENTRAL_PANEL_MARGIN_X: f32 = 24.0;
 /// edge, so every element ends on the same vertical line. The page-level
 /// vertical scrollbar rides the window edge inside this gutter.
 const PAGE_RIGHT_MARGIN: f32 = 15.0;
-/// Height of the oversized Start button used by every page's primary
-/// action (Start backup, Run restore, Verify backup, Clone disk) —
-/// rendered full-panel-width with a play glyph, deliberately bigger than
-/// the standard `FORM_BUTTON_W` × `ACTION_BUTTON_HEIGHT` form controls.
+/// Height of the sticky bottom action bar (`action_bar::show`) that hosts
+/// every page's primary action (Start backup, Run restore, Verify backup,
+/// Clone disk) — pinned full-pane-width below the scrolling content,
+/// deliberately bigger than the standard `FORM_BUTTON_W` ×
+/// `ACTION_BUTTON_HEIGHT` form controls.
 const START_BUTTON_HEIGHT: f32 = 52.0;
 
 /// Decode the embedded application icon for the OS window chrome (title
@@ -827,6 +829,75 @@ impl PhoenixApp {
             }
         }
     }
+
+    /// The current page's primary Start action, if it has one — rendered by
+    /// the sticky bottom action bar (`action_bar::show`) instead of inline
+    /// in the page content. Enabled/hint state is derived from the same app
+    /// state the page forms edit, so the bar stays in step with them.
+    fn current_page_action(&self, busy: bool) -> Option<StartAction<'static>> {
+        let action = match self.page {
+            Page::Backup => StartAction {
+                label: "Start Backup",
+                icon: Some(egui_phosphor::fill::PLAY),
+                enabled: !busy && !self.backup_name.trim().is_empty(),
+                disabled_hint: Some(if busy {
+                    "A backup is already running"
+                } else {
+                    "Enter a backup name first"
+                }),
+            },
+            Page::Restore => {
+                let plan_ready = self
+                    .restore_layout
+                    .as_ref()
+                    .is_some_and(|l| l.has_restorable_entries());
+                StartAction {
+                    label: "Run Restore",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy && plan_ready,
+                    disabled_hint: Some(if busy {
+                        "A restore is already running"
+                    } else if self.restore_layout.is_none() {
+                        "Choose a backup file first"
+                    } else if self.target_disk_index.is_none() {
+                        "Choose a target disk first"
+                    } else {
+                        "Map at least one partition onto the target"
+                    }),
+                }
+            }
+            Page::Verify => StartAction {
+                label: "Verify Backup",
+                icon: Some(egui_phosphor::fill::PLAY),
+                enabled: !busy && !self.restore_backup_path.trim().is_empty(),
+                disabled_hint: Some(if busy {
+                    "A verify is already running"
+                } else {
+                    "Choose a backup file first"
+                }),
+            },
+            Page::Clone => {
+                let plan_ready = self
+                    .clone_layout
+                    .as_ref()
+                    .is_some_and(|l| l.has_restorable_entries());
+                StartAction {
+                    label: "Clone Disk",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy && plan_ready,
+                    disabled_hint: Some(if busy {
+                        "A job is already running"
+                    } else if self.clone_layout.is_none() {
+                        "Choose a source and a target disk first"
+                    } else {
+                        "Drag at least one source partition onto the target"
+                    }),
+                }
+            }
+            Page::Mount | Page::History | Page::Options => return None,
+        };
+        Some(action)
+    }
 }
 
 impl eframe::App for PhoenixApp {
@@ -881,12 +952,37 @@ impl eframe::App for PhoenixApp {
                 });
             });
 
+        // Sticky primary-action bar: pages with a Start action pin it to the
+        // bottom of the pane (between the content and the status bar) so the
+        // page content scrolls while the action stays put. Shown before the
+        // CentralPanel because egui panels claim space in declaration order.
+        let page_action = self.current_page_action(busy);
+        let mut action_bar_rect: Option<egui::Rect> = None;
+        if let Some(action) = &page_action {
+            let (clicked, bar_rect) = action_bar::show(ctx, &self.palette, action, !modal_open);
+            action_bar_rect = Some(bar_rect);
+            if clicked {
+                match self.page {
+                    Page::Backup => self.start_backup(),
+                    Page::Restore => self.start_restore(),
+                    Page::Verify => self.start_verify(),
+                    Page::Clone => self.start_clone(),
+                    _ => {}
+                }
+            }
+        }
+
         // Only the bottom-left corner is rounded: it nestles into the L
         // formed by the sidebar and status bar. The cutout shows through to
-        // `clear_color` (sidebar_bg).
-        let panel_rounding = egui::Rounding {
-            sw: 10.0,
-            ..egui::Rounding::ZERO
+        // `clear_color` (sidebar_bg). When the action bar is up it forms the
+        // pane's bottom edge and owns that corner, so the panel goes square.
+        let panel_rounding = if action_bar_rect.is_some() {
+            egui::Rounding::ZERO
+        } else {
+            egui::Rounding {
+                sw: action_bar::CORNER_RADIUS,
+                ..egui::Rounding::ZERO
+            }
         };
         let central = egui::CentralPanel::default()
             .frame(
@@ -915,13 +1011,20 @@ impl eframe::App for PhoenixApp {
         // pushing those sides 1px past the screen clips their stroke away,
         // leaving only the left edge, bottom edge, and the rounded corner.
         let rect = central.response.rect;
+        // The border wraps the whole pane — central panel plus the action
+        // bar when one is up — with the rounded corner always at the pane's
+        // true bottom-left (the bar's corner when present).
+        let bottom = action_bar_rect.map_or(rect.max.y, |r| r.max.y);
         let border_rect = egui::Rect::from_min_max(
             egui::pos2(rect.min.x, rect.min.y - 1.0),
-            egui::pos2(rect.max.x + 1.0, rect.max.y),
+            egui::pos2(rect.max.x + 1.0, bottom),
         );
         ctx.layer_painter(egui::LayerId::background()).rect_stroke(
             border_rect,
-            panel_rounding,
+            egui::Rounding {
+                sw: action_bar::CORNER_RADIUS,
+                ..egui::Rounding::ZERO
+            },
             egui::Stroke::new(1.0, self.palette.panel_border),
         );
 
@@ -1152,9 +1255,10 @@ fn disabled_when<R>(ui: &mut egui::Ui, busy: bool, body: impl FnOnce(&mut egui::
     ui.add_enabled_ui(!busy, body).inner
 }
 
-/// A single "start" affordance configured by [`action_row`]: green pill,
-/// disabled-and-dimmed when `enabled` is false, with an optional
-/// `disabled_hint` shown on hover when the user cannot click it.
+/// A page's primary "start" affordance, rendered by the sticky bottom
+/// action bar (`action_bar::show`): green gradient bar, disabled-and-dimmed
+/// when `enabled` is false, with an optional `disabled_hint` shown on hover
+/// when the user cannot click it.
 pub struct StartAction<'a> {
     pub label: &'a str,
     /// Optional phosphor glyph rendered before the label (e.g.
@@ -1224,64 +1328,27 @@ fn icon_label(
     job
 }
 
-/// Render `starts` (one or more green Start-style buttons) in a row.
-/// Returns `Some(start_idx)` when one of them was clicked, `None` otherwise.
-///
-/// Cancellation lives in the blocking status modal now (its Cancel button
-/// calls [`PhoenixApp::cancel_current_job`]), so this row no longer renders
-/// a per-page Cancel control.
-///
-/// The buttons split the full panel width evenly at `height`, labels
-/// centered (`add_sized` lays the button out centered-and-justified).
-/// Disabled colored buttons stay tinted (faded, via `Palette::dim`)
-/// instead of going fully grey so the user still recognizes the Go
-/// control.
-fn action_row(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    height: f32,
-    starts: &[StartAction<'_>],
-) -> Option<usize> {
-    let mut clicked_start: Option<usize> = None;
-    ui.horizontal(|ui| {
-        let spacing = ui.spacing().item_spacing.x;
-        let n = starts.len() as f32;
-        let button_w = ((ui.available_width() - spacing * (n - 1.0)) / n).max(0.0);
-        for (idx, start) in starts.iter().enumerate() {
-            let fill = if start.enabled {
-                palette.success
-            } else {
-                palette.dim(palette.success)
-            };
-            let text: egui::WidgetText = match start.icon {
-                Some(icon) => icon_label(
-                    icon,
-                    fonts::icon_fill(30.0),
-                    start.label,
-                    fonts::bold(24.0),
-                    egui::Color32::WHITE,
-                )
-                .into(),
-                None => egui::RichText::new(start.label)
-                    .font(fonts::bold(24.0))
-                    .color(egui::Color32::WHITE)
-                    .into(),
-            };
-            let resp = ui
-                .add_enabled_ui(start.enabled, |ui| {
-                    ui.add_sized([button_w, height], egui::Button::new(text).fill(fill))
-                })
-                .inner;
-            let resp = match start.disabled_hint {
-                Some(hint) => resp.on_disabled_hover_text(hint),
-                None => resp,
-            };
-            if resp.clicked() {
-                clicked_start = Some(idx);
-            }
-        }
+/// Common page shell: the whole page scrolls vertically as a unit, with
+/// the central panel's right margin reclaimed so the scrollbar rides the
+/// window edge and the content padded `PAGE_RIGHT_MARGIN` back off it —
+/// every control ends on the same vertical line, and the fixed action bar
+/// below never moves while the content scrolls.
+fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let mut full_rect = ui.max_rect();
+    full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(id_salt)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin {
+                        right: PAGE_RIGHT_MARGIN,
+                        ..egui::Margin::ZERO
+                    })
+                    .show(ui, body);
+            });
     });
-    clicked_start
 }
 
 /// Bold "label + TextEdit + Browse…" row used by the Verify, Restore, and
@@ -1382,54 +1449,14 @@ fn refresh_disks_button(ui: &mut Ui, palette: &Palette) -> Response {
 impl PhoenixApp {
     fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
         // Whole-page scroll: when the window is too short, the entire backup
-        // page (header, fields, drive list, options, buttons) scrolls as a
-        // unit. The drive list only scrolls horizontally — vertical overflow
-        // is this page-level scroll area's job.
-        // Reclaim the central panel's right margin so the scroll area — and
-        // therefore its scrollbar — reaches the window edge. Content is then
-        // padded `PAGE_RIGHT_MARGIN` inside the scroll area, which puts every
-        // control on one vertical line with the scrollbar riding the window
-        // edge in that gutter (instead of floating mid-panel).
-        let mut full_rect = ui.max_rect();
-        full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .inner_margin(egui::Margin {
-                            right: PAGE_RIGHT_MARGIN,
-                            ..egui::Margin::ZERO
-                        })
-                        .show(ui, |ui| self.ui_backup_inner(ui, busy));
-                });
+        // page (header, fields, drive list, options) scrolls as a unit above
+        // the fixed action bar. The drive list only scrolls horizontally —
+        // vertical overflow is the shell's job.
+        page_scroll_shell(ui, "backup_page", |ui| {
+            page_header(ui, &self.palette, "Create Backup", "");
+            let name_missing = self.backup_name.trim().is_empty();
+            ui.add_enabled_ui(!busy, |ui| self.ui_backup_form(ui, name_missing));
         });
-    }
-
-    fn ui_backup_inner(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_header(ui, &self.palette, "Create Backup", "");
-
-        // Compute name_missing OUTSIDE the disabled scope so the action
-        // row below can still gate Start on it.
-        let name_missing = self.backup_name.trim().is_empty();
-
-        ui.add_enabled_ui(!busy, |ui| self.ui_backup_form(ui, name_missing));
-
-        let starts = [StartAction {
-            label: "Start Backup",
-            icon: Some(egui_phosphor::fill::PLAY),
-            enabled: !busy && !name_missing,
-            disabled_hint: Some(if busy {
-                "A backup is already running"
-            } else {
-                "Enter a backup name first"
-            }),
-        }];
-        // Oversized relative to the standard action row — this is the
-        // page's primary action.
-        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
-            self.start_backup();
-        }
     }
 
     /// The greyed-when-busy portion of the Backup page: name field,
@@ -1680,33 +1707,12 @@ impl PhoenixApp {
     }
 
     fn ui_restore(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_header(ui, &self.palette, "Restore", "");
-
-        ui.add_enabled_ui(!busy, |ui| {
-            self.ui_restore_form(ui);
+        page_scroll_shell(ui, "restore_page", |ui| {
+            page_header(ui, &self.palette, "Restore", "");
+            ui.add_enabled_ui(!busy, |ui| {
+                self.ui_restore_form(ui);
+            });
         });
-
-        let plan_ready = self
-            .restore_layout
-            .as_ref()
-            .is_some_and(|l| l.has_restorable_entries());
-        let starts = [StartAction {
-            label: "Run Restore",
-            icon: Some(egui_phosphor::fill::PLAY),
-            enabled: !busy && plan_ready,
-            disabled_hint: Some(if busy {
-                "A restore is already running"
-            } else if self.restore_layout.is_none() {
-                "Choose a backup file first"
-            } else if self.target_disk_index.is_none() {
-                "Choose a target disk first"
-            } else {
-                "Map at least one partition onto the target"
-            }),
-        }];
-        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
-            self.start_restore();
-        }
     }
 
     /// "Select target" header + disk dropdown + refresh button on the
@@ -1886,38 +1892,18 @@ impl PhoenixApp {
     }
 
     fn ui_verify(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_header(
-            ui,
-            &self.palette,
-            "Verify Backup",
-            "",
-        );
-
-        ui.add_enabled_ui(!busy, |ui| {
-            let _ = backup_path_picker(
-                ui,
-                "Backup file",
-                "Path to .phnx file",
-                &mut self.restore_backup_path,
-                None,
-            );
+        page_scroll_shell(ui, "verify_page", |ui| {
+            page_header(ui, &self.palette, "Verify Backup", "");
+            ui.add_enabled_ui(!busy, |ui| {
+                let _ = backup_path_picker(
+                    ui,
+                    "Backup file",
+                    "Path to .phnx file",
+                    &mut self.restore_backup_path,
+                    None,
+                );
+            });
         });
-
-        let path_filled = !self.restore_backup_path.trim().is_empty();
-        let disabled_hint = if busy {
-            "A verify is already running"
-        } else {
-            "Choose a backup file first"
-        };
-        let starts = [StartAction {
-            label: "Verify Backup",
-            icon: Some(egui_phosphor::fill::PLAY),
-            enabled: !busy && path_filled,
-            disabled_hint: Some(disabled_hint),
-        }];
-        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
-            self.start_verify();
-        }
     }
 
     fn start_verify(&mut self) {
@@ -1935,27 +1921,12 @@ impl PhoenixApp {
         // Same shell as the Backup page: the whole page scrolls vertically,
         // with content padded off the window edge so the scrollbar rides the
         // edge gutter; the drive lists scroll horizontally on their own.
-        let mut full_rect = ui.max_rect();
-        full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("clone_page")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .inner_margin(egui::Margin {
-                            right: PAGE_RIGHT_MARGIN,
-                            ..egui::Margin::ZERO
-                        })
-                        .show(ui, |ui| self.ui_clone_inner(ui));
-                });
-        });
+        page_scroll_shell(ui, "clone_page", |ui| self.ui_clone_inner(ui));
     }
 
     fn ui_clone_inner(&mut self, ui: &mut egui::Ui) {
         page_header(ui, &self.palette, "Clone", "");
 
-        let busy = self.busy();
         if self.disks.is_empty() {
             ui.label("No disks detected. Run as Administrator, then refresh.");
             if refresh_disks_button(ui, &self.palette).clicked() {
@@ -1986,7 +1957,8 @@ impl PhoenixApp {
             ui.ctx().request_repaint();
         }
 
-        // Options + warning + action, driven by the current plan shape.
+        // Options + warning, driven by the current plan shape (the Clone
+        // Disk action itself lives in the sticky bottom action bar).
         if let Some(layout) = &self.clone_layout {
             let full_disk = layout.full_disk;
             if full_disk
@@ -2013,28 +1985,6 @@ impl PhoenixApp {
                 };
                 ui.colored_label(self.palette.warning, warning);
             }
-        }
-        ui.add_space(8.0);
-
-        let plan_ready = self
-            .clone_layout
-            .as_ref()
-            .is_some_and(|l| l.has_restorable_entries());
-        let disabled_hint = if busy {
-            "A job is already running"
-        } else if self.clone_layout.is_none() {
-            "Choose a source and a target disk first"
-        } else {
-            "Drag at least one source partition onto the target"
-        };
-        let starts = [StartAction {
-            label: "Clone Disk",
-            icon: Some(egui_phosphor::fill::PLAY),
-            enabled: !busy && plan_ready,
-            disabled_hint: Some(disabled_hint),
-        }];
-        if action_row(ui, &self.palette, START_BUTTON_HEIGHT, &starts) == Some(0) {
-            self.start_clone();
         }
     }
 
