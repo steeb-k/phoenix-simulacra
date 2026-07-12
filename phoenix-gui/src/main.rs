@@ -60,10 +60,11 @@ const CENTRAL_PANEL_MARGIN_X: f32 = 24.0;
 /// edge, so every element ends on the same vertical line. The page-level
 /// vertical scrollbar rides the window edge inside this gutter.
 const PAGE_RIGHT_MARGIN: f32 = 15.0;
-/// Oversized Start button on the Backup page — the page's primary action,
-/// rendered with a play glyph and deliberately bigger than the standard
-/// `FORM_BUTTON_W` × `ACTION_BUTTON_HEIGHT` action row.
-const START_BACKUP_BUTTON_SIZE: egui::Vec2 = egui::vec2(190.0, 52.0);
+/// Oversized Start button used by every page's primary action (Start
+/// backup, Run restore, Verify backup, Clone disk) — rendered with a play
+/// glyph and deliberately bigger than the standard `FORM_BUTTON_W` ×
+/// `ACTION_BUTTON_HEIGHT` form controls.
+const START_BUTTON_SIZE: egui::Vec2 = egui::vec2(190.0, 52.0);
 
 /// Decode the embedded application icon for the OS window chrome (title
 /// bar / taskbar / Alt-Tab thumbnail). This is intentionally a *separate*
@@ -1155,7 +1156,7 @@ impl PhoenixApp {
         }];
         // Oversized relative to the standard action row — this is the
         // page's primary action.
-        if action_row(ui, &self.palette, START_BACKUP_BUTTON_SIZE, &starts) == Some(0) {
+        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
             self.start_backup();
         }
     }
@@ -1425,7 +1426,7 @@ impl PhoenixApp {
             .is_some_and(|l| l.has_restorable_entries());
         let starts = [StartAction {
             label: "Run restore",
-            icon: None,
+            icon: Some(egui_phosphor::regular::PLAY),
             enabled: !busy && plan_ready,
             disabled_hint: Some(if busy {
                 "A restore is already running"
@@ -1433,13 +1434,7 @@ impl PhoenixApp {
                 "Choose a backup file first"
             }),
         }];
-        if action_row(
-            ui,
-            &self.palette,
-            egui::vec2(FORM_BUTTON_W, ACTION_BUTTON_HEIGHT),
-            &starts,
-        ) == Some(0)
-        {
+        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
             self.start_restore();
         }
     }
@@ -1639,17 +1634,11 @@ impl PhoenixApp {
         };
         let starts = [StartAction {
             label: "Verify backup",
-            icon: None,
+            icon: Some(egui_phosphor::regular::PLAY),
             enabled: !busy && path_filled,
             disabled_hint: Some(disabled_hint),
         }];
-        if action_row(
-            ui,
-            &self.palette,
-            egui::vec2(FORM_BUTTON_W, ACTION_BUTTON_HEIGHT),
-            &starts,
-        ) == Some(0)
-        {
+        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
             self.start_verify();
         }
     }
@@ -1770,17 +1759,11 @@ impl PhoenixApp {
         };
         let starts = [StartAction {
             label: "Clone disk",
-            icon: None,
+            icon: Some(egui_phosphor::regular::PLAY),
             enabled: !busy && plan_ready,
             disabled_hint: Some(disabled_hint),
         }];
-        if action_row(
-            ui,
-            &self.palette,
-            egui::vec2(FORM_BUTTON_W, ACTION_BUTTON_HEIGHT),
-            &starts,
-        ) == Some(0)
-        {
+        if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
             self.start_clone();
         }
     }

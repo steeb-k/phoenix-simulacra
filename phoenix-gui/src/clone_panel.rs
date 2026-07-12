@@ -384,7 +384,18 @@ fn draw_empty_face(ui: &mut Ui, width: f32, hint: &str, palette: &Palette) -> bo
     } else {
         disk_map::with_alpha(palette.subtle_text, 90)
     };
-    painter.rect_stroke(rect, Rounding::same(6.0), Stroke::new(1.0, stroke_color));
+    // Inset by half the stroke width (radius reduced to match) so the whole
+    // stroke — corner arcs included — lands inside the clip rect and hugs the
+    // fill's silhouette. A stroke centered on the rect edge gets its straight
+    // runs halved by the clip while the corner arcs escape it, leaving bare
+    // panel background showing past the rounded fill at each corner (same
+    // artifact `disk_map::draw_selection_stroke` fixes on the cards).
+    let w = 1.0;
+    painter.rect_stroke(
+        rect.shrink(w / 2.0),
+        Rounding::same(6.0 - w / 2.0),
+        Stroke::new(w, stroke_color),
+    );
     painter.text(
         egui::pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -480,14 +491,40 @@ fn draw_disk_list_row(
 }
 
 /// Big source→target arrow between the two dropdowns, centered on the
-/// visible viewport (not the virtual scroll width).
+/// visible viewport (not the virtual scroll width). Painted as a filled
+/// shaft + head rather than a phosphor glyph: the icon font only ships the
+/// outline variant, and this wants to read as one solid accent-colored mark.
 fn draw_flow_arrow(ui: &mut Ui, palette: &Palette, viewport_width: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(viewport_width, 44.0), Sense::hover());
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        egui_phosphor::regular::ARROW_FAT_DOWN,
-        fonts::icon(34.0),
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(viewport_width, 52.0), Sense::hover());
+    let c = rect.center();
+    let w = 40.0; // head width
+    let h = 42.0; // total height
+    let shaft_w = w * 0.45;
+    let head_h = h * 0.45;
+    let top = c.y - h / 2.0;
+    let bottom = c.y + h / 2.0;
+    let painter = ui.painter();
+    // Shaft overlaps the head by half a pixel so anti-aliasing can't open a
+    // hairline seam between the two shapes.
+    painter.rect_filled(
+        Rect::from_min_max(
+            egui::pos2(c.x - shaft_w / 2.0, top),
+            egui::pos2(c.x + shaft_w / 2.0, bottom - head_h + 0.5),
+        ),
+        Rounding {
+            nw: 2.0,
+            ne: 2.0,
+            ..Rounding::ZERO
+        },
         palette.accent,
     );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - w / 2.0, bottom - head_h),
+            egui::pos2(c.x + w / 2.0, bottom - head_h),
+            egui::pos2(c.x, bottom),
+        ],
+        palette.accent,
+        Stroke::NONE,
+    ));
 }
