@@ -243,6 +243,8 @@ struct PhoenixApp {
     pending_clone: Option<PendingClone>,
     /// Restore waiting on its confirm-the-target dialog.
     pending_restore: Option<PendingRestore>,
+    /// `--demo-confirm`: show a fake wipe-confirmation dialog for styling work.
+    demo_confirm: bool,
     /// Total number of jobs in the current multi-disk run (for "Disk N of M"
     /// status text). Reset to 0 when the queue drains.
     total_backups: usize,
@@ -331,6 +333,7 @@ impl PhoenixApp {
             pending_overwrite: None,
             pending_clone: None,
             pending_restore: None,
+            demo_confirm: demo_confirm_from_args(),
             total_backups: 0,
             current_backup_index: 0,
             restore_backup_path: String::new(),
@@ -837,6 +840,7 @@ impl eframe::App for PhoenixApp {
         self.show_overwrite_dialog(ctx);
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
+        self.show_demo_confirm_dialog(ctx);
     }
 }
 
@@ -938,6 +942,8 @@ impl PhoenixApp {
                 confirm_label: "Overwrite",
                 cancel_label: "Cancel",
                 confirm_danger: true,
+                // Overwrites backup *files*, not a disk — no tape.
+                hazard_tape: false,
             };
             confirm_dialog::show(ctx, &self.palette, &view)
         };
@@ -971,6 +977,7 @@ impl PhoenixApp {
             confirm_label: "Clone disk",
             cancel_label: "Cancel",
             confirm_danger: true,
+            hazard_tape: true,
         };
         match confirm_dialog::show(ctx, &self.palette, &view) {
             ConfirmAction::Confirm => {
@@ -1003,6 +1010,7 @@ impl PhoenixApp {
             confirm_label: "Run restore",
             cancel_label: "Cancel",
             confirm_danger: true,
+            hazard_tape: true,
         };
         match confirm_dialog::show(ctx, &self.palette, &view) {
             ConfirmAction::Confirm => {
@@ -1019,6 +1027,31 @@ impl PhoenixApp {
                 self.status = "Restore cancelled — no changes were made".into();
             }
             ConfirmAction::None => {}
+        }
+    }
+
+    /// `--demo-confirm` styling aid: the restore dialog with canned details.
+    fn show_demo_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.demo_confirm {
+            return;
+        }
+        let details = vec![
+            "Disk number:   2".to_string(),
+            "Size:          931.5 GB".to_string(),
+            "Model:         WDC WD10EZEX-08WN4A0".to_string(),
+        ];
+        let view = ConfirmView {
+            title: "Confirm restore target",
+            message: "This will PERMANENTLY OVERWRITE the planned partitions on the target \
+                      disk with the backup's contents. Verify this is the right disk:",
+            details: &details,
+            confirm_label: "Run restore",
+            cancel_label: "Cancel",
+            confirm_danger: true,
+            hazard_tape: true,
+        };
+        if confirm_dialog::show(ctx, &self.palette, &view) != ConfirmAction::None {
+            self.demo_confirm = false;
         }
     }
 }
@@ -2323,6 +2356,13 @@ impl PhoenixApp {
             let _ = self.settings.save();
         }
     }
+}
+
+/// Debug/verification aid: `--demo-confirm` opens the app with a fake
+/// restore-confirmation dialog up, for eyeballing the dialog styling without
+/// staging a real destructive operation.
+fn demo_confirm_from_args() -> bool {
+    std::env::args().skip(1).any(|a| a == "--demo-confirm")
 }
 
 /// Debug/verification aid: `--page clone` (etc.) opens the app on that page

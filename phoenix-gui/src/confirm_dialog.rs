@@ -35,9 +35,54 @@ pub struct ConfirmView<'a> {
     /// Tint the confirm button with `palette.danger` (destructive) vs
     /// `palette.accent` (neutral).
     pub confirm_danger: bool,
+    /// Paint hazard-tape strips across the top and bottom edges. Reserved for
+    /// the disk-wipe confirmations, so the tape stays a "data will be
+    /// destroyed" signal rather than generic dialog chrome.
+    pub hazard_tape: bool,
 }
 
 const DIALOG_WIDTH: f32 = 460.0;
+const TAPE_HEIGHT: f32 = 32.0;
+/// Horizontal padding around the dialog body (`Frame` margin normally, a
+/// nested frame when the tape needs to bleed to the window edges).
+const BODY_MARGIN: f32 = 22.0;
+
+/// Diagonal yellow/black hazard stripes filling `rect`, drawn procedurally so
+/// they stay crisp at any DPI and tile to any width. 45° stripes as wide as
+/// the strip is tall, with a dark top fade for a bit of tape sheen.
+fn paint_tape(painter: &egui::Painter, rect: egui::Rect) {
+    let yellow = Color32::from_rgb(0xF6, 0xC4, 0x00);
+    let black = Color32::from_rgb(0x16, 0x16, 0x16);
+    painter.rect_filled(rect, 0.0, black);
+
+    let painter = painter.with_clip_rect(rect);
+    let h = rect.height();
+    // Start one slant early so the top edge is covered at the left corner.
+    let mut x = rect.left() - h;
+    while x < rect.right() {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(x, rect.bottom()),
+                egui::pos2(x + h, rect.bottom()),
+                egui::pos2(x + h * 2.0, rect.top()),
+                egui::pos2(x + h, rect.top()),
+            ],
+            yellow,
+            egui::Stroke::NONE,
+        ));
+        x += h * 2.0;
+    }
+
+    let mut sheen = egui::Mesh::default();
+    let top = Color32::from_black_alpha(80);
+    sheen.colored_vertex(rect.left_top(), top);
+    sheen.colored_vertex(rect.right_top(), top);
+    sheen.colored_vertex(rect.right_bottom(), Color32::TRANSPARENT);
+    sheen.colored_vertex(rect.left_bottom(), Color32::TRANSPARENT);
+    sheen.add_triangle(0, 1, 2);
+    sheen.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(sheen));
+}
 
 /// Render the dialog and return the user's action for this frame. Escape maps
 /// to Cancel; there is deliberately no Enter-to-confirm binding, so a
@@ -62,23 +107,25 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
         }
     });
 
-    let frame = egui::Frame::window(&ctx.style())
-        .fill(palette.sidebar_bg)
-        .inner_margin(egui::Margin::same(22.0))
-        .rounding(egui::Rounding::same(10.0));
+    // With tape the strips must bleed to the window edges, so the margin moves
+    // to a nested frame and the corners go square (stripes can't be clipped to
+    // a rounded rect, and sharp corners suit the hazard look anyway).
+    let frame = if view.hazard_tape {
+        egui::Frame::window(&ctx.style())
+            .fill(palette.sidebar_bg)
+            .inner_margin(egui::Margin::ZERO)
+            .rounding(egui::Rounding::ZERO)
+    } else {
+        egui::Frame::window(&ctx.style())
+            .fill(palette.sidebar_bg)
+            .inner_margin(egui::Margin::same(BODY_MARGIN))
+            .rounding(egui::Rounding::same(10.0))
+    };
 
-    egui::Window::new("confirm_dialog")
-        .order(Order::Tooltip)
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .movable(false)
-        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(frame)
-        .show(ctx, |ui| {
-            ui.set_width(DIALOG_WIDTH);
+    let body = |ui: &mut egui::Ui, action: &mut ConfirmAction| {
+        ui.set_width(DIALOG_WIDTH);
 
-            ui.label(RichText::new(view.title).font(fonts::bold(18.0)));
+        ui.label(RichText::new(view.title).font(fonts::bold(18.0)));
             ui.add_space(12.0);
 
             ui.label(RichText::new(view.message).color(palette.icon_color));
@@ -116,7 +163,7 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
                         .fill(ui.visuals().widgets.inactive.bg_fill),
                 );
                 if cancel.clicked() {
-                    action = ConfirmAction::Cancel;
+                    *action = ConfirmAction::Cancel;
                 }
 
                 let confirm_fill = if view.confirm_danger {
@@ -130,9 +177,45 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
                         .fill(confirm_fill),
                 );
                 if confirm.clicked() {
-                    action = ConfirmAction::Confirm;
+                    *action = ConfirmAction::Confirm;
                 }
             });
+    };
+
+    egui::Window::new("confirm_dialog")
+        .order(Order::Tooltip)
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .movable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(frame)
+        .show(ctx, |ui| {
+            if view.hazard_tape {
+                let width = DIALOG_WIDTH + BODY_MARGIN * 2.0;
+                ui.set_width(width);
+                // The strips and the body frame butt up against each other;
+                // the body's own margin provides all the breathing room.
+                let body_spacing = ui.spacing().item_spacing;
+                ui.spacing_mut().item_spacing.y = 0.0;
+
+                let (rect, _) = ui
+                    .allocate_exact_size(egui::vec2(width, TAPE_HEIGHT), egui::Sense::hover());
+                paint_tape(ui.painter(), rect);
+
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::same(BODY_MARGIN))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = body_spacing;
+                        body(ui, &mut action);
+                    });
+
+                let (rect, _) = ui
+                    .allocate_exact_size(egui::vec2(width, TAPE_HEIGHT), egui::Sense::hover());
+                paint_tape(ui.painter(), rect);
+            } else {
+                body(ui, &mut action);
+            }
         });
 
     action
