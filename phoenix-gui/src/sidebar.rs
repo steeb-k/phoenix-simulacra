@@ -1,5 +1,5 @@
 use eframe::egui;
-use egui::{Align2, Color32, Margin, Rect, Response, Rounding, Sense, Ui, Vec2};
+use egui::{Align2, Color32, Key, Margin, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2};
 
 use crate::fonts;
 use crate::theme::Palette;
@@ -20,6 +20,9 @@ struct NavItem {
     page: Page,
     label: &'static str,
     icon: &'static str,
+    /// Alt+key accelerator. Must match the first letter of `label` — the
+    /// underline hint drawn while Alt is held always sits under that letter.
+    key: Key,
 }
 
 const TOP_ITEMS: &[NavItem] = &[
@@ -27,26 +30,31 @@ const TOP_ITEMS: &[NavItem] = &[
         page: Page::Backup,
         label: "Backup",
         icon: egui_phosphor::regular::FLOPPY_DISK,
+        key: Key::B,
     },
     NavItem {
         page: Page::Clone,
         label: "Clone",
         icon: egui_phosphor::regular::COPY_SIMPLE,
+        key: Key::C,
     },
     NavItem {
         page: Page::Restore,
         label: "Restore",
         icon: egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE,
+        key: Key::R,
     },
     NavItem {
         page: Page::Verify,
         label: "Verify",
         icon: egui_phosphor::regular::SHIELD_CHECK,
+        key: Key::V,
     },
     NavItem {
         page: Page::Mount,
         label: "Mount",
         icon: egui_phosphor::regular::HARD_DRIVES,
+        key: Key::M,
     },
 ];
 
@@ -55,11 +63,13 @@ const BOTTOM_ITEMS: &[NavItem] = &[
         page: Page::History,
         label: "History",
         icon: egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE,
+        key: Key::H,
     },
     NavItem {
         page: Page::Options,
         label: "Options",
         icon: egui_phosphor::regular::GEAR,
+        key: Key::O,
     },
 ];
 
@@ -101,6 +111,18 @@ pub fn min_content_height() -> f32 {
 ///   * fixed bottom — History and Options, always pinned in view so they
 ///     don't disappear as the user shrinks the window.
 pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bool) {
+    // Alt+<first letter> jumps straight to a page. Consumed here (before any
+    // widget sees the key) but only while navigation is allowed, mirroring
+    // the click gating below. `consume_key` requires Alt to be the only
+    // modifier held, so Ctrl+Alt combos (e.g. AltGr input) pass through.
+    if !busy {
+        for item in TOP_ITEMS.iter().chain(BOTTOM_ITEMS) {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, item.key)) {
+                *current = item.page;
+            }
+        }
+    }
+
     egui::SidePanel::left("sidebar")
         .resizable(false)
         .exact_width(SIDEBAR_WIDTH)
@@ -231,14 +253,31 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
         icon_color,
     );
 
+    let label_font = fonts::regular(14.0);
     let text_pos = rect.left_center() + Vec2::new(42.0, 0.0);
-    painter.text(
+    let text_rect = painter.text(
         text_pos,
         Align2::LEFT_CENTER,
         item.label,
-        fonts::regular(14.0),
+        label_font.clone(),
         text_color,
     );
+
+    // While Alt is held (and navigation is allowed), underline the first
+    // letter as the accelerator hint, Windows-menu style.
+    let alt_held = ui.is_enabled() && ui.input(|i| i.modifiers.alt);
+    if alt_held {
+        let first = item.label.chars().next().unwrap_or('?');
+        let width = ui.fonts(|f| f.glyph_width(&label_font, first));
+        let y = text_rect.bottom() - 1.0;
+        painter.line_segment(
+            [
+                egui::pos2(text_rect.left(), y),
+                egui::pos2(text_rect.left() + width, y),
+            ],
+            Stroke::new(1.0, text_color),
+        );
+    }
 
     if response.clicked() {
         *current = item.page;
