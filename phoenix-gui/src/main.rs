@@ -1,5 +1,6 @@
 mod clone_panel;
 mod confirm_dialog;
+mod disk_dropdown;
 mod disk_map;
 mod disk_panel;
 mod fonts;
@@ -1630,35 +1631,56 @@ impl PhoenixApp {
                 }
             });
         });
-        ui.label(
-            egui::RichText::new("Choose the physical disk to restore the backup onto.")
-                .color(self.palette.subtle_text),
-        );
-        ui.add_space(4.0);
-
-        let selected_label = self
+        let selected_disk = self
             .disks
             .iter()
-            .find(|d| d.index == self.target_disk_index)
-            .map(format_disk_choice)
-            .unwrap_or_else(|| "Pick a target disk".to_string());
+            .find(|d| d.index == self.target_disk_index);
+        if selected_disk.is_none() {
+            ui.label(
+                egui::RichText::new("Choose the physical disk to restore the backup onto.")
+                    .color(self.palette.subtle_text),
+            );
+        }
+        ui.add_space(4.0);
 
-        // `from_id_salt` (rather than `from_label`) keeps the dropdown
-        // anonymous: the heading row above already announces what this
-        // control is, and a duplicate "Select target" tag next to the
-        // box would just be visual noise.
-        egui::ComboBox::from_id_salt("restore_target_disk")
-            .selected_text(selected_label)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for disk in &self.disks {
-                    ui.selectable_value(
-                        &mut self.target_disk_index,
-                        disk.index,
-                        format_disk_choice(disk),
-                    );
+        // Same rich dropdown as the Clone page: the closed face is the
+        // selected disk's live `[info card | partition map]` row, and the
+        // popup lists every disk the same way. The row here shows the
+        // target's CURRENT layout — the planned layout lives in the editor
+        // row the restore panel draws below.
+        let viewport_width = ui.available_width();
+        let palette = &self.palette;
+        let picked = disk_dropdown::disk_dropdown(
+            ui,
+            "restore_target_dropdown",
+            &self.disks,
+            selected_disk.map(|d| d.index),
+            None,
+            palette,
+            viewport_width,
+            |ui, face_width| match selected_disk {
+                Some(disk) => {
+                    let mut wants_open = false;
+                    egui::ScrollArea::horizontal()
+                        .id_salt("restore_target_face")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let row_width = face_width.max(disk_dropdown::min_row_width(disk));
+                            wants_open = disk_dropdown::draw_disk_list_row(
+                                ui, row_width, disk, true, false, palette,
+                            )
+                            .clicked;
+                        });
+                    wants_open
                 }
-            });
+                None => {
+                    disk_dropdown::draw_empty_face(ui, face_width, "Choose a target disk…", palette)
+                }
+            },
+        );
+        if let Some(idx) = picked {
+            self.target_disk_index = idx;
+        }
     }
 
     /// Greyed-when-busy portion of the Restore page.
@@ -2347,26 +2369,6 @@ fn describe_mounted_volumes(m: &phoenix_mount::ActiveMount) -> String {
         (true, _) => "no mountable volume in the selection".into(),
         (false, 0) => letters.join(", "),
         (false, n) => format!("{} (+{n} with no mountable volume)", letters.join(", ")),
-    }
-}
-
-/// Render a disk as the `"Disk N - 3.67 TB - Samsung SSD 970 EVO"` label
-/// used by the Restore page's target dropdown. The model segment is
-/// elided when `DiskInfo::model` is `None` (the IOCTL queried in
-/// `phoenix-core` failed) so the dropdown collapses cleanly to
-/// `"Disk N - 3.67 TB"` rather than printing a meaningless dangling
-/// dash.
-fn format_disk_choice(disk: &DiskInfo) -> String {
-    match disk.model.as_deref() {
-        Some(model) if !model.is_empty() => {
-            format!(
-                "Disk {} - {} - {}",
-                disk.index,
-                format_bytes(disk.size_bytes),
-                model
-            )
-        }
-        _ => format!("Disk {} - {}", disk.index, format_bytes(disk.size_bytes)),
     }
 }
 
