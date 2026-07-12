@@ -264,7 +264,9 @@ struct PhoenixApp {
     /// Set by Browse to load immediately on the next frame.
     restore_backup_load_now: bool,
     restore_layout: Option<restore_layout::RestoreLayoutState>,
-    target_disk_index: u32,
+    /// Restore page's chosen target disk; `None` until the user picks one
+    /// (deliberately never auto-selected — same contract as the Clone page).
+    target_disk_index: Option<u32>,
     /// Clone page state: chosen source/target disk indices and options.
     clone_source_index: Option<u32>,
     clone_target_index: Option<u32>,
@@ -344,7 +346,7 @@ impl PhoenixApp {
             restore_backup_load_after: None,
             restore_backup_load_now: false,
             restore_layout: None,
-            target_disk_index: 0,
+            target_disk_index: None,
             clone_source_index: None,
             clone_target_index: None,
             clone_expand: false,
@@ -434,13 +436,11 @@ impl PhoenixApp {
     }
 
     /// Reset the Restore page to its default: no backup chosen, no layout,
-    /// target snapped back to the first enumerated disk.
+    /// no target picked.
     fn reset_restore_page(&mut self) {
         self.restore_backup_path.clear();
         self.clear_restore_ui_state();
-        if let Some(first) = self.disks.first() {
-            self.target_disk_index = first.index;
-        }
+        self.target_disk_index = None;
     }
 
     /// Reset the Clone page to its untouched default (no disks picked, no
@@ -1588,8 +1588,12 @@ impl PhoenixApp {
             enabled: !busy && plan_ready,
             disabled_hint: Some(if busy {
                 "A restore is already running"
-            } else {
+            } else if self.restore_layout.is_none() {
                 "Choose a backup file first"
+            } else if self.target_disk_index.is_none() {
+                "Choose a target disk first"
+            } else {
+                "Map at least one partition onto the target"
             }),
         }];
         if action_row(ui, &self.palette, START_BUTTON_SIZE, &starts) == Some(0) {
@@ -1632,9 +1636,8 @@ impl PhoenixApp {
             });
         });
         let selected_disk = self
-            .disks
-            .iter()
-            .find(|d| d.index == self.target_disk_index);
+            .target_disk_index
+            .and_then(|t| self.disks.iter().find(|d| d.index == t));
         if selected_disk.is_none() {
             ui.label(
                 egui::RichText::new("Choose the physical disk to restore the backup onto.")
@@ -1679,7 +1682,7 @@ impl PhoenixApp {
             },
         );
         if let Some(idx) = picked {
-            self.target_disk_index = idx;
+            self.target_disk_index = Some(idx);
         }
     }
 
@@ -1714,9 +1717,8 @@ impl PhoenixApp {
         ui.add_space(4.0);
 
         if let Some(target) = self
-            .disks
-            .iter()
-            .find(|d| d.index == self.target_disk_index)
+            .target_disk_index
+            .and_then(|t| self.disks.iter().find(|d| d.index == t))
             .cloned()
         {
             if let Some(layout) = self.restore_layout.as_mut() {
@@ -1745,11 +1747,10 @@ impl PhoenixApp {
             return;
         };
         let Some(target) = self
-            .disks
-            .iter()
-            .find(|d| d.index == self.target_disk_index)
+            .target_disk_index
+            .and_then(|t| self.disks.iter().find(|d| d.index == t))
         else {
-            self.status = "Target disk not found".into();
+            self.status = "Choose a target disk first".into();
             return;
         };
         let plan = layout.to_restore_plan(target);
