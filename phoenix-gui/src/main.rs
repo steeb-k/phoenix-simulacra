@@ -425,6 +425,7 @@ impl PhoenixApp {
         };
         let job_kind = job.kind;
         let job_verified = job.verify_after;
+        let job_output = job.output.clone();
         if let Some(result) = job.poll() {
             // Capture the final step list before dropping the job so the
             // modal can keep showing it (with a Close button) after the
@@ -433,7 +434,21 @@ impl PhoenixApp {
             self.job = None;
             match result {
                 Ok(msg) => {
-                    if let Some(next) = self.pending_backups.pop() {
+                    if job_kind == JobKind::Verify && self.completed.is_some() {
+                        // The follow-up "Verify?" of a just-completed backup:
+                        // upgrade the parked completion modal in place instead
+                        // of replacing it with the verify job's own step list.
+                        self.status = msg;
+                        self.record_job(
+                            job_kind,
+                            phoenix_core::appdata::JobOutcome::Success,
+                            &final_snap,
+                        );
+                        self.job_started = None;
+                        if let Some(completed) = self.completed.as_mut() {
+                            completed.success_banner = Some("Completed and verified.".to_string());
+                        }
+                    } else if let Some(next) = self.pending_backups.pop() {
                         self.current_backup_index += 1;
                         let path_display = next.output.display().to_string();
                         self.status = format!(
@@ -442,7 +457,8 @@ impl PhoenixApp {
                         );
                         self.job = Some(spawn_backup(next));
                     } else {
-                        self.status = if self.total_backups > 1 {
+                        let multi = self.total_backups > 1;
+                        self.status = if multi {
                             format!("All {} backups completed", self.total_backups)
                         } else {
                             msg
@@ -458,7 +474,20 @@ impl PhoenixApp {
                             &final_snap,
                         );
                         self.job_started = None;
-                        self.finish_modal(job_kind, &final_snap, JobOutcome::Success, job_verified);
+                        // Offer "Verify?" only for a single unverified backup:
+                        // for a multi-disk run the parked modal represents the
+                        // whole queue, but the job only knows its own file.
+                        let verify_target =
+                            (job_kind == JobKind::Backup && !job_verified && !multi)
+                                .then_some(job_output)
+                                .flatten();
+                        self.finish_modal(
+                            job_kind,
+                            &final_snap,
+                            JobOutcome::Success,
+                            job_verified,
+                            verify_target,
+                        );
                     }
                 }
                 Err(e) => {
@@ -495,7 +524,7 @@ impl PhoenixApp {
                     };
                     self.record_job(job_kind, rec_outcome, &final_snap);
                     self.job_started = None;
-                    self.finish_modal(job_kind, &final_snap, outcome, job_verified);
+                    self.finish_modal(job_kind, &final_snap, outcome, job_verified, None);
                 }
             }
         } else {
@@ -512,6 +541,7 @@ impl PhoenixApp {
         snap: &phoenix_core::ProgressSnapshot,
         outcome: JobOutcome,
         verified_backup: bool,
+        verify_target: Option<std::path::PathBuf>,
     ) {
         // A successful backup swaps the progress bar + checklist for a big
         // green checkmark; the banner text records whether the verify pass ran.
@@ -530,7 +560,27 @@ impl PhoenixApp {
             outcome,
             message: self.status.clone(),
             success_banner,
+            verify_target,
         });
+    }
+
+    /// "Verify?" on an unverified completed backup: append a verify line to
+    /// the parked checklist and run a full image verify of the file just
+    /// written. While it runs, `show_status_modal` renders the parked backup
+    /// steps with the verify job's live progress; on success `poll_job`
+    /// upgrades the banner to "Completed and verified." in place.
+    fn start_completed_verify(&mut self) {
+        let Some(completed) = self.completed.as_mut() else {
+            return;
+        };
+        let Some(path) = completed.verify_target.take() else {
+            return;
+        };
+        completed.steps.push("Verifying backup".to_string());
+        completed.current_step = completed.steps.len() - 1;
+        self.status = format!("Verifying {}…", path.display());
+        self.job = Some(spawn_verify(path, false));
+        self.job_started = None;
     }
 
     /// Request the active worker to wind down at the next chunk boundary
@@ -640,7 +690,27 @@ impl PhoenixApp {
     /// is awaiting dismissal, then act on the user's Cancel/Close click.
     fn show_status_modal(&mut self, ctx: &egui::Context) {
         let mut action = ModalAction::None;
-        if let Some(completed) = &self.completed {
+        if let (Some(completed), Some(job)) = (&self.completed, &self.job) {
+            // A follow-up "Verify?" is running over a parked completed backup
+            // (the only state where both exist): show the backup's finished
+            // checklist — with the "Verifying backup" line appended by
+            // `start_completed_verify` — driven by the verify job's live
+            // progress bar and detail.
+            let snap = job.progress.snapshot();
+            let view = ModalView {
+                title: "Verifying",
+                steps: &completed.steps,
+                current_step: completed.current_step,
+                detail: &snap.detail,
+                fraction: snap.fraction(),
+                current_bytes: snap.current,
+                total_bytes: snap.total,
+                outcome: None,
+                success_banner: None,
+                offer_verify: false,
+            };
+            action = status_modal::show(ctx, &self.palette, &view);
+        } else if let Some(completed) = &self.completed {
             let view = ModalView {
                 title: &completed.title,
                 steps: &completed.steps,
@@ -651,6 +721,7 @@ impl PhoenixApp {
                 total_bytes: 0,
                 outcome: Some(completed.outcome),
                 success_banner: completed.success_banner.as_deref(),
+                offer_verify: completed.verify_target.is_some(),
             };
             action = status_modal::show(ctx, &self.palette, &view);
         } else if let Some(job) = &self.job {
@@ -677,6 +748,7 @@ impl PhoenixApp {
                 total_bytes: snap.total,
                 outcome: None,
                 success_banner: None,
+                offer_verify: false,
             };
             action = status_modal::show(ctx, &self.palette, &view);
         }
@@ -684,6 +756,7 @@ impl PhoenixApp {
         match action {
             ModalAction::Cancel => self.cancel_current_job(),
             ModalAction::Close => self.completed = None,
+            ModalAction::Verify => self.start_completed_verify(),
             ModalAction::None => {}
         }
     }

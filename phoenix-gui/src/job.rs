@@ -60,6 +60,9 @@ pub struct BackgroundJob {
     /// Drives the "Completed and verified." vs "Completed. Unverified."
     /// success screen in the status modal. Always false for non-backup jobs.
     pub verify_after: bool,
+    /// The `.phnx` file a backup job writes, kept so the finished modal can
+    /// offer an after-the-fact "Verify?" of it. None for non-backup jobs.
+    pub output: Option<PathBuf>,
     pub progress: ProgressHandle,
     rx: mpsc::Receiver<JobResult>,
     /// Kept so we can `join()` the worker and recover its panic payload if
@@ -130,6 +133,7 @@ where
     BackgroundJob {
         kind,
         verify_after: false,
+        output: None,
         progress,
         rx,
         handle: Some(handle),
@@ -143,6 +147,7 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
 
     let verify_after = opts.verify_after;
     let output_path = opts.output.clone();
+    let output_for_job = opts.output.clone();
     let output_display = output_path.display().to_string();
     let disk_index = opts.disk_index;
     let partitions = opts.partition_indices.clone();
@@ -208,6 +213,7 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
             .map_err(|e| e.to_string())
     });
     job.verify_after = verify_after;
+    job.output = Some(output_for_job);
     job
 }
 

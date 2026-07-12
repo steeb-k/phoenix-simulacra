@@ -35,6 +35,10 @@ pub struct CompletedJob {
     /// "Completed. Unverified."), the finished modal replaces the progress
     /// bar and step checklist with a big green checkmark over this text.
     pub success_banner: Option<String>,
+    /// The `.phnx` file this (successful, unverified, single-disk) backup
+    /// wrote. When set, the finished modal offers a "Verify?" button that
+    /// runs a full image verify of the file after the fact.
+    pub verify_target: Option<std::path::PathBuf>,
 }
 
 /// What the user did with the modal this frame.
@@ -43,6 +47,9 @@ pub enum ModalAction {
     None,
     Cancel,
     Close,
+    /// "Verify?" on an unverified completed backup: run a full image verify
+    /// of [`CompletedJob::verify_target`].
+    Verify,
 }
 
 /// Everything the modal needs to render one frame.
@@ -61,11 +68,14 @@ pub struct ModalView<'a> {
     /// See [`CompletedJob::success_banner`]. Only honored together with
     /// `Some(JobOutcome::Success)`.
     pub success_banner: Option<&'a str>,
+    /// Offer the "Verify?" button above Close (finished, unverified backups).
+    pub offer_verify: bool,
 }
 
 const MODAL_WIDTH: f32 = 460.0;
 const CANCEL_BUTTON_ID: &str = "status_modal_cancel";
 const CLOSE_BUTTON_ID: &str = "status_modal_close";
+const VERIFY_BUTTON_ID: &str = "status_modal_verify";
 /// How long the user must hold the Cancel button before the job is actually
 /// cancelled. A deliberate friction so a stray click can't kill a long backup.
 const CANCEL_HOLD_SECS: f32 = 1.5;
@@ -354,6 +364,26 @@ fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> Mo
             } else {
                 outcome_color(palette, outcome)
             };
+            // Unverified backup: offer an after-the-fact verify of the file
+            // just written, as a quieter secondary button above Close.
+            if view.offer_verify {
+                let vresp = ui
+                    .push_id(egui::Id::new(VERIFY_BUTTON_ID), |ui| {
+                        ui.add_sized(
+                            [160.0, 34.0],
+                            egui::Button::new(
+                                RichText::new("Verify?")
+                                    .size(13.0)
+                                    .color(palette.icon_color),
+                            ),
+                        )
+                    })
+                    .inner;
+                if vresp.clicked() {
+                    action = ModalAction::Verify;
+                }
+                ui.add_space(6.0);
+            }
             let resp = ui
                 .push_id(egui::Id::new(CLOSE_BUTTON_ID), |ui| {
                     ui.add_sized(
