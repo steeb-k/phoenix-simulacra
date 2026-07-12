@@ -1,8 +1,16 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
 
 const REGULAR: &str = "inter-regular";
 const BOLD: &str = "inter-bold";
 const PHOSPHOR: &str = "phosphor";
+const CAPTION: &str = "caption-icons";
+
+/// Whether the system caption-glyph font (Segoe Fluent Icons / Segoe MDL2
+/// Assets) was found and registered. Read via [`caption_icon`]; the titlebar
+/// falls back to phosphor glyphs when it's absent (non-Windows dev builds).
+static CAPTION_LOADED: AtomicBool = AtomicBool::new(false);
 
 /// Register Inter Regular/Bold (embedded at compile time) and Phosphor icons,
 /// then map egui text styles so headings use the bold face.
@@ -31,6 +39,20 @@ pub fn install(ctx: &egui::Context) {
         FontFamily::Name(BOLD.into()),
         vec![BOLD.into(), REGULAR.into()],
     );
+
+    // The caption buttons (minimize/maximize/close) render the exact glyphs
+    // native Windows titlebars use: Segoe Fluent Icons on Windows 11, Segoe
+    // MDL2 Assets on Windows 10 (same codepoints). Loaded from the system
+    // font directory at runtime — these fonts are not redistributable, and
+    // every supported Windows install ships one of them.
+    if let Some(data) = load_caption_font() {
+        fonts.font_data.insert(CAPTION.into(), data);
+        fonts.families.insert(
+            FontFamily::Name(CAPTION.into()),
+            vec![CAPTION.into(), REGULAR.into()],
+        );
+        CAPTION_LOADED.store(true, Ordering::Relaxed);
+    }
 
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
@@ -94,4 +116,30 @@ pub fn regular(size: f32) -> FontId {
 
 pub fn icon(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(PHOSPHOR.into()))
+}
+
+/// FontId for the native Windows caption glyphs, or `None` when no system
+/// caption font was found at startup.
+pub fn caption_icon(size: f32) -> Option<FontId> {
+    CAPTION_LOADED
+        .load(Ordering::Relaxed)
+        .then(|| FontId::new(size, FontFamily::Name(CAPTION.into())))
+}
+
+#[cfg(target_os = "windows")]
+fn load_caption_font() -> Option<FontData> {
+    let windir = std::env::var_os("WINDIR")?;
+    let fonts_dir = std::path::PathBuf::from(windir).join("Fonts");
+    // Windows 11 first (Segoe Fluent Icons), then the Windows 10 equivalent.
+    for file in ["SegoeIcons.ttf", "segmdl2.ttf"] {
+        if let Ok(bytes) = std::fs::read(fonts_dir.join(file)) {
+            return Some(FontData::from_owned(bytes));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn load_caption_font() -> Option<FontData> {
+    None
 }

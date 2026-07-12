@@ -8,6 +8,7 @@ mod restore_panel;
 mod sidebar;
 mod status_modal;
 mod theme;
+mod titlebar;
 mod util;
 mod version;
 
@@ -82,10 +83,16 @@ const MIN_WINDOW_WIDTH: f32 = 640.0;
 fn main() -> eframe::Result<()> {
     let _log_guard = init_logging();
 
-    let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
+    let min_height =
+        sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE + titlebar::TITLEBAR_HEIGHT;
     let options = eframe::NativeOptions {
+        // Chromeless: the OS titlebar is replaced by `titlebar::show` (custom
+        // caption strip + Win11-style control box) and, on Windows, a wndproc
+        // subclass that restores all native frame behavior (drag, edge
+        // resize, snap, system menu) — see `titlebar::install`.
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            .with_decorations(false)
+            .with_inner_size([1100.0, 752.0])
             .with_min_inner_size([MIN_WINDOW_WIDTH, min_height])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
@@ -244,6 +251,20 @@ impl PhoenixApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         fonts::install(&cc.egui_ctx);
+
+        // Hook the native window for the chromeless titlebar: DWM shadow +
+        // rounded corners, and the WM_NCHITTEST subclass that makes drag,
+        // edge-resize, Aero Snap, and the Snap Layouts flyout behave exactly
+        // like a decorated window.
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = cc.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    titlebar::install(h.hwnd.get(), cc.egui_ctx.clone());
+                }
+            }
+        }
 
         let settings = phoenix_core::appdata::Settings::load();
         let palette = theme::refresh(&cc.egui_ctx, settings.theme);
@@ -646,6 +667,10 @@ impl eframe::App for PhoenixApp {
 
         let busy = self.busy();
         let modal_open = self.modal_open();
+        // Custom caption strip first so it spans the full window width; the
+        // sidebar and status bar share its fill, extending the L-shaped
+        // surface into a frame around the central panel.
+        titlebar::show(ctx, &self.palette);
         sidebar::show(ctx, &mut self.page, &self.palette, modal_open);
 
         // Slim bottom status line for idle/non-job messages (disk count,
@@ -664,10 +689,12 @@ impl eframe::App for PhoenixApp {
                 });
             });
 
-        // Only the bottom-left corner is rounded: it nestles into the L
-        // formed by the sidebar and status bar. The cutout shows through to
+        // The left corners are rounded: they nestle into the frame formed by
+        // the titlebar, sidebar, and status bar. The right edge still sits on
+        // the window edge and stays square. The cutouts show through to
         // `clear_color` (sidebar_bg).
         let panel_rounding = egui::Rounding {
+            nw: 10.0,
             sw: 10.0,
             ..egui::Rounding::ZERO
         };
@@ -692,14 +719,15 @@ impl eframe::App for PhoenixApp {
                 });
             });
 
-        // 1px outline along the panel's edge against the sidebar/status-bar
-        // L. Drawn by hand rather than via `Frame::stroke` because the top
-        // and right sides sit on the window edge and must stay line-free:
-        // pushing those sides 1px past the screen clips their stroke away,
-        // leaving only the left edge, bottom edge, and the rounded corner.
+        // 1px outline along the panel's edge against the titlebar/sidebar/
+        // status-bar frame. Drawn by hand rather than via `Frame::stroke`
+        // because the right side sits on the window edge and must stay
+        // line-free: pushing that side 1px past the screen clips its stroke
+        // away, leaving the top, left, and bottom edges and the rounded
+        // corners.
         let rect = central.response.rect;
         let border_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x, rect.min.y - 1.0),
+            egui::pos2(rect.min.x, rect.min.y),
             egui::pos2(rect.max.x + 1.0, rect.max.y),
         );
         ctx.layer_painter(egui::LayerId::background()).rect_stroke(
