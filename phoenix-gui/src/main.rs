@@ -43,16 +43,8 @@ const REFRESH_ICON_SIZE: f32 = 32.0;
 /// Tuned to comfortably fit those labels at 16pt so the buttons render
 /// at a consistent width across pages.
 const FORM_BUTTON_W: f32 = 130.0;
-/// Padding added back to a `TextEdit::singleline` response rect to recover
-/// its outer visible height — `TextEdit::ui` subtracts its margin from
-/// the returned rect, so `response.rect.height() + INPUT_MARGIN_RESTORE`
-/// equals the field's visible outer height. With our `margin(10, 8)`
-/// that's `2 * 8 = 16`.
-const INPUT_MARGIN_RESTORE: f32 = 16.0;
-/// Default height for the colored Start/Cancel action buttons on pages
-/// that don't have a nearby `TextEdit` response to measure from
-/// (Restore, Verify). Tuned to match the Backup page's computed
-/// `input_height` (roughly 16pt text + 2×8px TextEdit margin).
+/// Uniform height for the standard form controls (TextEdit + Browse rows,
+/// colored action buttons). Roughly 16pt text + 2×8px TextEdit margin.
 const ACTION_BUTTON_HEIGHT: f32 = 36.0;
 /// Horizontal inner margin of the central panel — every page's content
 /// starts this far from the panel edges.
@@ -1158,11 +1150,12 @@ fn action_row(
     clicked_start
 }
 
-/// Bold "label + TextEdit + Browse…" row used by both the Verify and Restore
-/// pages for picking an existing `.phnx` file. Mirrors the styling of the
-/// "Save backup to folder" row on the Backup page: 14pt bold label, 16pt
-/// field text with `(10, 8)` margins, and a `Browse…` button whose width
-/// is reserved on the right so it never falls off the side of the pane.
+/// Bold "label + TextEdit + Browse…" row used by the Verify, Restore, and
+/// Mount pages for picking an existing `.phnx` file. Duplicates the Backup
+/// page's "Target" row: inline 14pt bold label, field and button both
+/// forced into `ACTION_BUTTON_HEIGHT` boxes via `add_sized` so they line
+/// up exactly, and the button's width reserved on the right so the field
+/// can't push it past the pane edge.
 ///
 /// When `on_path_changed` is `Some`, it is called after the text field
 /// loses focus with a changed value, and immediately after Browse picks a file.
@@ -1174,18 +1167,16 @@ fn backup_path_picker(
     path: &mut String,
     mut on_path_changed: Option<&mut dyn FnMut()>,
 ) -> bool {
-    ui.label(egui::RichText::new(label).font(fonts::bold(14.0)));
     ui.horizontal(|ui| {
-        // Same trick as the folder picker on the Backup page: take the
-        // button's fixed width out of `available_width` before sizing the
-        // field, so the field can't grow tall enough to push Browse past
-        // the right edge of the central panel.
+        ui.label(egui::RichText::new(label).font(fonts::bold(14.0)));
+
         let spacing = ui.spacing().item_spacing.x;
         let text_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
 
-        let field_response = ui.add(
+        let field_response = ui.add_sized(
+            [text_w, ACTION_BUTTON_HEIGHT],
             egui::TextEdit::singleline(path)
-                .desired_width(text_w)
+                .desired_width(f32::INFINITY)
                 .font(fonts::regular(16.0))
                 .hint_text_font(fonts::regular(16.0))
                 .margin(egui::Margin::symmetric(10.0, 8.0))
@@ -1197,16 +1188,18 @@ fn backup_path_picker(
             }
         }
 
-        // Outer (visible) height of the TextEdit — the response rect is
-        // the inner text area, so add back the vertical margin to get the
-        // height the user actually sees and size Browse to match.
-        let visible_h = field_response.rect.height() + INPUT_MARGIN_RESTORE;
-
+        let browse_label = icon_label(
+            egui_phosphor::regular::FOLDER,
+            16.0,
+            "Browse…",
+            14.0,
+            ui.visuals().widgets.inactive.fg_stroke.color,
+        );
         let mut browsed = false;
         if ui
             .add_sized(
-                [FORM_BUTTON_W, visible_h],
-                egui::Button::new(egui::RichText::new("Browse…").font(fonts::regular(16.0))),
+                [FORM_BUTTON_W, ACTION_BUTTON_HEIGHT],
+                egui::Button::new(browse_label),
             )
             .clicked()
         {
@@ -1567,12 +1560,7 @@ impl PhoenixApp {
     }
 
     fn ui_restore(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_header(
-            ui,
-            &self.palette,
-            "Restore",
-            "Apply a .phnx backup back onto a target disk.",
-        );
+        page_header(ui, &self.palette, "Restore", "");
 
         ui.add_enabled_ui(!busy, |ui| {
             self.ui_restore_form(ui);
