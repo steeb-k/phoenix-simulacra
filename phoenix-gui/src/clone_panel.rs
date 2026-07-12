@@ -11,7 +11,7 @@
 //! move/resize/delete editing as a partial restore.
 
 use eframe::egui;
-use egui::{CursorIcon, Rect, Rounding, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CursorIcon, Sense, Stroke, Ui, Vec2};
 
 use phoenix_core::disk::DiskInfo;
 
@@ -278,40 +278,20 @@ fn mode_button(ui: &mut Ui, icon: &str, label: &str, selected: bool, palette: &P
 }
 
 /// Big source→target arrow between the two dropdowns, centered on the
-/// visible viewport (not the virtual scroll width). Painted as a filled
-/// shaft + head rather than a phosphor glyph: the icon font only ships the
-/// outline variant, and this wants to read as one solid accent-colored mark.
+/// visible viewport (not the virtual scroll width). Monochrome — white in
+/// dark mode, black in light — so it reads as plumbing, not an action.
 fn draw_flow_arrow(ui: &mut Ui, palette: &Palette, viewport_width: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(viewport_width, 52.0), Sense::hover());
-    let c = rect.center();
-    let w = 40.0; // head width
-    let h = 42.0; // total height
-    let shaft_w = w * 0.45;
-    let head_h = h * 0.45;
-    let top = c.y - h / 2.0;
-    let bottom = c.y + h / 2.0;
-    let painter = ui.painter();
-    // Shaft overlaps the head by half a pixel so anti-aliasing can't open a
-    // hairline seam between the two shapes.
-    painter.rect_filled(
-        Rect::from_min_max(
-            egui::pos2(c.x - shaft_w / 2.0, top),
-            egui::pos2(c.x + shaft_w / 2.0, bottom - head_h + 0.5),
-        ),
-        Rounding {
-            nw: 2.0,
-            ne: 2.0,
-            ..Rounding::ZERO
-        },
-        palette.accent,
+    let color = if palette.light_mode {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        egui_phosphor::fill::ARROW_FAT_LINES_DOWN,
+        crate::fonts::icon_fill(42.0),
+        color,
     );
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(c.x - w / 2.0, bottom - head_h),
-            egui::pos2(c.x + w / 2.0, bottom - head_h),
-            egui::pos2(c.x, bottom),
-        ],
-        palette.accent,
-        Stroke::NONE,
-    ));
 }
