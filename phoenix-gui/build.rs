@@ -20,7 +20,7 @@ fn embed_windows_resources() {
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let manifest = root.join("windows").join("admin.manifest");
-    let icon = root.join("assets").join("carbon-phoenix-appicon.ico");
+    let icon = root.join("assets").join("carbon-phoenix-appicon2.ico");
 
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-changed={}", icon.display());
@@ -30,7 +30,7 @@ fn embed_windows_resources() {
         .expect("admin.manifest path must be valid UTF-8");
     let icon_str = icon
         .to_str()
-        .expect("carbon-phoenix-appicon.ico path must be valid UTF-8");
+        .expect("carbon-phoenix-appicon2.ico path must be valid UTF-8");
 
     winres::WindowsResource::new()
         .set_manifest_file(manifest_str)
