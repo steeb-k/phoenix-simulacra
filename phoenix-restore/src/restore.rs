@@ -594,7 +594,6 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             disk.index,
             entry.target_offset_bytes,
             entry.target_size_bytes,
-            idx_entry.sector_size as u64,
         ) {
             warn!(
                 partition = src_index,

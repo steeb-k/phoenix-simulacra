@@ -70,7 +70,10 @@ fn oob(width: usize, off: usize, len: usize) -> PhoenixError {
 /// 64 ClustersPerFileRecordSegment).
 #[derive(Debug, Clone, Copy)]
 struct NtfsBoot {
-    bytes_per_sector: u64,
+    // No `bytes_per_sector` field on purpose. It is read from the boot sector to
+    // derive `cluster_size`, but it is NOT the MFT fixup stride — that comes from
+    // each record's own USA count (see `fixup_stride`). Keeping it here is what
+    // let the fixup code reach for the wrong number and break on 4Kn.
     cluster_size: u64,
     mft_lcn: u64,
     mft_mirror_lcn: u64,
@@ -85,7 +88,7 @@ fn read_ntfs_boot(writer: &mut PartitionWriter) -> Result<NtfsBoot> {
             "boot sector is not NTFS (expected 'NTFS' at offset 3); cannot rewrite metadata".into(),
         ));
     }
-    let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]) as u64;
+    let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]) as u64; // cluster math only
     let sectors_per_cluster = sector[13] as u64;
     if bytes_per_sector == 0 || sectors_per_cluster == 0 {
         return Err(PhoenixError::Other(
@@ -114,7 +117,6 @@ fn read_ntfs_boot(writer: &mut PartitionWriter) -> Result<NtfsBoot> {
         );
     }
     Ok(NtfsBoot {
-        bytes_per_sector,
         cluster_size,
         mft_lcn,
         mft_mirror_lcn,
@@ -122,12 +124,44 @@ fn read_ntfs_boot(writer: &mut PartitionWriter) -> Result<NtfsBoot> {
     })
 }
 
+/// The byte stride between NTFS Update Sequence Array fixups, derived from the
+/// record itself.
+///
+/// This used to be the volume's `bytes_per_sector`, which is right up until it
+/// isn't: Windows formats a **4Kn** volume with `bytes_per_sector = 4096` but
+/// still uses **1024-byte MFT records**, so a "sector" is four times bigger than
+/// the whole record and the first fixup boundary lands past its end. That is
+/// exactly the error a 4Kn restore hit: "MFT record sector boundary 4096 past
+/// record length 1024".
+///
+/// The record already carries the answer. `usa_size_words` is one USN plus one
+/// entry per protected stride, so `record_len / (usa_size_words - 1)` is the
+/// stride NTFS actually used — 512 on both 512e and 4Kn volumes, which is what
+/// the doc comment above always claimed. Deriving it means we cannot disagree
+/// with the record we are about to rewrite.
+fn fixup_stride(record_len: usize, usa_size_words: usize) -> Result<usize> {
+    let strides = usa_size_words - 1; // callers guarantee usa_size_words >= 2
+    if strides == 0 || !record_len.is_multiple_of(strides) {
+        return Err(PhoenixError::Other(format!(
+            "MFT record length {record_len} is not divisible into {strides} fixup strides \
+             (USA size {usa_size_words}); record is malformed"
+        )));
+    }
+    let stride = record_len / strides;
+    if stride < 2 {
+        return Err(PhoenixError::Other(format!(
+            "MFT fixup stride {stride} is too small to hold a USN"
+        )));
+    }
+    Ok(stride)
+}
+
 /// Apply NTFS Update Sequence Array (USA) fixups to a record buffer
 /// read from disk. NTFS overwrites the last 2 bytes of each
 /// 512-byte sector with the record's USN as a corruption-detection
 /// hack; the original 2-byte values live in the USA. This puts them
 /// back so the record is the in-memory view that the spec describes.
-fn apply_fixups_for_read(record: &mut [u8], bytes_per_sector: u64) -> Result<()> {
+fn apply_fixups_for_read(record: &mut [u8]) -> Result<()> {
     if record.len() < 8 || &record[0..4] != b"FILE" {
         return Err(PhoenixError::Other(
             "MFT record missing 'FILE' magic; record may be unallocated or fixups already broken"
@@ -142,7 +176,7 @@ fn apply_fixups_for_read(record: &mut [u8], bytes_per_sector: u64) -> Result<()>
         ));
     }
     let usn = u16::from_le_bytes([record[usa_offset], record[usa_offset + 1]]);
-    let bps = bytes_per_sector as usize;
+    let bps = fixup_stride(record.len(), usa_size_words)?;
     for i in 1..usa_size_words {
         let sector_end = i * bps;
         if sector_end > record.len() {
@@ -167,7 +201,7 @@ fn apply_fixups_for_read(record: &mut [u8], bytes_per_sector: u64) -> Result<()>
     Ok(())
 }
 
-fn apply_fixups_for_write(record: &mut [u8], bytes_per_sector: u64) -> Result<()> {
+fn apply_fixups_for_write(record: &mut [u8]) -> Result<()> {
     if record.len() < 8 {
         return Err(PhoenixError::InvalidFormat(
             "MFT record too short for a USA header".into(),
@@ -183,7 +217,10 @@ fn apply_fixups_for_write(record: &mut [u8], bytes_per_sector: u64) -> Result<()
     let usn = le_u16(record, usa_offset)?.wrapping_add(1);
     record[usa_offset] = (usn & 0xFF) as u8;
     record[usa_offset + 1] = (usn >> 8) as u8;
-    let bps = bytes_per_sector as usize;
+    // Same derivation as the read path: the record's own USA count, not the
+    // volume's sector size (which is 4096 on 4Kn while records stay 1024).
+    let bps = fixup_stride(record.len(), usa_size_words)
+        .map_err(|e| PhoenixError::InvalidFormat(e.to_string()))?;
     for i in 1..usa_size_words {
         let sector_end = i * bps;
         if sector_end < 2 || sector_end > record.len() {
@@ -496,7 +533,7 @@ fn build_mft_extents_in_bytes(
     let mft_offset_bytes = mft_lcn_dst * boot.cluster_size;
     let mut record0 = vec![0u8; boot.bytes_per_record as usize];
     writer.read_at(mft_offset_bytes, &mut record0)?;
-    apply_fixups_for_read(&mut record0, boot.bytes_per_sector)?;
+    apply_fixups_for_read(&mut record0)?;
     let runs = find_unnamed_data_runs(&record0)?;
     let translated = relocate_runs(&runs, map);
     let mut out = Vec::new();
@@ -549,10 +586,10 @@ fn walk_and_rewrite_mft(
         if &buf[0..4] != b"FILE" {
             continue;
         }
-        apply_fixups_for_read(&mut buf, boot.bytes_per_sector)?;
+        apply_fixups_for_read(&mut buf)?;
         let changed = rewrite_record_runs(&mut buf, map, idx)?;
         if changed {
-            apply_fixups_for_write(&mut buf, boot.bytes_per_sector)?;
+            apply_fixups_for_write(&mut buf)?;
             writer.write_at(off, &buf)?;
             rewritten += 1;
         }
@@ -578,7 +615,7 @@ fn rewrite_bitmap(
     if &buf[0..4] != b"FILE" {
         return Ok(());
     }
-    apply_fixups_for_read(&mut buf, boot.bytes_per_sector)?;
+    apply_fixups_for_read(&mut buf)?;
     let runs = find_unnamed_data_runs(&buf)?;
     let translated = relocate_runs(&runs, map);
 
@@ -653,7 +690,7 @@ fn stamp_logfile(
     if &buf[0..4] != b"FILE" {
         return Ok(());
     }
-    apply_fixups_for_read(&mut buf, boot.bytes_per_sector)?;
+    apply_fixups_for_read(&mut buf)?;
     let runs = find_unnamed_data_runs(&buf)?;
     let translated = relocate_runs(&runs, map);
     let blank_cluster = vec![0xFFu8; boot.cluster_size as usize];
@@ -794,9 +831,9 @@ mod tests {
             let mut rec = buf.clone();
             let _ = rewrite_record_runs(&mut rec, &empty_map, 0);
             let mut rec2 = buf.clone();
-            let _ = apply_fixups_for_read(&mut rec2, 512);
+            let _ = apply_fixups_for_read(&mut rec2);
             let mut rec3 = buf.clone();
-            let _ = apply_fixups_for_write(&mut rec3, 512);
+            let _ = apply_fixups_for_write(&mut rec3);
         }
     }
 

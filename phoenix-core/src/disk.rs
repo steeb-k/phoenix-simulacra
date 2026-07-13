@@ -967,7 +967,13 @@ enum LayoutInfo {
 /// here; that value drives I/O alignment in the capture/restore paths (the
 /// on-disk extent unit itself stays a fixed 512-byte LBA — see the format
 /// spec — so this only affects read/write alignment, not extent math).
-fn get_sector_size(handle: HANDLE) -> u32 {
+// `HANDLE` is a raw pointer in the type system, but it is never dereferenced
+// here: it is handed to `DeviceIoControl`, which the kernel validates and fails
+// cleanly on a bad handle. Callers (restore's layout writer and NTFS extender)
+// already hold an open device handle and want its geometry — asking them to
+// wrap this in `unsafe` would imply a soundness obligation that doesn't exist.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn get_sector_size(handle: HANDLE) -> u32 {
     // Value of CTL_CODE(IOCTL_DISK_BASE, 0x0028, METHOD_BUFFERED, FILE_ANY_ACCESS).
     const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
     // DISK_GEOMETRY_EX begins with DISK_GEOMETRY; BytesPerSector is the last

@@ -37,6 +37,26 @@ impl SyntheticVhd {
     /// Build the synthesized disk from an opened backup. Consumes the reader
     /// (the chunk store owns it for on-demand reads).
     pub fn build(reader: PhnxReader) -> Result<Self> {
+        // This synthesizes a **fixed VHD**, whose format mandates 512-byte
+        // sectors, and every structure below (protective MBR, GPT LBAs, footer)
+        // is built on that. A volume captured from a 4Kn disk carries
+        // `BytesPerSector = 4096` in its own boot sector, and NTFS refuses to
+        // mount when the filesystem's sector size disagrees with the device's.
+        //
+        // So such a backup can be attached but never mounted. Refuse it here,
+        // where we can say why, instead of handing the user a disk that shows up
+        // as RAW and looks like data loss. Real support needs the VHDX path
+        // (4096-byte logical sectors) noted below.
+        let src_sector = reader.manifest.disk.sector_size;
+        if src_sector > 512 {
+            return Err(PhoenixError::Other(format!(
+                "this backup came from a {src_sector}-byte-sector (4Kn) disk, and mounting \
+                 synthesizes a fixed VHD, which the format pins to 512-byte sectors. Windows \
+                 would attach the disk but refuse to mount its volumes. Restore it to a 4Kn \
+                 disk instead; mounting 4Kn backups needs the VHDX path (not yet implemented)"
+            )));
+        }
+
         let (spans, raw_disk_size) = plan_layout(&reader, ALIGN);
         // Round up to a sector multiple and leave room for the trailing GPT +
         // footer beyond the last partition.

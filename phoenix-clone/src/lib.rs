@@ -327,7 +327,7 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
 
     // --- Grow NTFS volumes that were cloned into a larger partition ---
     for (offset, size) in grown_ntfs {
-        if let Err(e) = extend_ntfs_volume(target.index, offset, size, target.sector_size as u64) {
+        if let Err(e) = extend_ntfs_volume(target.index, offset, size) {
             warn!(offset, size, error = %e, "extend_ntfs_volume after clone failed (non-fatal)");
         }
     }

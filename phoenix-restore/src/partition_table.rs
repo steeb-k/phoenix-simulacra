@@ -473,6 +473,12 @@ fn set_drive_layout_mbr(handle: HANDLE, entries: &[MbrEntry]) -> Result<()> {
         CheckSum: 0,
     };
 
+    // `HiddenSectors` is the partition's start LBA, counted in the DEVICE's
+    // sectors — so it scales with the sector size, and dividing by a hardcoded
+    // 512 overstated it 8x on a 4Kn disk. (4Kn + MBR is unusual — Windows wants
+    // GPT to boot 4Kn — but a data disk can still be laid out this way.)
+    let sector_size = phoenix_core::disk::get_sector_size(handle).max(512) as u64;
+
     let entry_ptr = layout.PartitionEntry.as_mut_ptr();
     for (i, entry) in entries.iter().enumerate() {
         let part = unsafe { &mut *entry_ptr.add(i) };
@@ -485,7 +491,7 @@ fn set_drive_layout_mbr(handle: HANDLE, entries: &[MbrEntry]) -> Result<()> {
             PartitionType: entry.partition_type,
             BootIndicator: if entry.bootable { 1 } else { 0 },
             RecognizedPartition: 1,
-            HiddenSectors: (entry.offset_bytes / 512) as u32,
+            HiddenSectors: (entry.offset_bytes / sector_size) as u32,
             PartitionId: GUID {
                 data1: 0,
                 data2: 0,
@@ -539,7 +545,11 @@ fn set_drive_layout(
     let layout = unsafe { &mut *(buffer.as_mut_ptr() as *mut DRIVE_LAYOUT_INFORMATION_EX) };
     layout.PartitionStyle = PARTITION_STYLE_GPT as u32;
     layout.PartitionCount = entries.len() as u32;
-    let sector_size: u64 = 512;
+    // The GPT reserves are LBA counts, so the usable region depends on the
+    // disk's logical sector size. Ask the device: this was hardcoded to 512,
+    // which on a 4Kn disk put StartingUsableOffset at 34 x 512 = 17,408 — not
+    // even a multiple of 4096, so the IOCTL had no chance of accepting it.
+    let sector_size = phoenix_core::disk::get_sector_size(handle).max(512) as u64;
     layout.Anonymous.Gpt = windows_sys::Win32::System::Ioctl::DRIVE_LAYOUT_INFORMATION_GPT {
         DiskId: *disk_guid,
         StartingUsableOffset: (GPT_LEADING_RESERVED_SECTORS * sector_size) as i64,

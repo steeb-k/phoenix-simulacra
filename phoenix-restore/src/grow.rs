@@ -75,12 +75,16 @@ struct ExtendVolumeBuffer {
 /// mounted volume by exact extent match (the same logic
 /// `enumerate_disks` uses to attach drive letters).
 ///
-/// `bytes_per_sector` is the volume's own sector size — read from the
-/// source backup's `PartitionIndexEntry::sector_size`. We can't trust
-/// the disk's logical-sector size for this (a 4Kn drive hosting a
-/// volume formatted on a 512e drive will still expose 512-byte
-/// volumes), and re-reading the boot sector here would just duplicate
-/// what the capture path already recorded.
+/// `FSCTL_EXTEND_VOLUME` counts in the **device's logical sectors**, so the
+/// sector size is read off the volume handle we're about to extend
+/// (`get_sector_size`) rather than passed in. It used to be a parameter, and
+/// every caller in the restore path handed it
+/// `PartitionIndexEntry::sector_size` — which is **always 512**, because it is
+/// the `.phnx` format's fixed extent-addressing unit, not a device property
+/// (see `docs/phnx-format.md`). On a 512e disk the two happen to coincide and
+/// nobody noticed; on a 4Kn disk it asked NTFS to extend to 8x the sectors the
+/// partition actually has. Asking the device removes the whole class of
+/// confusion — there is now no way for a caller to supply the wrong value.
 ///
 /// Returns `Ok(())` on a successful extend OR if the volume couldn't
 /// be located after `MOUNT_WAIT` — the partition is still restored and
@@ -93,14 +97,7 @@ pub fn extend_ntfs_volume(
     disk_index: u32,
     partition_offset_bytes: u64,
     partition_size_bytes: u64,
-    bytes_per_sector: u64,
 ) -> Result<()> {
-    if bytes_per_sector == 0 {
-        return Err(PhoenixError::Other(
-            "extend_ntfs_volume: bytes_per_sector cannot be zero".into(),
-        ));
-    }
-
     let volume_path =
         match poll_for_volume(disk_index, partition_offset_bytes, partition_size_bytes) {
             Some(path) => path,
@@ -117,13 +114,22 @@ pub fn extend_ntfs_volume(
             }
         };
 
-    let new_sectors: i64 = (partition_size_bytes / bytes_per_sector)
-        .try_into()
-        .map_err(|_| {
-            PhoenixError::Other(
+    let handle = open_volume(&volume_path)?;
+
+    // Ask the volume device itself. `get_sector_size` falls back to 512 only if
+    // the IOCTL fails outright, which is the same answer the old code always
+    // gave — so a device that refuses to report its geometry is no worse off.
+    let bytes_per_sector = phoenix_core::disk::get_sector_size(handle).max(512) as u64;
+
+    let new_sectors: i64 = match (partition_size_bytes / bytes_per_sector).try_into() {
+        Ok(n) => n,
+        Err(_) => {
+            unsafe { CloseHandle(handle) };
+            return Err(PhoenixError::Other(
                 "extend_ntfs_volume: partition size in sectors exceeds i64::MAX".into(),
-            )
-        })?;
+            ));
+        }
+    };
 
     info!(
         volume = volume_path.as_str(),
@@ -133,7 +139,6 @@ pub fn extend_ntfs_volume(
         "extending NTFS volume to fill restored partition"
     );
 
-    let handle = open_volume(&volume_path)?;
     let result = run_extend(handle, new_sectors);
     unsafe { CloseHandle(handle) };
     result

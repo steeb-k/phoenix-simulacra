@@ -321,19 +321,25 @@ pub fn default_plan_from_backup(
 /// from the front can drift the last partition past the disk end when the
 /// source had inter-partition gaps (e.g. an MSR partition) — the clamp keeps
 /// the reconstructed layout valid. Returns `(offset, size)` per input size.
-fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> {
+fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64, sector_size: u64) -> Vec<(u64, u64)> {
     // GPT reserves 34 LBAs at the front (protective MBR + primary header +
     // entry array) and 33 at the back (backup entry array + header). No
     // partition may start before the front reserve or end past the back one.
-    const GPT_LEADING_BYTES: u64 = 34 * 512;
-    const GPT_TRAILING_BYTES: u64 = 33 * 512;
-    let usable_end = disk_size.saturating_sub(GPT_TRAILING_BYTES);
+    //
+    // Those are LBA counts, so they scale with the sector size: on a 4Kn disk
+    // the backup GPT occupies the last 33 x 4096 = 135,168 bytes, not 16,896.
+    // Reserving the 512-byte figure on a 4Kn target left the anchored last
+    // partition overlapping the backup GPT entry array by ~118 KB.
+    let ss = sector_size.max(512);
+    let gpt_leading_bytes: u64 = 34 * ss;
+    let gpt_trailing_bytes: u64 = 33 * ss;
+    let usable_end = disk_size.saturating_sub(gpt_trailing_bytes);
     let n = sizes.len();
     if n == 0 {
         return Vec::new();
     }
     let last = sizes[n - 1];
-    let min_lead_4k = align_up(GPT_LEADING_BYTES, 4096);
+    let min_lead_4k = align_up(gpt_leading_bytes, 4096);
 
     // Pass 1 (preferred): pack EVERY partition sequentially from the front at
     // 1 MiB alignment. When it fits, this is the layout to use — it leaves the
@@ -361,7 +367,7 @@ fn pack_full_disk(sizes: &[u64], disk_size: u64, align: u64) -> Vec<(u64, u64)> 
     // or fixed-geometry FAT that can't be resized). Try 1 MiB first, then 4 KiB
     // alignment with a minimal GPT-boundary lead; the first that fits wins.
     for &(lead, a) in &[
-        (align.max(GPT_LEADING_BYTES), align),
+        (align.max(gpt_leading_bytes), align),
         (min_lead_4k, 4096u64),
     ] {
         let anchored_start = align_down(usable_end.saturating_sub(last), a);
@@ -422,8 +428,24 @@ pub fn build_full_disk_plan(
             "MBR source: layout clamped to the 2 TiB MBR-addressable region"
         );
     }
+    // The GPT reserves scale with the TARGET's logical sector size, so ask the
+    // target device rather than assuming 512. Deliberately not taken from the
+    // backup: `PartitionIndexEntry::sector_size` is the format's fixed 512-byte
+    // extent unit, and the source's geometry is irrelevant to where the backup
+    // GPT lands on *this* disk. Falls back to 512 if the disk can't be
+    // enumerated, which is the value this code always used anyway.
+    let target_sector_size = phoenix_core::disk::enumerate_disks()
+        .ok()
+        .and_then(|disks| {
+            disks
+                .into_iter()
+                .find(|d| d.index == target_disk_index)
+                .map(|d| d.sector_size as u64)
+        })
+        .unwrap_or(512);
+
     let sizes: Vec<u64> = reader.index.iter().map(|e| e.original_size).collect();
-    let placed = pack_full_disk(&sizes, usable_size, align);
+    let placed = pack_full_disk(&sizes, usable_size, align, target_sector_size);
     // Diagnostic: dump the reconstructed full-disk layout so a restore that
     // fails validation can be traced back to the exact source sizes vs. placed
     // offsets/sizes without another round-trip.
@@ -713,7 +735,7 @@ mod tests {
         let msr = 16 * 1024 * 1024u64;
         // Data sized so msr + data + 1 MiB lead > disk (forces a clamp).
         let data = disk - align - msr + 2 * 1024 * 1024;
-        let placed = pack_full_disk(&[msr, data], disk, align);
+        let placed = pack_full_disk(&[msr, data], disk, align, 512);
         let last = placed.last().unwrap();
         let end = last.0 + last.1;
         assert!(
@@ -744,7 +766,7 @@ mod tests {
         let align = 1024 * 1024u64;
         let msr = 16_759_808u64;
         let data = 520_028_160u64; // reaches ~the GPT usable end
-        let placed = pack_full_disk(&[msr, data], disk, align);
+        let placed = pack_full_disk(&[msr, data], disk, align, 512);
         let (off, size) = placed[1];
         assert_eq!(size, data, "fixed-geometry partition must not be shrunk");
         assert_eq!(off % 512, 0, "start must stay logical-sector-aligned");
@@ -765,7 +787,7 @@ mod tests {
         let align = 1024 * 1024u64;
         let msr = 15 * 1024 * 1024u64;
         let data = 490 * 1024 * 1024u64;
-        let placed = pack_full_disk(&[msr, data], disk, align);
+        let placed = pack_full_disk(&[msr, data], disk, align, 512);
         assert_eq!(placed[1].1, data, "last partition size must be preserved");
         let end = placed[1].0 + placed[1].1;
         assert!(
@@ -789,7 +811,7 @@ mod tests {
         let align = 1024 * 1024u64;
         let msr = 16 * 1024 * 1024u64;
         let ntfs = 239 * 1024 * 1024u64;
-        let placed = pack_full_disk(&[msr, ntfs], disk, align);
+        let placed = pack_full_disk(&[msr, ntfs], disk, align, 512);
         // NTFS packed right after the MSR (near the front), not at the end.
         assert_eq!(placed[0], (align, msr));
         assert_eq!(
@@ -816,7 +838,7 @@ mod tests {
         let disk = 512 * 1024 * 1024u64;
         let align = 1024 * 1024u64;
         let size = disk - align - 33 * 512; // ends exactly at usable end
-        let placed = pack_full_disk(&[size], disk, align);
+        let placed = pack_full_disk(&[size], disk, align, 512);
         assert_eq!(placed[0], (align, size));
     }
 
