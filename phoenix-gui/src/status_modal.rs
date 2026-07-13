@@ -1,7 +1,12 @@
 //! Blocking status modal: a centered dialog over a dimmed, input-swallowing
 //! backdrop that renders the operation's predeclared step checklist, a
-//! progress bar, and a Cancel button that becomes a colored Close button
-//! once the job ends.
+//! progress bar, and a hold-to-cancel button.
+//!
+//! When the job ends the modal stays up and turns into a result screen: the
+//! progress bar gives way to a [`Verdict`] badge — a colored disc with a
+//! checkmark, an exclamation, or a cross — and the Cancel button becomes a
+//! Close button in the same color. Every job kind and every outcome gets one;
+//! the modal never leaves a finished job wearing the running layout.
 //!
 //! egui 0.29 has no `egui::Modal` (added in 0.30), so we hand-roll it from a
 //! foreground `Area` backdrop plus a centered `Window`. This is structured so
@@ -15,8 +20,8 @@ use crate::stripes;
 use crate::theme::{self, Palette};
 use crate::util::format_bytes;
 
-/// How a finished job ended, used to color the Close button and the final
-/// progress bar.
+/// How a finished job ended: picks the badge glyph, and the color of both the
+/// badge and the Close button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobOutcome {
     Success,
@@ -24,19 +29,27 @@ pub enum JobOutcome {
     Failure,
 }
 
+/// A finished job's verdict. Outcome and wording travel together — every job
+/// that ends says how it ended, whichever kind it was, so there is no way to
+/// leave a finished modal wearing the running layout.
+#[derive(Clone, Copy, Debug)]
+pub struct Verdict<'a> {
+    pub outcome: JobOutcome,
+    /// The one-line verdict shown under the badge: "Completed and verified.",
+    /// "Restore failed.", "Clone cancelled.".
+    pub banner: &'a str,
+}
+
 /// Snapshot of a finished job, kept around so the modal stays up (showing the
-/// final step list + a Close button) until the user dismisses it.
+/// verdict badge + a Close button) until the user dismisses it.
 pub struct CompletedJob {
     pub title: String,
     pub steps: Vec<String>,
     pub current_step: usize,
     pub outcome: JobOutcome,
     pub message: String,
-    /// When set (successful backups: "Completed and verified." /
-    /// "Completed. Unverified."; successful standalone verifies: "Backup
-    /// verified."), the finished modal replaces the progress bar and step
-    /// checklist with a big green checkmark over this text.
-    pub success_banner: Option<String>,
+    /// The [`Verdict::banner`] wording for this job.
+    pub banner: String,
     /// The `.phnx` file this (successful, unverified, single-disk) backup
     /// wrote. When set, the finished modal offers a "Verify?" button that
     /// runs a full image verify of the file after the fact.
@@ -65,11 +78,8 @@ pub struct ModalView<'a> {
     pub fraction: f32,
     pub current_bytes: u64,
     pub total_bytes: u64,
-    /// `None` while running, `Some(outcome)` once the job has finished.
-    pub outcome: Option<JobOutcome>,
-    /// See [`CompletedJob::success_banner`]. Only honored together with
-    /// `Some(JobOutcome::Success)`.
-    pub success_banner: Option<&'a str>,
+    /// `None` while running, `Some(verdict)` once the job has finished.
+    pub finished: Option<Verdict<'a>>,
     /// Offer the "Verify?" button above Close (finished, unverified backups).
     pub offer_verify: bool,
 }
@@ -131,7 +141,7 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
 
     let mut action = ModalAction::None;
 
-    if view.outcome.is_some() {
+    if view.finished.is_some() {
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape) {
                 action = ModalAction::Close;
@@ -158,31 +168,34 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
             ui.label(RichText::new(view.title).font(fonts::bold(18.0)));
             ui.add_space(12.0);
 
-            if let Some(banner) = success_banner(view) {
-                // Successful backup/verify: the play-by-play (bar + checklist)
-                // has served its purpose — replace it with one unambiguous verdict.
-                show_success_banner(ui, palette, banner);
-            } else {
-                show_progress_bar(ui, palette, view);
-                ui.add_space(14.0);
-
-                // Cap the checklist height so a many-partition job (e.g. a
-                // verify across a dozen partitions) scrolls instead of growing
-                // the modal taller than the window.
-                egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        show_steps(ui, palette, view);
-                    });
+            match view.finished {
+                // Finished: the play-by-play has served its purpose. The bar
+                // goes, and a badge in the outcome's color states what happened.
+                Some(verdict) => {
+                    show_verdict_badge(ui, palette, verdict);
+                    // A clean success has nothing left to explain, so the badge
+                    // stands alone. Anything else keeps the checklist below it:
+                    // it is the only thing that says *where* the job stopped.
+                    if verdict.outcome != JobOutcome::Success {
+                        ui.add_space(14.0);
+                        show_step_list(ui, palette, view);
+                    }
+                }
+                None => {
+                    show_progress_bar(ui, palette, view);
+                    ui.add_space(14.0);
+                    show_step_list(ui, palette, view);
+                }
             }
 
             if !view.detail.is_empty() {
                 ui.add_space(10.0);
                 let detail = RichText::new(view.detail).color(palette.subtle_text);
-                if success_banner(view).is_some() {
-                    // Everything on the checkmark screen is centered; keep the
-                    // result line ("Backup completed: <path>") in step with it.
+                if bare_success(view) {
+                    // Everything on the bare success screen is centered; keep
+                    // the result line ("Backup completed: <path>") in step with
+                    // it. Once a checklist is in play the detail is left-aligned
+                    // copy under left-aligned copy.
                     ui.vertical_centered(|ui| ui.label(detail));
                 } else {
                     ui.label(detail);
@@ -193,7 +206,7 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
             action = show_button(ui, palette, view);
         });
 
-    if view.outcome.is_some() {
+    if view.finished.is_some() {
         // Keep repainting while the result modal is up so a wake-from-sleep
         // does not leave a stale, input-deaf frame until the user moves the mouse.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -207,21 +220,34 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ModalView<'_>) -> Mod
 /// Windows accent. Legible on both the light and dark sidebar_bg fills.
 const SUCCESS_GREEN: Color32 = Color32::from_rgb(22, 154, 73);
 
-/// The banner text for the "big green checkmark" completion screen, or `None`
-/// when the normal bar + checklist layout should render. Requires a Success
-/// outcome so a Warning/Failure can never be dressed up as a green check.
-fn success_banner<'a>(view: &ModalView<'a>) -> Option<&'a str> {
-    match view.outcome {
-        Some(JobOutcome::Success) => view.success_banner,
-        _ => None,
+/// A finished, clean success: the one layout that drops the step checklist and
+/// centers everything, because there is nothing left to diagnose.
+fn bare_success(view: &ModalView<'_>) -> bool {
+    matches!(
+        view.finished,
+        Some(Verdict {
+            outcome: JobOutcome::Success,
+            ..
+        })
+    )
+}
+
+/// The color a finished job's badge, and its Close button, are painted in.
+/// Distinct from [`outcome_color`]: success here is *green*, not the Windows
+/// accent, because the badge is a verdict and not just an active-UI surface.
+fn verdict_color(palette: &Palette, outcome: JobOutcome) -> Color32 {
+    match outcome {
+        JobOutcome::Success => SUCCESS_GREEN,
+        JobOutcome::Warning => palette.warning,
+        JobOutcome::Failure => palette.danger,
     }
 }
 
-/// The completion screen for a successful backup or verify: a filled green
-/// circle with a white checkmark, over the bold verdict text ("Completed and
-/// verified." / "Completed. Unverified." / "Backup verified."). Replaces the
-/// progress bar and step checklist.
-fn show_success_banner(ui: &mut egui::Ui, palette: &Palette, banner: &str) {
+/// The completion badge: a big filled circle in the outcome's color carrying a
+/// white glyph — a checkmark for success, an exclamation for a cancel, a cross
+/// for a failure — over the bold verdict line ("Completed and verified.",
+/// "Restore failed."). Takes the progress bar's place once the job has ended.
+fn show_verdict_badge(ui: &mut egui::Ui, palette: &Palette, verdict: Verdict<'_>) {
     ui.vertical_centered(|ui| {
         ui.add_space(10.0);
         let radius = 36.0;
@@ -229,25 +255,43 @@ fn show_success_banner(ui: &mut egui::Ui, palette: &Palette, banner: &str) {
             ui.allocate_exact_size(egui::vec2(radius * 2.0, radius * 2.0), egui::Sense::hover());
         let center = rect.center();
         let painter = ui.painter();
-        painter.circle_filled(center, radius, SUCCESS_GREEN);
-        // Checkmark as a polyline; the small end/joint dots round off the
-        // square line caps egui strokes would otherwise leave.
-        let points = vec![
-            center + egui::vec2(-0.42 * radius, 0.02 * radius),
-            center + egui::vec2(-0.10 * radius, 0.34 * radius),
-            center + egui::vec2(0.45 * radius, -0.28 * radius),
-        ];
+        painter.circle_filled(center, radius, verdict_color(palette, verdict.outcome));
+
+        // Each glyph is one or more polylines, in units of the radius. The dots
+        // at every end and joint round off the square caps egui strokes would
+        // otherwise leave.
+        let glyph: &[&[egui::Vec2]] = match verdict.outcome {
+            JobOutcome::Success => &[&[
+                egui::vec2(-0.42, 0.02),
+                egui::vec2(-0.10, 0.34),
+                egui::vec2(0.45, -0.28),
+            ]],
+            JobOutcome::Failure => &[
+                &[egui::vec2(-0.32, -0.32), egui::vec2(0.32, 0.32)],
+                &[egui::vec2(0.32, -0.32), egui::vec2(-0.32, 0.32)],
+            ],
+            // An exclamation mark: its bar, then its dot — the dot drawn as a
+            // zero-length stroke, so the end-cap circle *is* the dot.
+            JobOutcome::Warning => &[
+                &[egui::vec2(0.0, -0.44), egui::vec2(0.0, 0.12)],
+                &[egui::vec2(0.0, 0.40), egui::vec2(0.0, 0.40)],
+            ],
+        };
         let stroke_width = 0.18 * radius;
-        for &p in &points {
-            painter.circle_filled(p, stroke_width / 2.0, Color32::WHITE);
+        for stroke in glyph {
+            let points: Vec<egui::Pos2> = stroke.iter().map(|&v| center + v * radius).collect();
+            for &p in &points {
+                painter.circle_filled(p, stroke_width / 2.0, Color32::WHITE);
+            }
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(stroke_width, Color32::WHITE),
+            ));
         }
-        painter.add(egui::Shape::line(
-            points,
-            egui::Stroke::new(stroke_width, Color32::WHITE),
-        ));
+
         ui.add_space(14.0);
         ui.label(
-            RichText::new(banner)
+            RichText::new(verdict.banner)
                 .font(fonts::bold(17.0))
                 .color(palette.icon_color),
         );
@@ -255,13 +299,33 @@ fn show_success_banner(ui: &mut egui::Ui, palette: &Palette, banner: &str) {
     });
 }
 
+/// The step checklist, height-capped so a many-partition job (e.g. a verify
+/// across a dozen partitions) scrolls instead of growing the modal taller than
+/// the window.
+fn show_step_list(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
+    egui::ScrollArea::vertical()
+        .max_height(300.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            show_steps(ui, palette, view);
+        });
+}
+
+/// The running job's progress bar — a dark track, and a filled part that is a
+/// barber pole of the accent striped with black, turning at a constant rate.
+/// The turn is pure liveness (the fraction alone carries the progress), which
+/// is why it doesn't speed up, slow down, or stop short of the end.
+///
+/// Only ever drawn while the job runs: once it ends, the verdict badge takes
+/// this slot, so nothing here has to have a "stopped" look.
+///
 /// Hand-painted rather than an `egui::ProgressBar`, which has no way to stripe
 /// its fill and takes its text color from the theme (that was the bug: in light
 /// mode it stamped *black* text over a dark accent fill).
 fn show_progress_bar(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
-    // Running with no measurable total: nothing to fill a bar with, so an
-    // indeterminate spinner it is.
-    if view.outcome.is_none() && view.total_bytes == 0 {
+    // No measurable total: nothing to fill a bar with, so an indeterminate
+    // spinner it is.
+    if view.total_bytes == 0 {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new());
             ui.label(RichText::new("Working…").color(palette.subtle_text));
@@ -278,66 +342,54 @@ fn show_progress_bar(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>)
     let time = ui.input(|i| i.time) as f32;
     let painter = ui.painter();
 
-    let Some(outcome) = view.outcome else {
-        // Running: a dark track, and a filled part that is a barber pole of the
-        // accent striped with black, turning at a constant rate. The turn is
-        // pure liveness — the fraction alone carries the progress — which is why
-        // it doesn't speed up, slow down, or stop short of the end.
-        painter.rect_filled(rect, rounding, BAR_TRACK);
-        let fraction = view.fraction.clamp(0.0, 1.0);
-        let fill = egui::Rect::from_min_size(
-            rect.left_top(),
-            egui::vec2(rect.width() * fraction, rect.height()),
-        );
-        painter.rect_filled(fill, 0.0, palette.accent);
-        stripes::paint(
-            painter,
-            fill,
-            BAR_STRIPE,
-            BAR_STRIPE_WIDTH,
-            time * BAR_STRIPE_SPEED,
-        );
-        // Stripes only clip to a rectangle, so the fill just squared off the
-        // bar's left corners (and, at 100%, its right ones). Carve them back.
-        stripes::patch_rounded_corners(painter, rect, rounding, palette.sidebar_bg);
+    painter.rect_filled(rect, rounding, BAR_TRACK);
+    let fraction = view.fraction.clamp(0.0, 1.0);
+    let fill = egui::Rect::from_min_size(
+        rect.left_top(),
+        egui::vec2(rect.width() * fraction, rect.height()),
+    );
+    painter.rect_filled(fill, 0.0, palette.accent);
+    stripes::paint(
+        painter,
+        fill,
+        BAR_STRIPE,
+        BAR_STRIPE_WIDTH,
+        time * BAR_STRIPE_SPEED,
+    );
+    // Stripes only clip to a rectangle, so the fill just squared off the
+    // bar's left corners (and, at 100%, its right ones). Carve them back.
+    stripes::patch_rounded_corners(painter, rect, rounding, palette.sidebar_bg);
 
-        let text = format!(
-            "{} / {} ({:.1}%)",
-            format_bytes(view.current_bytes),
-            format_bytes(view.total_bytes),
-            fraction * 100.0
-        );
-        let font = fonts::bold(13.0);
-        // The readout is white over a surface that is dark everywhere — the
-        // track, and the black half of the pole. The accent half is the one
-        // thing here the app doesn't choose (it's whatever the user set in
-        // Windows, and it can be pale), so ring the text in soft black first
-        // and its contrast stops depending on that.
-        for offset in TEXT_HALO {
-            painter.text(
-                rect.center() + offset,
-                Align2::CENTER_CENTER,
-                &text,
-                font.clone(),
-                HALO_COLOR,
-            );
-        }
+    let text = format!(
+        "{} / {} ({:.1}%)",
+        format_bytes(view.current_bytes),
+        format_bytes(view.total_bytes),
+        fraction * 100.0
+    );
+    let font = fonts::bold(13.0);
+    // The readout is white over a surface that is dark everywhere — the track,
+    // and the black half of the pole. The accent half is the one thing here the
+    // app doesn't choose (it's whatever the user set in Windows, and it can be
+    // pale), so ring the text in soft black first and its contrast stops
+    // depending on that.
+    for offset in TEXT_HALO {
         painter.text(
-            rect.center(),
+            rect.center() + offset,
             Align2::CENTER_CENTER,
-            text,
-            font,
-            Color32::WHITE,
+            &text,
+            font.clone(),
+            HALO_COLOR,
         );
-        // Keep the pole turning.
-        ui.ctx().request_repaint();
-        return;
-    };
-
-    // Finished: a full-width bar tinted by the outcome reads as a clear status
-    // banner regardless of how far the byte counter got. No stripes and no
-    // readout — the job has stopped, so nothing here should still be moving.
-    painter.rect_filled(rect, rounding, outcome_color(palette, outcome));
+    }
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        font,
+        Color32::WHITE,
+    );
+    // Keep the pole turning.
+    ui.ctx().request_repaint();
 }
 
 fn show_steps(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
@@ -378,18 +430,18 @@ fn step_style(i: usize, view: &ModalView<'_>, palette: &Palette) -> StepStyle {
         italic: false,
     };
 
-    match view.outcome {
-        Some(JobOutcome::Success) => done,
-        Some(outcome) => {
-            // Warning/Failure: everything before the stop point is done, the
-            // step we stopped on is highlighted in the outcome color, and
-            // anything after stays dimmed (never reached).
+    match view.finished {
+        // Finished — in practice a cancel or a failure, since a success shows
+        // its badge alone. Everything before the stop point is done, the step
+        // we stopped on is highlighted in the outcome's color, and anything
+        // after it stays dimmed (never reached).
+        Some(verdict) => {
             if i < view.current_step {
                 done
             } else if i == view.current_step {
                 StepStyle {
                     font: fonts::bold(15.0),
-                    color: outcome_color(palette, outcome),
+                    color: verdict_color(palette, verdict.outcome),
                     italic: false,
                 }
             } else {
@@ -410,7 +462,7 @@ fn step_style(i: usize, view: &ModalView<'_>, palette: &Palette) -> StepStyle {
 
 fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> ModalAction {
     let mut action = ModalAction::None;
-    ui.vertical_centered(|ui| match view.outcome {
+    ui.vertical_centered(|ui| match view.finished {
         // Running: a hold-to-cancel button. A quick click does nothing; the
         // job is cancelled only once the user holds it long enough to fill the
         // bar (see `show_hold_cancel_button`).
@@ -419,23 +471,16 @@ fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> Mo
                 action = ModalAction::Cancel;
             }
         }
-        // Finished: a Close button tinted by the outcome (blue success,
-        // amber warning/cancelled, red failure).
-        Some(outcome) => {
+        // Finished: a Close button in the badge's own color (green success,
+        // amber cancelled, red failure), so the whole modal reads as one verdict.
+        Some(verdict) => {
             // The job is over — clear any hold-to-cancel latch so the next
             // job's button starts from a clean, empty state.
             ui.data_mut(|d| {
                 d.remove::<f64>(egui::Id::new(CANCEL_HOLD_START_ID));
                 d.remove::<bool>(egui::Id::new(CANCEL_HOLD_FIRED_ID));
             });
-            // On the green-checkmark completion screen the button follows the
-            // checkmark's green rather than the blue accent, so the whole
-            // modal reads as one verdict.
-            let fill = if success_banner(view).is_some() {
-                SUCCESS_GREEN
-            } else {
-                outcome_color(palette, outcome)
-            };
+            let fill = verdict_color(palette, verdict.outcome);
             // Unverified backup: offer an after-the-fact verify of the file
             // just written, as a quieter secondary button above Close.
             if view.offer_verify {
@@ -609,13 +654,4 @@ fn show_hold_cancel_button(ui: &mut egui::Ui, palette: &Palette) -> bool {
         ui.ctx().request_repaint();
     }
     just_completed
-}
-
-fn outcome_color(palette: &Palette, outcome: JobOutcome) -> Color32 {
-    match outcome {
-        // Blue (the live Windows accent, used elsewhere for "active" UI).
-        JobOutcome::Success => palette.accent,
-        JobOutcome::Warning => palette.warning,
-        JobOutcome::Failure => palette.danger,
-    }
 }

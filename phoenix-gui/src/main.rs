@@ -34,7 +34,7 @@ use phoenix_restore::restore::RestoreOptions;
 use crate::confirm_dialog::{ConfirmAction, ConfirmView};
 use crate::job::{spawn_backup, spawn_clone, spawn_restore, spawn_verify, BackgroundJob, JobKind};
 use crate::sidebar::Page;
-use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView};
+use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView, Verdict};
 use crate::theme::Palette;
 use crate::util::format_bytes;
 
@@ -437,7 +437,7 @@ impl PhoenixApp {
             status: "Ready".into(),
             page: start_page_from_args().unwrap_or(Page::Backup),
             job: None,
-            completed: None,
+            completed: demo_completed_job_from_args(),
             palette,
             last_theme_refresh: Instant::now(),
             pending_refresh: None,
@@ -761,7 +761,7 @@ impl PhoenixApp {
                         false,
                     );
                     if let Some(completed) = self.completed.as_mut() {
-                        completed.success_banner = Some("Completed and verified.".to_string());
+                        completed.banner = "Completed and verified.".to_string();
                     }
                 } else if let Some(next) = self.pending_backups.pop() {
                     // One disk of a multi-disk run finished: record it, then
@@ -871,24 +871,28 @@ impl PhoenixApp {
         verified_backup: bool,
         verify_target: Option<std::path::PathBuf>,
     ) {
-        // A successful backup or verify swaps the progress bar + checklist for
-        // a big green checkmark. For a backup the banner text also records
-        // whether the verify pass ran.
-        let success_banner = (outcome == JobOutcome::Success)
-            .then(|| match kind {
-                JobKind::Backup if verified_backup => Some("Completed and verified.".to_string()),
-                JobKind::Backup => Some("Completed. Unverified.".to_string()),
-                JobKind::Verify => Some("Backup verified.".to_string()),
-                _ => None,
-            })
-            .flatten();
+        // Every finished job states its verdict under the modal's badge —
+        // whichever kind it was, however it ended. A successful backup's wording
+        // also records whether the verify pass ran.
+        let banner = match outcome {
+            JobOutcome::Success => match kind {
+                JobKind::Backup if verified_backup => "Completed and verified.".to_string(),
+                JobKind::Backup => "Completed. Unverified.".to_string(),
+                JobKind::Verify => "Backup verified.".to_string(),
+                JobKind::Restore => "Restore complete.".to_string(),
+                JobKind::Clone => "Clone complete.".to_string(),
+            },
+            // The only thing that raises a Warning is the user cancelling.
+            JobOutcome::Warning => format!("{}.", kind.cancelled_message()),
+            JobOutcome::Failure => format!("{} failed.", kind.noun()),
+        };
         self.completed = Some(CompletedJob {
             title: kind.noun().to_string(),
             steps: snap.steps.clone(),
             current_step: snap.current_step,
             outcome,
             message: self.status.clone(),
-            success_banner,
+            banner,
             verify_target,
         });
     }
@@ -1234,8 +1238,7 @@ impl PhoenixApp {
                 fraction: snap.fraction(),
                 current_bytes: snap.current,
                 total_bytes: snap.total,
-                outcome: None,
-                success_banner: None,
+                finished: None,
                 offer_verify: false,
             };
             action = status_modal::show(ctx, &self.palette, &view);
@@ -1248,8 +1251,10 @@ impl PhoenixApp {
                 fraction: 1.0,
                 current_bytes: 0,
                 total_bytes: 0,
-                outcome: Some(completed.outcome),
-                success_banner: completed.success_banner.as_deref(),
+                finished: Some(Verdict {
+                    outcome: completed.outcome,
+                    banner: &completed.banner,
+                }),
                 offer_verify: completed.verify_target.is_some(),
             };
             action = status_modal::show(ctx, &self.palette, &view);
@@ -1275,8 +1280,7 @@ impl PhoenixApp {
                 fraction: snap.fraction(),
                 current_bytes: snap.current,
                 total_bytes: snap.total,
-                outcome: None,
-                success_banner: None,
+                finished: None,
                 offer_verify: false,
             };
             action = status_modal::show(ctx, &self.palette, &view);
@@ -1312,8 +1316,7 @@ impl PhoenixApp {
                 confirm_label: "Overwrite",
                 cancel_label: "Cancel",
                 confirm_danger: true,
-                // Overwrites backup *files*, not a disk — no tape.
-                hazard_tape: false,
+                hazard_tape: true,
             };
             confirm_dialog::show(ctx, &self.palette, &view)
         };
@@ -1501,8 +1504,7 @@ impl PhoenixApp {
             fraction,
             current_bytes: (TOTAL as f64 * fraction as f64) as u64,
             total_bytes: TOTAL,
-            outcome: None,
-            success_banner: None,
+            finished: None,
             offer_verify: false,
         };
         if status_modal::show(ctx, &self.palette, &view) != ModalAction::None {
@@ -2794,6 +2796,52 @@ fn demo_confirm_from_args() -> bool {
 /// pole and the byte readout without running a real backup.
 fn demo_progress_from_args() -> bool {
     std::env::args().skip(1).any(|a| a == "--demo-progress")
+}
+
+/// Debug/verification aid: `--demo-complete [success|cancelled|failed]` (default
+/// `success`) opens the app on a finished restore's modal, so all three verdict
+/// badges can be eyeballed without staging a real destructive operation. Parks a
+/// canned [`CompletedJob`], which is exactly what a real finished job leaves
+/// behind — so this exercises the shipping render path, not a copy of it.
+fn demo_completed_job_from_args() -> Option<CompletedJob> {
+    let mut args = std::env::args()
+        .skip(1)
+        .skip_while(|a| a != "--demo-complete");
+    args.next()?;
+    let outcome = match args.next().as_deref() {
+        Some("cancelled") => JobOutcome::Warning,
+        Some("failed") => JobOutcome::Failure,
+        _ => JobOutcome::Success,
+    };
+    let (banner, message) = match outcome {
+        JobOutcome::Success => (
+            "Restore complete.",
+            "Restore completed to disk 2".to_string(),
+        ),
+        JobOutcome::Warning => (
+            "Restore cancelled.",
+            "Restore cancelled — the target disk is now in an incomplete state".to_string(),
+        ),
+        JobOutcome::Failure => (
+            "Restore failed.",
+            "Error: write to \\\\.\\PhysicalDrive2 failed at offset 4,294,967,296 \
+             (The device is not ready.)"
+                .to_string(),
+        ),
+    };
+    Some(CompletedJob {
+        title: "Restore".to_string(),
+        steps: vec![
+            "Writing partition table".to_string(),
+            "Restoring partition 1 (EFI System, 260 MB)".to_string(),
+            "Restoring partition 2 (Basic data, 931.2 GB)".to_string(),
+        ],
+        current_step: 2,
+        outcome,
+        message,
+        banner: banner.to_string(),
+        verify_target: None,
+    })
 }
 
 /// Debug/verification aid: `--demo-refresh` opens the app with the

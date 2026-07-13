@@ -36,10 +36,11 @@ pub struct ConfirmView<'a> {
     /// Tint the confirm button with `palette.danger` (destructive) vs
     /// `palette.accent` (neutral).
     pub confirm_danger: bool,
-    /// Paint hazard-tape strips across the top and bottom edges. Reserved for
-    /// the confirmations there is no taking back — the disk wipes, closing the
-    /// app with backups still mounted, and erasing a history entry — so the
-    /// tape keeps its meaning instead of becoming generic dialog chrome.
+    /// Paint hazard-tape strips across the top and bottom edges. Every warning
+    /// the app raises wears the tape; it is the app's one visual language for
+    /// "this is a warning", so a dialog that skipped it would just look like a
+    /// different app's dialog. Left as a flag because a purely informational
+    /// confirmation would not want it.
     pub hazard_tape: bool,
 }
 
