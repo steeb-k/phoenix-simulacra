@@ -59,6 +59,21 @@ test doesn't need a virgin disk), and fix crash-dump collection on the dev box
 (`volmgr` event 46, "Crash dump initialization failed", means no `MEMORY.DMP` is
 ever written — so a bugcheck currently teaches us nothing).
 
+### Known flaky test
+
+`vss.rs :: locked_backup_blocks_writers_for_duration` **fails intermittently**
+(observed 1-in-3 on 2026-07-13). It backs up an idle volume on one thread while
+hammering write attempts at it from another, and asserts at least one write was
+refused while the lock was held. When the backup finishes fast enough, no attempt
+lands inside the window and the test fails — the failing run was the *fastest*
+(12.7 s vs 18.4 s for the passing ones).
+
+It is a **test-timing bug, not an engine bug**: the lock itself is separately and
+deterministically proven by `volume_lock_blocks_external_writes`. Re-run it before
+believing it. Worth fixing properly (the writer thread should be synchronized to
+the capture window rather than racing it) — a flaky test in a data-integrity suite
+teaches people to ignore red.
+
 ### Known coverage gaps (as of 2026-07-13)
 
 These are **not** covered by any tier. Read [ROADMAP.md](ROADMAP.md) before
