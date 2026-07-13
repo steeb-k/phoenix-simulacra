@@ -153,42 +153,70 @@ cargo test -p phoenix-systests --features winfsp --test winfsp_mount -- --ignore
 
 ---
 
-## Tier 2-4Kn — 4096-byte-sector virtual disks (NOT YET WRITTEN)
+## Tier 2-4Kn — 4096-byte-sector virtual disks
 
-**This tier does not exist yet and should.** It is the cheapest way to close the
-single largest coverage gap, and it needs **no special hardware** — a 4Kn disk can
-be emulated on any x64 dev box.
+Closes the single largest coverage gap, and needs **no special hardware and no
+particular Windows edition** — a true 4Kn disk can be synthesized on any dev box.
 
-diskpart's `create vdisk` always produces 512-byte logical sectors, which is why
-every T2 test to date is 512-only. The Hyper-V PowerShell module can create a true
-4Kn VHDX. `New-VHD` is present on the dev box (module `Hyper-V`) and, like diskpart,
-**requires an elevated shell** — it fails with "You do not have the required
-permission" otherwise. The Hyper-V *hypervisor* does not need to be enabled; the
-management module is enough.
+Fixture: `TestVhd::create_4kn(size_mb)`. Tests: `phoenix-systests/tests/sector_4kn.rs`.
 
 ```powershell
-# elevated
-New-VHD -Path C:\tmp\4kn.vhdx -SizeBytes 8GB -Dynamic `
-        -LogicalSectorSize 4096 -PhysicalSectorSize 4096
-Mount-VHD -Path C:\tmp\4kn.vhdx
-Get-Disk | Select-Object Number, LogicalSectorSize, PhysicalSectorSize  # expect 4096 / 4096
+cargo test -p phoenix-systests --test sector_4kn -- --ignored --test-threads=1 --nocapture
 ```
 
-The harness change is small: `TestVhd::create` currently shells diskpart
-(`phoenix-systests/src/lib.rs:107`); a `TestVhd::create_4kn` would shell `New-VHD` +
-`Mount-VHD` instead and reuse the existing disk-number resolution.
+### Why not `New-VHD`
 
-Attach it, initialize GPT, format NTFS, and run capture → verify → restore → mount.
-**Expect it to fail immediately at capture** with `Win32 error 87`
-(`ERROR_INVALID_PARAMETER`): the filesystem parsers issue hardcoded 512-byte
-boot-sector reads on a raw handle, and raw handles reject any read that is not a
-multiple of the *logical* sector size. That failure is the first thing to fix; see
-[ROADMAP.md](ROADMAP.md) → "P1 — 4Kn media support" for the full itemized list of
-512-byte assumptions (reader alignment, `FSCTL_EXTEND_VOLUME` sector count, GPT
-reserve math, MBR `HiddenSectors`, and the 512-only mount synthesizer).
+diskpart's `create vdisk` cannot set a sector size — it always produces 512-byte
+logical sectors, which is why every other T2 fixture is 512-only. The obvious
+alternative, Hyper-V's `New-VHD -LogicalSectorSize 4096`, **is the wrong tool**: it
+ships with the Hyper-V management feature, which needs a **Windows Pro+ SKU**. That
+would put a license floor under the test suite that the product itself doesn't
+have — and this harness exists precisely to drive real virtual disks *without*
+Hyper-V.
 
-Because the whole 4Kn surface reproduces on a VHDX, **none of this work needs the
-ARM64 laptop** — do it here first.
+So `TestVhd::create_4kn` calls **`CreateVirtualDisk` (virtdisk.dll)** directly, with
+`CREATE_VIRTUAL_DISK_PARAMETERS` **Version2**, which carries `SectorSizeInBytes` and
+`PhysicalSectorSizeInBytes`. That is core Win32, present on **every** Windows edition
+including Home — and it is the same DLL `phoenix-mount` already uses to *attach* VHDs
+(`OpenVirtualDisk` / `AttachVirtualDisk`). Attach still goes through diskpart, which
+is happy to attach a VHDX it did not create.
+
+- **VHDX is required**: the older VHD format is 512-sector-only, so 4096-byte logical
+  sectors need `VIRTUAL_STORAGE_TYPE_DEVICE_VHDX`.
+- Version**1** parameters have no physical-sector field; Version2 is what lets the
+  fixture describe true 4Kn rather than 512e.
+- Still needs an **elevated** shell, like every T2 fixture — for the attach and the
+  raw disk handles, not for the create itself.
+
+`vhdx_4kn_reports_4096_byte_sectors` is the tier's foundation test: it asserts the
+attached disk enumerates with `sector_size == 4096`, so a broken fixture fails loudly
+rather than silently proving nothing.
+
+### State today: capture is broken on 4Kn (measured 2026-07-13)
+
+Disk enumeration and partition detection work fine — the disk reports
+`sector_size = 4096` and its NTFS partition is correctly classified as
+`UsedBlocks`. **Capture then dies on the very first read:**
+
+```text
+>>> disk sector_size=4096 partitions=2
+>>> part fs=Ntfs mode=UsedBlocks offset=16777216 size=1073741824
+>>> CAPTURE FAILED: disk error: ReadFile of 512 bytes at offset 0 failed
+    (Win32 error 87; volume length 1073741824)
+```
+
+Win32 87 is `ERROR_INVALID_PARAMETER`: raw disk/volume handles reject any read whose
+length or offset is not a multiple of the *logical* sector size, and every filesystem
+parser hands the reader a hardcoded 512-byte boot-sector buffer. Fixing that is the
+first step; see [ROADMAP.md](ROADMAP.md) → "P1 — 4Kn media support" for the rest of
+the 512-byte assumptions behind it (`FSCTL_EXTEND_VOLUME` sector count, GPT reserve
+math, MBR `HiddenSectors`, and the 512-only mount synthesizer).
+
+The round-trip tests for this tier land **with** that fix. Until then this file holds
+only the fixture-integrity test, so the suite stays green and the gap stays honest.
+
+Because the whole 4Kn surface reproduces here, **none of that work needs the ARM64
+laptop** — do it on x64 first.
 
 ---
 
@@ -358,8 +386,8 @@ resize restores, mount (WinFsp), and 4Kn / USB media.
 - **T2/T3**: Rust + an **elevated** shell (diskpart, raw disk handles, formatting).
 - **winfsp tests / feature**: LLVM (`libclang`, for `winfsp-sys` bindgen) + WinFsp
   installed (https://winfsp.dev).
-- **T2-4Kn** (when written): the **Hyper-V PowerShell module** for `New-VHD`
-  (management tools only — the hypervisor itself need not be enabled), elevated.
+- **T2-4Kn**: nothing beyond T2 — the 4Kn fixture uses `CreateVirtualDisk` from
+  virtdisk.dll, which is core Windows on every edition (no Hyper-V, no Pro SKU).
 - **T3-auto**: a spare USB disk you can fully erase.
 - **BitLocker tests** (T2 `bitlocker.rs`, T3 `real_mbr_bitlocker_roundtrip`):
   a Windows SKU with the BitLocker cmdlets (Pro/Enterprise). Data volumes use

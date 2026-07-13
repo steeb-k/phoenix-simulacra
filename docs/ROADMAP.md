@@ -65,8 +65,19 @@ threaded into the raw **write** path (`PartitionWriter` does a read-modify-write
 bounce for sub-sector I/O). The read path and the geometry math never got the same
 treatment.
 
-**Capture fails on the first read of a 4Kn volume.** Raw disk/volume handles reject
-any read whose length or offset is not a multiple of the *logical* sector size:
+**Capture fails on the first read of a 4Kn volume — measured, not inferred.**
+Against the `TestVhd::create_4kn` fixture (2026-07-13), enumeration and partition
+classification are fine and capture then dies immediately:
+
+```text
+>>> disk sector_size=4096 partitions=2
+>>> part fs=Ntfs mode=UsedBlocks offset=16777216 size=1073741824
+>>> CAPTURE FAILED: disk error: ReadFile of 512 bytes at offset 0 failed
+    (Win32 error 87; volume length 1073741824)
+```
+
+Raw disk/volume handles reject any read whose length or offset is not a multiple of
+the *logical* sector size:
 
 - **H1 (critical)** — `PartitionReader::read_at`
   (`phoenix-capture/src/reader.rs:143-184`) does a bare `ReadFile` with no
@@ -107,9 +118,10 @@ any read whose length or offset is not a multiple of the *logical* sector size:
   flags as unimplemented. Minimum viable fix: detect and **error clearly** instead
   of producing an unmountable disk.
 
-**All of this reproduces on x64 with a 4Kn VHDX** (`New-VHD -LogicalSectorSize
-4096`) — see TESTING.md → "Tier 2-4Kn". Do it here; it does not need the ARM
-machine.
+**All of this reproduces on x64 with a 4Kn VHDX** — `TestVhd::create_4kn`, which
+builds one via `CreateVirtualDisk` (virtdisk.dll, every Windows edition; **not**
+Hyper-V's Pro-only `New-VHD`). See TESTING.md → "Tier 2-4Kn". Do it here; it does
+not need the ARM machine.
 
 ### P1 — Partial clone (`UpdateExisting`) has no end-to-end test
 
@@ -136,10 +148,11 @@ done **on the x64 dev box** — none of the top four need the ARM64 laptop.
 1. **Fix P0 (NTFS cluster size).** Small, contained, and a data-integrity defect.
    Return `cluster_size` from `ntfs_plan`; add a T2 test that formats NTFS with
    64K clusters and shrinks it.
-2. **Build the 4Kn VHDX tier** (TESTING.md → "Tier 2-4Kn"). One `New-VHD` command
-   turns 4Kn from an untestable hardware question into a normal local test. This
-   is the highest-leverage single action available — it converts the entire ARM
-   sector-size risk into work you can do today.
+2. **Build out the 4Kn tier** (TESTING.md → "Tier 2-4Kn"). The fixture
+   (`TestVhd::create_4kn`) already exists and needs no Hyper-V and no Pro SKU, so
+   4Kn is now a normal local test rather than a hardware question. This is the
+   highest-leverage work available — it converts the entire ARM sector-size risk
+   into something you can finish today.
 3. **Fix P1 (4Kn), H1 first.** H1 alone unblocks capture; H2–H5 unblock restore;
    H6 (mount) can trail. Verify each against the VHDX from step 2.
 4. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
@@ -389,9 +402,9 @@ physical disk); keep it as a documented pre-release step.
 ### ~~P3 — Automate the manual T3 4Kn item~~ (SUPERSEDED — now P1, above)
 The live-system and boot-the-clone checks in `scripts/live-smoke-checklist.md`
 remain hard to automate safely. **4Kn media is no longer a "nice to automate"
-item** — a 4Kn VHDX is trivially creatable with `New-VHD -LogicalSectorSize 4096`
-(see TESTING.md → "Tier 2-4Kn"), and doing so immediately exposes the P1 4Kn
-defects above. Automate it as part of that fix, not after it.
+item** — `TestVhd::create_4kn` makes one via `CreateVirtualDisk` (see TESTING.md →
+"Tier 2-4Kn"), and attaching it immediately exposes the P1 4Kn defects above.
+Automate it as part of that fix, not after it.
 
 ### P3 — Engine throughput: pipeline/parallelize backup, restore, AND verify
 **Core work DONE (2026-07)** — see "What's done"; the deliberately deferred

@@ -22,6 +22,16 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+# `CreateVirtualDisk` (virtdisk.dll) — lets the harness make a 4Kn VHDX with an
+# explicit logical sector size, which diskpart's `create vdisk` cannot do. This
+# is the plain Win32 VHD API, present on every Windows edition; it is NOT the
+# Hyper-V PowerShell module (`New-VHD`), which needs a Pro+ SKU.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_Vhd",
+    "Win32_System_IO",
+] }
 
 [features]
 # Enables the WinFsp zero-space mount test (needs WinFsp + libclang to build).

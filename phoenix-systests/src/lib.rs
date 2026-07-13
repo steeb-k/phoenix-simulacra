@@ -94,11 +94,7 @@ impl TestVhd {
     /// [`TestVhd::init_gpt_with`] to lay down partitions.
     pub fn create(size_mb: u64) -> Result<Self> {
         require_admin();
-        let path = scratch_dir()?.join(format!("phoenix-systest-{}.vhdx", new_id()));
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow!("non-UTF-8 scratch path"))?
-            .to_string();
+        let (path, path_str) = new_vhdx_path()?;
 
         // Snapshot disk locations before attach so we can identify the new one
         // even if PhysicalDrive numbering is non-monotonic.
@@ -111,8 +107,41 @@ impl TestVhd {
         ))
         .context("diskpart create/attach vdisk")?;
 
-        // Resolve the attached disk's number by its VHDX location (robust
-        // against parallel disk changes; we still require --test-threads=1).
+        Self::finish_attach(path, path_str, before)
+    }
+
+    /// Create and attach an expandable VHDX with a **4096-byte logical sector
+    /// size** (true 4Kn), then resolve its physical-disk index. Left
+    /// uninitialized (RAW), same as [`TestVhd::create`].
+    ///
+    /// diskpart's `create vdisk` has no way to set the sector size — it always
+    /// produces 512-byte logical sectors, which is why every other T2 fixture is
+    /// 512-only. So the file is created through `CreateVirtualDisk`
+    /// (virtdisk.dll), which takes an explicit `SectorSizeInBytes`. That is the
+    /// plain Win32 VHD API present on **every** Windows edition (it is the same
+    /// DLL `phoenix-mount` already uses to attach) — deliberately **not** the
+    /// Hyper-V `New-VHD` cmdlet, which requires a Pro+ SKU and would put a
+    /// license floor under the test suite.
+    ///
+    /// Attach still goes through diskpart, which is happy to attach a VHDX it
+    /// did not create.
+    pub fn create_4kn(size_mb: u64) -> Result<Self> {
+        require_admin();
+        let (path, path_str) = new_vhdx_path()?;
+
+        create_vhdx_with_sector_size(&path, size_mb * 1024 * 1024, 4096)
+            .context("CreateVirtualDisk (4Kn)")?;
+
+        let before = disk_numbers_by_location()?;
+        run_diskpart(&format!("select vdisk file=\"{path_str}\"\nattach vdisk\n"))
+            .context("diskpart attach vdisk (4Kn)")?;
+
+        Self::finish_attach(path, path_str, before)
+    }
+
+    /// Resolve the just-attached disk's number by its VHDX location (robust
+    /// against parallel disk changes; we still require `--test-threads=1`).
+    fn finish_attach(path: PathBuf, path_str: String, before: Vec<(u32, String)>) -> Result<Self> {
         let disk_index = resolve_disk_number_for_vhd(&path_str, &before)
             .context("resolving attached VHD disk number")?;
 
@@ -674,6 +703,99 @@ fn scratch_dir() -> Result<PathBuf> {
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// A fresh, unused `<scratch>/phoenix-systest-<uuid>.vhdx` path, as both a
+/// `PathBuf` and the UTF-8 string diskpart scripts need.
+fn new_vhdx_path() -> Result<(PathBuf, String)> {
+    let path = scratch_dir()?.join(format!("phoenix-systest-{}.vhdx", new_id()));
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 scratch path"))?
+        .to_string();
+    Ok((path, path_str))
+}
+
+/// Create (but do not attach) a dynamically-expanding VHDX with an explicit
+/// **logical** sector size, via `CreateVirtualDisk` from virtdisk.dll.
+///
+/// This exists because diskpart cannot set a sector size. `CREATE_VIRTUAL_DISK_
+/// PARAMETERS` **Version2** carries `SectorSizeInBytes` (the logical size the
+/// disk reports to Windows, i.e. what makes a disk "4Kn") and
+/// `PhysicalSectorSizeInBytes`; Version1 has no physical-size field at all, so
+/// Version2 is required to describe 4Kn honestly rather than as 512e.
+///
+/// Sector size and edition support: virtdisk.dll is core Windows, present on
+/// Home. Only VHDX supports a 4096-byte logical sector (the older VHD format is
+/// 512-only), hence `VIRTUAL_STORAGE_TYPE_DEVICE_VHDX`.
+fn create_vhdx_with_sector_size(path: &Path, size_bytes: u64, logical_sector: u32) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Storage::Vhd::{
+        CreateVirtualDisk, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
+        CREATE_VIRTUAL_DISK_VERSION_2, VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE,
+        VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+    };
+
+    // VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT — {ec984aec-a0f9-47e9-901f-71415a66345b}
+    const VENDOR_MICROSOFT: GUID = GUID {
+        data1: 0xec98_4aec,
+        data2: 0xa0f9,
+        data3: 0x47e9,
+        data4: [0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b],
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    let storage_type = VIRTUAL_STORAGE_TYPE {
+        DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        VendorId: VENDOR_MICROSOFT,
+    };
+
+    // Zero-init and set only what we mean: a zeroed Version2 already says
+    // "dynamic, no parent, no source, provider-default block size", which is
+    // exactly the fixture we want. Building it field-by-field would also have to
+    // track fields we don't care about (SourceLimitPath, BackingStorageType).
+    // SAFETY: every field of Version2 is a pointer, integer, GUID, or POD struct,
+    // for all of which all-zero is a valid value.
+    let mut params: CREATE_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
+    params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+    params.Anonymous.Version2.MaximumSize = size_bytes;
+    params.Anonymous.Version2.SectorSizeInBytes = logical_sector;
+    params.Anonymous.Version2.PhysicalSectorSizeInBytes = logical_sector;
+
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: `storage_type`/`params` outlive the call, `wide` is NUL-terminated,
+    // and the optional security-descriptor / overlapped pointers are null.
+    // A dynamic VHDX is created by default (no FIXED flag), so nothing is
+    // preallocated and the call returns immediately.
+    let err = unsafe {
+        CreateVirtualDisk(
+            &storage_type,
+            wide.as_ptr(),
+            VIRTUAL_DISK_ACCESS_NONE,
+            std::ptr::null_mut(),
+            CREATE_VIRTUAL_DISK_FLAG_NONE,
+            0,
+            &params,
+            std::ptr::null(),
+            &mut handle,
+        )
+    };
+    if err != 0 {
+        bail!(
+            "CreateVirtualDisk failed for {} (Win32 error {err}); \
+             logical sector {logical_sector}",
+            path.display()
+        );
+    }
+    // The handle only keeps the disk open; the file is fully created. Closing it
+    // does not delete anything.
+    if !handle.is_null() {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+    }
+    Ok(())
 }
 
 /// Clean up any leaked VHDs from a previous crashed run: detach every attached
