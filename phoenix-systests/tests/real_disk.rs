@@ -292,7 +292,7 @@ fn real_mbr_restore_shrink() {
 
     // Restore with the NTFS SHRUNK 2 GB -> 512 MB (forces relocation of the
     // metadata NTFS parks near the volume end), FAT32 kept at 1 GB right after.
-    let ntfs_off = 1 * MB;
+    let ntfs_off = MB;
     let ntfs_size = 512 * MB;
     let fat_off = ntfs_off + ntfs_size;
     let plan = RestorePlan {
@@ -647,6 +647,7 @@ fn real_vss_backup_roundtrip() {
 
     let mut held = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(r"R:\held-open.bin")
         .expect("open held file");

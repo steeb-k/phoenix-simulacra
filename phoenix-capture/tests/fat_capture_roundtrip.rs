@@ -6,7 +6,9 @@
 
 use phoenix_capture::fat::{capture_fat, fat_plan};
 use phoenix_capture::MemoryBlockSource;
-use phoenix_core::container::{Header, PhnxReader, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION};
+use phoenix_core::container::{
+    Header, PartitionStreamSpec, PhnxReader, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION,
+};
 use phoenix_core::disk::{CaptureMode, FilesystemKind};
 use phoenix_core::manifest::{BackupManifest, DiskManifest, PartitionManifest};
 use uuid::Uuid;
@@ -21,7 +23,6 @@ struct Fat16 {
     root_dir_sectors: usize,
     data_start_sector: usize,
     total_sectors: usize,
-    cluster_count: usize,
 }
 
 fn fat16_geometry() -> Fat16 {
@@ -42,7 +43,6 @@ fn fat16_geometry() -> Fat16 {
         root_dir_sectors,
         data_start_sector,
         total_sectors,
-        cluster_count,
     }
 }
 
@@ -126,18 +126,18 @@ fn fat16_capture_reproduces_used_clusters() {
     };
     let mut writer = PhnxWriter::create(&path, header).unwrap();
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [0u8; 16],
-            "FAT16".into(),
-            (g.total_sectors * SECTOR) as u64,
-            FilesystemKind::Fat,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &extents,
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [0u8; 16],
+            name: "FAT16".into(),
+            original_size: (g.total_sectors * SECTOR) as u64,
+            fs_kind: FilesystemKind::Fat,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &extents,
             bytes_per_cluster,
-        )
+        })
         .unwrap();
     let (used_bytes, _) =
         capture_fat(&mut src, &mut stream, &extents, bitmap_hash.clone()).unwrap();

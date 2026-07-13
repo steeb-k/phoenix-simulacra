@@ -2,7 +2,7 @@ use std::path::Path;
 
 use phoenix_capture::fat::restore_fat;
 use phoenix_capture::ntfs::restore_ntfs;
-use phoenix_capture::raw::{restore_raw, PartitionWriter};
+use phoenix_capture::raw::{restore_raw, PartitionWriter, RestoreOpts};
 use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
 use phoenix_core::disk::{enumerate_disks, DiskInfo, FilesystemKind};
 use phoenix_core::error::Result;
@@ -427,6 +427,11 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             );
         }
 
+        let restore_opts = RestoreOpts {
+            verify: opts.verify_on_restore,
+            progress: opts.progress.as_ref(),
+            bytes_done,
+        };
         match fs {
             FilesystemKind::Ntfs => {
                 bytes_done += restore_ntfs(
@@ -434,9 +439,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                     &idx_entry,
                     &mut writer,
                     entry.target_size_bytes,
-                    opts.verify_on_restore,
-                    opts.progress.as_ref(),
-                    bytes_done,
+                    restore_opts,
                     relocation.as_ref(),
                 )?;
             }
@@ -447,9 +450,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                     &mut writer,
                     entry.target_size_bytes,
                     fs,
-                    opts.verify_on_restore,
-                    opts.progress.as_ref(),
-                    bytes_done,
+                    restore_opts,
                 )?;
             }
             _ => {
@@ -457,9 +458,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                     &mut reader,
                     &idx_entry,
                     &mut writer,
-                    opts.verify_on_restore,
-                    opts.progress.as_ref(),
-                    bytes_done,
+                    restore_opts,
                     None,
                     entry.target_size_bytes,
                 )?;

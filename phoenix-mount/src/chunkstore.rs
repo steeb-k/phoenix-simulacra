@@ -298,7 +298,9 @@ fn align_up(v: u64, a: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phoenix_core::container::{Extent, Header, PhnxWriter, CHUNK_SIZE, FORMAT_VERSION};
+    use phoenix_core::container::{
+        Extent, Header, PartitionStreamSpec, PhnxWriter, CHUNK_SIZE, FORMAT_VERSION,
+    };
     use phoenix_core::disk::{CaptureMode, FilesystemKind};
     use phoenix_core::manifest::{BackupManifest, DiskManifest, PartitionManifest};
     use uuid::Uuid;
@@ -324,18 +326,18 @@ mod tests {
         }];
         let mut w = PhnxWriter::create(&path, header).unwrap();
         let mut s = w
-            .begin_partition_stream(
-                0,
-                [0; 16],
-                "P".into(),
-                128 * 1024,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                EXTENT_LBA_BYTES,
-                0,
-                &extents,
-                4096,
-            )
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0; 16],
+                name: "P".into(),
+                original_size: 128 * 1024,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: EXTENT_LBA_BYTES,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         s.write_chunk(&vec![0x7Eu8; ext_bytes as usize]).unwrap();
         let (chunks, _) = s.finish().unwrap();
@@ -434,18 +436,18 @@ mod tests {
         ];
         let mut w = PhnxWriter::create(&path, header).unwrap();
         let mut s = w
-            .begin_partition_stream(
-                0,
-                [0; 16],
-                "P".into(),
-                part_bytes,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                EXTENT_LBA_BYTES,
-                0,
-                &extents,
-                4096,
-            )
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0; 16],
+                name: "P".into(),
+                original_size: part_bytes,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: EXTENT_LBA_BYTES,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         s.set_extent(0);
         s.write_chunk(&vec![0x33u8; e0_bytes as usize]).unwrap();
@@ -534,18 +536,18 @@ mod tests {
         }];
         let mut w = PhnxWriter::create(&path, header).unwrap();
         let mut s = w
-            .begin_partition_stream(
-                0,
-                [0; 16],
-                "P".into(),
-                part_bytes,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                EXTENT_LBA_BYTES,
-                0,
-                &extents,
-                4096,
-            )
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0; 16],
+                name: "P".into(),
+                original_size: part_bytes,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: EXTENT_LBA_BYTES,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         s.write_chunk(&vec![0x11u8; short_len]).unwrap();
         s.write_chunk(&vec![0x22u8; part_bytes as usize - short_len])

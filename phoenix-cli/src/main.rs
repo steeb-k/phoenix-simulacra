@@ -1,6 +1,6 @@
 mod version;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use phoenix_capture::backup::{run_backup, BackupOptions};
@@ -349,7 +349,7 @@ fn cmd_list_disks() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_list_backup(path: &PathBuf) -> anyhow::Result<()> {
+fn cmd_list_backup(path: &Path) -> anyhow::Result<()> {
     let reader = PhnxReader::open(path)?;
     println!("Backup: {}", path.display());
     println!("  ID: {}", reader.header.backup_id);
@@ -380,7 +380,7 @@ fn cmd_list_backup(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_plan(backup: &PathBuf, disk_index: u32, output: &PathBuf) -> anyhow::Result<()> {
+fn cmd_plan(backup: &Path, disk_index: u32, output: &PathBuf) -> anyhow::Result<()> {
     let reader = PhnxReader::open(backup)?;
     let disks = enumerate_disks()?;
     let target = disks
@@ -406,7 +406,7 @@ fn cmd_plan(backup: &PathBuf, disk_index: u32, output: &PathBuf) -> anyhow::Resu
 /// garbage values — the validate-extents-fit pre-flight will tell us
 /// "extent reaches sector N", but only this tool can say *which*
 /// extent and what its raw bytes look like.
-fn cmd_inspect(path: &PathBuf, full: bool) -> anyhow::Result<()> {
+fn cmd_inspect(path: &Path, full: bool) -> anyhow::Result<()> {
     let mut reader = PhnxReader::open(path)?;
     println!("Backup: {}", path.display());
     println!("  ID:         {}", reader.header.backup_id);

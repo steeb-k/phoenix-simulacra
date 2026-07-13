@@ -83,7 +83,7 @@ pub fn materialize(reader: PhnxReader, out_path: &Path) -> Result<MaterializedIm
 mod tests {
     use super::*;
     use phoenix_core::container::{
-        Extent, Header, PhnxWriter, EXTENT_LBA_BYTES as LBA, FORMAT_VERSION,
+        Extent, Header, PartitionStreamSpec, PhnxWriter, EXTENT_LBA_BYTES as LBA, FORMAT_VERSION,
     };
     use phoenix_core::disk::{CaptureMode, FilesystemKind};
     use phoenix_core::manifest::{BackupManifest, DiskManifest, PartitionManifest};
@@ -108,18 +108,18 @@ mod tests {
         }];
         let mut writer = PhnxWriter::create(&path, header).unwrap();
         let mut stream = writer
-            .begin_partition_stream(
-                0,
-                [0x11; 16],
-                "Vol".into(),
-                ext_bytes as u64,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                LBA,
-                0,
-                &extents,
-                4096,
-            )
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0x11; 16],
+                name: "Vol".into(),
+                original_size: ext_bytes as u64,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: LBA,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         let payload = vec![0x5Au8; ext_bytes];
         stream.write_chunk(&payload).unwrap();

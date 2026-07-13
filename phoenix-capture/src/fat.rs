@@ -2,7 +2,6 @@ use phoenix_core::container::{Extent, CHUNK_SIZE};
 use phoenix_core::disk::FilesystemKind;
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
-use phoenix_core::ProgressHandle;
 
 use crate::reader::BlockSource;
 
@@ -618,9 +617,7 @@ pub fn restore_fat(
     writer: &mut crate::raw::PartitionWriter,
     target_size: u64,
     fs: FilesystemKind,
-    verify: bool,
-    progress: Option<&ProgressHandle>,
-    bytes_done: u64,
+    opts: crate::raw::RestoreOpts<'_>,
 ) -> Result<u64> {
     if entry.used_bytes > target_size {
         return Err(PhoenixError::PartitionTooSmall {
@@ -633,16 +630,7 @@ pub fn restore_fat(
     // only). Pre-flight in `validate_extents_fit` still refuses any
     // FAT/exFAT shrink whose used data lives past the boundary, so this
     // None is correct: by the time we get here, the source already fits.
-    let written = crate::raw::restore_raw(
-        reader,
-        entry,
-        writer,
-        verify,
-        progress,
-        bytes_done,
-        None,
-        target_size,
-    )?;
+    let written = crate::raw::restore_raw(reader, entry, writer, opts, None, target_size)?;
     finalize_fat_partition(writer, target_size, fs)?;
     Ok(written)
 }
@@ -781,6 +769,7 @@ fn patch_fat_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> Re
 ///   * `ClusterCount` (offset 92, 4 bytes) — clusters in the heap,
 ///     derived from `(VolumeLength − ClusterHeapOffset) >>
 ///     SectorsPerClusterShift`.
+///
 /// Then recompute the 32-bit boot checksum and stamp it across all 128
 /// `u32` slots of sector 11 / 23 (each checksum sector replicates the
 /// scalar to fill its 512 bytes — the spec is explicit about this).

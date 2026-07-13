@@ -9,6 +9,18 @@ use windows_sys::Win32::Foundation::GetLastError;
 
 use crate::reader::BlockSource;
 
+/// The knobs every restore path threads through unchanged: whether to
+/// BLAKE3-check each chunk as it decompresses, where to report progress, and
+/// how many bytes the partitions restored *before* this one already
+/// contributed — progress is reported against the whole-disk total, so each
+/// partition has to pick up the running count where the last one left off.
+#[derive(Clone, Copy)]
+pub struct RestoreOpts<'a> {
+    pub verify: bool,
+    pub progress: Option<&'a ProgressHandle>,
+    pub bytes_done: u64,
+}
+
 /// How many bytes of a write at partition-relative `offset` of `len` bytes may
 /// actually be written without reaching `max_bytes`. `None` = write nothing
 /// (fully out of bounds); `Some(n)` = write the first `n` bytes.
@@ -81,9 +93,7 @@ pub fn restore_raw(
     reader: &mut phoenix_core::container::PhnxReader,
     entry: &phoenix_core::container::PartitionIndexEntry,
     writer: &mut PartitionWriter,
-    verify: bool,
-    progress: Option<&ProgressHandle>,
-    mut bytes_done: u64,
+    opts: RestoreOpts<'_>,
     relocation: Option<&RelocationMap>,
     // Never write at or past this partition-relative byte (the target
     // partition size). Data beyond it is dropped: for a raw-captured volume
@@ -92,6 +102,11 @@ pub fn restore_raw(
     // hard guard against a stream overrunning into the neighboring partition.
     max_bytes: u64,
 ) -> Result<u64> {
+    let RestoreOpts {
+        verify,
+        progress,
+        mut bytes_done,
+    } = opts;
     let stream = reader.read_stream_header(entry)?;
     let chunk_records: Vec<phoenix_core::manifest::ChunkRecord> = reader
         .manifest
@@ -324,13 +339,13 @@ impl PartitionWriter {
     /// status no longer collapses every failure to the unhelpful
     /// "write failed" string we used to emit. Common codes the user
     /// might see:
-    ///   *  5 (ERROR_ACCESS_DENIED)         — another process holds a
-    ///        handle on the volume; usually a re-mount races us.
-    ///   * 19 (ERROR_WRITE_PROTECT)         — disk is read-only.
-    ///   * 87 (ERROR_INVALID_PARAMETER)     — offset/length not aligned
-    ///        to the disk's logical sector size.
-    ///   * 33 (ERROR_LOCK_VIOLATION)        — disk's mounted volumes are
-    ///        active; need an FSCTL_LOCK_VOLUME / FSCTL_DISMOUNT first.
+    ///   * 5 (ERROR_ACCESS_DENIED) — another process holds a handle on
+    ///     the volume; usually a re-mount races us.
+    ///   * 19 (ERROR_WRITE_PROTECT) — disk is read-only.
+    ///   * 87 (ERROR_INVALID_PARAMETER) — offset/length not aligned to
+    ///     the disk's logical sector size.
+    ///   * 33 (ERROR_LOCK_VIOLATION) — disk's mounted volumes are
+    ///     active; need an FSCTL_LOCK_VOLUME / FSCTL_DISMOUNT first.
     pub fn write_at(&mut self, relative_offset: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());

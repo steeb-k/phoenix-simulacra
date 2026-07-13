@@ -55,7 +55,7 @@ impl AttachedDisk {
             .chain(std::iter::once(0))
             .collect();
 
-        let mut storage_type = VIRTUAL_STORAGE_TYPE {
+        let storage_type = VIRTUAL_STORAGE_TYPE {
             DeviceId: STORAGE_TYPE_DEVICE_UNKNOWN,
             VendorId: vendor_unknown(),
         };
@@ -67,7 +67,7 @@ impl AttachedDisk {
         open_params.Anonymous.Version1.RWDepth = RW_DEPTH_DEFAULT;
         let rc = unsafe {
             OpenVirtualDisk(
-                &mut storage_type,
+                &storage_type,
                 wide.as_ptr(),
                 VIRTUAL_DISK_ACCESS_ATTACH_RO | VIRTUAL_DISK_ACCESS_GET_INFO,
                 OPEN_VIRTUAL_DISK_FLAG_NONE,

@@ -70,26 +70,21 @@ impl VhdFs {
     }
 
     fn file_info(&self, node: Node) -> FileInfo {
-        let mut fi = FileInfo::default();
-        fi.creation_time = self.time;
-        fi.last_access_time = self.time;
-        fi.last_write_time = self.time;
-        fi.change_time = self.time;
-        match node {
-            Node::Root => {
-                fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
-                fi.file_size = 0;
-                fi.allocation_size = 0;
-                fi.index_number = 1;
-            }
-            Node::Vhd => {
-                fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
-                fi.file_size = self.total_len;
-                fi.allocation_size = self.total_len;
-                fi.index_number = 2;
-            }
+        let (file_attributes, size, index_number) = match node {
+            Node::Root => (FILE_ATTRIBUTE_DIRECTORY, 0, 1),
+            Node::Vhd => (FILE_ATTRIBUTE_NORMAL, self.total_len, 2),
+        };
+        FileInfo {
+            creation_time: self.time,
+            last_access_time: self.time,
+            last_write_time: self.time,
+            change_time: self.time,
+            file_attributes,
+            file_size: size,
+            allocation_size: size,
+            index_number,
+            ..Default::default()
         }
-        fi
     }
 
     /// Copy the security descriptor into `buf` if it fits; always return the
@@ -299,11 +294,10 @@ impl WinFspMount {
                 .ok_or_else(|| PhoenixError::Other("non-UTF-8 mount path".into()))?,
             selection.is_none(),
         )
-        .map_err(|e| {
+        .inspect_err(|_| {
             // Tear the FS back down if attach fails, so we don't leak a mount.
             host.stop();
             host.unmount();
-            e
         })?;
 
         let (volumes, assigned_letters) = match selection {
@@ -347,15 +341,15 @@ impl Drop for WinFspMount {
 
 /// Initialize WinFsp once per process. `winfsp_init` loads winfsp-<arch>.dll
 /// from the WinFsp install directory (via the registry) so the delay-loaded
-/// symbols resolve; it must run before any other WinFsp call. The returned
-/// token is leaked so WinFsp stays initialized for the process lifetime.
+/// symbols resolve; it must run before any other WinFsp call. The token it
+/// returns is a `Copy` marker with no `Drop`, so dropping it tears nothing
+/// down and WinFsp stays initialized for the process lifetime on its own.
 fn ensure_winfsp() -> Result<()> {
     static INIT: Once = Once::new();
     static OK: AtomicBool = AtomicBool::new(false);
     static ERR: Mutex<Option<String>> = Mutex::new(None);
     INIT.call_once(|| match winfsp::winfsp_init() {
-        Ok(token) => {
-            std::mem::forget(token);
+        Ok(_token) => {
             OK.store(true, Ordering::SeqCst);
         }
         Err(e) => {

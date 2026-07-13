@@ -221,11 +221,8 @@ impl ClonePlan {
 }
 
 fn align_down(value: u64, align: u64) -> u64 {
-    if align == 0 {
-        value
-    } else {
-        (value / align) * align
-    }
+    // `checked_div` is `None` only for `align == 0`, which means "no alignment".
+    value.checked_div(align).map_or(value, |q| q * align)
 }
 
 #[cfg(test)]

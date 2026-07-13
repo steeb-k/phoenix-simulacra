@@ -31,7 +31,7 @@ fn chs(total_sectors: u64) -> (u16, u8, u8) {
     } else {
         sectors_per_track = 17;
         cylinder_times_heads = ts / sectors_per_track;
-        heads = ((cylinder_times_heads + 1023) / 1024).max(4);
+        heads = cylinder_times_heads.div_ceil(1024).max(4);
         if cylinder_times_heads >= heads * 1024 || heads > 16 {
             sectors_per_track = 31;
             heads = 16;

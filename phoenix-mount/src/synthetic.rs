@@ -167,7 +167,7 @@ fn derive_guid(disk_guid: &[u8; 16], index: u32) -> [u8; 16] {
 mod tests {
     use super::*;
     use phoenix_core::container::{
-        Extent, Header, PhnxWriter, EXTENT_LBA_BYTES as LBA, FORMAT_VERSION,
+        Extent, Header, PartitionStreamSpec, PhnxWriter, EXTENT_LBA_BYTES as LBA, FORMAT_VERSION,
     };
     use phoenix_core::disk::{CaptureMode, FilesystemKind};
     use phoenix_core::manifest::{BackupManifest, DiskManifest, PartitionManifest};
@@ -195,18 +195,18 @@ mod tests {
         }];
         let mut w = PhnxWriter::create(&path, header).unwrap();
         let mut s = w
-            .begin_partition_stream(
-                0,
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
                 type_guid,
-                "Vol".into(),
-                ext_bytes,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                LBA,
-                0,
-                &extents,
-                4096,
-            )
+                name: "Vol".into(),
+                original_size: ext_bytes,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: LBA,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         s.write_chunk(&vec![0x5Au8; ext_bytes as usize]).unwrap();
         let (chunks, _) = s.finish().unwrap();

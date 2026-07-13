@@ -1,6 +1,6 @@
 use chrono::Utc;
 use phoenix_core::container::{
-    Extent, Header, PhnxWriter, CHUNK_SIZE, EXTENT_LBA_BYTES, FORMAT_VERSION,
+    Extent, Header, PartitionStreamSpec, PhnxWriter, CHUNK_SIZE, EXTENT_LBA_BYTES, FORMAT_VERSION,
 };
 use phoenix_core::disk::guid_to_string;
 use phoenix_core::disk::{
@@ -366,11 +366,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 
         info!("Backing up partition {} ({})", part.index, part.name);
 
-        let mut stream = writer.begin_partition_stream(
-            part.index,
-            part.type_guid,
-            part.name.clone(),
-            part.size_bytes,
+        let mut stream = writer.begin_partition_stream(PartitionStreamSpec {
+            index: part.index,
+            type_guid: part.type_guid,
+            name: part.name.clone(),
+            original_size: part.size_bytes,
             fs_kind,
             capture_mode,
             // The index entry's `sector_size` is the extent addressing unit,
@@ -381,11 +381,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             // so on a 4Kn disk passing 4096 here would inflate every offset
             // 8x. The real physical sector size is recorded in the manifest's
             // disk block and used only for I/O alignment.
-            EXTENT_LBA_BYTES,
-            0,
-            &prep.extents,
-            prep.bytes_per_cluster,
-        )?;
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &prep.extents,
+            bytes_per_cluster: prep.bytes_per_cluster,
+        })?;
 
         let (used_bytes, bitmap_hash) = match (fs_kind, capture_mode) {
             (FilesystemKind::Ntfs, CaptureMode::UsedBlocks) => {

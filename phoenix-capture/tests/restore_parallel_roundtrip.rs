@@ -8,9 +8,10 @@
 //! proves restore writes ONLY inside the extents (no stray writes below the
 //! partition base offset, between extents, or past the extent ends).
 
-use phoenix_capture::raw::{restore_raw, PartitionWriter};
+use phoenix_capture::raw::{restore_raw, PartitionWriter, RestoreOpts};
 use phoenix_core::container::{
-    Extent, Header, PhnxReader, PhnxWriter, CHUNK_SIZE, EXTENT_LBA_BYTES, FORMAT_VERSION,
+    Extent, Header, PartitionStreamSpec, PhnxReader, PhnxWriter, CHUNK_SIZE, EXTENT_LBA_BYTES,
+    FORMAT_VERSION,
 };
 use phoenix_core::disk::{CaptureMode, FilesystemKind};
 use phoenix_core::manifest::{BackupManifest, DiskManifest, PartitionManifest};
@@ -86,18 +87,18 @@ fn restore_raw_parallel_roundtrips_and_stays_in_bounds() {
     };
     let mut writer = PhnxWriter::create(&phnx_path, header).unwrap();
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [0u8; 16],
-            "R".into(),
-            part_size,
-            FilesystemKind::Ntfs,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &extents,
-            4096,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [0u8; 16],
+            name: "R".into(),
+            original_size: part_size,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &extents,
+            bytes_per_cluster: 4096,
+        })
         .unwrap();
     stream.set_extent(0);
     for c in &e0 {
@@ -148,9 +149,11 @@ fn restore_raw_parallel_roundtrips_and_stays_in_bounds() {
         &mut reader,
         &entry,
         &mut pw,
-        true, // verify chunk hashes on the parallel decode path
-        None,
-        0,
+        RestoreOpts {
+            verify: true, // verify chunk hashes on the parallel decode path
+            progress: None,
+            bytes_done: 0,
+        },
         None,
         part_size,
     )
@@ -208,7 +211,18 @@ fn restore_raw_parallel_roundtrips_and_stays_in_bounds() {
     let mut reader = PhnxReader::open(&phnx_path).unwrap();
     let mut pw =
         PartitionWriter::open_disk(target_path.to_str().unwrap(), base_offset, 512).unwrap();
-    let err = restore_raw(&mut reader, &entry, &mut pw, true, None, 0, None, part_size);
+    let err = restore_raw(
+        &mut reader,
+        &entry,
+        &mut pw,
+        RestoreOpts {
+            verify: true,
+            progress: None,
+            bytes_done: 0,
+        },
+        None,
+        part_size,
+    );
     assert!(
         err.is_err(),
         "verifying restore must fail on a corrupted chunk"

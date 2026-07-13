@@ -595,12 +595,15 @@ fn expand_ntfs_slack_inner(
         .sum();
     let mut remaining = trailing;
     for (pos, &idx) in extra_ntfs.iter().enumerate() {
+        // Split `trailing` in proportion to each partition's original size, or
+        // evenly when every one of them is zero-sized. `extra_ntfs` is non-empty
+        // (guarded above), so the even-split divisor is safe.
         let share = if pos + 1 == extra_ntfs.len() {
             remaining
-        } else if total_extra_orig > 0 {
-            trailing * entries[idx].target_size_bytes / total_extra_orig
         } else {
-            trailing / extra_ntfs.len() as u64
+            (trailing * entries[idx].target_size_bytes)
+                .checked_div(total_extra_orig)
+                .unwrap_or(trailing / extra_ntfs.len() as u64)
         };
         remaining = remaining.saturating_sub(share);
         entries[idx].target_size_bytes =

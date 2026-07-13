@@ -183,7 +183,7 @@ impl Header {
             return Err(PhoenixError::InvalidFormat("bad magic".into()));
         }
         let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-        if version < MIN_READ_VERSION || version > FORMAT_VERSION {
+        if !(MIN_READ_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(PhoenixError::InvalidFormat(format!(
                 "unsupported .phnx format version {version} (this build reads {MIN_READ_VERSION}..={FORMAT_VERSION})"
             )));
@@ -387,6 +387,29 @@ pub struct PhnxWriter {
     progress: Option<ProgressHandle>,
 }
 
+/// Everything [`PhnxWriter::begin_partition_stream`] needs to open a partition
+/// stream: the metadata that lands in the partition index entry, plus the
+/// extent map that heads the stream itself.
+///
+/// This is a struct rather than a parameter list because several of the fields
+/// share a type — `original_size`/`used_bytes` are both `u64`, and
+/// `sector_size`/`bytes_per_cluster` are both `u32`. Passed positionally, a
+/// transposed pair would still typecheck and still produce a structurally valid
+/// `.phnx`; it would just describe the partition wrongly, and nothing would
+/// notice until a restore. Named fields make that mistake impossible to write.
+pub struct PartitionStreamSpec<'a> {
+    pub index: u32,
+    pub type_guid: [u8; 16],
+    pub name: String,
+    pub original_size: u64,
+    pub fs_kind: FilesystemKind,
+    pub capture_mode: CaptureMode,
+    pub sector_size: u32,
+    pub used_bytes: u64,
+    pub extents: &'a [Extent],
+    pub bytes_per_cluster: u32,
+}
+
 impl PhnxWriter {
     pub fn create(path: &Path, header: Header) -> Result<Self> {
         Self::create_with_progress(path, header, None)
@@ -428,17 +451,20 @@ impl PhnxWriter {
 
     pub fn begin_partition_stream(
         &mut self,
-        index: u32,
-        type_guid: [u8; 16],
-        name: String,
-        original_size: u64,
-        fs_kind: FilesystemKind,
-        capture_mode: CaptureMode,
-        sector_size: u32,
-        used_bytes: u64,
-        extents: &[Extent],
-        bytes_per_cluster: u32,
+        spec: PartitionStreamSpec<'_>,
     ) -> Result<PartitionStreamWriter<'_>> {
+        let PartitionStreamSpec {
+            index,
+            type_guid,
+            name,
+            original_size,
+            fs_kind,
+            capture_mode,
+            sector_size,
+            used_bytes,
+            extents,
+            bytes_per_cluster,
+        } = spec;
         let stream_offset = self.current_offset;
         // Map header is 12 bytes (extent count + chunk count + bytes/cluster,
         // three u32s) followed by the extent table (16 bytes per extent). This
@@ -1122,9 +1148,7 @@ fn decode_items_for_verify<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{BackupManifest, DiskManifest, PartitionManifest};
     use std::io::Cursor;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn header_roundtrip() {
@@ -1213,18 +1237,18 @@ mod tests {
         ];
         let mut writer = PhnxWriter::create(&path, header).unwrap();
         let mut stream = writer
-            .begin_partition_stream(
-                0,
-                [0; 16],
-                "T".into(),
-                4096,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                EXTENT_LBA_BYTES,
-                0,
-                &extents,
-                4096,
-            )
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0; 16],
+                name: "T".into(),
+                original_size: 4096,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: EXTENT_LBA_BYTES,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         stream.set_extent(0);
         stream.write_chunk(&[0xCD; 4096]).unwrap();

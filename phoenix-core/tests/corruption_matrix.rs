@@ -4,7 +4,7 @@
 //! Pure file I/O — no admin, no disks — so it runs everywhere.
 
 use phoenix_core::container::{
-    Extent, Header, PhnxReader, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION,
+    Extent, Header, PartitionStreamSpec, PhnxReader, PhnxWriter, EXTENT_LBA_BYTES, FORMAT_VERSION,
 };
 use phoenix_core::disk::{CaptureMode, FilesystemKind};
 use phoenix_core::error::PhoenixError;
@@ -45,18 +45,18 @@ fn build_backup() -> std::path::PathBuf {
 
     let mut writer = PhnxWriter::create(&path, header).unwrap();
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [0; 16],
-            "P".into(),
-            (ext0_bytes + ext1_bytes) as u64,
-            FilesystemKind::Ntfs,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &extents,
-            4096,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [0; 16],
+            name: "P".into(),
+            original_size: (ext0_bytes + ext1_bytes) as u64,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &extents,
+            bytes_per_cluster: 4096,
+        })
         .unwrap();
     stream.set_extent(0);
     stream.write_chunk(&vec![0x11u8; CHUNK]).unwrap();

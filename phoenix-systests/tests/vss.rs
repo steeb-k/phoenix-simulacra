@@ -273,6 +273,7 @@ fn vss_fallback_enforces_volume_lock() {
 
     let mut held = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(r"X:\held-open.bin")
         .expect("open held file");

@@ -4,7 +4,6 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use phoenix_core::container::{Extent, CHUNK_SIZE};
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::hash;
-use phoenix_core::ProgressHandle;
 
 use crate::reader::BlockSource;
 
@@ -15,8 +14,6 @@ struct NtfsBootSector {
     bytes_per_sector: u16,
     sectors_per_cluster: u8,
     total_sectors: u64,
-    mft_cluster: i64,
-    clusters_per_mft_record: i8,
 }
 
 /// Stream every byte covered by `extents` from the (possibly volume-locked)
@@ -78,15 +75,10 @@ fn parse_boot_sector(boot: &[u8]) -> Result<NtfsBootSector> {
     let sectors_per_cluster = cur.read_u8()?;
     cur.seek(SeekFrom::Start(40))?;
     let total_sectors = cur.read_u64::<LittleEndian>()?;
-    cur.seek(SeekFrom::Start(48))?;
-    let mft_cluster = cur.read_i64::<LittleEndian>()?;
-    let clusters_per_mft_record = cur.read_i8()?;
     Ok(NtfsBootSector {
         bytes_per_sector,
         sectors_per_cluster,
         total_sectors,
-        mft_cluster,
-        clusters_per_mft_record,
     })
 }
 
@@ -195,9 +187,7 @@ pub fn restore_ntfs(
     entry: &phoenix_core::container::PartitionIndexEntry,
     writer: &mut crate::raw::PartitionWriter,
     target_size: u64,
-    verify: bool,
-    progress: Option<&ProgressHandle>,
-    bytes_done: u64,
+    opts: crate::raw::RestoreOpts<'_>,
     relocation: Option<&phoenix_core::relocation::RelocationMap>,
 ) -> Result<u64> {
     if entry.used_bytes > target_size {
@@ -207,16 +197,7 @@ pub fn restore_ntfs(
             required: entry.used_bytes,
         });
     }
-    let written = crate::raw::restore_raw(
-        reader,
-        entry,
-        writer,
-        verify,
-        progress,
-        bytes_done,
-        relocation,
-        target_size,
-    )?;
+    let written = crate::raw::restore_raw(reader, entry, writer, opts, relocation, target_size)?;
     finalize_ntfs_partition(writer, target_size, relocation)?;
     Ok(written)
 }

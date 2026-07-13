@@ -7,8 +7,8 @@
 //! with a full verify.
 
 use phoenix_core::container::{
-    compress_chunk, Extent, Header, PhnxReader, PhnxWriter, CHUNK_SIZE, EXTENT_LBA_BYTES,
-    FORMAT_VERSION, HEADER_SIZE, INDEX_TABLE_RESERVE,
+    compress_chunk, Extent, Header, PartitionStreamSpec, PhnxReader, PhnxWriter, CHUNK_SIZE,
+    EXTENT_LBA_BYTES, FORMAT_VERSION, HEADER_SIZE, INDEX_TABLE_RESERVE,
 };
 use phoenix_core::disk::{CaptureMode, FilesystemKind};
 use phoenix_core::hash;
@@ -126,18 +126,18 @@ fn parallel_writer_matches_serial_reference() {
     let mut writer = PhnxWriter::create(&path, header.clone()).unwrap();
 
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [1u8; 16],
-            "P0".into(),
-            p0_size,
-            FilesystemKind::Ntfs,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &p0_extents,
-            4096,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [1u8; 16],
+            name: "P0".into(),
+            original_size: p0_size,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &p0_extents,
+            bytes_per_cluster: 4096,
+        })
         .unwrap();
     stream.set_extent(0);
     for c in &p0e0 {
@@ -150,18 +150,18 @@ fn parallel_writer_matches_serial_reference() {
     let (p0_records, _) = stream.finish().unwrap();
 
     let mut stream = writer
-        .begin_partition_stream(
-            1,
-            [2u8; 16],
-            "P1".into(),
-            p1_size,
-            FilesystemKind::Ntfs,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &p1_extents,
-            4096,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 1,
+            type_guid: [2u8; 16],
+            name: "P1".into(),
+            original_size: p1_size,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &p1_extents,
+            bytes_per_cluster: 4096,
+        })
         .unwrap();
     stream.set_extent(0);
     for c in &p1e0 {
@@ -271,18 +271,18 @@ fn cancelled_progress_fails_write_chunk() {
     let chunks = build_chunks(8, 7);
     let extents = vec![extent_for(&chunks, 0)];
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [0u8; 16],
-            "C".into(),
-            extents[0].sector_count * EXTENT_LBA_BYTES as u64,
-            FilesystemKind::Ntfs,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &extents,
-            4096,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [0u8; 16],
+            name: "C".into(),
+            original_size: extents[0].sector_count * EXTENT_LBA_BYTES as u64,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &extents,
+            bytes_per_cluster: 4096,
+        })
         .unwrap();
     stream.set_extent(0);
     stream.write_chunk(&chunks[0]).unwrap();
@@ -319,18 +319,18 @@ fn full_size_chunks_roundtrip() {
 
     let mut writer = PhnxWriter::create(&path, header.clone()).unwrap();
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [0u8; 16],
-            "F".into(),
-            size,
-            FilesystemKind::Ntfs,
-            CaptureMode::UsedBlocks,
-            EXTENT_LBA_BYTES,
-            0,
-            &extents,
-            4096,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [0u8; 16],
+            name: "F".into(),
+            original_size: size,
+            fs_kind: FilesystemKind::Ntfs,
+            capture_mode: CaptureMode::UsedBlocks,
+            sector_size: EXTENT_LBA_BYTES,
+            used_bytes: 0,
+            extents: &extents,
+            bytes_per_cluster: 4096,
+        })
         .unwrap();
     stream.set_extent(0);
     for c in &chunks {
@@ -386,18 +386,18 @@ fn pipeline_throughput() {
         let start = std::time::Instant::now();
         let mut writer = PhnxWriter::create(&path, header.clone()).unwrap();
         let mut stream = writer
-            .begin_partition_stream(
-                0,
-                [0u8; 16],
-                "B".into(),
-                size,
-                FilesystemKind::Ntfs,
-                CaptureMode::UsedBlocks,
-                EXTENT_LBA_BYTES,
-                0,
-                &extents,
-                4096,
-            )
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0u8; 16],
+                name: "B".into(),
+                original_size: size,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: EXTENT_LBA_BYTES,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
             .unwrap();
         stream.set_extent(0);
         for c in &chunks {

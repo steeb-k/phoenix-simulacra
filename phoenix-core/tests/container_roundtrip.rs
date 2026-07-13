@@ -1,7 +1,9 @@
-use phoenix_core::container::{Extent, Header, PhnxReader, PhnxWriter, FORMAT_VERSION};
+use phoenix_core::container::{
+    Extent, Header, PartitionStreamSpec, PhnxReader, PhnxWriter, FORMAT_VERSION,
+};
 use phoenix_core::disk::{CaptureMode, FilesystemKind};
 use phoenix_core::manifest::{BackupManifest, ChunkRecord, DiskManifest, PartitionManifest};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -40,18 +42,18 @@ fn phnx_write_read_manifest() {
         sector_count: 8,
     }];
     let mut stream = writer
-        .begin_partition_stream(
-            0,
-            [0; 16],
-            "Test".into(),
-            4096,
-            FilesystemKind::Unknown,
-            CaptureMode::Raw,
-            512,
-            0,
-            &extents,
-            0,
-        )
+        .begin_partition_stream(PartitionStreamSpec {
+            index: 0,
+            type_guid: [0; 16],
+            name: "Test".into(),
+            original_size: 4096,
+            fs_kind: FilesystemKind::Unknown,
+            capture_mode: CaptureMode::Raw,
+            sector_size: 512,
+            used_bytes: 0,
+            extents: &extents,
+            bytes_per_cluster: 0,
+        })
         .unwrap();
     // The single extent covers 8 sectors = 4096 bytes, so the captured chunk
     // must be exactly 4096 bytes for the structure check's per-extent coverage
