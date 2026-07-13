@@ -1,3 +1,4 @@
+mod about_panel;
 mod action_bar;
 mod clone_panel;
 mod confirm_dialog;
@@ -489,7 +490,7 @@ impl PhoenixApp {
                 self.history = phoenix_core::appdata::History::load()
             }
             Page::History => {}
-            Page::Verify | Page::Mount | Page::Options => {}
+            Page::Verify | Page::Mount | Page::About => {}
         }
     }
 
@@ -567,7 +568,7 @@ impl PhoenixApp {
     }
 
     /// Reset the Backup page to its untouched default: nothing selected,
-    /// empty name, the settings-default folder, VSS off. The refresh button
+    /// empty name, the last-used folder, VSS off. The refresh button
     /// doubles as a page reset on every page that has one.
     fn clear_backup_ui_state(&mut self) {
         self.selections.clear();
@@ -1066,7 +1067,7 @@ impl PhoenixApp {
                     }),
                 }
             }
-            Page::History | Page::Options => return None,
+            Page::History | Page::About => return None,
         };
         Some(action)
     }
@@ -1118,7 +1119,19 @@ impl eframe::App for PhoenixApp {
         // to `titlebar::show` along with the floating corner pill. That pill
         // hosts the app's one Refresh button — live only when the window is
         // otherwise idle (no job, no modal, no refresh already in flight).
-        let brand_rect = sidebar::show(ctx, &mut self.page, &self.palette, modal_open);
+        let nav = sidebar::show(
+            ctx,
+            &mut self.page,
+            &self.palette,
+            modal_open,
+            &mut self.settings.theme,
+        );
+        let brand_rect = nav.brand_rect;
+        if nav.theme_changed {
+            self.palette = theme::refresh(ctx, self.settings.theme);
+            self.last_theme_refresh = Instant::now();
+            let _ = self.settings.save();
+        }
         let can_refresh = !busy && !modal_open && self.refresh_overlay_until.is_none();
         let refresh_key = ctx.input(|i| i.key_pressed(egui::Key::F5));
         let refresh_clicked = titlebar::show(ctx, &self.palette, brand_rect, can_refresh);
@@ -1192,7 +1205,7 @@ impl eframe::App for PhoenixApp {
                     Page::Verify => self.ui_verify(ui, busy),
                     Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
                     Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
-                    Page::Options => disabled_when(ui, busy, |ui| self.ui_options(ui)),
+                    Page::About => disabled_when(ui, busy, |ui| self.ui_about(ui)),
                 });
             });
 
@@ -1941,6 +1954,18 @@ impl PhoenixApp {
         if !folder.is_dir() {
             self.status = format!("Backup destination is not a folder: {}", folder.display());
             return;
+        }
+
+        // The folder the user just backed up into becomes the one the Backup
+        // page opens on next time. There is no "default backup folder" setting
+        // any more — the last folder that actually worked is a better default
+        // than one somebody configured once and forgot. Persisted only after
+        // the folder has been validated above, so a typo'd path can't become
+        // the remembered one.
+        let remembered = folder.display().to_string();
+        if self.settings.default_backup_dir.as_deref() != Some(remembered.as_str()) {
+            self.settings.default_backup_dir = Some(remembered);
+            let _ = self.settings.save();
         }
 
         let base_path = folder.join(format!("{name}.phnx"));
@@ -2705,56 +2730,12 @@ impl PhoenixApp {
         }
     }
 
-    fn ui_options(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, &self.palette, "Options", "");
-
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label("Theme:");
-            use phoenix_core::appdata::ThemeChoice;
-            for (choice, label) in [
-                (ThemeChoice::System, "System"),
-                (ThemeChoice::Dark, "Dark"),
-                (ThemeChoice::Light, "Light"),
-            ] {
-                if ui
-                    .selectable_label(self.settings.theme == choice, label)
-                    .clicked()
-                {
-                    self.settings.theme = choice;
-                    self.palette = theme::refresh(ui.ctx(), choice);
-                    self.last_theme_refresh = Instant::now();
-                    changed = true;
-                }
+    fn ui_about(&mut self, ui: &mut egui::Ui) {
+        page_scroll_shell(ui, "about_page", |ui| {
+            if about_panel::show(ui, &self.palette, version::BUILD_INFO.version) {
+                self.status = "Update checks aren't wired up yet.".into();
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Default backup folder:");
-            let mut dir = self.settings.default_backup_dir.clone().unwrap_or_default();
-            if ui.text_edit_singleline(&mut dir).changed() {
-                self.settings.default_backup_dir = if dir.trim().is_empty() {
-                    None
-                } else {
-                    Some(dir)
-                };
-                changed = true;
-            }
-            if ui.button("Browse…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.settings.default_backup_dir = Some(path.display().to_string());
-                    changed = true;
-                }
-            }
-        });
-        changed |= ui
-            .checkbox(
-                &mut self.settings.verify_after_backup,
-                "Verify each backup after it completes",
-            )
-            .changed();
-        if changed {
-            let _ = self.settings.save();
-        }
     }
 }
 
@@ -2925,7 +2906,7 @@ fn start_page_from_args() -> Option<Page> {
                 "verify" => Some(Page::Verify),
                 "mount" => Some(Page::Mount),
                 "history" => Some(Page::History),
-                "options" => Some(Page::Options),
+                "about" => Some(Page::About),
                 _ => None,
             };
         }

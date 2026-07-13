@@ -165,6 +165,21 @@ pub fn draw_focus_outline(ui: &Ui, response: &Response, palette: &Palette) {
     );
 }
 
+/// Black or white, whichever stays readable on top of `bg`. Needed wherever
+/// text sits on the *Windows accent* color: the user's accent can be anything
+/// from near-black to pale yellow, so neither hardcoded foreground is safe.
+/// The threshold is on perceived (Rec. 601 luma) brightness, not the raw
+/// channel average — a saturated green is far brighter to the eye than a blue
+/// of the same numeric value.
+pub fn contrast_text(bg: Color32) -> Color32 {
+    let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if luma > 150.0 {
+        Color32::from_rgb(0x10, 0x10, 0x10)
+    } else {
+        Color32::WHITE
+    }
+}
+
 /// Lerp `a` toward `b` by `t` (0..1). Operates per-channel in sRGB space,
 /// which is "good enough" for picking palette tints — strict color
 /// correctness would do the lerp in linear-light, but for our use cases

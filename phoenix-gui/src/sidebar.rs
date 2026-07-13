@@ -1,8 +1,9 @@
 use eframe::egui;
 use egui::{Align2, Color32, Key, Margin, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2};
+use phoenix_core::appdata::ThemeChoice;
 
 use crate::fonts;
-use crate::theme::Palette;
+use crate::theme::{self, Palette};
 
 /// All top-level pages the app can show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,7 +14,7 @@ pub enum Page {
     Verify,
     Mount,
     History,
-    Options,
+    About,
 }
 
 struct NavItem {
@@ -66,10 +67,10 @@ const BOTTOM_ITEMS: &[NavItem] = &[
         key: Key::H,
     },
     NavItem {
-        page: Page::Options,
-        label: "Options",
-        icon: egui_phosphor::regular::GEAR,
-        key: Key::O,
+        page: Page::About,
+        label: "About",
+        icon: egui_phosphor::regular::INFO,
+        key: Key::A,
     },
 ];
 
@@ -83,6 +84,10 @@ const BRAND_BOTTOM_PAD: f32 = 18.0;
 const BRAND_IMAGE_TRAILER: f32 = 6.0;
 const BOTTOM_NAV_TOP_PAD: f32 = 8.0;
 const BOTTOM_NAV_BOTTOM_PAD: f32 = 18.0;
+/// Height of the segmented System/Dark/Light pill pinned under the bottom nav.
+const THEME_PILL_HEIGHT: f32 = 28.0;
+/// Gap between the last nav row and the theme pill.
+const THEME_PILL_TOP_PAD: f32 = 10.0;
 /// How many scrollable nav items must remain visible at the smallest allowed
 /// window height. 1.5 = one full item plus a half-item "more below" hint.
 const MIN_VISIBLE_TOP_ITEMS: f32 = 1.5;
@@ -91,29 +96,50 @@ const MIN_VISIBLE_TOP_ITEMS: f32 = 1.5;
 /// fixed brand and bottom-nav blocks while still showing
 /// [`MIN_VISIBLE_TOP_ITEMS`] of the scrollable middle section. The main app
 /// uses this to set the OS window's `min_inner_size` so the sidebar layout
-/// can't collapse below "logo + 1.5-item scroll hint + History/Options".
+/// can't collapse below "logo + 1.5-item scroll hint + History/About + theme
+/// pill".
 pub fn min_content_height() -> f32 {
     let brand = BRAND_TOP_PAD + LOGO_SIZE + BRAND_IMAGE_TRAILER + BRAND_BOTTOM_PAD;
-    let bottom =
-        BOTTOM_NAV_TOP_PAD + (BOTTOM_ITEMS.len() as f32) * ROW_HEIGHT + BOTTOM_NAV_BOTTOM_PAD;
+    let bottom = BOTTOM_NAV_TOP_PAD
+        + (BOTTOM_ITEMS.len() as f32) * ROW_HEIGHT
+        + THEME_PILL_TOP_PAD
+        + THEME_PILL_HEIGHT
+        + BOTTOM_NAV_BOTTOM_PAD;
     let middle = ROW_HEIGHT * MIN_VISIBLE_TOP_ITEMS;
     brand + bottom + middle
 }
 
+/// What one `show` call produced.
+pub struct SidebarOutput {
+    /// The brand block's rect — the chromeless window uses it as a drag
+    /// handle (see `titlebar::show`).
+    pub brand_rect: Rect,
+    /// The theme pill was clicked and `theme` now holds a new choice: the
+    /// caller re-applies the palette and persists the setting.
+    pub theme_changed: bool,
+}
+
 /// Render the left sidebar. `current` is updated when the user clicks a nav
-/// item. While `busy` is true, items remain visible but click-through is
-/// disabled while the status modal is up so navigation can't interrupt a job.
-///
-/// Returns the brand block's rect — the chromeless window uses it as a
-/// drag handle (see `titlebar::show`).
+/// item, `theme` when the user picks a segment of the theme pill. While `busy`
+/// is true, items remain visible but click-through is disabled while the status
+/// modal is up so navigation can't interrupt a job.
 ///
 /// Layout is three vertically-stacked regions:
 ///   * fixed top — brand/logo;
 ///   * scrollable middle — the primary nav (Backup, Clone, Restore, Verify,
 ///     Mount). Scrolls when the window is short;
-///   * fixed bottom — History and Options, always pinned in view so they
-///     don't disappear as the user shrinks the window.
-pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bool) -> Rect {
+///   * fixed bottom — History and About plus the theme pill, always pinned in
+///     view so they don't disappear as the user shrinks the window. The theme
+///     lives here rather than on a settings page because it's the one
+///     preference people flip on a whim, and it wants to be one click away
+///     from wherever they are.
+pub fn show(
+    ctx: &egui::Context,
+    current: &mut Page,
+    palette: &Palette,
+    busy: bool,
+    theme: &mut ThemeChoice,
+) -> SidebarOutput {
     // Alt+<first letter> jumps straight to a page. Consumed here (before any
     // widget sees the key) but only while navigation is allowed, mirroring
     // the click gating below. `consume_key` requires Alt to be the only
@@ -154,11 +180,11 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                     .response
                     .rect;
 
-                // Fixed bottom nav (History + Options) — pinned, always
-                // visible. Declared before the central panel so the
+                // Fixed bottom nav (History + About + theme pill) — pinned,
+                // always visible. Declared before the central panel so the
                 // remaining space is correctly handed to the scrollable
                 // middle.
-                egui::TopBottomPanel::bottom("sidebar_bottom_nav")
+                let theme_changed = egui::TopBottomPanel::bottom("sidebar_bottom_nav")
                     .resizable(false)
                     .show_separator_line(false)
                     .frame(egui::Frame::none().inner_margin(Margin {
@@ -171,7 +197,10 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                         for item in BOTTOM_ITEMS {
                             nav_row(ui, item, current, palette);
                         }
-                    });
+                        ui.add_space(THEME_PILL_TOP_PAD);
+                        theme_pill(ui, theme, palette)
+                    })
+                    .inner;
 
                 // Scrollable middle: primary nav. Fills whatever vertical
                 // room is left between the brand and bottom nav.
@@ -188,11 +217,110 @@ pub fn show(ctx: &egui::Context, current: &mut Page, palette: &Palette, busy: bo
                             });
                     });
 
-                brand_rect
+                SidebarOutput {
+                    brand_rect,
+                    theme_changed,
+                }
             })
             .inner
         })
         .inner
+}
+
+/// How long the accent thumb takes to slide between segments.
+const THEME_PILL_SLIDE: f32 = 0.14;
+
+/// The segmented System/Dark/Light control pinned under the bottom nav.
+/// Painted by hand rather than built from `selectable_label`s so the three
+/// segments read as one pill: a single rounded well with one accent-colored
+/// thumb that *slides* to the segment you pick rather than blinking there.
+/// Returns whether `theme` changed.
+fn theme_pill(ui: &mut Ui, theme: &mut ThemeChoice, palette: &Palette) -> bool {
+    const CHOICES: [(ThemeChoice, &str); 3] = [
+        (ThemeChoice::System, "System"),
+        (ThemeChoice::Dark, "Dark"),
+        (ThemeChoice::Light, "Light"),
+    ];
+
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), THEME_PILL_HEIGHT),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    let radius = rect.height() / 2.0;
+    painter.rect_filled(rect, Rounding::same(radius), palette.sidebar_hover_bg);
+
+    let seg_width = rect.width() / CHOICES.len() as f32;
+    let seg_rect = |i: f32| {
+        Rect::from_min_size(
+            rect.left_top() + Vec2::new(i * seg_width, 0.0),
+            Vec2::new(seg_width, rect.height()),
+        )
+    };
+    let selected_index = CHOICES
+        .iter()
+        .position(|(choice, _)| choice == theme)
+        .unwrap_or(0) as f32;
+
+    // The thumb's position is animated, not snapped: egui eases the stored
+    // value toward the selected index and asks for repaints until it lands.
+    // Everything else (hover tints, label weight) still keys off the real
+    // selection, so only the accent block is in motion.
+    let thumb_at = ui.ctx().animate_value_with_time(
+        ui.id().with("theme_thumb"),
+        selected_index,
+        THEME_PILL_SLIDE,
+    );
+    // Inset from the well so a sliver of track still shows around the thumb —
+    // that ring is what makes the pill read as a track with something moving
+    // along it rather than three abutting buttons.
+    painter.rect_filled(
+        seg_rect(thumb_at).shrink(2.0),
+        Rounding::same(radius - 2.0),
+        palette.accent,
+    );
+
+    let mut changed = false;
+    for (i, (choice, label)) in CHOICES.iter().enumerate() {
+        let seg = seg_rect(i as f32);
+        let response = ui.interact(seg, ui.id().with(("theme_pill", i)), Sense::click());
+        let selected = *theme == *choice;
+
+        if !selected && response.hovered() {
+            painter.rect_filled(
+                seg.shrink(2.0),
+                Rounding::same(radius - 2.0),
+                palette.sidebar_hover_bg,
+            );
+        }
+
+        // Fade each label between its on-accent and off-accent color by how
+        // much of the thumb currently covers it, so a label never sits in the
+        // wrong color while the thumb is passing over it.
+        let covered = (1.0 - (thumb_at - i as f32).abs()).clamp(0.0, 1.0);
+        let text_color = theme::tint(
+            palette.icon_color.gamma_multiply(0.85),
+            covered,
+            theme::contrast_text(palette.accent),
+        );
+        painter.text(
+            seg.center(),
+            Align2::CENTER_CENTER,
+            label,
+            if selected {
+                fonts::bold(12.0)
+            } else {
+                fonts::regular(12.0)
+            },
+            text_color,
+        );
+
+        if response.clicked() && !selected {
+            *theme = *choice;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn draw_brand(ui: &mut Ui) {

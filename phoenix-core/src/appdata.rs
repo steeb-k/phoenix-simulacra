@@ -235,7 +235,13 @@ pub enum ThemeChoice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// The folder the last backup was written to — what the Backup page opens
+    /// on. Not a setting the user picks: the GUI writes it after every backup
+    /// whose destination it has already validated.
     pub default_backup_dir: Option<String>,
+    /// No UI exposes this any more — verifying is what makes an image worth
+    /// having, so the GUI always verifies. Kept as a hand-editable escape
+    /// hatch, and read by the GUI when it builds a backup job.
     pub verify_after_backup: bool,
     pub default_verify_quick: bool,
     pub clone_readback_verify: bool,
