@@ -18,12 +18,13 @@ disk had 512-byte sectors. Both are now **fixed and covered**:
    relocation map. Platform-independent — it bit 512e media too. Covered by
    `ntfs_restore_shrink_64k_clusters`, the first fixture in this tree to look at a
    volume that isn't 4K-cluster.
-2. ~~**4Kn media unsupported; capture failed on the first read**~~ — **DONE**
-   (except mount). Backup, restore, `chkdsk`, and byte-for-byte fixture recovery
-   all work on a true 4096-byte-sector disk. See P1 below.
+2. ~~**4Kn media unsupported; capture failed on the first read**~~ — **DONE, all of
+   it.** Backup, restore, `chkdsk`, byte-for-byte fixture recovery, **and mount** all
+   work on a true 4096-byte-sector disk. See P1 below.
 
-Both were found *and fixed* on the x64 dev box against a synthesized 4Kn VHDX —
-the ARM64 laptop was never needed.
+Both were found *and fixed* on the x64 dev box against a 4Kn VHDX we synthesize
+ourselves — the ARM64 laptop was never needed, which was the whole point of building
+that fixture.
 
 3. ~~**Partial clone had no end-to-end test**~~ — **DONE.** The GUI's default clone
    mode, which rewrites a live target's partition table, was shipping on five unit
@@ -56,13 +57,36 @@ Fixed by returning the parsed cluster size and threading it through. Covered by
 that isn't 4K-cluster (the harness gained `init_gpt_with_cluster` for it). The absence
 of such a fixture is the whole reason this survived.
 
-### ~~P1 — 4Kn media support~~ (DONE 2026-07-13, except mount)
+### ~~P1 — 4Kn media support~~ (DONE 2026-07-13 — **all of it**, mount included)
 
-**A 4Kn NTFS volume now backs up, restores to a 4Kn disk, mounts, passes `chkdsk`,
-and returns every byte** (`ntfs_4kn_backup_restore_roundtrip`). H1–H5 are fixed;
-**H6 (mounting a 4Kn backup) is refused with a clear error**, because the fixed-VHD
-format the mount synthesizes is 512-sector by definition — real support needs the
-VHDX path (see "Remaining" at the end of this section).
+**A 4Kn NTFS volume backs up, restores to a 4Kn disk, mounts, passes `chkdsk`, and
+returns every byte.** H1–H6 are all fixed
+(`ntfs_4kn_backup_restore_roundtrip`, `winfsp_mount_a_4kn_backup`).
+
+**Every one of these bugs was found and fixed on the x64 dev box**, against a 4Kn
+VHDX we synthesize ourselves. No 4Kn hardware was ever involved — which was the
+entire argument for building `TestVhd::create_4kn` in the first place.
+
+**H6 (mount)** turned out to be the most interesting. Mounting synthesizes a virtual
+disk and attaches it; that disk was a **fixed VHD**, a format with *no field for a
+sector size* — 512 is simply what a VHD is. Hand NTFS a volume whose boot sector says
+4096 on a device that says 512 and it declines, and Windows shows the user a RAW disk.
+So `phoenix-mount` now synthesizes a **VHDX** (which states its logical sector size in
+metadata) when the backup came from a 4Kn disk, and keeps the simpler VHD for 512e.
+
+Two things that cost real time there, both worth remembering:
+
+- **VHDX checksums with CRC-32C (Castagnoli), GPT with CRC-32 (IEEE).** Use the wrong
+  polynomial and you get a structurally perfect container that Windows refuses to open
+  with `ERROR_FILE_CORRUPT` and not one word about which field it disliked.
+- **`FileParameters` is *file* metadata, not *virtual-disk* metadata**, so its
+  `IsVirtualDisk` flag must be clear. Ours was set, and that single bit produced the
+  same undiagnosable rejection. Found by dumping the metadata table of a VHDX Windows
+  built itself and reading the two side by side (`vhdx_diff.rs` — keep it).
+
+And the GPT had to learn the same lesson as everything else: its 34/33-sector reserve
+is a *512-byte* fact. The entry array is 16 KiB regardless — 32 sectors of 512, but
+only **4** of 4096 — so a 4Kn GPT reserves 6 and 5, and every LBA in it moves.
 
 The fix that mattered most wasn't in the original list. Once H2–H5 landed, the
 restore got far enough to hit the real bug: **NTFS on a 4Kn volume reports
@@ -81,12 +105,8 @@ wrong one — which is exactly how H2 happened (`grow.rs` documented its paramet
 "the volume's own sector size" while every caller handed it the format's 512-byte
 constant).
 
-**Remaining:** mounting a 4Kn backup needs the VHDX synthesis path
-(`synthetic.rs` — 4096-byte logical sectors); today it errors clearly. And the
-original 4Kn hazard list, for the record:
-
 <details>
-<summary>Original H1–H6 findings (all fixed except H6)</summary>
+<summary>The original H1–H6 hazard list, for the record (all fixed)</summary>
 
 The `.phnx` format was designed for 4Kn (extents use a fixed 512-byte *format*
 addressing unit deliberately decoupled from device geometry; the real logical
@@ -96,7 +116,7 @@ threaded into the raw **write** path (`PartitionWriter` does a read-modify-write
 bounce for sub-sector I/O). The read path and the geometry math never got the same
 treatment.
 
-**Status: capture is FIXED (H1, 2026-07-13). Restore and mount are not (H2–H6).**
+**Status: ALL FIXED (2026-07-13).**
 
 Raw disk/volume handles reject any read whose length or offset is not a multiple of
 the *logical* sector size:
@@ -152,10 +172,9 @@ the *logical* sector size:
   `.sector_size(512)`); nothing reads `manifest.disk.sector_size`. A volume
   captured from 4Kn has `BytesPerSector = 4096` in its BPB, and NTFS **refuses to
   mount** on a device advertising 512. The fixed-VHD format is inherently
-  512-sector, so real 4Kn mount needs the VHDX path `synthetic.rs:44-49` already
-  flags as unimplemented. Minimum viable fix: detect and **error clearly** instead
-  of producing an unmountable disk. ← **this is what shipped**; the VHDX path is
-  still owed.
+  512-sector, so real 4Kn mount needs a VHDX. ← **DONE**: `phoenix-mount/src/vhdx.rs`
+  synthesizes one, and `synthetic.rs` picks the container from the backup's recorded
+  sector size.
 
 </details>
 
@@ -230,10 +249,7 @@ coverage of things that need hardware we haven't pointed at yet:
 2. **ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — the last wholly-unexecuted
    platform. With 4Kn fixed, a failure there isolates to the architecture instead
    of being confounded with sector size.
-3. **4Kn mount (H6)** — needs VHDX synthesis (4096-byte logical sectors) in
-   `phoenix-mount/src/synthetic.rs`. Today it errors clearly instead of attaching
-   a disk Windows would call RAW.
-4. **WinFsp installer bundling** and **post-restore BCD fixup** (see Backlog).
+3. **WinFsp installer bundling** and **post-restore BCD fixup** (see Backlog).
 5. **Then go to ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — with 4Kn already
    fixed, ARM testing tests *ARM*, and a failure there isolates cleanly to the
    architecture instead of being confounded with sector size.
@@ -540,11 +556,10 @@ Remaining avenues (deferred until real-hardware profiling says otherwise):
 > Note the distinction: the items below are **deliberate trade-offs**. The 4Kn and
 > NTFS-cluster-size items at the top of this document are **bugs**, not caveats.
 
-- **4Kn (4096-byte logical sector) media: backup and restore work; MOUNT does not.**
-  Mounting synthesizes a fixed VHD, a format pinned to 512-byte sectors, so a 4Kn
-  backup would attach as a disk Windows calls RAW. It is refused with an explicit
-  error instead. Real support needs VHDX synthesis. 512e media (4096 physical /
-  512 logical) is the common case and fully supported everywhere.
+- **4Kn (4096-byte logical sector) media is fully supported** — backup, restore, and
+  mount. Mounting a 4Kn backup synthesizes a **VHDX** rather than a fixed VHD, because
+  only VHDX can state a logical sector size. 512e media (4096 physical / 512 logical)
+  remains the common case and keeps the simpler VHD path.
 - **Mount without the `winfsp` feature** (an explicit `--no-default-features`
   build — the feature is on by default for GUI/CLI) falls back to materializing
   a full-size temp VHD — a **dev-only stopgap**. It's never used in a `winfsp`

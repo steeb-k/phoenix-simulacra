@@ -146,14 +146,15 @@ the disk's true sector size is recorded in the manifest's `disk.sector_size`.
 counted a 4096-byte disk in 512-byte units in six places — capture died on the very
 first read, and restore reserved the backup GPT, computed `StartingUsableOffset`,
 sized `FSCTL_EXTEND_VOLUME`, and applied NTFS MFT fixups all in the wrong unit.
-All fixed and covered by `ntfs_4kn_backup_restore_roundtrip`.
+**Mounting** a 4Kn backup works too: the mount synthesizes a **VHDX** (which can state
+its logical sector size) instead of a fixed VHD (which cannot), and Windows attaches it
+as a genuine 4096-byte-sector disk. Covered by `ntfs_4kn_backup_restore_roundtrip` and
+`winfsp_mount_a_4kn_backup`.
 
-**Crucially, all of it was found and fixed on the x64 dev box**, against a 4Kn VHDX
-synthesized with `CreateVirtualDisk`. The ARM machine was never required — so the
-laptop's UFS drive is no longer a risk to the plan, just a data point.
-
-Only **mounting** a 4Kn backup remains unsupported (the fixed-VHD format is
-512-sector by definition); it errors clearly.
+**Crucially, all of it was found and fixed on the x64 dev box**, against a 4Kn VHDX we
+synthesize ourselves. The ARM machine was never required — so the laptop's UFS drive is
+no longer a risk to the plan, just a data point. **4Kn is not a known gap any more**,
+which means a 4Kn failure on that machine is a *finding*, not an expected limitation.
 
 Note that many UFS/NVMe devices are **512e**: 4096-byte *physical* sectors with
 512-byte *logical* sectors. 512e is the common case and is fully supported today —
@@ -196,13 +197,11 @@ Record the results. Then:
 
 - **`LogicalSectorSize = 512`** (512e — the likely case): the 4Kn bugs do not
   fire. Proceed with the whole plan; you are testing *ARM64*, not 4Kn.
-- **`LogicalSectorSize = 4096`** (true 4Kn): **backup and restore both work**
-  (fixed 2026-07-13 — full round-trip, chkdsk-clean, byte-for-byte, covered by
-  `ntfs_4kn_backup_restore_roundtrip` on a synthesized 4Kn VHDX). Run the whole
-  plan. The **one** exception is **phase 5 (mount)**: mounting synthesizes a fixed
-  VHD, which the format pins to 512-byte sectors, so a 4Kn backup is refused with
-  an explicit error rather than attached as a disk Windows would call RAW. That is
-  expected, not a regression — see ROADMAP → "4Kn media support".
+- **`LogicalSectorSize = 4096`** (true 4Kn): **fully supported — backup, restore,
+  and mount** (fixed 2026-07-13; covered by `ntfs_4kn_backup_restore_roundtrip` and
+  `winfsp_mount_a_4kn_backup`, both against a 4Kn VHDX we synthesize ourselves).
+  Run the whole plan, phase 5 included. Nothing about 4Kn is a known gap any more,
+  so a failure here is a **finding**, not an expected limitation — capture it.
 
 Also record: core count, RAM, free disk space, and whether BitLocker is on
 (`Get-BitLockerVolume`) — a Snapdragon laptop very likely has it enabled on C:.

@@ -67,7 +67,6 @@ trusting a green run to mean "everything works".
 | Gap | Why it matters |
 |-----|----------------|
 | **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). The last wholly-unrun platform. |
-| **4Kn *mount*** | Backup and restore on 4Kn are covered (see "Tier 2-4Kn"); mounting is refused by design, because the synthesized fixed VHD is 512-sector. Needs VHDX synthesis. |
 | **4Kn *clone*** | Disk-to-disk clone on 4Kn media is untested. The clone path shares the fixed reader and `extend_ntfs_volume`, so it is *expected* to work — but expected is not tested. |
 
 ---
@@ -235,6 +234,9 @@ rather than silently proving nothing.
 | `vhdx_4kn_reports_4096_byte_sectors` | The fixture itself: the attached disk enumerates with `sector_size == 4096`. Foundation for the tier — a silently-512 fixture would make every 4Kn conclusion below worthless, so it fails loudly instead. |
 | `ntfs_4kn_backup_verifies_against_source` | NTFS **capture** off a 4Kn disk with verify-after-source *and* a full image verify, plus `UsedBlocks` planning (proving the boot sector actually parsed rather than degrading to a raw capture) and that the manifest kept the source's 4Kn geometry. |
 | `ntfs_4kn_backup_restore_roundtrip` | The full **round-trip**: 4Kn source → backup → restore to a second 4Kn disk → drive letter → `chkdsk` clean → fixture byte-identical. Covers the GPT reserve, `StartingUsableOffset`, `FSCTL_EXTEND_VOLUME`'s sector count, and the NTFS MFT fixup stride, all of which counted in 512s. |
+| `winfsp_mount_a_4kn_backup` | **Mounting** a 4Kn backup: the served image is a `.vhdx`, Windows reports `LogicalSectorSize = 4096`, the volume mounts, and the fixture verifies. (In `winfsp_mount.rs`.) |
+| `vhdx_container.rs` | Does **Windows** accept the VHDX we hand-synthesize? Writes the bytes out, attaches them, and asks `Get-Disk` for the sector size — at 4096 *and* 512, so we know the metadata is being read rather than agreeing by luck. Self-consistency proves nothing here; `OpenVirtualDisk` answers `ERROR_FILE_CORRUPT` and explains nothing. |
+| `vhdx_diff.rs` | Diagnostic: dumps the structure of a VHDX **Windows built itself** beside ours. This is what found the one bit (`FileParameters.IsVirtualDisk`) that made Windows reject an otherwise perfect container. Keep it — the next VHDX bug will be found the same way. |
 
 ### State today: backup + restore work; mount does not (2026-07-13)
 
@@ -246,13 +248,14 @@ was fixing up*. The Update Sequence Array stride was never the disk's sector siz
 is 512, and each record states it outright in its USA count, so `fixup_stride` now
 derives it from the record.
 
-**Mount is refused, by design.** Mounting synthesizes a **fixed VHD**, whose format
-mandates 512-byte sectors, and NTFS won't mount when the filesystem's sector size
-disagrees with the device's. A 4Kn backup therefore errors clearly rather than
-attaching a disk Windows would report as RAW. Real support needs VHDX synthesis
-(ROADMAP → 4Kn, H6).
+**Mount works too** (`winfsp_mount_a_4kn_backup`). Mounting synthesizes a virtual disk
+and attaches it, and that disk used to be a **fixed VHD** — a format with no field for
+a sector size. A 4Kn backup is now served as a **VHDX**, which states its logical sector
+size in metadata; 512e keeps the simpler VHD. Windows attaches it, reports a 4096-byte
+sector, parses the GPT we synthesized at 4096-byte LBAs, and mounts the NTFS inside.
 
-The whole 4Kn surface reproduced here, so **none of this needed the ARM64 laptop.**
+The whole 4Kn surface reproduced here, so **none of this needed the ARM64 laptop** —
+not the engine fixes, and not the mount.
 
 ---
 
