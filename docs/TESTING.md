@@ -67,7 +67,6 @@ trusting a green run to mean "everything works".
 | Gap | Why it matters |
 |-----|----------------|
 | **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). The last wholly-unrun platform. |
-| **4Kn *clone*** | Disk-to-disk clone on 4Kn media is untested. The clone path shares the fixed reader and `extend_ntfs_volume`, so it is *expected* to work — but expected is not tested. |
 
 ---
 
@@ -234,6 +233,7 @@ rather than silently proving nothing.
 | `vhdx_4kn_reports_4096_byte_sectors` | The fixture itself: the attached disk enumerates with `sector_size == 4096`. Foundation for the tier — a silently-512 fixture would make every 4Kn conclusion below worthless, so it fails loudly instead. |
 | `ntfs_4kn_backup_verifies_against_source` | NTFS **capture** off a 4Kn disk with verify-after-source *and* a full image verify, plus `UsedBlocks` planning (proving the boot sector actually parsed rather than degrading to a raw capture) and that the manifest kept the source's 4Kn geometry. |
 | `ntfs_4kn_backup_restore_roundtrip` | The full **round-trip**: 4Kn source → backup → restore to a second 4Kn disk → drive letter → `chkdsk` clean → fixture byte-identical. Covers the GPT reserve, `StartingUsableOffset`, `FSCTL_EXTEND_VOLUME`'s sector count, and the NTFS MFT fixup stride, all of which counted in 512s. |
+| `ntfs_4kn_clone_same_size_and_expanded` | Disk-to-disk **clone** between two 4Kn disks, same-size and expand-to-fill. Clone writes the partition table itself and grows NTFS through its own call site, so it reaches the 512-vs-4096 geometry by a different route than restore does. Asserts the volume actually grew — otherwise a clone that quietly stayed at the source size would pass and prove nothing. |
 | `winfsp_mount_a_4kn_backup` | **Mounting** a 4Kn backup: the served image is a `.vhdx`, Windows reports `LogicalSectorSize = 4096`, the volume mounts, and the fixture verifies. (In `winfsp_mount.rs`.) |
 | `vhdx_container.rs` | Does **Windows** accept the VHDX we hand-synthesize? Writes the bytes out, attaches them, and asks `Get-Disk` for the sector size — at 4096 *and* 512, so we know the metadata is being read rather than agreeing by luck. Self-consistency proves nothing here; `OpenVirtualDisk` answers `ERROR_FILE_CORRUPT` and explains nothing. |
 | `vhdx_diff.rs` | Diagnostic: dumps the structure of a VHDX **Windows built itself** beside ours. This is what found the one bit (`FileParameters.IsVirtualDisk`) that made Windows reject an otherwise perfect container. Keep it — the next VHDX bug will be found the same way. |

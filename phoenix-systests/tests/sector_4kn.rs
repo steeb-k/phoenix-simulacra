@@ -16,6 +16,7 @@
 //! ```
 
 use phoenix_capture::backup::{run_backup, BackupOptions};
+use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::enumerate_disks;
 use phoenix_restore::plan::default_plan_from_backup;
@@ -213,4 +214,121 @@ fn ntfs_4kn_backup_restore_roundtrip() {
     verify_fixture(letter, &digest).expect("fixture survived the 4Kn round-trip");
 
     let _ = std::fs::remove_file(&backup);
+}
+
+/// Disk-to-disk **clone** between two 4Kn disks, same size and expanded.
+///
+/// The clone path shares the fixed reader (H1) and `extend_ntfs_volume` (H2) with
+/// backup/restore, so it was *expected* to work once those landed — but expected
+/// is not tested, and clone reaches them by a different route. It writes the
+/// partition table itself (`set_drive_layout`, where the GPT reserve and
+/// `StartingUsableOffset` counted in 512s), and it grows NTFS through its own
+/// call site, which is the one the original audit found was *already* passing the
+/// right sector size while restore was passing the wrong one.
+///
+/// Both source and target are synthesized 4Kn disks. No 4Kn hardware.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn ntfs_4kn_clone_same_size_and_expanded() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let source = TestVhd::create_4kn(1024).expect("create 4Kn source");
+    source
+        .init_gpt_with(&[PartSpec {
+            size_mb: 0,
+            fs: TestFs::Ntfs,
+            letter: 'X',
+            label: "CLN4KN".into(),
+        }])
+        .expect("init 4Kn source");
+    assert!(wait_for_letter('X', 15_000), "4Kn source never mounted");
+    let digest = fill_fixture('X', 0x4096_C10E).expect("fill fixture");
+
+    // --- Same-size clone onto a second 4Kn disk -----------------------------
+    let target = TestVhd::create_4kn(1024).expect("create 4Kn target");
+    let d = clone_disks();
+    let src = disk_at(&d, source.disk_index());
+    assert_eq!(src.sector_size, 4096, "source is not 4Kn");
+    let tgt = disk_at(&d, target.disk_index());
+    assert_eq!(tgt.sector_size, 4096, "target is not 4Kn");
+
+    run_clone(CloneOptions {
+        source_disk_index: source.disk_index(),
+        target_disk_index: target.disk_index(),
+        plan: ClonePlan::identity(&src),
+        verify: CloneVerify::ReadBack,
+        use_vss: false,
+        progress: None,
+    })
+    .expect("same-size clone between 4Kn disks");
+
+    let letter = wait_for_restored_letter(target.disk_index(), 60_000)
+        .expect("cloned 4Kn volume never got a drive letter");
+    chkdsk_clean(letter).expect("cloned 4Kn volume is chkdsk-clean");
+    verify_fixture(letter, &digest).expect("fixture survived the 4Kn clone");
+    drop(target);
+
+    // --- Expand-to-fill onto a LARGER 4Kn disk ------------------------------
+    // This is the arm that exercises the grow: NTFS must be extended into the
+    // extra space, and `FSCTL_EXTEND_VOLUME` counts in the DEVICE's sectors —
+    // 4096 here, not the 512 the restore path used to assume.
+    let bigger = TestVhd::create_4kn(2048).expect("create larger 4Kn target");
+    let d = clone_disks();
+    let src = disk_at(&d, source.disk_index());
+    let big = disk_at(&d, bigger.disk_index());
+    assert_eq!(big.sector_size, 4096);
+
+    run_clone(CloneOptions {
+        source_disk_index: source.disk_index(),
+        target_disk_index: bigger.disk_index(),
+        plan: ClonePlan::expand_to_fill(&src, &big),
+        verify: CloneVerify::ReadBack,
+        use_vss: false,
+        progress: None,
+    })
+    .expect("expand-to-fill clone between 4Kn disks");
+
+    let letter = wait_for_restored_letter(bigger.disk_index(), 90_000)
+        .expect("expanded 4Kn volume never got a drive letter");
+    chkdsk_clean(letter).expect("expanded 4Kn volume is chkdsk-clean");
+    verify_fixture(letter, &digest).expect("fixture survived the expanding 4Kn clone");
+
+    // The volume really did grow — otherwise this passes on a clone that quietly
+    // stayed at the source's size and proves nothing about the extend.
+    let after = clone_disks();
+    let grown = disk_at(&after, bigger.disk_index());
+    let ntfs = grown
+        .partitions
+        .iter()
+        .find(|p| p.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .expect("no NTFS partition on the expanded target");
+    let src_ntfs = src
+        .partitions
+        .iter()
+        .find(|p| p.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .unwrap();
+    assert!(
+        ntfs.size_bytes > src_ntfs.size_bytes,
+        "expand-to-fill left the partition at {} bytes, the same as the source — it did not grow",
+        ntfs.size_bytes
+    );
+}
+
+fn clone_disks() -> Vec<phoenix_core::disk::DiskInfo> {
+    let mut d = enumerate_disks().expect("enumerate disks");
+    for disk in &mut d {
+        for p in &mut disk.partitions {
+            phoenix_core::disk::refine_partition_fs(p);
+        }
+    }
+    d
+}
+
+fn disk_at(disks: &[phoenix_core::disk::DiskInfo], index: u32) -> phoenix_core::disk::DiskInfo {
+    disks
+        .iter()
+        .find(|d| d.index == index)
+        .unwrap_or_else(|| panic!("disk {index} not enumerated"))
+        .clone()
 }
