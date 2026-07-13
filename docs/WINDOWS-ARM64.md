@@ -114,13 +114,22 @@ WinFsp MSI, both ARM64 builds.
 Produces `dist/<target>/carbon-phoenix.exe` and `carbon-phoenix-gui.exe` for both
 targets.
 
-⚠️ **Known gap:** the script runs both `cargo build` invocations in whichever
-shell launched it and does **no per-target MSVC environment switch**. It relies on
-the `cc` crate finding the cross toolchain by itself. If `zstd-sys` fails with
-"failed to find tool cl.exe", the target's C++ toolchain is not active in that
-shell — launch from the matching Native Tools prompt, or run the two targets from
-two shells. The script also does not stage WinFsp, so `dist/` binaries cannot
-mount until WinFsp is installed on the target machine.
+✅ **Verified working, x64 host → both targets (2026-07-13.)** All four binaries
+build from an ordinary shell, and the PE `Machine` field confirms them: `0x8664`
+for x64, `0xAA64` for ARM64. An earlier revision of this document warned that the
+script does no per-target MSVC environment switch and would likely die in
+`zstd-sys` with "failed to find tool cl.exe" — **it doesn't.** The `cc` crate finds
+the ARM64 cross toolchain by itself when the MSVC ARM64 component is installed. If
+you do hit that error, the ARM64 C++ workload is what's missing; the fallback is a
+matching Native Tools prompt.
+
+⚠️ The script does **not** stage WinFsp, so `dist/` binaries cannot *mount* until
+WinFsp is installed on the target machine (see "P2 — WinFsp installer bundling" in
+the roadmap). Everything else works without it.
+
+Note this is **cross-compilation from an x64 host**, which is a different question
+from *building natively on the ARM64 laptop* — see the `winfsp-sys` registry hazard
+above, which still stands and applies only to the native case.
 
 ### Single target
 
