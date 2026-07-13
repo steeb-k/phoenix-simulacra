@@ -375,9 +375,14 @@ fn clone_one_partition(
         .unwrap_or(false);
 
     let mut reader = if read_path.contains("PhysicalDrive") {
-        PartitionReader::open_disk_partition(&read_path, part.offset_bytes, part.size_bytes)?
+        PartitionReader::open_disk_partition(
+            &read_path,
+            part.offset_bytes,
+            part.size_bytes,
+            part.sector_size,
+        )?
     } else {
-        PartitionReader::open_volume(&read_path)?
+        PartitionReader::open_volume(&read_path, part.sector_size)?
     };
 
     // Plan extents BEFORE locking (FSCTL_GET_VOLUME_BITMAP fails on a locked

@@ -1087,10 +1087,25 @@ pub fn unlock_bitlocker_password(letter: char, password: &str) -> Result<()> {
 /// `"NTFS    "`, `"-FVE-FS-"` (BitLocker), or `"EXFAT   "`.
 pub fn partition_boot_oem_tag(disk_index: u32, offset_bytes: u64) -> Result<String> {
     let path = format!(r"\\.\PhysicalDrive{disk_index}");
+    // Ask the device for its logical sector size rather than assuming 512: on a
+    // 4Kn disk the reader needs it to bounce this sub-sector read into an
+    // aligned span, and hardcoding 512 here would make the probe itself the
+    // thing that fails on the media we most want to check.
+    let sector_size = phoenix_core::disk::enumerate_disks()
+        .map_err(|e| anyhow!("enumerate disks: {e}"))?
+        .into_iter()
+        .find(|d| d.index == disk_index)
+        .map(|d| d.sector_size)
+        .ok_or_else(|| anyhow!("disk {disk_index} not found"))?;
     // Read one 512-byte sector at the partition offset. `length` only bounds
     // the reader; a single sector covers the OEM tag at bytes 3..11.
-    let mut pr = phoenix_capture::PartitionReader::open_disk_partition(&path, offset_bytes, 4096)
-        .map_err(|e| anyhow!("open partition reader at offset {offset_bytes}: {e}"))?;
+    let mut pr = phoenix_capture::PartitionReader::open_disk_partition(
+        &path,
+        offset_bytes,
+        4096,
+        sector_size,
+    )
+    .map_err(|e| anyhow!("open partition reader at offset {offset_bytes}: {e}"))?;
     let mut buf = [0u8; 512];
     let mut got = 0usize;
     while got < buf.len() {

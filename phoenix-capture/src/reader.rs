@@ -68,6 +68,11 @@ pub struct PartitionReader {
     handle: HANDLE,
     offset: u64,
     length: u64,
+    /// Logical sector size of the underlying device (512 or 4096). Raw disk and
+    /// volume handles reject reads whose offset or length isn't a multiple of
+    /// this, so `read_at` bounces sub-sector requests through an aligned span.
+    /// Mirrors the same field on [`crate::raw::PartitionWriter`].
+    sector_size: u64,
     /// True once `FSCTL_LOCK_VOLUME` has succeeded on `handle`. Drop is
     /// responsible for issuing the matching `FSCTL_UNLOCK_VOLUME` before
     /// closing the handle so a panic / cancel / mid-loop error can't leave
@@ -85,21 +90,32 @@ pub struct PartitionReader {
 unsafe impl Send for PartitionReader {}
 
 impl PartitionReader {
+    /// `sector_size` is the **device's** logical sector size — take it from
+    /// `PartitionInfo::sector_size` / `DiskInfo::sector_size`, which read it off
+    /// the device via `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`. It is not the 512-byte
+    /// extent addressing unit the `.phnx` format uses (see `docs/phnx-format.md`
+    /// — those two are deliberately decoupled, and conflating them is what broke
+    /// 4Kn support in the first place).
     pub fn open_disk_partition(
         disk_path: &str,
         offset_bytes: u64,
         length_bytes: u64,
+        sector_size: u32,
     ) -> Result<Self> {
         let handle = open_disk_readonly(disk_path)?;
         Ok(Self {
             handle,
             offset: offset_bytes,
             length: length_bytes,
+            sector_size: (sector_size as u64).max(512),
             locked: false,
         })
     }
 
-    pub fn open_volume(volume_path: &str) -> Result<Self> {
+    /// `sector_size` as in [`Self::open_disk_partition`]. For a VSS shadow
+    /// device, pass the sector size of the volume being shadowed: a shadow
+    /// presents the same geometry as its source.
+    pub fn open_volume(volume_path: &str, sector_size: u32) -> Result<Self> {
         let handle = open_volume_readonly(volume_path)?;
         let mut size = 0u64;
         #[repr(C)]
@@ -127,28 +143,86 @@ impl PartitionReader {
             handle,
             offset: 0,
             length: size,
+            sector_size: (sector_size as u64).max(512),
             locked: false,
         })
     }
 
-    pub fn from_path(path: &str, offset: u64, length: u64) -> Result<Self> {
+    pub fn from_path(path: &str, offset: u64, length: u64, sector_size: u32) -> Result<Self> {
         if path.contains("PhysicalDrive") {
-            Self::open_disk_partition(path, offset, length)
+            Self::open_disk_partition(path, offset, length, sector_size)
         } else {
             let _ = (offset, length);
-            Self::open_volume(path)
+            Self::open_volume(path, sector_size)
         }
     }
 
+    /// Read at a partition-relative offset, transparently handling
+    /// sub-sector-aligned requests.
+    ///
+    /// Raw disk and volume handles reject any `ReadFile` whose offset *or*
+    /// length isn't a multiple of the device's logical sector size. On a 512e
+    /// disk that constraint is invisible, because the filesystem parsers all
+    /// read in 512-byte units. On a **4Kn** disk it is fatal: the very first
+    /// read of a boot sector (a 512-byte buffer at offset 0) comes back as
+    /// Win32 87 (`ERROR_INVALID_PARAMETER`) and capture dies before writing a
+    /// byte.
+    ///
+    /// So a misaligned request bounces through the enclosing aligned span —
+    /// read whole sectors, copy out the slice the caller actually asked for.
+    /// This mirrors the read-modify-write bounce [`crate::raw::PartitionWriter`]
+    /// has always done for sub-sector *writes*; the read side simply never got
+    /// the same treatment.
+    ///
+    /// Callers therefore stay in whatever units suit them (512-byte boot
+    /// sectors, 4-byte-aligned FAT spans) and never have to know the device's
+    /// geometry.
     pub fn read_at(&mut self, position: u64, buf: &mut [u8]) -> Result<usize> {
         if position >= self.length {
             return Ok(0);
         }
-        let abs_pos = self.offset + position;
+        let to_read = buf.len().min((self.length - position) as usize);
+        if to_read == 0 {
+            return Ok(0);
+        }
+        let abs = self.offset + position;
+        let ss = self.sector_size;
+
+        // Fast path: aligned in both offset and length. This is every streamed
+        // data chunk — chunk offsets and lengths are multiples of CHUNK_SIZE,
+        // itself a multiple of any sector size — so the bounce below never
+        // touches the hot capture loop.
+        if abs.is_multiple_of(ss) && (to_read as u64).is_multiple_of(ss) {
+            return self.read_raw(abs, &mut buf[..to_read]);
+        }
+
+        let aligned_start = abs - (abs % ss);
+        let aligned_end = (abs + to_read as u64).div_ceil(ss) * ss;
+        let mut span = vec![0u8; (aligned_end - aligned_start) as usize];
+        let got = self.read_raw(aligned_start, &mut span)?;
+
+        // A short read can leave us with fewer bytes than the caller wanted
+        // (or none at all, if the device stopped before the requested slice
+        // even begins). Report what we actually got rather than handing back
+        // uninitialized zeros as if they were data.
+        let inner = (abs - aligned_start) as usize;
+        if got <= inner {
+            return Ok(0);
+        }
+        let avail = (got - inner).min(to_read);
+        buf[..avail].copy_from_slice(&span[inner..inner + avail]);
+        Ok(avail)
+    }
+
+    /// Absolute-offset raw read. `abs` and `data.len()` must both be
+    /// sector-aligned — every caller reaches this through `read_at`, which
+    /// guarantees that (directly on the fast path, or by computing an aligned
+    /// span on the bounce path). Returns the number of bytes actually read.
+    fn read_raw(&mut self, abs: u64, data: &mut [u8]) -> Result<usize> {
         unsafe {
             let mut dist = 0i64;
-            let low = (abs_pos & 0xFFFF_FFFF) as u32;
-            let high = (abs_pos >> 32) as u32;
+            let low = (abs & 0xFFFF_FFFF) as u32;
+            let high = (abs >> 32) as u32;
             if windows_sys::Win32::Storage::FileSystem::SetFilePointerEx(
                 self.handle,
                 ((high as i64) << 32) | low as i64,
@@ -159,25 +233,28 @@ impl PartitionReader {
                 return Err(PhoenixError::Disk("seek failed".into()));
             }
         }
-        let to_read = buf.len().min((self.length - position) as usize);
         let mut read = 0u32;
         let ok = unsafe {
             ReadFile(
                 self.handle,
-                buf.as_mut_ptr() as *mut _,
-                to_read as u32,
+                data.as_mut_ptr() as *mut _,
+                data.len() as u32,
                 &mut read,
                 ptr::null_mut(),
             )
         };
         if ok == 0 {
             let err = unsafe { GetLastError() };
-            // Win32 87 (ERROR_INVALID_PARAMETER) here almost always means a
-            // non-sector-aligned offset or length on a raw volume/disk handle.
+            // Win32 87 (ERROR_INVALID_PARAMETER) should now be unreachable for
+            // alignment reasons — `read_at` guarantees a sector-aligned span.
+            // If it still shows up, the reader was handed the wrong sector size
+            // for this device, so say so instead of blaming the caller.
             return Err(PhoenixError::Disk(format!(
-                "ReadFile of {to_read} bytes at offset {abs_pos} failed (Win32 error {err}; \
-                 volume length {})",
-                self.length
+                "ReadFile of {} bytes at offset {abs} failed (Win32 error {err}; \
+                 volume length {}, sector size {})",
+                data.len(),
+                self.length,
+                self.sector_size
             )));
         }
         Ok(read as usize)

@@ -251,12 +251,13 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         let mut reader = match &volume {
             Some(vol) => {
                 is_live = true;
-                PartitionReader::open_volume(vol)?
+                PartitionReader::open_volume(vol, part.sector_size)?
             }
             None => PartitionReader::open_disk_partition(
                 &disk.path,
                 part.offset_bytes,
                 part.size_bytes,
+                part.sector_size,
             )?,
         };
 
@@ -311,7 +312,10 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                         // one we're about to stream, and it can differ from the
                         // live bitmap we read a moment ago. Assigning `reader`
                         // drops the live handle.
-                        reader = PartitionReader::open_volume(&shadow)?;
+                        // A shadow device presents the same geometry as the
+                        // volume it snapshots, so the source's sector size is
+                        // the right one to read it with.
+                        reader = PartitionReader::open_volume(&shadow, part.sector_size)?;
                         (
                             extents,
                             bytes_per_cluster,

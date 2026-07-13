@@ -105,7 +105,10 @@ fn backup_disk(disk_index: u32) -> phoenix_core::error::Result<std::path::PathBu
 fn wait_until_lockable(volume: &str, timeout_ms: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        if let Ok(mut reader) = phoenix_capture::PartitionReader::open_volume(volume) {
+        // 512: these fixtures are diskpart VHDs, which are always 512-byte
+        // sector. The reader is only used to take and drop a lock here — no
+        // reads — so the sector size is inert either way.
+        if let Ok(mut reader) = phoenix_capture::PartitionReader::open_volume(volume, 512) {
             if reader.lock_volume(volume).is_ok() {
                 return; // reader drops here → FSCTL_UNLOCK_VOLUME
             }
@@ -314,8 +317,9 @@ fn volume_lock_blocks_external_writes() {
     std::fs::write(r"X:\pre-lock.txt", b"before").expect("pre-lock write");
 
     {
+        // 512: a diskpart VHD fixture; this reader only holds a lock, never reads.
         let mut reader =
-            phoenix_capture::PartitionReader::open_volume(r"\\.\X:").expect("open volume");
+            phoenix_capture::PartitionReader::open_volume(r"\\.\X:", 512).expect("open volume");
         reader.lock_volume(r"\\.\X:").expect("lock_volume");
         assert!(reader.is_locked());
 

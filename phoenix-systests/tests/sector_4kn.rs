@@ -15,8 +15,12 @@
 //! cargo test -p phoenix-systests --test sector_4kn -- --ignored --test-threads=1 --nocapture
 //! ```
 
+use phoenix_capture::backup::{run_backup, BackupOptions};
+use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::enumerate_disks;
-use phoenix_systests::{cleanup_leaked_vhds, require_admin, TestVhd};
+use phoenix_systests::{
+    cleanup_leaked_vhds, fill_fixture, require_admin, wait_for_letter, PartSpec, TestFs, TestVhd,
+};
 
 /// The disk really is 4Kn, and our own enumeration agrees.
 ///
@@ -43,4 +47,82 @@ fn vhdx_4kn_reports_4096_byte_sectors() {
          4Kn conclusion drawn from it would be trustworthy",
         d.sector_size
     );
+}
+
+/// Capture an NTFS volume off a 4Kn disk, with verify-after-backup on.
+///
+/// This is the test that H1 was blocking. Before the reader learned to bounce
+/// sub-sector reads through an aligned span, this died on the *first* read —
+/// `ntfs_plan` asks for a 512-byte boot sector at offset 0, and a raw handle on
+/// a 4Kn device rejects that outright:
+///
+/// ```text
+/// CAPTURE FAILED: ReadFile of 512 bytes at offset 0 failed (Win32 error 87)
+/// ```
+///
+/// Passing proves three things at once: the boot sector parsed (so used-block
+/// planning ran rather than silently degrading to a raw capture), the extent
+/// streaming survived 4096-byte alignment, and verify-after re-read the source
+/// and agreed with the image byte for byte.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn ntfs_4kn_backup_verifies_against_source() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let vhd = TestVhd::create_4kn(1024).expect("create 4Kn VHDX");
+    vhd.init_gpt_with(&[PartSpec {
+        size_mb: 0, // rest of disk
+        fs: TestFs::Ntfs,
+        letter: 'X',
+        label: "SRC4KN".into(),
+    }])
+    .expect("init 4Kn gpt + format NTFS");
+    assert!(wait_for_letter('X', 15_000), "4Kn volume never mounted");
+    fill_fixture('X', 0x4096_5EED).expect("fill fixture");
+
+    let disks = enumerate_disks().expect("enumerate disks");
+    let disk = disks
+        .iter()
+        .find(|d| d.index == vhd.disk_index())
+        .expect("4Kn disk enumerated");
+    assert_eq!(disk.sector_size, 4096, "fixture is not actually 4Kn");
+
+    let ntfs = disk
+        .partitions
+        .iter()
+        .find(|p| p.capture_mode == phoenix_core::disk::CaptureMode::UsedBlocks)
+        .expect(
+            "no partition planned as UsedBlocks — the NTFS boot sector failed to parse, which \
+             means the 4Kn read path silently degraded to a raw capture instead of erroring",
+        );
+    assert_eq!(ntfs.sector_size, 4096);
+
+    let backup = std::env::temp_dir().join(format!(
+        "phoenix-systest-4kn-{}.phnx",
+        uuid::Uuid::new_v4().simple()
+    ));
+    run_backup(BackupOptions {
+        disk_index: vhd.disk_index(),
+        partition_indices: disk.partitions.iter().map(|p| p.index).collect(),
+        output: backup.clone(),
+        // The point of the test: re-read the 4Kn source and confirm the image
+        // matches it. A capture that "succeeded" by reading the wrong offsets
+        // would fail here rather than pass quietly.
+        verify_after: true,
+        verify_image: true,
+        progress: None,
+    })
+    .expect("run_backup on a 4Kn disk");
+
+    // The manifest must record the source's real geometry, not the format's
+    // 512-byte extent unit (see docs/phnx-format.md — the two are decoupled).
+    let reader = PhnxReader::open(&backup).expect("open backup");
+    assert_eq!(
+        reader.manifest.disk.sector_size, 4096,
+        "manifest lost the source disk's 4Kn geometry"
+    );
+    drop(reader);
+
+    let _ = std::fs::remove_file(&backup);
 }
