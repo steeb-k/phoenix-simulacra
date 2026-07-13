@@ -60,7 +60,7 @@ impl IncrementalHasher {
     }
 }
 
-/// CRC32 (IEEE) for header validation.
+/// CRC32 (IEEE) for header validation. Used by GPT.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -73,9 +73,46 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// CRC32**C** (Castagnoli) — a *different polynomial* from [`crc32`], and the one
+/// VHDX requires for its header and region-table checksums.
+///
+/// The two are easy to confuse and fail identically-shaped: a VHDX checksummed
+/// with the IEEE polynomial is structurally perfect and Windows rejects the file
+/// outright, with no hint as to why. Keeping both here, adjacent and named for
+/// what they are, is the cheapest way to not make that mistake twice.
+pub fn crc32c(data: &[u8]) -> u32 {
+    // 0x82F63B78 is the bit-reflected Castagnoli polynomial, matching the
+    // reflected (LSB-first) formulation used above.
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Known-answer vectors. `crc32c("123456789") == 0xE3069283` is the standard
+    /// CRC-32C check value; the IEEE polynomial gives `0xCBF43926` for the same
+    /// input. Pinning both proves we didn't silently wire one to the other —
+    /// which would produce a VHDX Windows rejects with no diagnosis.
+    #[test]
+    fn crc32_variants_are_the_right_polynomials() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926, "IEEE CRC-32 check value");
+        assert_eq!(
+            crc32c(b"123456789"),
+            0xE306_9283,
+            "Castagnoli CRC-32C check value"
+        );
+        assert_ne!(crc32(b"123456789"), crc32c(b"123456789"));
+        assert_eq!(crc32c(b""), 0);
+    }
 
     #[test]
     fn blake3_deterministic() {

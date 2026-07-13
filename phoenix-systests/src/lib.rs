@@ -809,7 +809,11 @@ fn new_vhdx_path() -> Result<(PathBuf, String)> {
 /// Sector size and edition support: virtdisk.dll is core Windows, present on
 /// Home. Only VHDX supports a 4096-byte logical sector (the older VHD format is
 /// 512-only), hence `VIRTUAL_STORAGE_TYPE_DEVICE_VHDX`.
-fn create_vhdx_with_sector_size(path: &Path, size_bytes: u64, logical_sector: u32) -> Result<()> {
+pub fn create_vhdx_with_sector_size(
+    path: &Path,
+    size_bytes: u64,
+    logical_sector: u32,
+) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::core::GUID;

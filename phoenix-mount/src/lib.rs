@@ -22,6 +22,7 @@ pub mod gpt;
 pub mod image;
 pub mod synthetic;
 pub mod vhd;
+pub mod vhdx;
 
 #[cfg(windows)]
 pub mod active;
