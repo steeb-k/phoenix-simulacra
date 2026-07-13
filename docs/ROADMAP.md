@@ -65,28 +65,35 @@ threaded into the raw **write** path (`PartitionWriter` does a read-modify-write
 bounce for sub-sector I/O). The read path and the geometry math never got the same
 treatment.
 
-**Capture fails on the first read of a 4Kn volume — measured, not inferred.**
-Against the `TestVhd::create_4kn` fixture (2026-07-13), enumeration and partition
-classification are fine and capture then dies immediately:
-
-```text
->>> disk sector_size=4096 partitions=2
->>> part fs=Ntfs mode=UsedBlocks offset=16777216 size=1073741824
->>> CAPTURE FAILED: disk error: ReadFile of 512 bytes at offset 0 failed
-    (Win32 error 87; volume length 1073741824)
-```
+**Status: capture is FIXED (H1, 2026-07-13). Restore and mount are not (H2–H6).**
 
 Raw disk/volume handles reject any read whose length or offset is not a multiple of
 the *logical* sector size:
 
-- **H1 (critical)** — `PartitionReader::read_at`
-  (`phoenix-capture/src/reader.rs:143-184`) does a bare `ReadFile` with no
-  alignment handling, and every FS parser hands it a hardcoded 512-byte
+- ~~**H1 (critical)** — capture fails on the first read of a 4Kn volume.~~ **DONE.**
+  `PartitionReader` now carries the device's sector size and bounces sub-sector reads
+  through the enclosing aligned span — the same read-modify-write trick
+  `PartitionWriter` already used for sub-sector *writes*. The filesystem parsers were
+  left alone: they still read in 512-byte units, and the reader absorbs the geometry,
+  so callers never have to know what they're sitting on. Streamed chunks are already
+  sector-multiples, so the hot loop takes the fast path and never allocates a bounce
+  buffer. Covered by `ntfs_4kn_backup_verifies_against_source`.
+
+  *For the record, the failure it fixed — measured against `TestVhd::create_4kn`,
+  not inferred:*
+
+  ```text
+  >>> disk sector_size=4096 partitions=2
+  >>> part fs=Ntfs mode=UsedBlocks offset=16777216 size=1073741824
+  >>> CAPTURE FAILED: ReadFile of 512 bytes at offset 0 failed (Win32 error 87)
+  ```
+
+  *The old code:* `PartitionReader::read_at` did a bare `ReadFile` with no
+  alignment handling, and every FS parser handed it a hardcoded 512-byte
   boot-sector buffer: `ntfs.rs:158`, `ntfs.rs:346` (the main capture path),
   `fat.rs:78`, `fat.rs:506`. `fat.rs:89` rounds a FAT read up to 512 rather than
-  to the device's sector size. All return Win32 87 on 4Kn → backup **and** clone
-  fail before writing a byte. *Fix: give `PartitionReader` a `sector_size` and
-  mirror the RMW bounce that `raw.rs:259-272` already implements.*
+  to the device's sector size. All returned Win32 87 on 4Kn → backup **and** clone
+  failed before writing a byte.
 - **H2 (high)** — `extend_ntfs_volume` is passed
   `PartitionIndexEntry::sector_size`, which is **always the 512-byte format
   constant**, not the volume's sector size (`phoenix-restore/src/restore.rs:597`;
@@ -140,22 +147,21 @@ and the clone path has never been run against a live mounted target. Owed: a T2
 The packaging, polish, and performance backlog continues in **Backlog** below, after
 the context section. Everything in it ranks *under* the three items above.
 
-### Recommended order of work (2026-07-13)
+### Recommended order of work (updated 2026-07-13)
 
 Platform-independent, and deliberately front-loaded with the things that can be
-done **on the x64 dev box** — none of the top four need the ARM64 laptop.
+done **on the x64 dev box** — none of the remaining items need the ARM64 laptop.
+
+- ~~**Build the 4Kn tier**~~ **DONE.** `TestVhd::create_4kn` (no Hyper-V, no Pro
+  SKU) turned 4Kn from a hardware question into a normal local test.
+- ~~**Fix H1**~~ **DONE.** 4Kn capture works and verifies against its own source.
 
 1. **Fix P0 (NTFS cluster size).** Small, contained, and a data-integrity defect.
    Return `cluster_size` from `ntfs_plan`; add a T2 test that formats NTFS with
-   64K clusters and shrinks it.
-2. **Build out the 4Kn tier** (TESTING.md → "Tier 2-4Kn"). The fixture
-   (`TestVhd::create_4kn`) already exists and needs no Hyper-V and no Pro SKU, so
-   4Kn is now a normal local test rather than a hardware question. This is the
-   highest-leverage work available — it converts the entire ARM sector-size risk
-   into something you can finish today.
-3. **Fix P1 (4Kn), H1 first.** H1 alone unblocks capture; H2–H5 unblock restore;
-   H6 (mount) can trail. Verify each against the VHDX from step 2.
-4. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
+   64K clusters and shrinks it. Independent of 4Kn — it bites on 512e media too.
+2. **Fix the rest of 4Kn (H2–H6)** against the tier from step 0: H2–H5 unblock
+   restore, H6 (mount) can trail. Then add the 4Kn restore round-trip test.
+3. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
    A destructive engine mode that is the GUI's default should not be shipping on
    planning-math unit tests alone.
 5. **Then go to ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — with 4Kn already
@@ -464,9 +470,10 @@ Remaining avenues (deferred until real-hardware profiling says otherwise):
 > Note the distinction: the items below are **deliberate trade-offs**. The 4Kn and
 > NTFS-cluster-size items at the top of this document are **bugs**, not caveats.
 
-- **4Kn (4096-byte logical sector) media is not supported.** Capture fails on the
-  first read. 512e media (4096 physical / 512 logical) is fully supported and is
-  the common case. See "P1 — 4Kn media support".
+- **4Kn (4096-byte logical sector) media is only half-supported.** Capture works
+  (fixed 2026-07-13); **restore and mount do not**. 512e media (4096 physical /
+  512 logical) is fully supported and is the common case. See "P1 — 4Kn media
+  support".
 - **Mount without the `winfsp` feature** (an explicit `--no-default-features`
   build — the feature is on by default for GUI/CLI) falls back to materializing
   a full-size temp VHD — a **dev-only stopgap**. It's never used in a `winfsp`

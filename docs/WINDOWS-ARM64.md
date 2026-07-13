@@ -196,11 +196,12 @@ Record the results. Then:
 
 - **`LogicalSectorSize = 512`** (512e — the likely case): the 4Kn bugs do not
   fire. Proceed with the whole plan; you are testing *ARM64*, not 4Kn.
-- **`LogicalSectorSize = 4096`** (true 4Kn): **stop.** Backup cannot work yet.
-  Fix the 4Kn items in the roadmap first — they reproduce on x64 against the
-  `TestVhd::create_4kn` fixture (TESTING.md → "Tier 2-4Kn"), so this does **not**
-  need the ARM machine. Then come back. Trying to "just see what happens" here only
-  produces a Win32 87 you already know is coming.
+- **`LogicalSectorSize = 4096`** (true 4Kn): **backup works, restore does not.**
+  Capture was fixed on 2026-07-13 and verifies against its own source; restore and
+  mount still compute geometry in units of 512 (ROADMAP → P1, H2–H6). So you can
+  run phases 1–4, but **do not trust a 4Kn restore** until those land — and they
+  reproduce on x64 against the `TestVhd::create_4kn` fixture, so fixing them does
+  **not** need this machine.
 
 Also record: core count, RAM, free disk space, and whether BitLocker is on
 (`Get-BitLockerVolume`) — a Snapdragon laptop very likely has it enabled on C:.

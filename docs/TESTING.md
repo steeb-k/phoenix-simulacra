@@ -30,7 +30,7 @@ trusting a green run to mean "everything works".
 
 | Gap | Why it matters |
 |-----|----------------|
-| **4Kn (4096-byte logical sector) media** | Zero coverage, virtual or real. Every T2 VHD is 512-byte (diskpart `create vdisk` cannot do otherwise) and all T3 hardware to date has been 512e. A 4Kn audit found capture **fails on the first read**. See "Tier 2-4Kn" below — this is now testable on x64 and should be. |
+| **4Kn restore / clone / mount** | 4Kn **capture** is fixed and covered (see "Tier 2-4Kn"). Everything downstream of it is not: restore still computes GPT geometry in units of 512, and the mount synthesizer is 512-only. See ROADMAP.md → "P1 — 4Kn media support" (H2–H6). |
 | **Partial clone (`CloneTableMode::UpdateExisting`)** | The GUI's **default** clone mode, and it rewrites a live target's partition table. It has 5 planning-math unit tests and **no end-to-end test at any tier**. |
 | **Non-4K-cluster NTFS** | Every test formats NTFS at the 4K default, so nothing exercises (e.g.) 64K clusters — which is exactly the case a hardcoded cluster size would break. |
 | **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). |
@@ -192,28 +192,28 @@ is happy to attach a VHDX it did not create.
 attached disk enumerates with `sector_size == 4096`, so a broken fixture fails loudly
 rather than silently proving nothing.
 
-### State today: capture is broken on 4Kn (measured 2026-07-13)
+### Tests
 
-Disk enumeration and partition detection work fine — the disk reports
-`sector_size = 4096` and its NTFS partition is correctly classified as
-`UsedBlocks`. **Capture then dies on the very first read:**
+| Test | Covers |
+|------|--------|
+| `vhdx_4kn_reports_4096_byte_sectors` | The fixture itself: the attached disk enumerates with `sector_size == 4096`. Foundation for the tier — a silently-512 fixture would make every 4Kn conclusion below worthless, so it fails loudly instead. |
+| `ntfs_4kn_backup_verifies_against_source` | NTFS **capture** off a 4Kn disk with verify-after-source *and* a full image verify, plus `UsedBlocks` planning (proving the boot sector actually parsed rather than degrading to a raw capture) and that the manifest kept the source's 4Kn geometry. |
 
-```text
->>> disk sector_size=4096 partitions=2
->>> part fs=Ntfs mode=UsedBlocks offset=16777216 size=1073741824
->>> CAPTURE FAILED: disk error: ReadFile of 512 bytes at offset 0 failed
-    (Win32 error 87; volume length 1073741824)
-```
+### State today: capture works, restore doesn't (measured 2026-07-13)
 
-Win32 87 is `ERROR_INVALID_PARAMETER`: raw disk/volume handles reject any read whose
-length or offset is not a multiple of the *logical* sector size, and every filesystem
-parser hands the reader a hardcoded 512-byte boot-sector buffer. Fixing that is the
-first step; see [ROADMAP.md](ROADMAP.md) → "P1 — 4Kn media support" for the rest of
-the 512-byte assumptions behind it (`FSCTL_EXTEND_VOLUME` sector count, GPT reserve
-math, MBR `HiddenSectors`, and the 512-only mount synthesizer).
+**Capture is fixed.** It used to die on the very first read — `ntfs_plan` asks for a
+512-byte boot sector at offset 0, and a raw handle on a 4Kn device rejects that with
+`ERROR_INVALID_PARAMETER` (Win32 87). `PartitionReader` now bounces sub-sector reads
+through an aligned span (the same read-modify-write trick `PartitionWriter` has always
+used for sub-sector *writes*), so the filesystem parsers keep speaking 512 and no
+longer have to know the device's geometry.
 
-The round-trip tests for this tier land **with** that fix. Until then this file holds
-only the fixture-integrity test, so the suite stays green and the gap stays honest.
+**Restore and mount are still 512-only.** Expect a 4Kn restore to fail or misplace the
+GPT: `FSCTL_EXTEND_VOLUME` is handed a 512-derived sector count, `pack_full_disk`
+reserves the backup GPT with `33 * 512`, `set_drive_layout` hardcodes 512, and the
+mount synthesizer advertises 512-byte sectors (so a 4096-BPS volume won't mount on it).
+See [ROADMAP.md](ROADMAP.md) → "P1 — 4Kn media support", items H2–H6. Round-trip tests
+land with those fixes.
 
 Because the whole 4Kn surface reproduces here, **none of that work needs the ARM64
 laptop** — do it on x64 first.
