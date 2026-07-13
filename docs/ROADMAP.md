@@ -25,9 +25,13 @@ disk had 512-byte sectors. Both are now **fixed and covered**:
 Both were found *and fixed* on the x64 dev box against a synthesized 4Kn VHDX —
 the ARM64 laptop was never needed.
 
-**Still open:** partial clone (`UpdateExisting`) is the GUI's default clone mode,
-rewrites a live target's partition table, and has no end-to-end test at any tier.
-That is now the biggest hole.
+3. ~~**Partial clone had no end-to-end test**~~ — **DONE.** The GUI's default clone
+   mode, which rewrites a live target's partition table, was shipping on five unit
+   tests of planning math. Now covered at T2 *and* validated on real hardware
+   (32 GB USB stick → 4 TB external HDD, all six clone scenarios green).
+
+**The correctness backlog is empty.** Everything now open is packaging, polish, or
+platforms we haven't run on yet — see "Recommended order of work" below.
 
 ---
 
@@ -160,7 +164,33 @@ builds one via `CreateVirtualDisk` (virtdisk.dll, every Windows edition; **not**
 Hyper-V's Pro-only `New-VHD`). See TESTING.md → "Tier 2-4Kn". It never needed the
 ARM machine, and it was all found and fixed on the dev box.
 
-### P1 — Partial clone (`UpdateExisting`) has no end-to-end test
+### ~~P1 — Partial clone (`UpdateExisting`) has no end-to-end test~~ (DONE 2026-07-13)
+
+Covered at both tiers, and **validated on real hardware**:
+
+- **T2** — `partial_clone.rs`: replace a slot and keep the sibling, shrink NTFS
+  into a smaller slot, drop a live partition nobody asked to keep.
+- **T3** — `real_clone.rs` + `scripts/run-real-clone.ps1`: the whole clone matrix
+  between two real disks (a 32 GB USB stick and a 4 TB external HDD). All six
+  scenarios green, including the partial clone preserving its exFAT sibling.
+
+**The lesson worth keeping** is how the "preserved partition is untouched" check
+has to be written. The obvious version — hash the neighbour before and after,
+demand equality — fails instantly, and the failure looks *exactly* like the engine
+eating a partition the user didn't select. It isn't. The preserved volume stays
+**mounted** through the clone (the engine only locks the slots it is about to
+overwrite), so NTFS's lazy writer keeps flushing its own `$MFT`/`$LogFile` and the
+bytes drift no matter what the engine does.
+
+What separates the two is *where* the changes land: NTFS metadata sits in a
+contiguous run in the middle of the volume (observed: blocks 5–21 of 368), while an
+engine spilling out of the slot below would have to start at **block 0**, the shared
+boundary. So compare block-wise, judge the shape, and let the fixture digest and
+`chkdsk` say whether the data actually survived. Don't "fix" this by loosening it to
+"it still mounts."
+
+<details>
+<summary>The original finding</summary>
 
 `CloneTableMode::UpdateExisting` writes into an **existing** target partition and
 rewrites that target's partition table in place. It is the **default** mode on the
@@ -171,11 +201,12 @@ test**.
 
 This is the same class of bug as the partial-restore volume-lock failure that T3B
 `boot_e` caught (a raw write to a still-mounted slot → `ERROR_ACCESS_DENIED`) —
-and the clone path has never been run against a live mounted target. Owed: a T2
-`partial_clone.rs` mirroring `partial_mbr.rs`, then a real-media run.
+and the clone path had never been run against a live mounted target.
+
+</details>
 
 The packaging, polish, and performance backlog continues in **Backlog** below, after
-the context section. Everything in it ranks *under* the three items above.
+the context section.
 
 ### Recommended order of work (updated 2026-07-13)
 
@@ -186,19 +217,23 @@ done **on the x64 dev box** — none of the remaining items need the ARM64 lapto
   SKU) turned 4Kn from a hardware question into a normal local test.
 - ~~**Fix P0 (NTFS cluster size)**~~ **DONE.** Covered by a 64K-cluster shrink.
 - ~~**Fix 4Kn H1–H5**~~ **DONE.** Full 4Kn backup → restore → chkdsk round-trip.
+- ~~**Partial-clone coverage**~~ **DONE.** T2 + a real-hardware clone matrix, all
+  green on a 32 GB USB stick → 4 TB external HDD.
 
-1. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
-   A destructive engine mode that is the GUI's *default* should not be shipping on
-   planning-math unit tests alone. This is now the largest untested surface.
-2. **Reduce T2 VHD churn** — a single one-shot suite run bugchecks the dev box
+**The correctness backlog is empty.** What's left is packaging, polish, and
+coverage of things that need hardware we haven't pointed at yet:
+
+1. **Reduce T2 VHD churn** — a single one-shot suite run bugchecks the dev box
    (see TESTING.md). Staging is a workaround; fewer attach/detach cycles is the
-   cure. Also fix crash-dump collection on the box, or the next one teaches us
-   nothing either.
+   cure. Also fix crash-dump collection on the box, or the next bugcheck teaches
+   us nothing either.
+2. **ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — the last wholly-unexecuted
+   platform. With 4Kn fixed, a failure there isolates to the architecture instead
+   of being confounded with sector size.
 3. **4Kn mount (H6)** — needs VHDX synthesis (4096-byte logical sectors) in
    `phoenix-mount/src/synthetic.rs`. Today it errors clearly instead of attaching
    a disk Windows would call RAW.
-4. **Then ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)). With 4Kn fixed, a failure
-   there isolates to the architecture instead of being confounded with sector size.
+4. **WinFsp installer bundling** and **post-restore BCD fixup** (see Backlog).
 5. **Then go to ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — with 4Kn already
    fixed, ARM testing tests *ARM*, and a failure there isolates cleanly to the
    architecture instead of being confounded with sector size.

@@ -15,8 +15,10 @@ source, and the full source → backup → restore/clone round-trip byte-for-byt
 |------|------|-------|--------|
 | **T1** | Pure unit tests (no disks) | every lib crate + `#[test]` | no |
 | **T2** | System tests on virtual disks (VHDX via diskpart) | `phoenix-systests/tests/` | **yes** |
+| **T2-4Kn** | Backup/restore on a true **4096-byte-sector** virtual disk | `phoenix-systests/tests/sector_4kn.rs` | **yes** |
 | **T2-winfsp** | Zero-space WinFsp mount system tests (incl. partition selection) | `phoenix-systests/tests/winfsp_mount.rs` | **yes** |
-| **T3-auto** | Destructive tests on a **real physical USB disk** | `phoenix-systests/tests/real_disk.rs` | **yes** |
+| **T3-auto** | Destructive backup/restore on a **real physical USB disk** | `phoenix-systests/tests/real_disk.rs` | **yes** |
+| **T3-clone** | The **clone matrix between two real disks** (wipes both) | `phoenix-systests/tests/real_clone.rs` + `scripts/run-real-clone.ps1` | **yes** |
 | **T3B** | Boot-disk cloning from the LIVE system disk | `phoenix-systests/tests/boot_disk.rs` | **yes** |
 | **T3-manual** | Live system-disk VSS backup/clone + boot | `scripts/live-smoke-checklist.md` | **yes** |
 
@@ -64,10 +66,9 @@ trusting a green run to mean "everything works".
 
 | Gap | Why it matters |
 |-----|----------------|
-| **Partial clone (`CloneTableMode::UpdateExisting`)** | The GUI's **default** clone mode, and it rewrites a live target's partition table. It has 5 planning-math unit tests and **no end-to-end test at any tier**. The largest untested surface in the tree. |
+| **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). The last wholly-unrun platform. |
 | **4Kn *mount*** | Backup and restore on 4Kn are covered (see "Tier 2-4Kn"); mounting is refused by design, because the synthesized fixed VHD is 512-sector. Needs VHDX synthesis. |
 | **4Kn *clone*** | Disk-to-disk clone on 4Kn media is untested. The clone path shares the fixed reader and `extend_ntfs_volume`, so it is *expected* to work — but expected is not tested. |
-| **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). |
 
 ---
 
@@ -153,6 +154,7 @@ cargo test -p phoenix-systests -- --ignored --test-threads=1 --nocapture
 | `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): encrypt with a password protector → **unlocked** volume classifies NTFS/used-blocks/`Unlocked` and round-trips as a normal *plaintext* backup → `Lock-BitLocker` → classifies Bitlocker/raw/`Locked`, backup is *ciphertext* (verify-after passes), restore comes back locked and yields the fixture only after `Unlock-BitLocker` with the original password |
 | `gpt_identity.rs` | restore preserves the source's **disk GUID, partition unique GUIDs, and attribute bits** (the identities the BCD uses) — proven collision-free by detaching the source VHD before restoring |
 | `partial_mbr.rs` | partial restores that **rewrite the partition table**: MBR shrunk-slot rewrite with a preserved sibling surviving byte-identical, deleting a live partition from the plan (its mounted volume locked + dismounted first), and a `reinit_style = "gpt"` plan re-initializing an MBR disk as GPT — the engine paths behind the GUI layout editor's replace/delete/blank/style-switch actions |
+| `partial_clone.rs` | **partial clone** (`CloneTableMode::UpdateExisting`) — the Clone page's **default** mode: replace one slot and keep the sibling, shrink NTFS into a smaller slot, and drop a live partition nobody asked to keep. The preserved sibling is snapshotted per 1 MiB block, not hashed whole: it stays **mounted** through the clone, so NTFS's lazy writer drifts its metadata regardless of the engine. An overspill from the slot below would have to start at block 0; metadata drift doesn't. Judge the shape, and let the fixture digest and `chkdsk` settle it. |
 | `vss.rs` | the **lock-then-VSS escalation** (no user switch) pinned on all three arms, with VSS **proven working, not just not-erroring** (`snapshot_volume`'s failure fallback is silent, so naive tests can pass with VSS broken): (1) point-in-time — snapshot, modify a file, read the *original* bytes through the shadow device; (2) backup of an NTFS volume **with a file handle held open** — no lock can survive that, so only a real escalation to a shadow read can succeed, then restore+verify; (3) **no second arm** via FAT32 (VSS is NTFS-only) + a held handle: unfreezable, so the backup must *abort* with a lock error rather than smear a live read; (4) idle FAT32: must lock → capture → unlock → restore byte-for-byte; (5+6) **outbound lock exclusivity** — while the lock is held (primitive-level, and for a whole locked backup's duration under a concurrent writer hammer) external file creates/opens on the volume must be refused, and allowed again after release |
 
 Most T2 disks are **GPT**; `partial_mbr.rs` lays its VHDX fixtures out as MBR
@@ -315,6 +317,47 @@ touched. Leave it unset on a small (USB-stick) disk to exercise grow-to-fill.
 
 Every scenario runs with **verify-after-backup on** (re-reads the source and
 confirms the backup matches before restoring).
+
+---
+
+## Tier 3-clone — the clone matrix between TWO real disks
+
+`phoenix-systests/tests/real_clone.rs` runs every clone mode the Clone page can
+reach, between two real physical disks. **Both are wiped.**
+
+```powershell
+.\scripts\run-real-clone.ps1 -SourceDisk 2 -TargetDisk 3 -AllowFixed `
+    -SourceSerial "<flash serial>" -TargetSerial "<hdd serial>" -MaxGB 4200
+# -WhatIf shows the plan and the resolved drives, and writes nothing.
+```
+
+The script prints both drives' **model and serial** before touching anything and
+makes you type the target's disk number to proceed (`-Yes` skips only that prompt,
+never a gate). It runs one cargo process per scenario with a settle between —
+staged, for the reason at the top of this document.
+
+**Both disks pass the full `RealDisk` gate**, source included. The source is read
+*and written* (each test lays its own fixture on it), so it is exactly as
+destroyable as the target, and a "source" exempt from the boot/system check would
+be the easiest imaginable way to reformat a laptop. Each disk carries its **own**
+serial pin (`PHOENIX_T3_SRC_SERIAL` / `PHOENIX_T3_SERIAL`) — a single shared pin
+means the two gates can only agree by accident.
+
+| Scenario | Covers |
+|----------|--------|
+| `real_clone_full_mbr_source_to_gpt_target` | Full clone with a **table-style switch**: MBR stick → GPT target |
+| `real_clone_full_match_source_keeps_mbr` | `ReinitMatchSource` leaves a 4 TB target **MBR**, where the 2 TiB table limit is not hypothetical |
+| `real_clone_grow_ntfs_into_larger_slot` | Clone + **grow** (`FSCTL_EXTEND_VOLUME`) |
+| `real_clone_shrink_ntfs_into_smaller_slot` | Clone + **shrink** (relocation + MFT rewrite) on **real fragmented NTFS** — the conditions that exposed the `div_ceil` phantom-cluster data-loss bug, and that an aligned VHDX fixture cannot reproduce |
+| `real_partial_clone_preserves_the_sibling` | **Partial clone** into a live partition table: the NTFS slot is rewritten, the mounted exFAT sibling comes through untouched |
+| `real_clone_back_from_hdd_to_flash` | The reverse trip, onto **removable** media (which Windows won't make GPT and diskpart won't format) |
+
+**Validated 2026-07-13** on a 32 GB SanDisk (source, MBR) → 4 TB Seagate Expansion
+(target, GPT): all six green, ~4 minutes.
+
+Fixtures are a few GB, not 4 TB. Clone streams used blocks and would finish either
+way, but `chkdsk` on a grown multi-terabyte volume would not — and a test nobody
+waits for is a test nobody runs. Growth is exercised into a bounded larger slot.
 
 ---
 
