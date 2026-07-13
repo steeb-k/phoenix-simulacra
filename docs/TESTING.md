@@ -64,9 +64,9 @@ trusting a green run to mean "everything works".
 
 | Gap | Why it matters |
 |-----|----------------|
-| **4Kn restore / clone / mount** | 4Kn **capture** is fixed and covered (see "Tier 2-4Kn"). Everything downstream of it is not: restore still computes GPT geometry in units of 512, and the mount synthesizer is 512-only. See ROADMAP.md → "P1 — 4Kn media support" (H2–H6). |
-| **Partial clone (`CloneTableMode::UpdateExisting`)** | The GUI's **default** clone mode, and it rewrites a live target's partition table. It has 5 planning-math unit tests and **no end-to-end test at any tier**. |
-| **Non-4K-cluster NTFS** | Every test formats NTFS at the 4K default, so nothing exercises (e.g.) 64K clusters — which is exactly the case a hardcoded cluster size would break. |
+| **Partial clone (`CloneTableMode::UpdateExisting`)** | The GUI's **default** clone mode, and it rewrites a live target's partition table. It has 5 planning-math unit tests and **no end-to-end test at any tier**. The largest untested surface in the tree. |
+| **4Kn *mount*** | Backup and restore on 4Kn are covered (see "Tier 2-4Kn"); mounting is refused by design, because the synthesized fixed VHD is 512-sector. Needs VHDX synthesis. |
+| **4Kn *clone*** | Disk-to-disk clone on 4Kn media is untested. The clone path shares the fixed reader and `extend_ntfs_volume`, so it is *expected* to work — but expected is not tested. |
 | **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). |
 
 ---
@@ -232,25 +232,25 @@ rather than silently proving nothing.
 |------|--------|
 | `vhdx_4kn_reports_4096_byte_sectors` | The fixture itself: the attached disk enumerates with `sector_size == 4096`. Foundation for the tier — a silently-512 fixture would make every 4Kn conclusion below worthless, so it fails loudly instead. |
 | `ntfs_4kn_backup_verifies_against_source` | NTFS **capture** off a 4Kn disk with verify-after-source *and* a full image verify, plus `UsedBlocks` planning (proving the boot sector actually parsed rather than degrading to a raw capture) and that the manifest kept the source's 4Kn geometry. |
+| `ntfs_4kn_backup_restore_roundtrip` | The full **round-trip**: 4Kn source → backup → restore to a second 4Kn disk → drive letter → `chkdsk` clean → fixture byte-identical. Covers the GPT reserve, `StartingUsableOffset`, `FSCTL_EXTEND_VOLUME`'s sector count, and the NTFS MFT fixup stride, all of which counted in 512s. |
 
-### State today: capture works, restore doesn't (measured 2026-07-13)
+### State today: backup + restore work; mount does not (2026-07-13)
 
-**Capture is fixed.** It used to die on the very first read — `ntfs_plan` asks for a
-512-byte boot sector at offset 0, and a raw handle on a 4Kn device rejects that with
-`ERROR_INVALID_PARAMETER` (Win32 87). `PartitionReader` now bounces sub-sector reads
-through an aligned span (the same read-modify-write trick `PartitionWriter` has always
-used for sub-sector *writes*), so the filesystem parsers keep speaking 512 and no
-longer have to know the device's geometry.
+**Backup and restore are fixed and covered.** The engine had counted a 4096-byte
+disk in 512-byte units in six places. The last one is the most instructive: **NTFS on
+a 4Kn volume reports 4096-byte sectors but still writes 1024-byte MFT records**, so
+the metadata rewriter computed its first fixup boundary *past the end of the record it
+was fixing up*. The Update Sequence Array stride was never the disk's sector size — it
+is 512, and each record states it outright in its USA count, so `fixup_stride` now
+derives it from the record.
 
-**Restore and mount are still 512-only.** Expect a 4Kn restore to fail or misplace the
-GPT: `FSCTL_EXTEND_VOLUME` is handed a 512-derived sector count, `pack_full_disk`
-reserves the backup GPT with `33 * 512`, `set_drive_layout` hardcodes 512, and the
-mount synthesizer advertises 512-byte sectors (so a 4096-BPS volume won't mount on it).
-See [ROADMAP.md](ROADMAP.md) → "P1 — 4Kn media support", items H2–H6. Round-trip tests
-land with those fixes.
+**Mount is refused, by design.** Mounting synthesizes a **fixed VHD**, whose format
+mandates 512-byte sectors, and NTFS won't mount when the filesystem's sector size
+disagrees with the device's. A 4Kn backup therefore errors clearly rather than
+attaching a disk Windows would report as RAW. Real support needs VHDX synthesis
+(ROADMAP → 4Kn, H6).
 
-Because the whole 4Kn surface reproduces here, **none of that work needs the ARM64
-laptop** — do it on x64 first.
+The whole 4Kn surface reproduced here, so **none of this needed the ARM64 laptop.**
 
 ---
 

@@ -142,18 +142,18 @@ and the `.phnx` format was designed for 4Kn: extents are addressed in a fixed
 512-byte *format* unit that is deliberately decoupled from device geometry, and
 the disk's true sector size is recorded in the manifest's `disk.sector_size`.
 
-**But the engine does not yet honor it end-to-end.** A 4Kn audit (2026-07-13)
-found that **capture fails on the first read** of a true 4Kn volume: every
-filesystem parser issues a hardcoded 512-byte boot-sector read on a raw handle
-(`ntfs.rs`, `fat.rs`), and raw disk/volume handles reject any read that is not a
-multiple of the *logical* sector size → `ERROR_INVALID_PARAMETER` (Win32 87).
-Several write-side paths also compute GPT geometry with a literal 512. See
-[ROADMAP.md](ROADMAP.md) → "4Kn media support" for the itemized list.
+**As of 2026-07-13 the engine honors it end-to-end.** A 4Kn audit found the engine
+counted a 4096-byte disk in 512-byte units in six places — capture died on the very
+first read, and restore reserved the backup GPT, computed `StartingUsableOffset`,
+sized `FSCTL_EXTEND_VOLUME`, and applied NTFS MFT fixups all in the wrong unit.
+All fixed and covered by `ntfs_4kn_backup_restore_roundtrip`.
 
-**Consequence for ARM testing: if the laptop's UFS drive reports 4096-byte
-logical sectors, backup will fail immediately and every downstream test is
-blocked.** So the very first thing to run on that machine is not a backup — it is
-a sector-size measurement (step 0 below).
+**Crucially, all of it was found and fixed on the x64 dev box**, against a 4Kn VHDX
+synthesized with `CreateVirtualDisk`. The ARM machine was never required — so the
+laptop's UFS drive is no longer a risk to the plan, just a data point.
+
+Only **mounting** a 4Kn backup remains unsupported (the fixed-VHD format is
+512-sector by definition); it errors clearly.
 
 Note that many UFS/NVMe devices are **512e**: 4096-byte *physical* sectors with
 512-byte *logical* sectors. 512e is the common case and is fully supported today —
@@ -196,12 +196,13 @@ Record the results. Then:
 
 - **`LogicalSectorSize = 512`** (512e — the likely case): the 4Kn bugs do not
   fire. Proceed with the whole plan; you are testing *ARM64*, not 4Kn.
-- **`LogicalSectorSize = 4096`** (true 4Kn): **backup works, restore does not.**
-  Capture was fixed on 2026-07-13 and verifies against its own source; restore and
-  mount still compute geometry in units of 512 (ROADMAP → P1, H2–H6). So you can
-  run phases 1–4, but **do not trust a 4Kn restore** until those land — and they
-  reproduce on x64 against the `TestVhd::create_4kn` fixture, so fixing them does
-  **not** need this machine.
+- **`LogicalSectorSize = 4096`** (true 4Kn): **backup and restore both work**
+  (fixed 2026-07-13 — full round-trip, chkdsk-clean, byte-for-byte, covered by
+  `ntfs_4kn_backup_restore_roundtrip` on a synthesized 4Kn VHDX). Run the whole
+  plan. The **one** exception is **phase 5 (mount)**: mounting synthesizes a fixed
+  VHD, which the format pins to 512-byte sectors, so a 4Kn backup is refused with
+  an explicit error rather than attached as a disk Windows would call RAW. That is
+  expected, not a regression — see ROADMAP → "4Kn media support".
 
 Also record: core count, RAM, free disk space, and whether BitLocker is on
 (`Get-BitLockerVolume`) — a Snapdragon laptop very likely has it enabled on C:.

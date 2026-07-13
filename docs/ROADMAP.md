@@ -6,20 +6,28 @@ virtual and real. This document tracks what's left.
 Status: all work is on `master` (2026-07). There is **no CI** — `.github/` was
 deleted 2026-07-13; validation is local and manual (see [TESTING.md](TESTING.md)).
 
-## ⚠️ Read this first — the "feature-complete" claim has two holes
+## What the 2026-07-13 audit found, and where it landed
 
-A code audit on 2026-07-13, run while preparing for ARM64 testing, found two
-**correctness** defects that outrank every polish/packaging item below. Neither is
-hypothetical; both are traced to specific lines. Neither is caught by any existing
-test, because every test formats NTFS at the 4K default and every test disk has
-512-byte sectors.
+Preparing for ARM64 testing turned up two **correctness** defects that no existing
+test could see, because every test formatted NTFS at the 4K default and every test
+disk had 512-byte sectors. Both are now **fixed and covered**:
 
-1. **NTFS cluster size is hardcoded to 4096 at capture-plan time** (P0 below).
-   Platform-independent. Affects any NTFS volume not formatted at 4K clusters.
-2. **4Kn media is unsupported and capture fails on the first read** (P1 below).
-   Blocks the ARM64 laptop's UFS drive *if* it reports 4096-byte logical sectors.
+1. ~~**NTFS cluster size hardcoded to 4096 at capture-plan time**~~ — **DONE.**
+   `ntfs_plan` parsed the volume's real cluster size and then dropped it;
+   `plan_capture` wrote a literal 4096 in its place, which fed the shrink
+   relocation map. Platform-independent — it bit 512e media too. Covered by
+   `ntfs_restore_shrink_64k_clusters`, the first fixture in this tree to look at a
+   volume that isn't 4K-cluster.
+2. ~~**4Kn media unsupported; capture failed on the first read**~~ — **DONE**
+   (except mount). Backup, restore, `chkdsk`, and byte-for-byte fixture recovery
+   all work on a true 4096-byte-sector disk. See P1 below.
 
-Until P0 is fixed, "validated" means "validated on 4K-cluster NTFS."
+Both were found *and fixed* on the x64 dev box against a synthesized 4Kn VHDX —
+the ARM64 laptop was never needed.
+
+**Still open:** partial clone (`UpdateExisting`) is the GUI's default clone mode,
+rewrites a live target's partition table, and has no end-to-end test at any tier.
+That is now the biggest hole.
 
 ---
 
@@ -55,7 +63,37 @@ Fix: return `cluster_size` from `ntfs_plan` and thread it through. Then **add a 
 test that formats NTFS with 64K clusters and shrinks it** — the absence of such a
 test is the reason this survived.
 
-### P1 — 4Kn media support (blocks ARM64 UFS testing)
+### ~~P1 — 4Kn media support~~ (DONE 2026-07-13, except mount)
+
+**A 4Kn NTFS volume now backs up, restores to a 4Kn disk, mounts, passes `chkdsk`,
+and returns every byte** (`ntfs_4kn_backup_restore_roundtrip`). H1–H5 are fixed;
+**H6 (mounting a 4Kn backup) is refused with a clear error**, because the fixed-VHD
+format the mount synthesizes is 512-sector by definition — real support needs the
+VHDX path (see "Remaining" at the end of this section).
+
+The fix that mattered most wasn't in the original list. Once H2–H5 landed, the
+restore got far enough to hit the real bug: **NTFS on a 4Kn volume reports
+4096-byte sectors but still writes 1024-byte MFT records**, so the metadata
+rewriter computed its first fixup boundary *past the end of the record it was
+fixing* (`MFT record sector boundary 4096 past record length 1024`). The Update
+Sequence Array stride was never the disk's sector size — it is 512, which the
+function's own doc comment had said all along, and which each record states
+outright in its USA count. `fixup_stride` now derives it from the record, so the
+code cannot disagree with the bytes it is about to rewrite.
+
+The shape of every fix here is the same and worth keeping: **ask the device, on a
+handle you already hold.** `extend_ntfs_volume`, `set_drive_layout`, and
+`set_drive_layout_mbr` no longer *take* a sector size, so no caller can pass the
+wrong one — which is exactly how H2 happened (`grow.rs` documented its parameter as
+"the volume's own sector size" while every caller handed it the format's 512-byte
+constant).
+
+**Remaining:** mounting a 4Kn backup needs the VHDX synthesis path
+(`synthetic.rs` — 4096-byte logical sectors); today it errors clearly. And the
+original 4Kn hazard list, for the record:
+
+<details>
+<summary>Original H1–H6 findings (all fixed except H6)</summary>
 
 The `.phnx` format was designed for 4Kn (extents use a fixed 512-byte *format*
 addressing unit deliberately decoupled from device geometry; the real logical
@@ -123,12 +161,15 @@ the *logical* sector size:
   mount** on a device advertising 512. The fixed-VHD format is inherently
   512-sector, so real 4Kn mount needs the VHDX path `synthetic.rs:44-49` already
   flags as unimplemented. Minimum viable fix: detect and **error clearly** instead
-  of producing an unmountable disk.
+  of producing an unmountable disk. ← **this is what shipped**; the VHDX path is
+  still owed.
 
-**All of this reproduces on x64 with a 4Kn VHDX** — `TestVhd::create_4kn`, which
+</details>
+
+**All of this reproduced on x64 with a 4Kn VHDX** — `TestVhd::create_4kn`, which
 builds one via `CreateVirtualDisk` (virtdisk.dll, every Windows edition; **not**
-Hyper-V's Pro-only `New-VHD`). See TESTING.md → "Tier 2-4Kn". Do it here; it does
-not need the ARM machine.
+Hyper-V's Pro-only `New-VHD`). See TESTING.md → "Tier 2-4Kn". It never needed the
+ARM machine, and it was all found and fixed on the dev box.
 
 ### P1 — Partial clone (`UpdateExisting`) has no end-to-end test
 
@@ -154,16 +195,21 @@ done **on the x64 dev box** — none of the remaining items need the ARM64 lapto
 
 - ~~**Build the 4Kn tier**~~ **DONE.** `TestVhd::create_4kn` (no Hyper-V, no Pro
   SKU) turned 4Kn from a hardware question into a normal local test.
-- ~~**Fix H1**~~ **DONE.** 4Kn capture works and verifies against its own source.
+- ~~**Fix P0 (NTFS cluster size)**~~ **DONE.** Covered by a 64K-cluster shrink.
+- ~~**Fix 4Kn H1–H5**~~ **DONE.** Full 4Kn backup → restore → chkdsk round-trip.
 
-1. **Fix P0 (NTFS cluster size).** Small, contained, and a data-integrity defect.
-   Return `cluster_size` from `ntfs_plan`; add a T2 test that formats NTFS with
-   64K clusters and shrinks it. Independent of 4Kn — it bites on 512e media too.
-2. **Fix the rest of 4Kn (H2–H6)** against the tier from step 0: H2–H5 unblock
-   restore, H6 (mount) can trail. Then add the 4Kn restore round-trip test.
-3. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
-   A destructive engine mode that is the GUI's default should not be shipping on
-   planning-math unit tests alone.
+1. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
+   A destructive engine mode that is the GUI's *default* should not be shipping on
+   planning-math unit tests alone. This is now the largest untested surface.
+2. **Reduce T2 VHD churn** — a single one-shot suite run bugchecks the dev box
+   (see TESTING.md). Staging is a workaround; fewer attach/detach cycles is the
+   cure. Also fix crash-dump collection on the box, or the next one teaches us
+   nothing either.
+3. **4Kn mount (H6)** — needs VHDX synthesis (4096-byte logical sectors) in
+   `phoenix-mount/src/synthetic.rs`. Today it errors clearly instead of attaching
+   a disk Windows would call RAW.
+4. **Then ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)). With 4Kn fixed, a failure
+   there isolates to the architecture instead of being confounded with sector size.
 5. **Then go to ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — with 4Kn already
    fixed, ARM testing tests *ARM*, and a failure there isolates cleanly to the
    architecture instead of being confounded with sector size.
@@ -470,10 +516,11 @@ Remaining avenues (deferred until real-hardware profiling says otherwise):
 > Note the distinction: the items below are **deliberate trade-offs**. The 4Kn and
 > NTFS-cluster-size items at the top of this document are **bugs**, not caveats.
 
-- **4Kn (4096-byte logical sector) media is only half-supported.** Capture works
-  (fixed 2026-07-13); **restore and mount do not**. 512e media (4096 physical /
-  512 logical) is fully supported and is the common case. See "P1 — 4Kn media
-  support".
+- **4Kn (4096-byte logical sector) media: backup and restore work; MOUNT does not.**
+  Mounting synthesizes a fixed VHD, a format pinned to 512-byte sectors, so a 4Kn
+  backup would attach as a disk Windows calls RAW. It is refused with an explicit
+  error instead. Real support needs VHDX synthesis. 512e media (4096 physical /
+  512 logical) is the common case and fully supported everywhere.
 - **Mount without the `winfsp` feature** (an explicit `--no-default-features`
   build — the feature is on by default for GUI/CLI) falls back to materializing
   a full-size temp VHD — a **dev-only stopgap**. It's never used in a `winfsp`
