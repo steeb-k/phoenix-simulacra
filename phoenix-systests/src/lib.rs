@@ -454,6 +454,18 @@ fn env_gb(name: &str) -> Option<f64> {
 ///
 /// Unknown/blank `MediaType` fails safe: treated as NON-removable (strict).
 fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
+    validate_real_disk_pinned(index, "PHOENIX_T3_SERIAL")
+}
+
+/// As [`validate_real_disk`], but reads the serial pin from `serial_var`.
+///
+/// A disk-to-disk clone needs **two** real disks, and the second one must be
+/// gated exactly as hard as the first — it is about to be read from, yes, but
+/// the tests also lay a fresh fixture down on it, so it is just as destroyable.
+/// Giving the source its own serial variable is what lets both be pinned
+/// independently; sharing one would mean the two gates could only ever agree by
+/// accident.
+fn validate_real_disk_pinned(index: u32, serial_var: &str) -> Result<ValidatedDisk> {
     let info = powershell(&format!(
         "$d = Get-Disk -Number {index} -ErrorAction Stop; \
          $dd = Get-CimInstance Win32_DiskDrive -Filter \"Index={index}\"; \
@@ -482,16 +494,14 @@ fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
         }
         // The exact-serial pin is MANDATORY (belt-and-suspenders against wiping
         // the wrong drive now that the removable safety net is gone).
-        let want = std::env::var("PHOENIX_T3_SERIAL").map_err(|_| {
+        let want = std::env::var(serial_var).map_err(|_| {
             anyhow!(
-                "SAFETY: targeting a non-removable disk requires PHOENIX_T3_SERIAL set to the \
-                 exact device serial (got PHOENIX_T3_ALLOW_FIXED but no serial pin)"
+                "SAFETY: targeting a non-removable disk requires {serial_var} set to the exact \
+                 device serial (got PHOENIX_T3_ALLOW_FIXED but no serial pin)"
             )
         })?;
         if !serial.eq_ignore_ascii_case(want.trim()) {
-            bail!(
-                "SAFETY: disk {index} serial {serial:?} != PHOENIX_T3_SERIAL {want:?} — refusing"
-            );
+            bail!("SAFETY: disk {index} serial {serial:?} != {serial_var} {want:?} — refusing");
         }
     }
     if is_boot.eq_ignore_ascii_case("True") {
@@ -511,11 +521,9 @@ fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
     }
     // Removable path keeps the historical *optional* serial pin.
     if is_removable {
-        if let Ok(want) = std::env::var("PHOENIX_T3_SERIAL") {
+        if let Ok(want) = std::env::var(serial_var) {
             if !serial.eq_ignore_ascii_case(want.trim()) {
-                bail!(
-                    "SAFETY: disk {index} serial {serial:?} != PHOENIX_T3_SERIAL {want:?} — refusing"
-                );
+                bail!("SAFETY: disk {index} serial {serial:?} != {serial_var} {want:?} — refusing");
             }
         }
     }
@@ -538,14 +546,30 @@ impl RealDisk {
     /// `PHOENIX_T3_DISK` is unset (the test should skip). Every safety gate is
     /// checked; a failure returns `Err` rather than a disk.
     pub fn acquire() -> Result<Option<Self>> {
-        let Ok(raw) = std::env::var("PHOENIX_T3_DISK") else {
+        Self::acquire_env("PHOENIX_T3_DISK", "PHOENIX_T3_SERIAL")
+    }
+
+    /// The **source** disk of a real disk-to-disk clone, opted into via
+    /// `PHOENIX_T3_SRC_DISK` / `PHOENIX_T3_SRC_SERIAL`.
+    ///
+    /// Gated exactly as hard as the target, and for the same reason: the clone
+    /// tests lay their own fixture down on the source before reading it, so it is
+    /// every bit as destroyable as the disk being cloned onto. A "source" that
+    /// skipped the boot/system check would be the easiest way imaginable to
+    /// reformat someone's laptop.
+    pub fn acquire_source() -> Result<Option<Self>> {
+        Self::acquire_env("PHOENIX_T3_SRC_DISK", "PHOENIX_T3_SRC_SERIAL")
+    }
+
+    fn acquire_env(disk_var: &str, serial_var: &str) -> Result<Option<Self>> {
+        let Ok(raw) = std::env::var(disk_var) else {
             return Ok(None);
         };
         let index: u32 = raw
             .trim()
             .parse()
-            .context("PHOENIX_T3_DISK must be a disk number")?;
-        let v = validate_real_disk(index)?;
+            .with_context(|| format!("{disk_var} must be a disk number"))?;
+        let v = validate_real_disk_pinned(index, serial_var)?;
         eprintln!(
             "[T3] target = disk {index}, {}, serial {} — safety gates passed",
             if v.is_removable {
