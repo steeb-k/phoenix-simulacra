@@ -1389,6 +1389,56 @@ pub fn wait_for_restored_letter(disk_index: u32, timeout_ms: u64) -> Option<char
     assign_letter_to_largest(disk_index).filter(|&l| reachable(l))
 }
 
+/// Drive letter of the partition at an **exact byte offset**, waiting for it to
+/// mount and assigning one if Windows doesn't.
+///
+/// [`wait_for_restored_letter`] returns the *first* lettered partition on the
+/// disk, which is fine when the test just restored the whole disk and there is
+/// only one candidate. It is actively wrong for a **partial** clone or restore:
+/// the target keeps its other partitions, so "first letter on the disk" can just
+/// as easily hand back the partition we were supposed to leave alone — and then
+/// verifying the source's fixture against it would be a false pass, or a false
+/// failure, depending on which way the dice fell.
+///
+/// Identify the slot by the one thing the plan actually pinned: its offset.
+pub fn wait_for_letter_at_offset(
+    disk_index: u32,
+    offset_bytes: u64,
+    timeout_ms: u64,
+) -> Option<char> {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(timeout_ms);
+    let force_after = start + std::time::Duration::from_millis(timeout_ms / 2);
+    let mut forced = false;
+    let reachable = |l: char| Path::new(&format!("{l}:\\")).exists();
+
+    let letter_at = || -> Option<char> {
+        phoenix_core::disk::enumerate_disks()
+            .ok()?
+            .into_iter()
+            .find(|d| d.index == disk_index)?
+            .partitions
+            .into_iter()
+            .find(|p| p.offset_bytes == offset_bytes)?
+            .drive_letter
+    };
+
+    while std::time::Instant::now() < deadline {
+        if let Some(l) = letter_at().filter(|&l| reachable(l)) {
+            return Some(l);
+        }
+        if !forced && std::time::Instant::now() >= force_after {
+            forced = true;
+            // Windows sometimes leaves a freshly-rewritten slot unmounted until
+            // something pokes it; assign letters to any lettered-less partition
+            // on the disk, then look again for OUR offset specifically.
+            let _ = assign_letters_to_disk(disk_index);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    letter_at().filter(|&l| reachable(l))
+}
+
 /// Drive letter currently assigned to the first lettered partition of a
 /// physical disk (via PowerShell `Get-Partition`), if any.
 pub fn first_letter_on_disk(disk_index: u32) -> Option<char> {

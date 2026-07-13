@@ -33,35 +33,24 @@ That is now the biggest hole.
 
 ## Correctness backlog — do these first
 
-### P0 — NTFS `bytes_per_cluster` is hardcoded to 4096 (data-integrity)
+### ~~P0 — NTFS `bytes_per_cluster` hardcoded to 4096~~ (DONE 2026-07-13)
 
-`ntfs_plan` parses the boot sector and computes the volume's real cluster size
-(`phoenix-capture/src/ntfs.rs:349`) — and then **does not return it**. Its
-signature is `-> Result<(Vec<Extent>, Option<String>)>`, so `plan_capture`
-substitutes a literal:
+`ntfs_plan` parsed the volume's real cluster size out of the boot sector and then
+**didn't return it**, so `plan_capture` substituted a literal `4096`. FAT and exFAT
+had always passed their parsed value through; NTFS alone was guessing — and guessing
+right, because NTFS picks 4096 for every volume up to 16 TB and so did every fixture
+in the suite.
 
-```rust
-// phoenix-capture/src/backup.rs:817-819
-(FilesystemKind::Ntfs, CaptureMode::UsedBlocks) => {
-    let (extents, bitmap_hash) = ntfs_plan(reader)?;
-    Ok((extents, 4096, mode, fs, bitmap_hash))   // <-- the real value was discarded
-}
-```
+That literal became `bytes_per_cluster` in the manifest and fed `build_relocation_map`
+on the shrink path, so **shrinking an NTFS volume formatted with non-4K clusters (64K
+is common on large data volumes) built its relocation map at up to 1/16th the real
+cluster stride.** Extent capture was unaffected — this was a restore/clone-shrink
+defect, not a capture one.
 
-FAT and exFAT do this correctly (`backup.rs:825`, `backup.rs:837` return the
-parsed value); NTFS alone is wrong.
-
-That literal becomes `bytes_per_cluster` in the manifest and is fed to
-`build_relocation_map` on the shrink path (`phoenix-restore/src/restore.rs:411`,
-`phoenix-clone/src/lib.rs:399`). **Shrinking an NTFS volume formatted with
-non-4K clusters (64K is common on large data volumes) therefore builds its
-relocation map with a cluster size up to 16× too small.** Extent capture itself is
-unaffected (extents come straight from `ntfs_plan`), so this is a
-restore/clone-shrink defect, not a capture one.
-
-Fix: return `cluster_size` from `ntfs_plan` and thread it through. Then **add a T2
-test that formats NTFS with 64K clusters and shrinks it** — the absence of such a
-test is the reason this survived.
+Fixed by returning the parsed cluster size and threading it through. Covered by
+`ntfs_restore_shrink_64k_clusters`, the first fixture in this tree to look at a volume
+that isn't 4K-cluster (the harness gained `init_gpt_with_cluster` for it). The absence
+of such a fixture is the whole reason this survived.
 
 ### ~~P1 — 4Kn media support~~ (DONE 2026-07-13, except mount)
 
