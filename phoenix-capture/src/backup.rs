@@ -819,8 +819,12 @@ pub fn plan_capture(
     let mode = part.capture_mode;
     match (fs, mode) {
         (FilesystemKind::Ntfs, CaptureMode::UsedBlocks) => {
-            let (extents, bitmap_hash) = ntfs_plan(reader)?;
-            Ok((extents, 4096, mode, fs, bitmap_hash))
+            // Use the cluster size `ntfs_plan` read out of the boot sector. This
+            // used to be a hardcoded 4096 — right for a default-formatted volume,
+            // and wrong by up to 16x for one formatted with 64K clusters, which
+            // then fed a mis-scaled relocation map into every shrink restore.
+            let (extents, bytes_per_cluster, bitmap_hash) = ntfs_plan(reader)?;
+            Ok((extents, bytes_per_cluster, mode, fs, bitmap_hash))
         }
         (FilesystemKind::Fat, CaptureMode::UsedBlocks) => {
             // FAT12/16/32: walk the FAT to derive extents up front so the

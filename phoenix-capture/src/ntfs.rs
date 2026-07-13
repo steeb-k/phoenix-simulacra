@@ -342,7 +342,14 @@ fn patch_ntfs_size(writer: &mut crate::raw::PartitionWriter, new_size: u64) -> R
 /// [`capture_ntfs`] (for the data stream); reading the bitmap a second time
 /// would risk re-tripping the same IOCTL failure and re-introduce the
 /// previously-flagged two-reads-can-disagree race.
-pub fn ntfs_plan(reader: &mut impl BlockSource) -> Result<(Vec<Extent>, Option<String>)> {
+///
+/// Returns `(used_extents, bytes_per_cluster, bitmap_hash)`. The cluster size
+/// is **read from the volume's boot sector**, not assumed: `plan_capture` used
+/// to discard it and substitute a literal 4096, which silently mis-sized the
+/// shrink relocation map for any volume not formatted at 4K clusters (64K is
+/// common on large data volumes). FAT and exFAT always returned their parsed
+/// value; NTFS is now consistent with them.
+pub fn ntfs_plan(reader: &mut impl BlockSource) -> Result<(Vec<Extent>, u32, Option<String>)> {
     let mut boot = vec![0u8; 512];
     reader.read_at(0, &mut boot)?;
     let bs = parse_boot_sector(&boot)?;
@@ -386,5 +393,5 @@ pub fn ntfs_plan(reader: &mut impl BlockSource) -> Result<(Vec<Extent>, Option<S
             sector_count: (cluster_size / SECTOR_SIZE).max(8),
         });
     }
-    Ok((extents, bitmap_hash))
+    Ok((extents, cluster_size as u32, bitmap_hash))
 }

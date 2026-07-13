@@ -131,3 +131,84 @@ fn ntfs_restore_shrink() {
     restore_full_disk_and_verify(&backup, &target, 300 * MIB, &digest);
     let _ = std::fs::remove_file(&backup);
 }
+
+/// Shrink an NTFS volume formatted with **64K clusters**.
+///
+/// Every other fixture in this suite takes NTFS's default allocation unit,
+/// which is 4096 bytes for any volume up to 16 TB. That uniformity is what let
+/// `plan_capture` get away with discarding the cluster size `ntfs_plan` had just
+/// parsed and substituting a literal `4096`: for every disk the tests ever
+/// built, the lie was true.
+///
+/// It is not true for a 64K-cluster volume — common on real large data volumes.
+/// The wrong cluster size feeds `build_relocation_map`, so the shrink path
+/// computed its relocation map at 1/16th the real cluster stride. This test is
+/// the one fixture in the tree that can tell the difference.
+#[test]
+#[ignore = "requires elevation + diskpart; run with --ignored --test-threads=1"]
+fn ntfs_restore_shrink_64k_clusters() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let source = TestVhd::create(512).expect("create source vhd");
+    source
+        .init_gpt_with_cluster(
+            &[PartSpec {
+                size_mb: 0,
+                fs: TestFs::Ntfs,
+                letter: 'X',
+                label: "SRC64K".into(),
+            }],
+            65536,
+        )
+        .expect("init source with 64K clusters");
+    assert!(wait_for_letter('X', 15_000), "source volume never mounted");
+    let digest = fill_fixture('X', 0x6464).expect("fill fixture");
+
+    let disks = enumerate_disks().unwrap();
+    let disk = disks
+        .iter()
+        .find(|d| d.index == source.disk_index())
+        .unwrap();
+    let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
+
+    let backup =
+        std::env::temp_dir().join(format!("resize64k-{}.phnx", uuid::Uuid::new_v4().simple()));
+    run_backup(BackupOptions {
+        disk_index: source.disk_index(),
+        partition_indices: parts,
+        output: backup.clone(),
+        verify_after: true,
+        verify_image: false,
+        progress: None,
+    })
+    .expect("run_backup");
+
+    // The manifest must carry the volume's REAL cluster size. If this reads 4096
+    // the capture planner is lying about the source's geometry, and the shrink
+    // below would be relocating clusters at the wrong stride — so assert it here,
+    // where the failure names the actual cause, rather than waiting for chkdsk to
+    // report damage it can't explain.
+    let mut reader = PhnxReader::open(&backup).expect("open backup");
+    let ntfs_entry = reader
+        .index
+        .iter()
+        .find(|e| e.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .expect("no NTFS partition in backup")
+        .clone();
+    let stream = reader
+        .read_stream_header(&ntfs_entry)
+        .expect("read stream header");
+    assert_eq!(
+        stream.bytes_per_cluster, 65536,
+        "manifest recorded {} bytes per cluster for a 64K-cluster volume — the capture \
+         planner discarded the parsed cluster size",
+        stream.bytes_per_cluster
+    );
+    drop(reader);
+
+    // Now the part the wrong cluster size would actually corrupt: shrink it.
+    let target = TestVhd::create(300).expect("create target");
+    restore_full_disk_and_verify(&backup, &target, 300 * MIB, &digest);
+    let _ = std::fs::remove_file(&backup);
+}

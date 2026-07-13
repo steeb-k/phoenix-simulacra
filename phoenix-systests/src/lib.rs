@@ -167,6 +167,13 @@ impl TestVhd {
         diskpart_layout(self.disk_index, true, parts)
     }
 
+    /// As [`TestVhd::init_gpt_with`], but formats with an explicit
+    /// allocation-unit size (e.g. 65536 for 64K clusters) instead of the
+    /// filesystem default.
+    pub fn init_gpt_with_cluster(&self, parts: &[PartSpec], cluster_bytes: u32) -> Result<()> {
+        diskpart_layout_with_cluster(self.disk_index, true, parts, Some(cluster_bytes))
+    }
+
     /// Detach the VHD explicitly (also done on Drop). Idempotent.
     pub fn detach(&mut self) -> Result<()> {
         if self.detached {
@@ -232,11 +239,37 @@ fn ensure_letter_free(letter: char, target_disk: u32) -> Result<()> {
 /// DESTRUCTIVE — used by both [`TestVhd`] and [`RealDisk`] (which safety-checks
 /// the target first).
 pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result<()> {
+    diskpart_layout_with_cluster(disk_index, gpt, parts, None)
+}
+
+/// As [`diskpart_layout`], but formats every partition with an explicit
+/// allocation-unit size (diskpart's `format ... unit=`) instead of the
+/// filesystem's default.
+///
+/// The default matters more than it looks: NTFS picks 4096 for any volume up to
+/// 16 TB, so *every* fixture in this suite is a 4K-cluster volume — which is
+/// exactly why a hardcoded `bytes_per_cluster = 4096` in the capture planner
+/// survived unnoticed. 64K clusters are common on real large data volumes, and a
+/// fixture that uses them is the only thing that can catch that class of bug.
+///
+/// The override is per-layout rather than per-`PartSpec` on purpose: only the
+/// cluster-size regression test needs it, and threading an `Option` through all
+/// 30 `PartSpec` literals would be churn for no coverage.
+pub fn diskpart_layout_with_cluster(
+    disk_index: u32,
+    gpt: bool,
+    parts: &[PartSpec],
+    cluster_bytes: Option<u32>,
+) -> Result<()> {
     for p in parts {
         ensure_letter_free(p.letter, disk_index)?;
     }
     let style = if gpt { "gpt" } else { "mbr" };
     let mut script = format!("select disk {disk_index}\nclean\nconvert {style}\n");
+    // diskpart takes the allocation unit in bytes (`unit=65536`).
+    let unit = cluster_bytes
+        .map(|c| format!(" unit={c}"))
+        .unwrap_or_default();
     for p in parts {
         if p.size_mb == 0 {
             script.push_str("create partition primary\n");
@@ -244,7 +277,7 @@ pub fn diskpart_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Result
             script.push_str(&format!("create partition primary size={}\n", p.size_mb));
         }
         script.push_str(&format!(
-            "format fs={} label={} quick\n",
+            "format fs={} label={}{unit} quick\n",
             p.fs.diskpart_fs(),
             p.label
         ));
