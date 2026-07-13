@@ -1,16 +1,25 @@
-//! Restore page source/target disk map rows and the layout-editing toolbar.
+//! Restore page: the backup's source disk row, the source→target flow arrow,
+//! and the drag-to-partial-restore layout editor.
+//!
+//! The page is laid out like the Clone page, and the two share every piece of
+//! layout-editing machinery below (the Clone page imports it from here): the
+//! target dropdown's closed face IS the editor once a target is picked. The
+//! only structural difference is the source — a `.phnx` file picked with the
+//! Browse row above, not a disk chosen from a dropdown.
 
 use eframe::egui;
-use egui::{Align2, CursorIcon, Rect, Rounding, Sense, Ui, Vec2};
+use egui::{Align2, Color32, CursorIcon, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use phoenix_core::disk::{DiskInfo, PartitionInfo};
 
 use std::sync::Arc;
 
+use crate::disk_dropdown::{
+    self, disk_dropdown, draw_disk_list_row, draw_empty_face, draw_hint_face, min_row_width,
+};
 use crate::disk_map::{
-    self, draw_disk_info_card, draw_partition_map, draw_partition_map_segments,
-    draw_partition_segment_visual_styled, MapScale, SegmentKind, CHECKBOX_COLUMN_WIDTH,
-    CHECKBOX_GAP, INFO_CARD_GAP, INFO_CARD_WIDTH, ROW_HEIGHT, ROW_VERTICAL_GAP,
+    self, draw_disk_info_card, draw_partition_map_segments, draw_partition_segment_visual_styled,
+    MapScale, SegmentKind, INFO_CARD_GAP, INFO_CARD_WIDTH, ROW_HEIGHT, ROW_VERTICAL_GAP,
 };
 use crate::fonts;
 use crate::restore_layout::{DropFit, LayoutDrag, RestoreLayoutState};
@@ -61,75 +70,249 @@ pub(crate) fn clear_drag(ctx: &egui::Context) {
 }
 
 pub struct RestorePanelOutput {
-    pub plan_entries_updated: bool,
+    /// A different target disk was picked this frame.
+    pub target_changed: bool,
 }
 
 pub fn show(
     ui: &mut Ui,
-    layout: &mut RestoreLayoutState,
-    target: &DiskInfo,
+    disks: &[DiskInfo],
+    target_index: &mut Option<u32>,
+    mut layout: Option<&mut RestoreLayoutState>,
     palette: &Palette,
     viewport_width: f32,
 ) -> RestorePanelOutput {
     let mut out = RestorePanelOutput {
-        plan_entries_updated: false,
+        target_changed: false,
     };
-    layout.ensure_target(target);
 
-    ui.label(egui::RichText::new("Source media").strong());
-    ui.add_space(4.0);
-    let row_width = viewport_width.max(disk_map::min_disk_row_width(&layout.source_disk));
-    draw_source_row(ui, row_width, layout, target, palette);
-    ui.add_space(12.0);
-
-    // Heading row with the layout toolbar on the right.
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Target disk layout").strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if draw_layout_toolbar(ui, layout, target, palette) {
-                out.plan_entries_updated = true;
-            }
-        });
-    });
-    ui.label(
-        egui::RichText::new(
-            "Drag a source partition onto a target partition to replace it, or into empty space to add it. Drag edges to resize, the body to move; click to select.",
-        )
-        .color(palette.subtle_text),
-    );
-    ui.add_space(4.0);
-
-    // Baseline cursor for a drag in flight; the target row overrides it with
-    // NotAllowed when hovering somewhere the source can't fit.
+    // While a drag is in flight the grab cursor rules the page; the drop
+    // targets override it with NotAllowed where the payload can't land.
     if active_drag(ui.ctx()).is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
     }
-    // Delete key mirrors the toolbar's delete button.
-    if !layout.full_disk
-        && layout.selected_slot.is_some()
-        && ui.ctx().input(|i| i.key_pressed(egui::Key::Delete))
-        && layout.delete_selected()
-    {
-        out.plan_entries_updated = true;
+
+    let target_disk = target_index
+        .and_then(|t| disks.iter().find(|d| d.index == t))
+        .cloned();
+    if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk.as_ref()) {
+        layout.ensure_target(target);
     }
 
-    let target_view = layout.target_view(target);
-    let target_row_width = viewport_width.max(disk_map::min_disk_row_width(&target_view));
-    if draw_target_row(
+    // ---- Source row: the layout captured in the backup ----
+    // The Clone page picks its source from a dropdown; here the Browse row
+    // above did that job, so the row stands alone — inset to the same width
+    // as the target dropdown's face (chevron column excluded) so the two
+    // rows still line up edge to edge.
+    let face_width =
+        (viewport_width - disk_dropdown::CHEVRON_COL_W - ui.spacing().item_spacing.x).max(0.0);
+    let mut drag_started: Option<u32> = None;
+    ui.scope(|ui| {
+        ui.set_max_width(face_width);
+        match layout.as_deref() {
+            Some(l) => {
+                let disk = l.source_disk.clone();
+                egui::ScrollArea::horizontal()
+                    .id_salt("restore_source_face")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let row_width = face_width.max(min_row_width(&disk));
+                        let ev = draw_disk_list_row(ui, row_width, &disk, true, true, palette);
+                        drag_started = ev.drag_started;
+                    });
+            }
+            None => draw_hint_face(
+                ui,
+                face_width,
+                "Choose a backup file to see its partitions…",
+                palette,
+            ),
+        }
+    });
+
+    // A drag lifting off the source while the plan is still "entire disk"
+    // switches to a partial restore: the editor re-seeds from the target's
+    // LIVE layout, and the dragged partition lands wherever it's dropped.
+    if let Some(part) = drag_started {
+        ui.ctx().data_mut(|d| d.insert_temp(drag_source_id(), part));
+        if let Some(layout) = layout.as_deref_mut() {
+            if layout.full_disk {
+                if let Some(target) = target_disk.as_ref() {
+                    layout.clear_full_disk(target);
+                }
+            }
+        }
+    }
+
+    // ---- Flow arrow ----
+    // The layout toolbar occupies a row between the arrow and the target
+    // dropdown once a target is picked; mirroring that row's height above
+    // the arrow keeps it equidistant from the source row either way.
+    let show_editor = layout.is_some() && target_disk.is_some();
+    if show_editor {
+        ui.add_space(TOOLBAR_BTN + ui.spacing().item_spacing.y);
+    }
+    draw_flow_arrow(ui, palette, viewport_width);
+
+    // ---- Toolbar + mode switch, shown once both ends are picked ----
+    if let (Some(layout), Some(target)) = (layout.as_deref_mut(), target_disk.as_ref()) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                draw_layout_toolbar(ui, layout, target, palette);
+            });
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if mode_button(
+                ui,
+                egui_phosphor::regular::HARD_DRIVE,
+                "Entire disk",
+                layout.full_disk,
+                palette,
+            ) && !layout.full_disk
+            {
+                layout.apply_full_disk(target);
+            }
+            if mode_button(
+                ui,
+                egui_phosphor::regular::PUZZLE_PIECE,
+                "Individual partitions",
+                !layout.full_disk,
+                palette,
+            ) && layout.full_disk
+            {
+                layout.clear_full_disk(target);
+            }
+        });
+        ui.add_space(2.0);
+        let caption = if layout.full_disk {
+            "Full-disk restore — the target's entire contents are replaced with the backup's \
+             layout."
+        } else {
+            "Drag a source partition onto a target partition to replace it, or into empty space \
+             to add it. Drag edges to resize, the body to move; click to select. Unmapped \
+             partitions are preserved."
+        };
+        ui.label(egui::RichText::new(caption).color(palette.subtle_text));
+
+        // Delete key mirrors the toolbar's delete button (partial only).
+        if !layout.full_disk
+            && layout.selected_slot.is_some()
+            && ui.ctx().input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            layout.delete_selected();
+        }
+    }
+    ui.add_space(6.0);
+
+    // ---- Target dropdown, whose closed face is the layout editor ----
+    let picked = disk_dropdown(
         ui,
-        target_row_width,
-        CHECKBOX_COLUMN_WIDTH + CHECKBOX_GAP,
-        layout,
-        &target_view,
+        "restore_target_dropdown",
+        disks,
+        *target_index,
+        None,
         palette,
-    ) {
-        out.plan_entries_updated = true;
+        viewport_width,
+        |ui, face_width| {
+            if show_editor {
+                let layout = layout.as_deref_mut().expect("checked is_some");
+                let target = target_disk.as_ref().expect("checked is_some");
+                let view = layout.target_view(target);
+                egui::ScrollArea::horizontal()
+                    .id_salt("restore_target_face")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let row_width = face_width.max(min_row_width(&view));
+                        let _ = draw_target_row(ui, row_width, layout, &view, palette);
+                    });
+                // The editor owns clicks (slot selection); the chevron is
+                // the only way to reopen the list.
+                false
+            } else if let Some(disk) = target_disk.as_ref() {
+                let mut wants_open = false;
+                egui::ScrollArea::horizontal()
+                    .id_salt("restore_target_face")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let row_width = face_width.max(min_row_width(disk));
+                        let ev = draw_disk_list_row(ui, row_width, disk, true, false, palette);
+                        wants_open = ev.clicked;
+                    });
+                wants_open
+            } else {
+                draw_empty_face(ui, face_width, "Choose a target disk…", palette)
+            }
+        },
+    );
+    if let Some(idx) = picked {
+        if *target_index != Some(idx) {
+            *target_index = Some(idx);
+            out.target_changed = true;
+        }
     }
 
-    drag_lifecycle(ui.ctx(), layout, palette);
+    if let Some(layout) = layout.as_deref() {
+        drag_lifecycle(ui.ctx(), layout, palette);
+    }
 
     ui.add_space(ROW_VERTICAL_GAP);
     out
+}
+
+/// Bordered mode-switch button with a leading icon; the active mode gets an
+/// accent border and tinted fill so the pair reads as a two-state control.
+/// Shared with the Clone page.
+pub(crate) fn mode_button(
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    selected: bool,
+    palette: &Palette,
+) -> bool {
+    // Text stays at full contrast in both states — the accent border and
+    // tinted fill carry the selection; accent-colored text on the accent
+    // tint would be hard to read.
+    let text = crate::icon_label(
+        icon,
+        fonts::icon(16.0),
+        label,
+        fonts::regular(14.0),
+        palette.icon_color,
+    );
+    let fill = if selected {
+        disk_map::blend(palette.content_card_bg, palette.accent, 0.18)
+    } else {
+        palette.content_card_bg
+    };
+    let stroke = if selected {
+        Stroke::new(1.5, palette.accent)
+    } else {
+        Stroke::new(1.0, disk_map::with_alpha(palette.subtle_text, 90))
+    };
+    let response = ui.add(egui::Button::new(text).fill(fill).stroke(stroke));
+    crate::theme::draw_focus_outline(ui, &response, palette);
+    response.clicked()
+}
+
+/// Big source→target arrow between the source row and the target dropdown,
+/// centered on the visible viewport (not the virtual scroll width).
+/// Monochrome — white in dark mode, black in light — so it reads as plumbing,
+/// not an action. Shared with the Clone page.
+pub(crate) fn draw_flow_arrow(ui: &mut Ui, palette: &Palette, viewport_width: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(viewport_width, 52.0), Sense::hover());
+    let color = if palette.light_mode {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        egui_phosphor::fill::ARROW_FAT_LINES_DOWN,
+        fonts::icon_fill(42.0),
+        color,
+    );
 }
 
 /// Drag lifecycle, run once per frame after every row that can start or
@@ -271,120 +454,12 @@ fn draw_drag_ghost(ctx: &egui::Context, palette: &Palette, src: &PartitionInfo) 
         });
 }
 
-fn draw_source_row(
-    ui: &mut Ui,
-    row_width: f32,
-    layout: &mut RestoreLayoutState,
-    target: &DiskInfo,
-    palette: &Palette,
-) {
-    let full_disk = layout.full_disk;
-    let disk = layout.source_disk.clone();
-    let row_size = Vec2::new(row_width, ROW_HEIGHT);
-    let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
-
-    let checkbox_rect = Rect::from_min_size(
-        row_rect.left_top(),
-        Vec2::new(CHECKBOX_COLUMN_WIDTH, ROW_HEIGHT),
-    );
-    draw_full_disk_checkbox(ui, checkbox_rect, layout, target, palette);
-
-    let info_rect = Rect::from_min_size(
-        egui::pos2(checkbox_rect.right() + CHECKBOX_GAP, row_rect.top()),
-        Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT),
-    );
-    draw_disk_info_card(ui, info_rect, &disk, palette, full_disk);
-
-    let map_rect = Rect::from_min_max(
-        egui::pos2(info_rect.right() + INFO_CARD_GAP, row_rect.top()),
-        row_rect.right_bottom(),
-    );
-
-    let dragging_source = active_drag(ui.ctx());
-
-    draw_partition_map(
-        ui,
-        map_rect,
-        &disk,
-        palette,
-        |ui, _disk_idx, p, seg_rect| {
-            let id = ui.id().with(("restore_src", p.index));
-            let response = ui.interact(seg_rect, id, Sense::click_and_drag());
-            if !full_disk {
-                if response.drag_started() {
-                    ui.ctx()
-                        .data_mut(|d| d.insert_temp(drag_source_id(), p.index));
-                }
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(CursorIcon::Grab);
-                }
-            }
-            let selected = dragging_source == Some(p.index);
-            draw_partition_segment_visual_styled(
-                ui,
-                seg_rect,
-                p,
-                palette,
-                response.hovered(),
-                selected,
-                None,
-            );
-            response.on_hover_ui_at_pointer(|ui| disk_map::partition_tooltip(ui, p));
-            true
-        },
-    );
-}
-
-fn draw_full_disk_checkbox(
-    ui: &mut Ui,
-    rect: Rect,
-    layout: &mut RestoreLayoutState,
-    target: &DiskInfo,
-    palette: &Palette,
-) {
-    let id = ui.id().with("restore_full_disk");
-    let response = ui.interact(rect, id, Sense::click());
-    let painter = ui.painter_at(rect);
-    let box_size = 22.0;
-    let box_rect = Rect::from_center_size(rect.center(), Vec2::splat(box_size));
-    if layout.full_disk {
-        painter.rect_filled(box_rect, egui::Rounding::same(4.0), palette.accent);
-        painter.text(
-            box_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            egui_phosphor::regular::CHECK,
-            crate::fonts::icon(16.0),
-            egui::Color32::WHITE,
-        );
-    } else {
-        let stroke = if response.hovered() {
-            palette.accent
-        } else {
-            palette.subtle_text
-        };
-        painter.rect_stroke(
-            box_rect,
-            egui::Rounding::same(4.0),
-            egui::Stroke::new(1.5, stroke),
-        );
-    }
-    if response.clicked() {
-        if layout.full_disk {
-            layout.clear_full_disk(target);
-        } else {
-            layout.apply_full_disk(target);
-        }
-    }
-}
-
 /// The editable planned-layout row: info card + segment map with drop,
-/// move, resize, and select interactions. `inset` is dead space reserved at
-/// the row's left edge (the Restore page uses it to stay column-aligned
-/// with the source row's full-disk checkbox; the Clone page passes 0).
+/// move, resize, and select interactions. Both pages render it as the target
+/// dropdown's closed face.
 pub(crate) fn draw_target_row(
     ui: &mut Ui,
     row_width: f32,
-    inset: f32,
     layout: &mut RestoreLayoutState,
     view: &DiskInfo,
     palette: &Palette,
@@ -393,10 +468,8 @@ pub(crate) fn draw_target_row(
     let row_size = Vec2::new(row_width, ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
 
-    let info_rect = Rect::from_min_size(
-        egui::pos2(row_rect.left() + inset, row_rect.top()),
-        Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT),
-    );
+    let info_rect =
+        Rect::from_min_size(row_rect.left_top(), Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT));
     draw_disk_info_card(ui, info_rect, view, palette, false);
 
     let map_rect = Rect::from_min_max(

@@ -742,3 +742,35 @@ pub fn draw_backup_disk_row(
         },
     );
 }
+
+/// A read-only `[info card | partition map]` row: hover tooltips and nothing
+/// else — no checkbox, no selection, no drag. The Verify page previews the
+/// chosen image's captured layout with it.
+pub fn draw_static_disk_row(ui: &mut Ui, row_width: f32, disk: &DiskInfo, palette: &Palette) {
+    let row_size = Vec2::new(row_width, ROW_HEIGHT);
+    let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
+
+    let info_rect =
+        Rect::from_min_size(row_rect.left_top(), Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT));
+    draw_disk_info_card(ui, info_rect, disk, palette, false);
+
+    let map_rect = Rect::from_min_max(
+        egui::pos2(info_rect.right() + INFO_CARD_GAP, row_rect.top()),
+        row_rect.right_bottom(),
+    );
+    draw_partition_map(ui, map_rect, disk, palette, |ui, _disk, p, seg_rect| {
+        let id = ui.id().with(("preview_part", p.index));
+        let response = ui.interact(seg_rect, id, Sense::hover());
+        draw_partition_segment_visual_styled(
+            ui,
+            seg_rect,
+            p,
+            palette,
+            response.hovered(),
+            false,
+            None,
+        );
+        response.on_hover_ui_at_pointer(|ui| partition_tooltip(ui, p));
+        true
+    });
+}

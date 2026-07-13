@@ -147,11 +147,37 @@ fn dropdown_chevron(ui: &mut Ui, height: f32, popup_id: egui::Id, palette: &Pale
 /// ComboBox-like placeholder face shown until a disk is picked. Returns
 /// true on click.
 pub(crate) fn draw_empty_face(ui: &mut Ui, width: f32, hint: &str, palette: &Palette) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, EMPTY_FACE_HEIGHT), Sense::click());
+    let response = draw_face_frame(ui, width, hint, palette, true);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    crate::theme::draw_focus_outline(ui, &response, palette);
+    response.clicked()
+}
+
+/// Inert twin of [`draw_empty_face`]: the Restore page's source row is filled
+/// by the Browse field above it, not by a click here, so the placeholder must
+/// not advertise itself as a control.
+pub(crate) fn draw_hint_face(ui: &mut Ui, width: f32, hint: &str, palette: &Palette) {
+    draw_face_frame(ui, width, hint, palette, false);
+}
+
+fn draw_face_frame(
+    ui: &mut Ui,
+    width: f32,
+    hint: &str,
+    palette: &Palette,
+    interactive: bool,
+) -> egui::Response {
+    let sense = if interactive {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, EMPTY_FACE_HEIGHT), sense);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, Rounding::same(6.0), palette.content_card_bg);
-    let stroke_color = if response.hovered() {
+    let stroke_color = if interactive && response.hovered() {
         palette.accent
     } else {
         disk_map::with_alpha(palette.subtle_text, 90)
@@ -175,11 +201,7 @@ pub(crate) fn draw_empty_face(ui: &mut Ui, width: f32, hint: &str, palette: &Pal
         fonts::regular(15.0),
         palette.subtle_text,
     );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    crate::theme::draw_focus_outline(ui, &response, palette);
-    response.clicked()
+    response
 }
 
 pub(crate) struct RowEvents {

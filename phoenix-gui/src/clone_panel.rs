@@ -11,15 +11,15 @@
 //! move/resize/delete editing as a partial restore.
 
 use eframe::egui;
-use egui::{Align2, Color32, CursorIcon, Sense, Stroke, Ui, Vec2};
+use egui::{CursorIcon, Ui};
 
 use phoenix_core::disk::DiskInfo;
 
 use crate::disk_dropdown::{disk_dropdown, draw_disk_list_row, draw_empty_face, min_row_width};
-use crate::disk_map;
 use crate::restore_layout::RestoreLayoutState;
 use crate::restore_panel::{
-    active_drag, drag_lifecycle, drag_source_id, draw_layout_toolbar, draw_target_row, TOOLBAR_BTN,
+    active_drag, drag_lifecycle, drag_source_id, draw_flow_arrow, draw_layout_toolbar,
+    draw_target_row, mode_button, TOOLBAR_BTN,
 };
 use crate::theme::Palette;
 
@@ -202,7 +202,7 @@ pub fn show(
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         let row_width = face_width.max(min_row_width(&view));
-                        let _ = draw_target_row(ui, row_width, 0.0, layout, &view, palette);
+                        let _ = draw_target_row(ui, row_width, layout, &view, palette);
                     });
                 // The editor owns clicks (slot selection); the chevron is
                 // the only way to reopen the list.
@@ -235,51 +235,4 @@ pub fn show(
     }
 
     out
-}
-
-/// Bordered mode-switch button with a leading icon; the active mode gets an
-/// accent border and tinted fill so the pair reads as a two-state control.
-fn mode_button(ui: &mut Ui, icon: &str, label: &str, selected: bool, palette: &Palette) -> bool {
-    // Text stays at full contrast in both states — the accent border and
-    // tinted fill carry the selection; accent-colored text on the accent
-    // tint would be hard to read.
-    let text = crate::icon_label(
-        icon,
-        crate::fonts::icon(16.0),
-        label,
-        crate::fonts::regular(14.0),
-        palette.icon_color,
-    );
-    let fill = if selected {
-        disk_map::blend(palette.content_card_bg, palette.accent, 0.18)
-    } else {
-        palette.content_card_bg
-    };
-    let stroke = if selected {
-        Stroke::new(1.5, palette.accent)
-    } else {
-        Stroke::new(1.0, disk_map::with_alpha(palette.subtle_text, 90))
-    };
-    let response = ui.add(egui::Button::new(text).fill(fill).stroke(stroke));
-    crate::theme::draw_focus_outline(ui, &response, palette);
-    response.clicked()
-}
-
-/// Big source→target arrow between the two dropdowns, centered on the
-/// visible viewport (not the virtual scroll width). Monochrome — white in
-/// dark mode, black in light — so it reads as plumbing, not an action.
-fn draw_flow_arrow(ui: &mut Ui, palette: &Palette, viewport_width: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(viewport_width, 52.0), Sense::hover());
-    let color = if palette.light_mode {
-        Color32::BLACK
-    } else {
-        Color32::WHITE
-    };
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        egui_phosphor::fill::ARROW_FAT_LINES_DOWN,
-        crate::fonts::icon_fill(42.0),
-        color,
-    );
 }

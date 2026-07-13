@@ -787,7 +787,12 @@ impl PhoenixApp {
                     } else {
                         msg
                     };
-                    if job_kind == JobKind::Restore {
+                    // A restore that wrote its image, or a verify that read one
+                    // through, is done with that file: clear the path field
+                    // (shared by both pages) along with the loaded layout, so
+                    // neither page sits there armed to re-run the same job.
+                    if job_kind == JobKind::Restore || job_kind == JobKind::Verify {
+                        self.restore_backup_path.clear();
                         self.clear_restore_ui_state();
                     }
                     if job_kind == JobKind::Clone {
@@ -886,12 +891,27 @@ impl PhoenixApp {
             JobOutcome::Warning => format!("{}.", kind.cancelled_message()),
             JobOutcome::Failure => format!("{} failed.", kind.noun()),
         };
+        // The detail line under the badge must not restate it. A job whose
+        // status text ("Full verify OK: <path>", "Restore completed") says
+        // nothing the banner hasn't already said drops to the one fact the
+        // banner leaves out — the image that was verified — or to nothing.
+        // The status bar keeps the fuller wording; it has no badge above it.
+        let message = match (outcome, kind) {
+            (JobOutcome::Success, JobKind::Verify) => self
+                .job_subject
+                .image_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            (JobOutcome::Success, JobKind::Restore) => String::new(),
+            _ => self.status.clone(),
+        };
         self.completed = Some(CompletedJob {
             title: kind.noun().to_string(),
             steps: snap.steps.clone(),
             current_step: snap.current_step,
             outcome,
-            message: self.status.clone(),
+            message,
             banner,
             verify_target,
         });
@@ -1067,7 +1087,9 @@ impl eframe::App for PhoenixApp {
         // painted the dim/spinner overlay, so it stays on screen while the
         // enumeration below blocks.
         self.run_pending_refresh();
-        if self.page == Page::Restore {
+        // Both pages that name a `.phnx` want it parsed: the Restore page to
+        // seed its layout editor, the Verify page to preview the contents.
+        if matches!(self.page, Page::Restore | Page::Verify) {
             self.poll_restore_backup_load();
         }
 
@@ -1993,78 +2015,16 @@ impl PhoenixApp {
         });
     }
 
-    /// "Select target" header + disk dropdown on the Restore page. Binds the
-    /// dropdown directly to `self.target_disk_index` so the existing restore
-    /// plumbing — which already keys off that field — works unchanged.
-    ///
-    /// When `self.disks` is empty (typically because we're not running
-    /// elevated or `enumerate_disks` failed), the dropdown is replaced with
-    /// the same "no disks / Refresh" note the Backup page shows.
-    fn ui_restore_target_picker(&mut self, ui: &mut egui::Ui) {
-        if self.disks.is_empty() {
-            ui.label("No disks found. Run as Administrator, then hit Refresh.");
-            return;
-        }
-
-        ui.label(egui::RichText::new("Select target").font(fonts::bold(16.0)));
-        let selected_disk = self
-            .target_disk_index
-            .and_then(|t| self.disks.iter().find(|d| d.index == t));
-        if selected_disk.is_none() {
-            ui.label(
-                egui::RichText::new("Choose the physical disk to restore the backup onto.")
-                    .color(self.palette.subtle_text),
-            );
-        }
-        ui.add_space(4.0);
-
-        // Same rich dropdown as the Clone page: the closed face is the
-        // selected disk's live `[info card | partition map]` row, and the
-        // popup lists every disk the same way. The row here shows the
-        // target's CURRENT layout — the planned layout lives in the editor
-        // row the restore panel draws below.
-        let viewport_width = ui.available_width();
-        let palette = &self.palette;
-        let picked = disk_dropdown::disk_dropdown(
-            ui,
-            "restore_target_dropdown",
-            &self.disks,
-            selected_disk.map(|d| d.index),
-            None,
-            palette,
-            viewport_width,
-            |ui, face_width| match selected_disk {
-                Some(disk) => {
-                    let mut wants_open = false;
-                    egui::ScrollArea::horizontal()
-                        .id_salt("restore_target_face")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            let row_width = face_width.max(disk_dropdown::min_row_width(disk));
-                            wants_open = disk_dropdown::draw_disk_list_row(
-                                ui, row_width, disk, true, false, palette,
-                            )
-                            .clicked;
-                        });
-                    wants_open
-                }
-                None => {
-                    disk_dropdown::draw_empty_face(ui, face_width, "Choose a target disk…", palette)
-                }
-            },
-        );
-        if let Some(idx) = picked {
-            self.target_disk_index = Some(idx);
-        }
-    }
-
-    /// Greyed-when-busy portion of the Restore page.
-    fn ui_restore_form(&mut self, ui: &mut egui::Ui) {
+    /// The `.phnx` Browse row plus the (debounced) load of whatever it names
+    /// into `restore_layout`. Shared by the Restore and Verify pages: both
+    /// read the same image, off the same path field, so both get the loaded
+    /// layout — the editor on one, the preview on the other.
+    fn ui_backup_file_picker(&mut self, ui: &mut egui::Ui, label: &str) {
         let path_before = self.restore_backup_path.clone();
         let mut path_edited = false;
         let browsed = backup_path_picker(
             ui,
-            "Source media",
+            label,
             "Path to .phnx file",
             &mut self.restore_backup_path,
             Some(&mut || path_edited = true),
@@ -2078,33 +2038,31 @@ impl PhoenixApp {
                 self.schedule_restore_backup_load();
             }
         }
+    }
+
+    /// Greyed-when-busy portion of the Restore page: the `.phnx` Browse row,
+    /// then the same source→target layout editor the Clone page runs, with
+    /// the backup standing in for a source disk.
+    fn ui_restore_form(&mut self, ui: &mut egui::Ui) {
+        self.ui_backup_file_picker(ui, "Source media");
 
         ui.add_space(8.0);
-        let prev_target = self.target_disk_index;
-        self.ui_restore_target_picker(ui);
-        if self.target_disk_index != prev_target && !self.restore_backup_path.trim().is_empty() {
-            self.restore_loaded_path.clear();
-            self.restore_backup_load_now = true;
+        if self.disks.is_empty() {
+            ui.label("No disks found. Run as Administrator, then hit Refresh.");
+            return;
         }
-        ui.add_space(4.0);
 
-        if let Some(target) = self
-            .target_disk_index
-            .and_then(|t| self.disks.iter().find(|d| d.index == t))
-            .cloned()
-        {
-            if let Some(layout) = self.restore_layout.as_mut() {
-                let panel_out =
-                    restore_panel::show(ui, layout, &target, &self.palette, ui.available_width());
-                if panel_out.plan_entries_updated {
-                    // layout drives plan at run time
-                }
-            }
-        } else if self.restore_layout.is_some() {
-            ui.label(
-                egui::RichText::new("Select a target disk to map partitions.")
-                    .color(self.palette.subtle_text),
-            );
+        let viewport_width = ui.available_width();
+        let out = restore_panel::show(
+            ui,
+            &self.disks,
+            &mut self.target_disk_index,
+            self.restore_layout.as_mut(),
+            &self.palette,
+            viewport_width,
+        );
+        if out.target_changed {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2162,15 +2120,31 @@ impl PhoenixApp {
         page_scroll_shell(ui, "verify_page", |ui| {
             page_header(ui, &self.palette, "Verify Backup", "");
             ui.add_enabled_ui(!busy, |ui| {
-                let _ = backup_path_picker(
-                    ui,
-                    "Backup file",
-                    "Path to .phnx file",
-                    &mut self.restore_backup_path,
-                    None,
-                );
+                self.ui_verify_form(ui);
             });
         });
+    }
+
+    /// Greyed-when-busy portion of the Verify page: the `.phnx` Browse row,
+    /// then a read-only preview of the layout the chosen image holds — the
+    /// same row the Restore page drags partitions off, minus the dragging.
+    fn ui_verify_form(&mut self, ui: &mut egui::Ui) {
+        self.ui_backup_file_picker(ui, "Backup file");
+
+        let Some(layout) = self.restore_layout.as_ref() else {
+            return;
+        };
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Backup contents").font(fonts::bold(14.0)));
+        ui.add_space(4.0);
+        let disk = &layout.source_disk;
+        egui::ScrollArea::horizontal()
+            .id_salt("verify_preview")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let row_width = ui.available_width().max(disk_dropdown::min_row_width(disk));
+                disk_map::draw_static_disk_row(ui, row_width, disk, &self.palette);
+            });
     }
 
     fn start_verify(&mut self) {
