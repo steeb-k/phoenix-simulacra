@@ -31,7 +31,11 @@ use crate::attach::AttachedDisk;
 use crate::synthetic::SyntheticVhd;
 
 /// The single file the volume exposes.
+/// The two names the filesystem may serve. Which one depends on the container
+/// `SyntheticVhd` chose: a 4Kn backup needs VHDX (only that format can state a
+/// sector size), everything else keeps the simpler fixed VHD.
 const VHD_NAME: &str = "backup.vhd";
+const VHDX_NAME: &str = "backup.vhdx";
 
 // NTSTATUS / attribute constants (avoid pulling extra windows-sys surface).
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
@@ -52,6 +56,8 @@ struct VhdFs {
     /// WinFsp calls us from many dispatcher threads, so guard it.
     vhd: Mutex<SyntheticVhd>,
     total_len: u64,
+    /// `backup.vhd` or `backup.vhdx`, per the container.
+    image_name: &'static str,
     /// A permissive self-relative security descriptor (grant World read).
     security: Vec<u8>,
     /// Fixed timestamp for the synthesized nodes.
@@ -61,9 +67,11 @@ struct VhdFs {
 impl VhdFs {
     fn new(vhd: SyntheticVhd) -> Result<Self> {
         let total_len = vhd.total_len();
+        let image_name = vhd.image_name();
         Ok(Self {
             vhd: Mutex::new(vhd),
             total_len,
+            image_name,
             security: build_security_descriptor(),
             time: now_filetime(),
         })
@@ -102,13 +110,18 @@ impl VhdFs {
     }
 }
 
-/// Resolve a WinFsp path (`\`, `\backup.vhd`) to a node.
+/// Resolve a WinFsp path (`\`, `\backup.vhd`, `\backup.vhdx`) to a node.
+///
+/// Accepts BOTH names regardless of which this mount advertises. The filesystem
+/// hosts exactly one image, so there is nothing to disambiguate — and being
+/// liberal here means a stale path can't produce a baffling "file not found"
+/// against a mount that is working perfectly.
 fn resolve(file_name: &U16CStr) -> Option<Node> {
     let s = file_name.to_string_lossy();
     let norm = s.trim_start_matches('\\');
     if norm.is_empty() {
         Some(Node::Root)
-    } else if norm.eq_ignore_ascii_case(VHD_NAME) {
+    } else if norm.eq_ignore_ascii_case(VHD_NAME) || norm.eq_ignore_ascii_case(VHDX_NAME) {
         Some(Node::Vhd)
     } else {
         None
@@ -210,7 +223,7 @@ impl FileSystemContext for VhdFs {
         if !already_past {
             let mut info: DirInfo<255> = DirInfo::new();
             *info.file_info_mut() = self.file_info(Node::Vhd);
-            let name: Vec<u16> = VHD_NAME.encode_utf16().collect();
+            let name: Vec<u16> = self.image_name.encode_utf16().collect();
             info.set_name_raw(name.as_slice())
                 .map_err(|_| FspError::NTSTATUS(STATUS_END_OF_FILE))?;
             if !info.append_to_buffer(buffer, &mut cursor) {
@@ -230,6 +243,8 @@ pub struct WinFspMount {
     attached: Option<AttachedDisk>,
     host: FileSystemHost<VhdFs, FineGuard>,
     mount_dir: PathBuf,
+    /// `backup.vhd` or `backup.vhdx`, per the container the backup needed.
+    image_name: &'static str,
     pub backup_path: PathBuf,
     pub disk_size: u64,
     pub volumes: Vec<crate::letters::MountedVolume>,
@@ -259,6 +274,10 @@ impl WinFspMount {
         let vhd = SyntheticVhd::build(reader)?;
         let disk_size = vhd.disk_size();
         let spans = vhd.spans().to_vec();
+        // Which container the image needs: a 4Kn backup gets a VHDX, because only
+        // VHDX can state a sector size. Capture the name before the disk moves
+        // into the filesystem — it decides what we hand AttachVirtualDisk.
+        let image_name = vhd.image_name();
         let fs = VhdFs::new(vhd)?;
 
         let mut params = VolumeParams::new();
@@ -287,7 +306,7 @@ impl WinFspMount {
         host.start()
             .map_err(|e| PhoenixError::Other(format!("WinFsp start failed: {e}")))?;
 
-        let vhd_path = mount_dir.join(VHD_NAME);
+        let vhd_path = mount_dir.join(image_name);
         let attached = AttachedDisk::attach_readonly_opts(
             vhd_path
                 .to_str()
@@ -312,6 +331,7 @@ impl WinFspMount {
             attached: Some(attached),
             host,
             mount_dir,
+            image_name,
             backup_path: backup.to_path_buf(),
             disk_size,
             volumes,
@@ -319,10 +339,22 @@ impl WinFspMount {
         })
     }
 
-    /// Path to the synthesized VHD file inside the WinFsp mount (the file the
+    /// Path to the synthesized image inside the WinFsp mount (the file the
     /// virtual disk is attached from). Useful for diagnostics/tests.
     pub fn vhd_path(&self) -> PathBuf {
-        self.mount_dir.join(VHD_NAME)
+        self.mount_dir.join(self.image_name)
+    }
+
+    /// `N` in `\\.\PhysicalDriveN` for the attached synthetic disk.
+    ///
+    /// Exists so a test can ask **Windows** what it makes of the disk we handed it
+    /// — its sector size in particular, which for a 4Kn backup is the entire point
+    /// and is not something our own bytes can vouch for.
+    pub fn attached_disk_number(&self) -> Result<u32> {
+        self.attached
+            .as_ref()
+            .ok_or_else(|| PhoenixError::Other("virtual disk is not attached".into()))?
+            .physical_drive_number()
     }
 }
 

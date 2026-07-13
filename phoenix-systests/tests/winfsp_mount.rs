@@ -256,3 +256,132 @@ fn winfsp_mount_selected_partition_only() {
     );
     let _ = std::fs::remove_file(&backup_path);
 }
+
+/// Mount a backup taken from a **4Kn** disk.
+///
+/// This is what the VHDX container was built for. A fixed VHD cannot state a
+/// sector size — 512 is the format, not a field — so a volume whose own boot
+/// sector says `BytesPerSector = 4096` would be attached onto a 512-byte device
+/// and NTFS would refuse it, leaving the user staring at a RAW disk. Mounting a
+/// 4Kn backup used to be refused outright for exactly that reason.
+///
+/// Now the synthesized disk is a VHDX that says 4096, and Windows' own NTFS
+/// driver does the rest. Green means:
+///
+///   * the container we hand `AttachVirtualDisk` is a VHDX Windows accepts,
+///   * the attached disk really reports a 4096-byte logical sector,
+///   * the GPT we synthesized at 4096-byte LBAs is one Windows can parse,
+///   * and every fixture byte comes back through the whole stack.
+///
+/// No 4Kn hardware anywhere: the source disk is a synthesized 4Kn VHDX too.
+#[test]
+#[ignore = "requires elevation + WinFsp + --features winfsp"]
+fn winfsp_mount_a_4kn_backup() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let source = TestVhd::create_4kn(512).expect("create 4Kn source");
+    source
+        .init_gpt_with(&[PartSpec {
+            size_mb: 0,
+            fs: TestFs::Ntfs,
+            letter: 'X',
+            label: "SRC4KN".into(),
+        }])
+        .expect("init 4Kn source");
+    assert!(wait_for_letter('X', 15_000), "4Kn source never mounted");
+    let digest = fill_fixture('X', 0x4096_1234).expect("fill fixture");
+
+    let disks = enumerate_disks().unwrap();
+    let disk = disks
+        .iter()
+        .find(|d| d.index == source.disk_index())
+        .unwrap();
+    assert_eq!(disk.sector_size, 4096, "source fixture is not 4Kn");
+    let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
+
+    let backup_path =
+        std::env::temp_dir().join(format!("winfsp-4kn-{}.phnx", uuid::Uuid::new_v4().simple()));
+    run_backup(BackupOptions {
+        disk_index: source.disk_index(),
+        partition_indices: parts,
+        output: backup_path.clone(),
+        verify_after: true,
+        verify_image: false,
+        progress: None,
+    })
+    .expect("run_backup from 4Kn");
+
+    // Detach the source before mounting: two disks carrying the same fixture at
+    // once would make "find the new fixture volume" ambiguous, and a test that
+    // can accidentally verify the SOURCE proves nothing about the mount.
+    drop(source);
+
+    let pre_existing = fixture_letters();
+    let scratch = std::env::temp_dir()
+        .join("phoenix-systests")
+        .join("winfsp-mounts");
+    let session = WinFspMount::mount(&backup_path, &scratch)
+        .expect("mounting a 4Kn backup (this used to be refused outright)");
+
+    // The served file must be the VHDX, not the VHD — the container is chosen
+    // from the backup's recorded sector size.
+    let served = session.vhd_path();
+    eprintln!("winfsp-served image: {}", served.display());
+    assert_eq!(
+        served.extension().and_then(|e| e.to_str()),
+        Some("vhdx"),
+        "a 4Kn backup must be served as VHDX; a fixed VHD cannot express its sector size"
+    );
+
+    // Windows' own view of the attached disk. This is the assertion the whole
+    // feature reduces to.
+    let attached = session
+        .attached_disk_number()
+        .expect("attached disk number");
+    let ss = disk_logical_sector_size(attached);
+    eprintln!("attached as PhysicalDrive{attached}, LogicalSectorSize = {ss}");
+    assert_eq!(
+        ss, 4096,
+        "the mounted disk reports a {ss}-byte sector, so its 4Kn NTFS volume can never mount"
+    );
+
+    // And the data survives the round trip through the synthesized VHDX.
+    let mut mounted = None;
+    for _ in 0..40 {
+        if let Some(l) = fixture_letters()
+            .into_iter()
+            .find(|l| !pre_existing.contains(l))
+        {
+            mounted = Some(l);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let letter = mounted.expect(
+        "no volume appeared from the mounted 4Kn backup — Windows attached the disk but could \
+         not mount its filesystem",
+    );
+    eprintln!("4Kn backup mounted at {letter}:");
+    verify_fixture(letter, &digest).expect("fixture readable through the 4Kn WinFsp mount");
+
+    drop(session);
+    let _ = std::fs::remove_file(&backup_path);
+}
+
+/// Windows' `LogicalSectorSize` for an attached disk.
+fn disk_logical_sector_size(disk_number: u32) -> u32 {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-Disk -Number {disk_number}).LogicalSectorSize"),
+        ])
+        .output()
+        .expect("Get-Disk");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}

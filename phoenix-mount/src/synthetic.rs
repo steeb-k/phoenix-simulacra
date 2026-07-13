@@ -13,21 +13,42 @@ use phoenix_core::container::PhnxReader;
 use phoenix_core::error::{PhoenixError, Result};
 
 use crate::chunkstore::{plan_layout, ChunkStore, PartitionSpan};
-use crate::gpt::{self, GptPart, LEADING_SECTORS, TRAILING_SECTORS};
+use crate::gpt::{self, GptPart};
 use crate::vhd::{self, VHD_MAX_BYTES};
+use crate::vhdx::Vhdx;
 
-const SECTOR: u64 = 512;
 /// 1 MiB partition alignment, matching what the restore path lays down.
 pub(crate) const ALIGN: u64 = 1024 * 1024;
 
+/// How the raw disk image is wrapped for `AttachVirtualDisk`.
+///
+/// The two formats differ in exactly one way that matters here: a fixed VHD
+/// **cannot express a sector size** (512 is baked into the format), and VHDX can.
+/// So a 512e backup keeps the VHD path — it is simpler, it is what every existing
+/// mount test exercises, and there is nothing to gain by moving it — while a 4Kn
+/// backup gets a VHDX, without which its volumes could be attached but never
+/// mounted.
+enum Container {
+    /// `[disk image][512-byte footer]`.
+    Vhd(Box<[u8; 512]>),
+    /// `[prologue][disk image]`, with the logical sector size stated in metadata.
+    Vhdx(Box<Vhdx>),
+}
+
 pub struct SyntheticVhd {
     store: ChunkStore,
-    /// Protective MBR + primary GPT header + entry array (the first 34 sectors).
+    /// Protective MBR + primary GPT header + entry array.
     gpt_leading: Vec<u8>,
-    /// Backup GPT entry array + header (the last 33 sectors before the footer).
+    /// Backup GPT entry array + header, at the end of the disk.
     gpt_trailing: Vec<u8>,
-    /// 512-byte fixed-VHD footer.
-    footer: [u8; 512],
+    container: Container,
+    /// Logical sector size the synthesized disk advertises — 512, or 4096 when the
+    /// backup came from a 4Kn disk. Every GPT LBA below is in these units.
+    sector_size: u64,
+    /// Byte offset at which the trailing (backup) GPT begins.
+    trailing_start: u64,
+    /// Byte length of the leading GPT region.
+    leading_end: u64,
     /// Virtual disk size (excludes the trailing VHD footer).
     disk_size: u64,
     spans: Vec<PartitionSpan>,
@@ -37,36 +58,49 @@ impl SyntheticVhd {
     /// Build the synthesized disk from an opened backup. Consumes the reader
     /// (the chunk store owns it for on-demand reads).
     pub fn build(reader: PhnxReader) -> Result<Self> {
-        // This synthesizes a **fixed VHD**, whose format mandates 512-byte
-        // sectors, and every structure below (protective MBR, GPT LBAs, footer)
-        // is built on that. A volume captured from a 4Kn disk carries
-        // `BytesPerSector = 4096` in its own boot sector, and NTFS refuses to
-        // mount when the filesystem's sector size disagrees with the device's.
-        //
-        // So such a backup can be attached but never mounted. Refuse it here,
-        // where we can say why, instead of handing the user a disk that shows up
-        // as RAW and looks like data loss. Real support needs the VHDX path
-        // (4096-byte logical sectors) noted below.
-        let src_sector = reader.manifest.disk.sector_size;
-        if src_sector > 512 {
-            return Err(PhoenixError::Other(format!(
-                "this backup came from a {src_sector}-byte-sector (4Kn) disk, and mounting \
-                 synthesizes a fixed VHD, which the format pins to 512-byte sectors. Windows \
-                 would attach the disk but refuse to mount its volumes. Restore it to a 4Kn \
-                 disk instead; mounting 4Kn backups needs the VHDX path (not yet implemented)"
-            )));
-        }
+        // The synthesized disk must advertise the SOURCE disk's sector size. A
+        // volume captured from a 4Kn disk records `BytesPerSector = 4096` in its
+        // own boot sector, and NTFS refuses to mount when the filesystem's sector
+        // size disagrees with the device it is sitting on. Present such a volume on
+        // a 512-byte device and Windows attaches the disk, then calls it RAW.
+        let sector_size = match reader.manifest.disk.sector_size {
+            0 | 512 => 512u64,
+            4096 => 4096u64,
+            other => {
+                return Err(PhoenixError::Other(format!(
+                    "backup came from a disk with a {other}-byte sector, which neither VHD (512 \
+                     only) nor VHDX (512 or 4096) can express"
+                )))
+            }
+        };
 
         let (spans, raw_disk_size) = plan_layout(&reader, ALIGN);
-        // Round up to a sector multiple and leave room for the trailing GPT +
-        // footer beyond the last partition.
-        let disk_size = align_up(raw_disk_size + TRAILING_SECTORS * SECTOR + ALIGN, SECTOR);
-        if disk_size > VHD_MAX_BYTES {
-            return Err(PhoenixError::Other(format!(
-                "backup describes a {disk_size}-byte disk, larger than the {VHD_MAX_BYTES}-byte \
-                 fixed-VHD limit; disks this large need the VHDX path (not yet implemented)"
-            )));
-        }
+        let trail_bytes = gpt::trailing_sectors(sector_size) * sector_size;
+        // Round up to a sector multiple and leave room for the trailing GPT past
+        // the last partition.
+        let disk_size = align_up(raw_disk_size + trail_bytes + ALIGN, sector_size);
+
+        // A fixed VHD cannot say what its sector size is — 512 is the format, not
+        // a field — so 4Kn must go through VHDX. VHDX also has no 2040 GiB ceiling,
+        // which is the other thing that used to make a mount simply refuse.
+        let container = if sector_size == 512 {
+            if disk_size > VHD_MAX_BYTES {
+                return Err(PhoenixError::Other(format!(
+                    "backup describes a {disk_size}-byte disk, larger than the \
+                     {VHD_MAX_BYTES}-byte fixed-VHD limit"
+                )));
+            }
+            Container::Vhd(Box::new(vhd::build_footer(
+                disk_size,
+                *reader.header.backup_id.as_bytes(),
+            )))
+        } else {
+            Container::Vhdx(Box::new(Vhdx::new(
+                disk_size,
+                sector_size as u32,
+                *reader.header.backup_id.as_bytes(),
+            )?))
+        };
 
         // Synthesize the GPT + footer from the layout while we still hold the
         // reader's index.
@@ -85,83 +119,187 @@ impl SyntheticVhd {
                 GptPart {
                     type_guid,
                     unique_guid: derive_guid(&disk_guid, s.partition_index),
-                    first_lba: s.disk_offset / SECTOR,
-                    last_lba: (s.disk_offset + s.size) / SECTOR - 1,
+                    // LBAs are in the DISK's sectors, so partition offsets divide
+                    // by 4096 on a 4Kn disk, not 512. Partition spans are 1 MiB
+                    // aligned, so both divide cleanly.
+                    first_lba: s.disk_offset / sector_size,
+                    last_lba: (s.disk_offset + s.size) / sector_size - 1,
                     attributes: 0,
                     name: entry.map(|e| e.name.clone()).unwrap_or_default(),
                 }
             })
             .collect();
-        let gpt_img = gpt::synthesize(disk_size, disk_guid, &parts);
-        let footer = vhd::build_footer(disk_size, disk_guid);
+        let gpt_img = gpt::synthesize(disk_size, disk_guid, &parts, sector_size);
+
+        let leading_end = gpt::leading_sectors(sector_size) * sector_size;
+        let trailing_start = disk_size - gpt::trailing_sectors(sector_size) * sector_size;
+        debug_assert_eq!(gpt_img.leading.len() as u64, leading_end);
+        debug_assert_eq!(gpt_img.trailing.len() as u64, disk_size - trailing_start);
 
         let store = ChunkStore::new(reader, spans.clone(), disk_size)?;
 
         Ok(Self {
             store,
+            sector_size,
+            leading_end,
+            trailing_start,
+            container,
             gpt_leading: gpt_img.leading,
             gpt_trailing: gpt_img.trailing,
-            footer,
             disk_size,
             spans,
         })
     }
 
-    /// Total addressable length: the virtual disk plus its 512-byte footer.
+    /// Total length of the **file** the mount serves: the virtual disk plus
+    /// whatever the container wraps it in.
     pub fn total_len(&self) -> u64 {
-        self.disk_size + SECTOR
+        match &self.container {
+            // `[disk image][512-byte footer]`
+            Container::Vhd(_) => self.disk_size + 512,
+            // `[prologue][disk image][padding to a whole block]`
+            Container::Vhdx(v) => v.file_size(),
+        }
     }
 
     pub fn disk_size(&self) -> u64 {
         self.disk_size
     }
 
+    /// The logical sector size the attached disk will report — 512, or 4096 for a
+    /// backup taken from a 4Kn disk.
+    pub fn sector_size(&self) -> u64 {
+        self.sector_size
+    }
+
+    /// The filename to serve. `OpenVirtualDisk` sniffs the content, but the
+    /// extension is what a human (and some tooling) will trust.
+    pub fn image_name(&self) -> &'static str {
+        match &self.container {
+            Container::Vhd(_) => "backup.vhd",
+            Container::Vhdx(_) => "backup.vhdx",
+        }
+    }
+
     pub fn spans(&self) -> &[PartitionSpan] {
         &self.spans
     }
 
-    /// Read `buf.len()` bytes starting at absolute `offset` in the synthesized
-    /// image, filling any region past the end with zeros.
+    /// Read `buf.len()` bytes at `offset` **in the container file**, which is what
+    /// the mount actually serves.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        buf.fill(0);
-        let total = self.total_len();
-        let leading_end = LEADING_SECTORS * SECTOR;
-        let trailing_start = self.disk_size - TRAILING_SECTORS * SECTOR;
+        // Split the borrow: the VHDX arm needs `&container` and `&mut store` at
+        // once, and they are disjoint fields.
+        let Self {
+            store,
+            gpt_leading,
+            gpt_trailing,
+            container,
+            disk_size,
+            leading_end,
+            trailing_start,
+            ..
+        } = self;
 
-        let mut done = 0usize;
-        while done < buf.len() {
-            let pos = offset + done as u64;
-            if pos >= total {
-                break; // past the footer: leave zeros
+        match container {
+            Container::Vhd(footer) => {
+                // `[disk image][footer]`. The footer sits past the disk, so serve
+                // it here and let everything below it be the disk image.
+                buf.fill(0);
+                let total = *disk_size + 512;
+                let mut done = 0usize;
+                while done < buf.len() {
+                    let pos = offset + done as u64;
+                    if pos >= total {
+                        break;
+                    }
+                    let remaining = buf.len() - done;
+                    if pos >= *disk_size {
+                        let off = (pos - *disk_size) as usize;
+                        let n = remaining.min((total - pos) as usize);
+                        buf[done..done + n].copy_from_slice(&footer[off..off + n]);
+                        done += n;
+                    } else {
+                        let n = remaining.min((*disk_size - pos) as usize);
+                        read_disk_image(
+                            store,
+                            gpt_leading,
+                            gpt_trailing,
+                            *disk_size,
+                            *leading_end,
+                            *trailing_start,
+                            pos,
+                            &mut buf[done..done + n],
+                        )?;
+                        done += n;
+                    }
+                }
+                Ok(())
             }
-            let remaining = buf.len() - done;
-            // Pick the region owning `pos` and copy a contiguous run from it.
-            let (src_slice, run): (&[u8], usize) = if pos < leading_end {
-                let off = pos as usize;
-                let n = remaining.min((leading_end - pos) as usize);
-                (&self.gpt_leading[off..off + n], n)
-            } else if pos >= self.disk_size {
-                // VHD footer.
-                let off = (pos - self.disk_size) as usize;
-                let n = remaining.min((total - pos) as usize);
-                (&self.footer[off..off + n], n)
-            } else if pos >= trailing_start {
-                let off = (pos - trailing_start) as usize;
-                let n = remaining.min((self.disk_size - pos) as usize);
-                (&self.gpt_trailing[off..off + n], n)
-            } else {
-                // Partition-data region: served on demand (zeros for gaps /
-                // free space). Delegate a run up to the trailing-GPT boundary.
-                let n = remaining.min((trailing_start - pos) as usize);
-                self.store.read_at(pos, &mut buf[done..done + n])?;
-                done += n;
-                continue;
-            };
-            buf[done..done + run].copy_from_slice(src_slice);
-            done += run;
+            Container::Vhdx(v) => {
+                // `[prologue][disk image]`. The VHDX knows where its payload starts
+                // and hands us plain image offsets — so the disk image below is
+                // written once and both containers use it.
+                v.read_at(offset, buf, |image_off, dst| {
+                    read_disk_image(
+                        store,
+                        gpt_leading,
+                        gpt_trailing,
+                        *disk_size,
+                        *leading_end,
+                        *trailing_start,
+                        image_off,
+                        dst,
+                    )
+                })
+            }
         }
-        Ok(())
     }
+}
+
+/// The raw disk image, container-free: `[leading GPT][partition data][backup GPT]`.
+///
+/// Both containers are only framing around this. Keeping it a free function is
+/// what lets the VHDX arm borrow the chunk store mutably while borrowing the
+/// container immutably.
+#[allow(clippy::too_many_arguments)]
+fn read_disk_image(
+    store: &mut ChunkStore,
+    gpt_leading: &[u8],
+    gpt_trailing: &[u8],
+    disk_size: u64,
+    leading_end: u64,
+    trailing_start: u64,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<()> {
+    buf.fill(0);
+    let mut done = 0usize;
+    while done < buf.len() {
+        let pos = offset + done as u64;
+        if pos >= disk_size {
+            break; // past the disk: leave zeros
+        }
+        let remaining = buf.len() - done;
+        let (src, run): (&[u8], usize) = if pos < leading_end {
+            let off = pos as usize;
+            let n = remaining.min((leading_end - pos) as usize);
+            (&gpt_leading[off..off + n], n)
+        } else if pos >= trailing_start {
+            let off = (pos - trailing_start) as usize;
+            let n = remaining.min((disk_size - pos) as usize);
+            (&gpt_trailing[off..off + n], n)
+        } else {
+            // Partition data: served on demand, zeros for gaps and free space.
+            let n = remaining.min((trailing_start - pos) as usize);
+            store.read_at(pos, &mut buf[done..done + n])?;
+            done += n;
+            continue;
+        };
+        buf[done..done + run].copy_from_slice(src);
+        done += run;
+    }
+    Ok(())
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -296,11 +434,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// GPT type GUID at entry `i` of the entry array (LBA 2 onward).
+    /// GPT type GUID at entry `i` of the entry array, which starts at LBA 2 — so
+    /// its byte offset depends on the disk's sector size.
     fn entry_type_guid(vhd: &mut SyntheticVhd, i: usize) -> [u8; 16] {
+        let at = 2 * vhd.sector_size() + i as u64 * 128;
         let mut entry = [0u8; 128];
-        vhd.read_at(2 * SECTOR + i as u64 * 128, &mut entry)
-            .unwrap();
+        vhd.read_at(at, &mut entry).unwrap();
         entry[0..16].try_into().unwrap()
     }
 
