@@ -16,14 +16,15 @@
 //! ```
 
 use phoenix_capture::backup::{run_backup, BackupOptions};
-use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
+use phoenix_clone::{run_clone, CloneEntry, CloneOptions, ClonePlan, CloneTableMode, CloneVerify};
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::enumerate_disks;
 use phoenix_restore::plan::default_plan_from_backup;
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
     chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
-    wait_for_letter, wait_for_restored_letter, PartSpec, TestFs, TestVhd,
+    wait_for_letter, wait_for_letter_at_offset, wait_for_restored_letter, PartSpec, TestFs,
+    TestVhd,
 };
 
 /// The disk really is 4Kn, and our own enumeration agrees.
@@ -331,4 +332,98 @@ fn disk_at(disks: &[phoenix_core::disk::DiskInfo], index: u32) -> phoenix_core::
         .find(|d| d.index == index)
         .unwrap_or_else(|| panic!("disk {index} not enumerated"))
         .clone()
+}
+
+/// Clone NTFS into a **smaller** slot on a 4Kn disk: the volume must shrink.
+///
+/// This is the arm worth having most. Shrinking is the only path that rewrites
+/// NTFS metadata in place — the relocation map, then the MFT / `$Bitmap` /
+/// `$LogFile` rewrite — and it is precisely where 4Kn hid its nastiest bug:
+/// **NTFS on a 4Kn volume reports 4096-byte sectors but still writes 1024-byte
+/// MFT records**, so the fixup code computed its first sector boundary *past the
+/// end of the record it was fixing up*:
+///
+/// ```text
+/// MFT record sector boundary 4096 past record length 1024
+/// ```
+///
+/// That was found through the *restore* path. Clone reaches the same rewriter by
+/// its own route, so this pins that the fix holds there too — and a wrong fixup
+/// stride does not fail loudly, it writes a subtly corrupt filesystem, which is
+/// why `chkdsk` and the fixture digest both have to agree before this passes.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn ntfs_4kn_clone_shrinks_into_a_smaller_slot() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let source = TestVhd::create_4kn(1024).expect("create 4Kn source");
+    source
+        .init_gpt_with(&[PartSpec {
+            size_mb: 0,
+            fs: TestFs::Ntfs,
+            letter: 'X',
+            label: "SHR4KN".into(),
+        }])
+        .expect("init 4Kn source");
+    assert!(wait_for_letter('X', 15_000), "4Kn source never mounted");
+    let digest = fill_fixture('X', 0x4096_5152).expect("fill fixture");
+
+    let target = TestVhd::create_4kn(1024).expect("create 4Kn target");
+    let d = clone_disks();
+    let src = disk_at(&d, source.disk_index());
+    assert_eq!(src.sector_size, 4096, "source is not 4Kn");
+    assert_eq!(
+        disk_at(&d, target.disk_index()).sector_size,
+        4096,
+        "target is not 4Kn"
+    );
+
+    let src_ntfs = src
+        .partitions
+        .iter()
+        .find(|p| p.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .expect("source NTFS partition");
+
+    // Half the source. The fixture is far smaller than that, so its data fits —
+    // but the volume's own metadata lives past the new boundary and has to be
+    // relocated to make it so, which is the whole point.
+    let shrunk = src_ntfs.size_bytes / 2;
+    let offset = 1024 * 1024u64;
+    assert!(shrunk < src_ntfs.size_bytes);
+
+    run_clone(CloneOptions {
+        source_disk_index: source.disk_index(),
+        target_disk_index: target.disk_index(),
+        plan: ClonePlan {
+            entries: vec![CloneEntry {
+                source_partition_index: src_ntfs.index,
+                target_offset_bytes: offset,
+                target_size_bytes: shrunk,
+            }],
+            table_mode: CloneTableMode::ReinitMatchSource,
+        },
+        verify: CloneVerify::ReadBack,
+        use_vss: false,
+        progress: None,
+    })
+    .expect("shrinking clone between 4Kn disks");
+
+    // The table says it shrank...
+    let after = clone_disks();
+    let cloned = disk_at(&after, target.disk_index())
+        .partitions
+        .into_iter()
+        .find(|p| p.offset_bytes == offset)
+        .expect("cloned partition missing from the target's table");
+    assert_eq!(
+        cloned.size_bytes, shrunk,
+        "the partition table does not reflect the shrunk size"
+    );
+
+    // ...and the filesystem inside it is actually coherent, not merely present.
+    let letter = wait_for_letter_at_offset(target.disk_index(), offset, 90_000)
+        .expect("shrunk 4Kn volume never got a drive letter");
+    chkdsk_clean(letter).expect("shrunk 4Kn volume is chkdsk-clean");
+    verify_fixture(letter, &digest).expect("fixture survived the shrinking 4Kn clone");
 }
