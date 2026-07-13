@@ -782,7 +782,6 @@ fn real_clone_to_vhd() {
         target_disk_index: target.disk_index(),
         plan,
         verify: CloneVerify::ReadBack,
-        use_vss: false,
         progress: None,
     })
     .expect("run_clone real -> vhd");

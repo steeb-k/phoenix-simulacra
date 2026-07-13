@@ -27,7 +27,6 @@ fn opts(verify: CloneVerify, progress: Option<ProgressHandle>) -> CloneOptions {
         target_disk_index: 0,
         plan: ClonePlan::default(),
         verify,
-        use_vss: false,
         progress,
     }
 }

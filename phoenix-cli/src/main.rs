@@ -76,8 +76,11 @@ enum Commands {
         /// Read every written block back off the target and compare to source
         #[arg(long, default_value_t = false)]
         verify: bool,
-        /// Do NOT use a VSS snapshot for live source volumes
-        #[arg(long, default_value_t = false)]
+        /// Deprecated and ignored. How a source is frozen is not a user choice:
+        /// the engine locks each volume, escalates to a VSS shadow when the lock
+        /// is refused, and aborts rather than read a lettered volume it cannot
+        /// freeze. Accepted so existing scripts don't break.
+        #[arg(long, default_value_t = false, hide = true)]
         no_vss: bool,
         /// Skip the interactive "type the target disk number" confirmation
         #[arg(long, default_value_t = false)]
@@ -190,7 +193,14 @@ fn main() -> anyhow::Result<()> {
             verify,
             no_vss,
             yes,
-        } => cmd_clone(source_disk, target_disk, expand, verify, !no_vss, yes)?,
+        } => {
+            if no_vss {
+                tracing::warn!(
+                    "--no-vss is deprecated and ignored: the engine now always takes the                      strongest freeze each volume allows (lock, else VSS shadow, else abort                      for a lettered volume)"
+                );
+            }
+            cmd_clone(source_disk, target_disk, expand, verify, yes)?
+        }
         Commands::Mount { backup, partitions } => cmd_mount(&backup, partitions.as_deref())?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
     }
@@ -233,7 +243,6 @@ fn cmd_clone(
     target_disk: u32,
     expand: bool,
     verify: bool,
-    use_vss: bool,
     yes: bool,
 ) -> anyhow::Result<()> {
     use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
@@ -293,7 +302,6 @@ fn cmd_clone(
         } else {
             CloneVerify::None
         },
-        use_vss,
         progress: None,
     })?;
     info!(

@@ -60,7 +60,6 @@ fn ntfs_clone_same_size() {
         target_disk_index: target.disk_index(),
         plan,
         verify: CloneVerify::ReadBack,
-        use_vss: false, // source volume is idle
         progress: None,
     })
     .expect("run_clone");
@@ -117,7 +116,6 @@ fn ntfs_clone_expand_to_larger_target() {
         target_disk_index: target.disk_index(),
         plan,
         verify: CloneVerify::None,
-        use_vss: false,
         progress: None,
     })
     .expect("run_clone expand");

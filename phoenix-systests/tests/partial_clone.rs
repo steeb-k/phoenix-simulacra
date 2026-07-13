@@ -210,7 +210,6 @@ fn partial_clone_replaces_one_slot_and_preserves_sibling() {
         target_disk_index: target.disk_index(),
         plan,
         verify: CloneVerify::ReadBack,
-        use_vss: false,
         progress: None,
     })
     .expect("partial clone");
@@ -372,7 +371,6 @@ fn partial_clone_shrinks_ntfs_into_a_smaller_slot() {
             },
         },
         verify: CloneVerify::ReadBack,
-        use_vss: false,
         progress: None,
     })
     .expect("partial clone with shrink");
@@ -498,7 +496,6 @@ fn partial_clone_drops_an_unpreserved_live_partition() {
             },
         },
         verify: CloneVerify::ReadBack,
-        use_vss: false,
         progress: None,
     })
     .expect("partial clone dropping a live partition");
@@ -535,4 +532,140 @@ fn partial_clone_drops_an_unpreserved_live_partition() {
         .expect("cloned slot never got a drive letter");
     chkdsk_clean(slot_letter).expect("cloned slot is chkdsk-clean");
     verify_fixture(slot_letter, &src_digest).expect("cloned slot holds the source fixture");
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight: a source we cannot freeze must abort BEFORE the target is touched.
+// ---------------------------------------------------------------------------
+
+/// A clone that cannot freeze one of its source partitions must fail **without
+/// having written anything to the target**.
+///
+/// This is the guarantee that a boot-disk clone actually needs. The engine used to
+/// freeze each partition inline, immediately before streaming it — so partition 1
+/// was fully cloned (and the target's partition table already wiped) before
+/// partition 2's lock was even attempted. A source volume that couldn't be frozen
+/// destroyed the user's target disk on the way to discovering something knowable
+/// up front.
+///
+/// The source here is a **two**-partition disk: an idle NTFS partition that locks
+/// fine, and a FAT32 partition with a file held open. FAT32 is the important
+/// choice — **VSS cannot snapshot FAT**, so there is no shadow to escalate to, and
+/// the held handle makes the lock impossible. It is exactly the shape of the ESP,
+/// which is what bit the real boot-disk clone.
+///
+/// The target is pre-filled with a fixture, and the test asserts that fixture is
+/// *still there and still valid* afterwards. Not "the clone failed" — anyone can
+/// fail. The point is that it failed **harmlessly**.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn clone_aborts_before_touching_the_target_when_a_source_cannot_be_frozen() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    // Source: NTFS (lockable) followed by FAT32 (which we will make unfreezable).
+    let source = TestVhd::create(512).expect("create source");
+    source
+        .init_gpt_with(&[
+            PartSpec {
+                size_mb: 256,
+                fs: TestFs::Ntfs,
+                letter: 'X',
+                label: "PFNTFS".into(),
+            },
+            PartSpec {
+                size_mb: 0,
+                fs: TestFs::Fat32,
+                letter: 'Y',
+                label: "PFFAT".into(),
+            },
+        ])
+        .expect("init source");
+    assert!(wait_for_letter('X', 15_000), "source NTFS never mounted");
+    assert!(wait_for_letter('Y', 15_000), "source FAT32 never mounted");
+    let _ = fill_fixture('X', 0xBEEF_0001).expect("fill source NTFS");
+    let _ = fill_fixture('Y', 0xBEEF_0002).expect("fill source FAT32");
+
+    // Target: a disk with its OWN data on it, which must survive untouched.
+    let target = TestVhd::create(768).expect("create target");
+    target
+        .init_gpt_with(&[PartSpec {
+            size_mb: 0,
+            fs: TestFs::Ntfs,
+            letter: 'Z',
+            label: "TGTDATA".into(),
+        }])
+        .expect("init target");
+    assert!(wait_for_letter('Z', 15_000), "target never mounted");
+    let target_digest = fill_fixture('Z', 0xBEEF_0003).expect("fill target fixture");
+
+    let tgt_before = disk_by_index(target.disk_index());
+    let tgt_parts_before: Vec<(u64, u64)> = tgt_before
+        .partitions
+        .iter()
+        .map(|p| (p.offset_bytes, p.size_bytes))
+        .collect();
+
+    // Make the FAT32 source partition unfreezable: hold a file open on it. The lock
+    // is now impossible, and VSS cannot snapshot FAT to escalate to.
+    let mut held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(r"Y:\held-open.bin")
+        .expect("open held file on the FAT32 source");
+    use std::io::Write as _;
+    held.write_all(b"held").expect("write held file");
+
+    // Clone the WHOLE source disk. Partition 1 (NTFS) is perfectly cloneable — the
+    // old engine would have happily wiped the target and written it before ever
+    // discovering that partition 2 cannot be frozen.
+    let src_disk = disk_by_index(source.disk_index());
+    let result = run_clone(CloneOptions {
+        source_disk_index: source.disk_index(),
+        target_disk_index: target.disk_index(),
+        plan: ClonePlan::identity(&src_disk),
+        verify: CloneVerify::ReadBack,
+        progress: None,
+    });
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!(
+            "the clone SUCCEEDED with a held handle on an unsnapshottable FAT32 source — the \
+             engine copied a live, mutating filesystem instead of refusing"
+        ),
+    };
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("lock"),
+        "clone failed for an unexpected reason (wanted a volume-lock failure): {err}"
+    );
+    eprintln!("[preflight] clone correctly refused: {err}");
+
+    drop(held);
+    let _ = std::fs::remove_file(r"Y:\held-open.bin");
+
+    // THE ASSERTION THAT MATTERS. The clone failed — but did it fail before doing
+    // any damage? The target's partition table must be exactly as it was...
+    let tgt_after = disk_by_index(target.disk_index());
+    let tgt_parts_after: Vec<(u64, u64)> = tgt_after
+        .partitions
+        .iter()
+        .map(|p| (p.offset_bytes, p.size_bytes))
+        .collect();
+    assert_eq!(
+        tgt_parts_before, tgt_parts_after,
+        "the target's partition table CHANGED even though the clone aborted — the engine wiped \
+         the target before discovering it could not read the source"
+    );
+
+    // ...and its data must still be there, and still readable.
+    assert!(
+        wait_for_letter('Z', 30_000),
+        "the target's volume lost its drive letter after an aborted clone"
+    );
+    chkdsk_clean('Z').expect("target volume is chkdsk-clean after an aborted clone");
+    verify_fixture('Z', &target_digest)
+        .expect("the target's own data was destroyed by a clone that never completed");
 }

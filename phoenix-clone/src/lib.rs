@@ -49,10 +49,14 @@ pub struct CloneOptions {
     pub target_disk_index: u32,
     pub plan: ClonePlan,
     pub verify: CloneVerify,
-    /// Use a VSS snapshot for live, mounted source volumes so the clone is
-    /// crash-consistent even while Windows is running off the source disk.
-    pub use_vss: bool,
     pub progress: Option<ProgressHandle>,
+    // NOTE: there is deliberately no `use_vss`. How a source is frozen is not a
+    // user choice — the engine takes the strongest freeze each volume allows (see
+    // `prepare_partition`), exactly as the backup path has since the "Use VSS"
+    // switch was dropped. The old flag made VSS an all-or-nothing decision taken
+    // *before* the lock was even tried, which is how a boot-disk clone ended up
+    // hard-failing on the ESP: VSS cannot snapshot FAT32, `snapshot_volume` fell
+    // back to the live path, and the lock that followed was refused.
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +162,41 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
         p.set_step(0);
     }
 
+    // --- PRE-FLIGHT: freeze and plan EVERY source partition, before the target
+    // --- is touched at all.
+    //
+    // This runs first for a reason that cost a boot-disk clone: the target init
+    // below WIPES the target's partition table, and the streaming loop used to do
+    // its freezing inline, partition by partition. So a source volume that could
+    // not be frozen — the ESP is the one that actually bites — failed only once
+    // the engine reached it, by which point the target had already been
+    // re-initialized and earlier partitions written over it. The user's disk was
+    // destroyed to discover something knowable up front.
+    //
+    // Backup has always done it this way (`run_backup`'s `prepared` phase). Clone
+    // now matches: every source partition is opened, frozen, and planned here, and
+    // any failure returns before a single byte of the target changes. The
+    // `prepared` Vec dropping on the error path releases every lock and shadow we
+    // took along the way, so there is no cleanup to forget.
+    //
+    // The VssSession must outlive the streaming — dropping it deletes the shadows
+    // we are reading through — so it lives here, not inside the loop.
+    let mut vss = phoenix_vss::VssSession::new();
+    let mut prepared: Vec<PreparedPartition> = Vec::with_capacity(opts.plan.entries.len());
+    for entry in &opts.plan.entries {
+        if let Some(ref p) = opts.progress {
+            if p.is_cancelled() {
+                return Err(PhoenixError::Cancelled);
+            }
+        }
+        let part = source
+            .partitions
+            .iter()
+            .find(|p| p.index == entry.source_partition_index)
+            .ok_or_else(|| PhoenixError::Disk("source partition vanished".into()))?;
+        prepared.push(prepare_partition(source, part, entry, &mut vss, opts)?);
+    }
+
     // --- Initialize the target disk (GPT/MBR skeleton, no entries yet) ---
     // Same rationale as restore: defer the partition entries until after the
     // data is written so mountmgr can't lazy-mount empty volumes and bounce
@@ -224,20 +263,22 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     let mut bytes_done = 0u64;
     let mut grown_ntfs: Vec<(u64, u64)> = Vec::new(); // (target_offset, target_size)
 
-    for (i, entry) in opts.plan.entries.iter().enumerate() {
+    // Every source is already frozen and planned; from here on we only write.
+    for (i, mut prep) in prepared.into_iter().enumerate() {
         if let Some(ref p) = opts.progress {
             if p.is_cancelled() {
                 return Err(PhoenixError::Cancelled);
             }
             p.set_step(i + 1);
         }
+        let entry = prep.entry.clone();
         let part = source
             .partitions
             .iter()
             .find(|p| p.index == entry.source_partition_index)
             .ok_or_else(|| PhoenixError::Disk("source partition vanished".into()))?;
 
-        bytes_done = clone_one_partition(source, target, part, entry, opts, bytes_done)?;
+        bytes_done = stream_one_partition(target, part, &entry, &mut prep, opts, bytes_done)?;
 
         summary.partitions_cloned += 1;
         if entry.target_size_bytes != part.size_bytes {
@@ -338,62 +379,164 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     Ok(summary)
 }
 
-/// Stream one partition's used blocks from source to target, applying shrink
-/// relocation and the FS-specific finalization. Returns the running byte total.
-fn clone_one_partition(
+/// A source partition that has been resolved to a read path, opened, frozen (or
+/// knowingly not), and planned — with **nothing written to the target yet**.
+///
+/// The clone's equivalent of `run_backup`'s `PreparedPartition`, and it exists for
+/// the same reason: so a failure on partition N cannot strand an operation that has
+/// already destroyed the target.
+struct PreparedPartition {
+    reader: PartitionReader,
+    entry: CloneEntry,
+    extents: Vec<Extent>,
+    bytes_per_cluster: u32,
+    capture_mode: CaptureMode,
+    fs_kind: FilesystemKind,
+}
+
+/// Freeze and plan one source partition. Writes nothing.
+///
+/// The freeze strategy is **not a user choice** — the engine takes the strongest
+/// one each volume allows, in the same order the backup path uses:
+///
+///   1. **Exclusive `FSCTL_LOCK_VOLUME`.** Cheapest and strongest: no shadow
+///      storage, no VSS writers, and Windows flushes dirty cache pages before
+///      granting it.
+///   2. **A VSS shadow**, when the lock is refused because files are open — the
+///      normal case for the running Windows volume.
+///   3. **Neither: read unfrozen**, tolerated *only* for un-lettered volumes
+///      (ESP/Recovery). A **lettered** volume that can be frozen neither way
+///      aborts the clone, because a smeared read would silently corrupt it.
+///
+/// This ordering is the fix for a boot-disk clone failing on the ESP. The old code
+/// decided VSS-or-not *up front* from a `use_vss` flag, and for the ESP that was
+/// doubly wrong: VSS **cannot snapshot FAT32**, so `snapshot_volume` silently
+/// handed back the live path (it never errors — see its docs), and the code then
+/// hard-failed on a lock that Windows was never going to grant for a volume it
+/// keeps mounted itself. The user saw "can't get exclusive access to the EFI
+/// partition" and no sign of VSS — because VSS *had* been tried, and had quietly
+/// declined.
+fn prepare_partition(
     source: &DiskInfo,
-    target: &DiskInfo,
     part: &PartitionInfo,
     entry: &CloneEntry,
+    vss: &mut phoenix_vss::VssSession,
     opts: &CloneOptions,
-    mut bytes_done: u64,
-) -> Result<u64> {
-    // --- Source prep: resolve read path (VSS shadow / live volume / raw
-    // disk), plan extents, lock if reading a live mounted volume. ---
-    let original_volume = part.volume_path.clone();
-    let mut vss = phoenix_vss::VssSession::new();
-    // A locked BitLocker volume must be read through the PHYSICAL disk
-    // handle: fvevol rejects volume-device reads with FVE_E_LOCKED_VOLUME
-    // (0x80310000) until unlock, and there's no filesystem for VSS to
-    // snapshot. Same rule as the backup path in phoenix-capture.
-    let read_path = if part.bitlocker == phoenix_core::disk::BitlockerState::Locked {
-        source.path.clone()
-    } else if opts.use_vss {
-        if let Some(ref vol) = original_volume {
-            vss.snapshot_volume(vol)?
-        } else {
-            source.path.clone()
-        }
-    } else if let Some(ref vol) = original_volume {
-        vol.clone()
-    } else {
-        source.path.clone()
+) -> Result<PreparedPartition> {
+    // A locked BitLocker volume must be read through the PHYSICAL disk handle:
+    // fvevol rejects volume-device reads with FVE_E_LOCKED_VOLUME (0x80310000)
+    // until unlock, and there's no filesystem for VSS to snapshot. There is also
+    // nothing to freeze — ciphertext at rest doesn't move.
+    let locked_bitlocker = part.bitlocker == phoenix_core::disk::BitlockerState::Locked;
+    let volume = match &part.volume_path {
+        Some(vol) if !locked_bitlocker => Some(vol.clone()),
+        // No mounted volume (MSR, unformatted, BitLocker-locked): read the
+        // partition's bytes straight off `\\.\PhysicalDriveN`. Nothing to lock and
+        // nothing to snapshot.
+        _ => None,
     };
-    let is_live = original_volume
-        .as_deref()
-        .map(|orig| orig == read_path.as_str())
-        .unwrap_or(false);
 
-    let mut reader = if read_path.contains("PhysicalDrive") {
-        PartitionReader::open_disk_partition(
-            &read_path,
+    let mut reader = match &volume {
+        Some(vol) => PartitionReader::open_volume(vol, part.sector_size)?,
+        None => PartitionReader::open_disk_partition(
+            &source.path,
             part.offset_bytes,
             part.size_bytes,
             part.sector_size,
-        )?
-    } else {
-        PartitionReader::open_volume(&read_path, part.sector_size)?
+        )?,
     };
 
-    // Plan extents BEFORE locking (FSCTL_GET_VOLUME_BITMAP fails on a locked
-    // NTFS volume on some builds — same ordering constraint as backup).
-    let (extents, bytes_per_cluster, capture_mode, fs_kind, _bitmap_hash) =
+    // Plan BEFORE locking: `FSCTL_GET_VOLUME_BITMAP` fails with ERROR_NOT_READY on
+    // a locked NTFS volume on some builds (USB-attached NTFS reproduces reliably).
+    // Same ordering constraint as backup.
+    let (mut extents, mut bytes_per_cluster, mut capture_mode, mut fs_kind, mut _bitmap_hash) =
         plan_capture(part, &mut reader)?;
 
-    if is_live {
-        let label = original_volume.as_deref().unwrap_or(&read_path).to_string();
-        reader.lock_volume(&label)?;
+    if let Some(vol) = &volume {
+        if let Some(ref p) = opts.progress {
+            p.set_detail(format!("Locking {vol} for exclusive read access"));
+        }
+        match reader.lock_volume(vol) {
+            Ok(()) => {}
+            Err(lock_err) => {
+                // Busy — the running Windows volume always is. Escalate to a shadow,
+                // which freezes it without evicting anyone.
+                if let Some(ref p) = opts.progress {
+                    p.set_detail(format!("{vol} is in use — taking a VSS snapshot instead"));
+                }
+                // `snapshot_volume` never errors on Windows: on any failure it hands
+                // back the live path it was given, so an unchanged path means "no
+                // shadow for this volume" (FAT/exFAT — which is exactly the ESP —
+                // removable media, or no shadow storage).
+                let shadow = vss.snapshot_volume(vol)?;
+                if shadow != *vol {
+                    info!(
+                        volume = vol.as_str(),
+                        error = %lock_err,
+                        "volume is in use; reading a VSS shadow instead of the live volume"
+                    );
+                    // Re-plan against the shadow: its bitmap is the frozen one we are
+                    // about to stream, and it can differ from the live one we read a
+                    // moment ago. Assigning `reader` drops the live handle.
+                    reader = PartitionReader::open_volume(&shadow, part.sector_size)?;
+                    (
+                        extents,
+                        bytes_per_cluster,
+                        capture_mode,
+                        fs_kind,
+                        _bitmap_hash,
+                    ) = plan_capture(part, &mut reader)?;
+                } else if phoenix_core::disk::parse_drive_letter(vol).is_some() {
+                    // A lettered volume we could neither lock nor snapshot: files are
+                    // open and the filesystem is actively mutating. Abort now, before
+                    // the target is touched, rather than clone a torn filesystem the
+                    // user would trust.
+                    return Err(lock_err);
+                } else {
+                    // Un-lettered volumes (ESP/Recovery, reached via their
+                    // \\?\Volume{GUID} device). Windows keeps the ESP mounted itself
+                    // and refuses the lock (observed: ERROR_ACCESS_DENIED), and VSS
+                    // will not snapshot FAT32 — and there is no open file the user
+                    // could close to change either answer. These partitions are small,
+                    // static, and not being written during a clone, so read them
+                    // unfrozen rather than refuse to clone a boot disk at all.
+                    warn!(
+                        volume = vol.as_str(),
+                        error = %lock_err,
+                        "cannot lock or snapshot un-lettered volume (ESP/Recovery); cloning it \
+                         without a frozen source"
+                    );
+                }
+            }
+        }
     }
+
+    Ok(PreparedPartition {
+        reader,
+        entry: entry.clone(),
+        extents,
+        bytes_per_cluster,
+        capture_mode,
+        fs_kind,
+    })
+}
+
+/// Stream one **already-prepared** partition to the target, applying shrink
+/// relocation and the FS-specific finalization. Returns the running byte total.
+fn stream_one_partition(
+    target: &DiskInfo,
+    part: &PartitionInfo,
+    entry: &CloneEntry,
+    prep: &mut PreparedPartition,
+    opts: &CloneOptions,
+    mut bytes_done: u64,
+) -> Result<u64> {
+    // Take the extents (the reader stays borrowed in place — `stream_extents` needs
+    // it by &mut, and the rest are Copy).
+    let extents = std::mem::take(&mut prep.extents);
+    let bytes_per_cluster = prep.bytes_per_cluster;
+    let capture_mode = prep.capture_mode;
+    let fs_kind = prep.fs_kind;
 
     // --- Shrink relocation (NTFS only) ---
     let relocation: Option<RelocationMap> =
@@ -423,7 +566,7 @@ fn clone_one_partition(
     };
 
     bytes_done = stream_extents(
-        &mut reader,
+        &mut prep.reader,
         &mut writer,
         &effective_extents,
         relocation.as_ref(),

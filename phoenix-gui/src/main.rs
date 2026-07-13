@@ -2353,7 +2353,6 @@ impl PhoenixApp {
                 target_disk_index: tgt,
                 plan,
                 verify: phoenix_clone::CloneVerify::None,
-                use_vss: true,
                 progress: None,
             },
             message,
