@@ -341,8 +341,7 @@ pub fn draw_partition_segment_visual_styled(
     // rect gets its radius clamped to bar_height/2 and pokes past the card's
     // corner curve. Paint the full card shape instead, clipped to the bar
     // strip, so the corner geometry matches the background exactly.
-    let track_clip =
-        Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), FILL_BAR_HEIGHT));
+    let track_clip = Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), FILL_BAR_HEIGHT));
     painter.with_clip_rect(track_clip).rect_filled(
         rect,
         Rounding::same(SEGMENT_ROUNDING),

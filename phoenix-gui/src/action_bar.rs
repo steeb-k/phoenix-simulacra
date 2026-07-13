@@ -365,8 +365,7 @@ fn shade_of(col: u32, row: u32, seed: u32) -> u32 {
 /// Integer hash of a tile coordinate and a seed. Cheap, and good enough that
 /// neighbouring tiles land on unrelated values.
 fn hash(col: u32, row: u32, seed: u32) -> u32 {
-    let mut h = col
-        .wrapping_mul(0x9E37_79B9)
+    let mut h = col.wrapping_mul(0x9E37_79B9)
         ^ row.wrapping_mul(0x85EB_CA6B)
         ^ seed.wrapping_mul(0xC2B2_AE35);
     h ^= h >> 15;
@@ -471,10 +470,38 @@ fn rounded_rect_points(rect: Rect, rounding: Rounding) -> Vec<Pos2> {
 
     let mut pts = Vec::with_capacity(4 * (ARC_STEPS + 1));
     let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
-    corner(&mut pts, l + rounding.nw, t + rounding.nw, rounding.nw, PI, 1.5 * PI);
-    corner(&mut pts, r - rounding.ne, t + rounding.ne, rounding.ne, 1.5 * PI, TAU);
-    corner(&mut pts, r - rounding.se, b - rounding.se, rounding.se, 0.0, FRAC_PI_2);
-    corner(&mut pts, l + rounding.sw, b - rounding.sw, rounding.sw, FRAC_PI_2, PI);
+    corner(
+        &mut pts,
+        l + rounding.nw,
+        t + rounding.nw,
+        rounding.nw,
+        PI,
+        1.5 * PI,
+    );
+    corner(
+        &mut pts,
+        r - rounding.ne,
+        t + rounding.ne,
+        rounding.ne,
+        1.5 * PI,
+        TAU,
+    );
+    corner(
+        &mut pts,
+        r - rounding.se,
+        b - rounding.se,
+        rounding.se,
+        0.0,
+        FRAC_PI_2,
+    );
+    corner(
+        &mut pts,
+        l + rounding.sw,
+        b - rounding.sw,
+        rounding.sw,
+        FRAC_PI_2,
+        PI,
+    );
     pts
 }
 

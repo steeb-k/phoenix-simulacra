@@ -75,13 +75,7 @@ const FOLDER_GAP: f32 = 1.0;
 /// `max(viewport, min_width())` — the same discipline the disk maps use —
 /// so it fills a wide window and scrolls horizontally in a cramped one.
 pub fn min_width() -> f32 {
-    CARD_PAD_X * 2.0
-        + NAME_MIN_W
-        + SIZE_W
-        + LETTER_W
-        + EXPLORE_W
-        + UNMOUNT_W
-        + COL_GAP * 4.0
+    CARD_PAD_X * 2.0 + NAME_MIN_W + SIZE_W + LETTER_W + EXPLORE_W + UNMOUNT_W + COL_GAP * 4.0
 }
 
 /// Column geometry for a card/header of the given rect. The fixed columns are
@@ -141,7 +135,10 @@ pub fn show(ui: &mut Ui, width: f32, rows: &[MountRow], palette: &Palette) -> Mo
     painter.hline(
         (header.left() + CARD_PAD_X)..=(header.right() - CARD_PAD_X),
         header.bottom(),
-        Stroke::new(1.0, with_alpha(palette.subtle_text, if empty { 40 } else { 70 })),
+        Stroke::new(
+            1.0,
+            with_alpha(palette.subtle_text, if empty { 40 } else { 70 }),
+        ),
     );
 
     if empty {
@@ -179,7 +176,13 @@ fn empty_card(ui: &mut Ui, width: f32, palette: &Palette) {
 }
 
 /// One backup's card. Returns the click it produced, if any.
-fn card(ui: &mut Ui, width: f32, index: usize, row: &MountRow, palette: &Palette) -> Option<MountAction> {
+fn card(
+    ui: &mut Ui,
+    width: f32,
+    index: usize,
+    row: &MountRow,
+    palette: &Palette,
+) -> Option<MountAction> {
     // A mount whose selection exposed no letter at all still gets a row, so it
     // can be seen — and unmounted.
     let sub_rows = row.letters.len().max(1);
@@ -337,11 +340,7 @@ fn table_button(
 
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(BTN_ROUNDING), fill);
-    painter.rect_stroke(
-        rect,
-        Rounding::same(BTN_ROUNDING),
-        Stroke::new(1.0, border),
-    );
+    painter.rect_stroke(rect, Rounding::same(BTN_ROUNDING), Stroke::new(1.0, border));
     let job = icon_label(
         icon,
         fonts::icon(15.0),

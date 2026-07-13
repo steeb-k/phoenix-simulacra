@@ -76,8 +76,7 @@ pub fn show(
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         let row_width = face_width.max(min_row_width(disk));
-                        let ev =
-                            draw_disk_list_row(ui, row_width, disk, true, can_drag, palette);
+                        let ev = draw_disk_list_row(ui, row_width, disk, true, can_drag, palette);
                         wants_open = ev.clicked;
                         drag_started = ev.drag_started;
                     });
@@ -100,12 +99,10 @@ pub fn show(
     // switches to a partial clone: the editor re-seeds from the target's
     // LIVE layout, and the dragged partition lands wherever it's dropped.
     if let Some(part) = drag_started {
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(drag_source_id(), part));
+        ui.ctx().data_mut(|d| d.insert_temp(drag_source_id(), part));
         if let Some(layout) = layout.as_deref_mut() {
             if layout.full_disk {
-                if let Some(target) =
-                    target_index.and_then(|t| disks.iter().find(|d| d.index == t))
+                if let Some(target) = target_index.and_then(|t| disks.iter().find(|d| d.index == t))
                 {
                     layout.clear_full_disk(target);
                 }

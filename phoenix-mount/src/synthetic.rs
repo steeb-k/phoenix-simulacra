@@ -279,7 +279,8 @@ mod tests {
     /// GPT type GUID at entry `i` of the entry array (LBA 2 onward).
     fn entry_type_guid(vhd: &mut SyntheticVhd, i: usize) -> [u8; 16] {
         let mut entry = [0u8; 128];
-        vhd.read_at(2 * SECTOR + i as u64 * 128, &mut entry).unwrap();
+        vhd.read_at(2 * SECTOR + i as u64 * 128, &mut entry)
+            .unwrap();
         entry[0..16].try_into().unwrap()
     }
 

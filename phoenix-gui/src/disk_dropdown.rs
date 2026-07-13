@@ -114,10 +114,8 @@ pub(crate) fn disk_dropdown(
 /// The `⌄` column at the right edge of a dropdown control. Returns true on
 /// click (the caller toggles the popup).
 fn dropdown_chevron(ui: &mut Ui, height: f32, popup_id: egui::Id, palette: &Palette) -> bool {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(CHEVRON_COL_W - 6.0, height),
-        Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(CHEVRON_COL_W - 6.0, height), Sense::click());
     let hovered = response.hovered();
     let open = ui.memory(|m| m.is_popup_open(popup_id));
     let painter = ui.painter_at(rect);
@@ -208,7 +206,8 @@ pub(crate) fn draw_disk_list_row(
     let row_size = Vec2::new(row_width, ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
 
-    let info_rect = Rect::from_min_size(row_rect.left_top(), Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT));
+    let info_rect =
+        Rect::from_min_size(row_rect.left_top(), Vec2::new(INFO_CARD_WIDTH, ROW_HEIGHT));
     let info_resp = ui.interact(
         info_rect,
         ui.id().with(("disk_row", disk.index)),

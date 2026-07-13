@@ -202,11 +202,7 @@ fn paint_row(
     ui.painter()
         .rect_filled(rect, rounding, with_alpha(palette.content_card_bg, stripe));
     let hovered = ui
-        .interact(
-            rect,
-            ui.id().with(("history_row", index)),
-            Sense::hover(),
-        )
+        .interact(rect, ui.id().with(("history_row", index)), Sense::hover())
         .hovered();
     if hovered {
         ui.painter()
@@ -249,7 +245,8 @@ fn paint_row(
     let details = details_galley(ui, row, palette, cols.details_w);
     let details_pos = egui::pos2(cols.details_x, rect.center().y - details.size().y * 0.5);
     let details_rect = Rect::from_min_size(details_pos, details.size());
-    ui.painter().galley(details_pos, details, palette.icon_color);
+    ui.painter()
+        .galley(details_pos, details, palette.icon_color);
     let full = match &row.error {
         Some(e) => format!("{} — {e}", row.details),
         None => row.details.clone(),
@@ -314,7 +311,11 @@ fn details_galley(
 /// it is the only destructive control on the page.
 fn remove_button(ui: &mut Ui, rect: Rect, index: usize, palette: &Palette) -> bool {
     let response = ui
-        .interact(rect, ui.id().with(("history_remove", index)), Sense::click())
+        .interact(
+            rect,
+            ui.id().with(("history_remove", index)),
+            Sense::click(),
+        )
         .on_hover_text("Remove this entry from the history");
     let color = if response.hovered() {
         palette.danger

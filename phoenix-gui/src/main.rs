@@ -74,8 +74,8 @@ const START_BUTTON_HEIGHT: f32 = 52.0;
 /// while the in-app icons are vector glyphs tinted by the active theme.
 fn app_icon() -> egui::IconData {
     let bytes = include_bytes!("../../assets/carbon-phoenix-appicon2-256px.png");
-    let image = image::load_from_memory(bytes)
-        .expect("failed to decode carbon-phoenix-appicon2-256px.png");
+    let image =
+        image::load_from_memory(bytes).expect("failed to decode carbon-phoenix-appicon2-256px.png");
     let image = image.into_rgba8();
     let (width, height) = image.dimensions();
     egui::IconData {
@@ -2648,7 +2648,9 @@ impl PhoenixApp {
             let action = egui::ScrollArea::horizontal()
                 .id_salt("history_table")
                 .auto_shrink([false, true])
-                .show(ui, |ui| history_table::show(ui, table_width, &rows, &palette))
+                .show(ui, |ui| {
+                    history_table::show(ui, table_width, &rows, &palette)
+                })
                 .inner;
 
             if let history_table::HistoryAction::Remove(row) = action {

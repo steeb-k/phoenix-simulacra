@@ -87,7 +87,10 @@ fn draw(ui: &mut Ui, palette: &Palette, brand_rect: Rect, refresh_enabled: bool)
     // sit on a surface of their own instead of floating over page content.
     // Painted first; the buttons paint their hover/press fills on top.
     let controls_left = screen.right() - 3.0 * BUTTON_WIDTH;
-    let controls = Rect::from_min_max(egui::pos2(controls_left, screen.top()), egui::pos2(screen.right(), bottom));
+    let controls = Rect::from_min_max(
+        egui::pos2(controls_left, screen.top()),
+        egui::pos2(screen.right(), bottom),
+    );
     ui.painter()
         .rect_filled(controls, Rounding::ZERO, controls_bg(palette));
 
@@ -102,7 +105,10 @@ fn draw(ui: &mut Ui, palette: &Palette, brand_rect: Rect, refresh_enabled: bool)
     let mut right = screen.right();
     let mut button_rects = [Rect::NOTHING; 3]; // indexed by `Caption as usize`
     for which in [Caption::Close, Caption::Maximize, Caption::Minimize] {
-        let r = Rect::from_min_max(egui::pos2(right - BUTTON_WIDTH, screen.top()), egui::pos2(right, bottom));
+        let r = Rect::from_min_max(
+            egui::pos2(right - BUTTON_WIDTH, screen.top()),
+            egui::pos2(right, bottom),
+        );
         button_rects[which as usize] = r;
         right = r.left();
         caption_button(ui, r, which, palette, focused, maximized);
@@ -114,7 +120,11 @@ fn draw(ui: &mut Ui, palette: &Palette, brand_rect: Rect, refresh_enabled: bool)
     // dragging before egui ever sees it.
     let band = Rect::from_min_max(screen.min, egui::pos2(refresh_rect.left(), bottom));
     for (i, zone) in [band, brand_rect].into_iter().enumerate() {
-        let drag = ui.interact(zone, ui.id().with(("drag-zone", i)), Sense::click_and_drag());
+        let drag = ui.interact(
+            zone,
+            ui.id().with(("drag-zone", i)),
+            Sense::click_and_drag(),
+        );
         if drag.double_clicked() {
             ui.ctx()
                 .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
@@ -141,7 +151,11 @@ fn refresh_fonts() -> (FontId, FontId) {
 fn refresh_width(ui: &Ui) -> f32 {
     let (icon_font, text_font) = refresh_fonts();
     let measure = |text: &str, font: FontId| {
-        ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE).size().x)
+        ui.fonts(|f| {
+            f.layout_no_wrap(text.to_owned(), font, Color32::WHITE)
+                .size()
+                .x
+        })
     };
     REFRESH_PAD_X * 2.0
         + measure(egui_phosphor::bold::ARROWS_CLOCKWISE, icon_font)
@@ -254,8 +268,7 @@ fn caption_button(
 
     let nc_hover = nc::hovered() == Some(which);
     let hovered = nc_hover || resp.hovered();
-    let pressed =
-        (nc_hover && nc::pressed() == Some(which)) || resp.is_pointer_button_down_on();
+    let pressed = (nc_hover && nc::pressed() == Some(which)) || resp.is_pointer_button_down_on();
 
     // Win11 styling: fully transparent at rest, subtle overlay for
     // minimize/maximize, fixed red for close. Native pressed states are
@@ -298,7 +311,13 @@ fn caption_button(
     };
     match fonts::caption_icon(10.0) {
         Some(font) => {
-            painter.text(rect.center(), Align2::CENTER_CENTER, fluent, font, glyph_color);
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                fluent,
+                font,
+                glyph_color,
+            );
         }
         None => {
             painter.text(
@@ -335,8 +354,8 @@ mod nc {
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetSystemMenu, IsZoomed, PostMessageW, TrackPopupMenu, HTBOTTOM,
-        HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON,
-        HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE,
+        HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTRIGHT,
+        HTTOP, HTTOPLEFT, HTTOPRIGHT, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE,
         TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST,
         WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
         WM_NCRBUTTONUP, WM_SYSCOMMAND,
@@ -405,16 +424,10 @@ mod nc {
         }
     }
 
-    pub(super) fn publish_geometry(
-        ctx: &Context,
-        buttons: &[Rect; 3],
-        refresh: Rect,
-        brand: Rect,
-    ) {
+    pub(super) fn publish_geometry(ctx: &Context, buttons: &[Rect; 3], refresh: Rect, brand: Rect) {
         let ppp = ctx.pixels_per_point();
         let px = |v: f32| (v * ppp).round() as i32;
-        let rect_px =
-            |r: Rect| (px(r.left()), px(r.top()), px(r.right()), px(r.bottom()));
+        let rect_px = |r: Rect| (px(r.left()), px(r.top()), px(r.right()), px(r.bottom()));
         let mut geo = GEOMETRY.lock().unwrap();
         geo.band_h = px(super::CAPTION_BAND_HEIGHT);
         geo.border = px(super::RESIZE_BORDER).max(4);
@@ -618,9 +631,8 @@ mod nc {
             }
         }
 
-        let in_rect = |r: (i32, i32, i32, i32)| {
-            pt.x >= r.0 && pt.x < r.2 && pt.y >= r.1 && pt.y < r.3
-        };
+        let in_rect =
+            |r: (i32, i32, i32, i32)| pt.x >= r.0 && pt.x < r.2 && pt.y >= r.1 && pt.y < r.3;
         for (i, r) in geo.buttons.iter().copied().enumerate() {
             if in_rect(r) {
                 return Some([HTMINBUTTON, HTMAXBUTTON, HTCLOSE][i]);

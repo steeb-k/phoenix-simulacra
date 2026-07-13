@@ -12,7 +12,13 @@ fn hexdump(buf: &[u8]) {
         let hex: Vec<String> = row.iter().map(|b| format!("{b:02X}")).collect();
         let ascii: String = row
             .iter()
-            .map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7F).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("    {} |{}|", hex.join(" "), ascii);
     }
@@ -34,7 +40,11 @@ fn main() {
 
     let mut vhd = SyntheticVhd::build(reader).unwrap();
     let spans: Vec<_> = vhd.spans().to_vec();
-    println!("\ndisk_size={} ({:.1} MiB)", vhd.disk_size(), vhd.disk_size() as f64 / 1048576.0);
+    println!(
+        "\ndisk_size={} ({:.1} MiB)",
+        vhd.disk_size(),
+        vhd.disk_size() as f64 / 1048576.0
+    );
 
     for s in &spans {
         println!(
@@ -52,7 +62,11 @@ fn main() {
                 hexdump(&boot[..96]);
                 println!(
                     "  sig 0x55AA at 510: {}",
-                    if boot[510] == 0x55 && boot[511] == 0xAA { "YES" } else { "NO" }
+                    if boot[510] == 0x55 && boot[511] == 0xAA {
+                        "YES"
+                    } else {
+                        "NO"
+                    }
                 );
                 if &boot[3..7] == b"NTFS" {
                     let total_sectors = u64::from_le_bytes(boot[0x28..0x30].try_into().unwrap());
@@ -85,7 +99,11 @@ fn main() {
         match vhd.read_at(s.disk_offset + s.size - 512, &mut tail) {
             Ok(()) => println!(
                 "  last sector: sig 0x55AA: {}  first bytes: {:02X?}",
-                if tail[510] == 0x55 && tail[511] == 0xAA { "YES" } else { "NO" },
+                if tail[510] == 0x55 && tail[511] == 0xAA {
+                    "YES"
+                } else {
+                    "NO"
+                },
                 &tail[..8]
             ),
             Err(e) => println!("  LAST SECTOR READ ERROR: {e}"),

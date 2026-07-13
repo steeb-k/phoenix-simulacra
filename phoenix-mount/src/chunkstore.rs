@@ -597,7 +597,9 @@ mod tests {
         );
 
         let mut straddle = vec![0u8; 8192];
-        store.read_at(poff + short_len as u64 - 4096, &mut straddle).unwrap();
+        store
+            .read_at(poff + short_len as u64 - 4096, &mut straddle)
+            .unwrap();
         assert!(straddle[..4096].iter().all(|&b| b == 0x11));
         assert!(straddle[4096..].iter().all(|&b| b == 0x22));
 

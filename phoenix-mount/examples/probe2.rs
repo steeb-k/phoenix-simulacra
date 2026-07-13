@@ -46,7 +46,9 @@ fn main() {
     println!("stream duplicate (extent,chunk) keys: {}", dups.len());
     let mut seen_m = HashMap::new();
     for r in &records {
-        *seen_m.entry((r.extent_index, r.chunk_index)).or_insert(0u32) += 1;
+        *seen_m
+            .entry((r.extent_index, r.chunk_index))
+            .or_insert(0u32) += 1;
     }
     let dups_m: Vec<_> = seen_m.iter().filter(|(_, &n)| n > 1).collect();
     println!("manifest duplicate (extent,chunk) keys: {}", dups_m.len());
@@ -157,7 +159,10 @@ fn main() {
     for (i, c) in stream.chunks.iter().enumerate() {
         let last_of_0 = c.extent_index == 0
             && stream.chunks.iter().filter(|x| x.extent_index == 0).count() - 3
-                <= stream.chunks[..i].iter().filter(|x| x.extent_index == 0).count();
+                <= stream.chunks[..i]
+                    .iter()
+                    .filter(|x| x.extent_index == 0)
+                    .count();
         if last_of_0 || c.extent_index == 1 {
             println!(
                 "  [{i}] ext {} chunk {} len {} file_off {}",
