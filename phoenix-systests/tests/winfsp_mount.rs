@@ -172,19 +172,43 @@ fn winfsp_mount_selected_partition_only() {
     })
     .expect("run_backup");
 
-    // Pick the second partition's index out of the backup by its label.
+    // Pick the second NTFS partition out of the backup.
+    //
+    // NOT by label: `PartitionIndexEntry::name` is the **GPT partition name**
+    // ("Basic data partition"), which is a different thing from the volume label
+    // diskpart's `format label=SRC2` sets — the manifest doesn't record volume
+    // labels at all. Selecting on the label is what made the original version of
+    // this test panic here on every run since the day it was written, so it never
+    // once reached the mount below.
+    //
+    // The disk is MSR + SRC1 + SRC2, so the NTFS entries are exactly the two data
+    // partitions in on-disk order. Assert that shape rather than assume it: if the
+    // layout ever changes, this should fail loudly instead of quietly selecting
+    // (and then "verifying") the wrong partition.
     let reader = phoenix_core::container::PhnxReader::open(&backup_path).expect("open backup");
-    let second_idx = reader
+    let ntfs: Vec<&phoenix_core::container::PartitionIndexEntry> = reader
         .index
         .iter()
-        .find(|e| e.name.contains("SRC2"))
-        .unwrap_or_else(|| {
-            panic!(
-                "no SRC2 entry in backup index (names: {:?})",
-                reader.index.iter().map(|e| &e.name).collect::<Vec<_>>()
-            )
-        })
-        .index;
+        .filter(|e| e.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .collect();
+    assert_eq!(
+        ntfs.len(),
+        2,
+        "expected exactly 2 NTFS partitions in the backup, got {:?}",
+        reader
+            .index
+            .iter()
+            .map(|e| (&e.name, e.fs_kind))
+            .collect::<Vec<_>>()
+    );
+    let second = ntfs[1];
+    // SRC2 is the "rest of disk" partition, so it must be the larger of the two —
+    // a cheap check that we grabbed the one holding `digest2`.
+    assert!(
+        second.original_size > ntfs[0].original_size,
+        "second NTFS partition should be the larger (rest-of-disk) one"
+    );
+    let second_idx = second.index;
     drop(reader);
 
     let pre_existing = fixture_letters();
