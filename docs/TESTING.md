@@ -23,6 +23,40 @@ source, and the full source → backup → restore/clone round-trip byte-for-byt
 `--test-threads=1` is mandatory for every T2/T3 run: diskpart, disk-index
 discovery, and drive-letter assignment are process-global and race in parallel.
 
+### ⚠️ Run the suite STAGED — a single long run can bugcheck the machine
+
+**Observed twice on 2026-07-13: a full one-shot T2 run hard-hung Windows** (no
+bugcheck code recorded; the System log's last entries were `disk` event 51 paging
+errors on the attached VHD devices and Filter Manager reporting a volume
+"unavailable for filtering **until a reboot**", i.e. resource exhaustion).
+
+It is **not** a specific test. Every binary — including `partial_mbr`, where both
+crashes landed — passes cleanly when run on its own after a reboot. What correlates
+is **cumulative VHD attach/detach churn** inside one uptime: by the time the crash
+hit, Windows was handing out `\Device\HarddiskVolume1065` and device `DR449`. The
+storage stack, not the engine, is what gives out.
+
+So drive the suite as **one cargo process per test binary**, with a short settle
+between them, rather than a single `cargo test -p phoenix-systests`:
+
+```powershell
+foreach ($b in @('resize_roundtrip','sector_4kn','backup_restore_roundtrip','clone',
+                 'fat_family','gpt_identity','partial_mbr','mount','vss','bitlocker',
+                 'winfsp_mount')) {
+    cargo test -p phoenix-systests --features winfsp --test $b -- --ignored --test-threads=1
+    Start-Sleep -Seconds 5   # VHD detach is asynchronous; let it finish
+}
+```
+
+Log a breadcrumb to a **file** before and after each binary. A hard hang loses
+whatever is sitting in a stdout pipe, but an append that already reached disk
+survives — that breadcrumb is the only reason the crash was localized at all.
+
+Two follow-ups this deserves: reduce per-test VHD churn (reuse fixtures where a
+test doesn't need a virgin disk), and fix crash-dump collection on the dev box
+(`volmgr` event 46, "Crash dump initialization failed", means no `MEMORY.DMP` is
+ever written — so a bugcheck currently teaches us nothing).
+
 ### Known coverage gaps (as of 2026-07-13)
 
 These are **not** covered by any tier. Read [ROADMAP.md](ROADMAP.md) before
