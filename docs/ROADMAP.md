@@ -1,13 +1,159 @@
 # Carbon Phoenix — Roadmap & Remaining Work
 
-The engine is **feature-complete and validated on both virtual and real
-hardware.** This document tracks what's left: known caveats, follow-up work, and
-things noted during development that could use extra love. Nothing here blocks
-using the tool; these are polish, packaging, and coverage-expansion items.
+The engine is **feature-complete and validated on 512-byte-sector x64 hardware**,
+virtual and real. This document tracks what's left.
 
-Status: **merged to `master`** (2026-07). The engine work (formerly
-`feature/engine-completion`), the parallel chunk pipeline, and the
-partial-restore volume-lock fix are all on `master`.
+Status: all work is on `master` (2026-07). There is **no CI** — `.github/` was
+deleted 2026-07-13; validation is local and manual (see [TESTING.md](TESTING.md)).
+
+## ⚠️ Read this first — the "feature-complete" claim has two holes
+
+A code audit on 2026-07-13, run while preparing for ARM64 testing, found two
+**correctness** defects that outrank every polish/packaging item below. Neither is
+hypothetical; both are traced to specific lines. Neither is caught by any existing
+test, because every test formats NTFS at the 4K default and every test disk has
+512-byte sectors.
+
+1. **NTFS cluster size is hardcoded to 4096 at capture-plan time** (P0 below).
+   Platform-independent. Affects any NTFS volume not formatted at 4K clusters.
+2. **4Kn media is unsupported and capture fails on the first read** (P1 below).
+   Blocks the ARM64 laptop's UFS drive *if* it reports 4096-byte logical sectors.
+
+Until P0 is fixed, "validated" means "validated on 4K-cluster NTFS."
+
+---
+
+## Correctness backlog — do these first
+
+### P0 — NTFS `bytes_per_cluster` is hardcoded to 4096 (data-integrity)
+
+`ntfs_plan` parses the boot sector and computes the volume's real cluster size
+(`phoenix-capture/src/ntfs.rs:349`) — and then **does not return it**. Its
+signature is `-> Result<(Vec<Extent>, Option<String>)>`, so `plan_capture`
+substitutes a literal:
+
+```rust
+// phoenix-capture/src/backup.rs:817-819
+(FilesystemKind::Ntfs, CaptureMode::UsedBlocks) => {
+    let (extents, bitmap_hash) = ntfs_plan(reader)?;
+    Ok((extents, 4096, mode, fs, bitmap_hash))   // <-- the real value was discarded
+}
+```
+
+FAT and exFAT do this correctly (`backup.rs:825`, `backup.rs:837` return the
+parsed value); NTFS alone is wrong.
+
+That literal becomes `bytes_per_cluster` in the manifest and is fed to
+`build_relocation_map` on the shrink path (`phoenix-restore/src/restore.rs:411`,
+`phoenix-clone/src/lib.rs:399`). **Shrinking an NTFS volume formatted with
+non-4K clusters (64K is common on large data volumes) therefore builds its
+relocation map with a cluster size up to 16× too small.** Extent capture itself is
+unaffected (extents come straight from `ntfs_plan`), so this is a
+restore/clone-shrink defect, not a capture one.
+
+Fix: return `cluster_size` from `ntfs_plan` and thread it through. Then **add a T2
+test that formats NTFS with 64K clusters and shrinks it** — the absence of such a
+test is the reason this survived.
+
+### P1 — 4Kn media support (blocks ARM64 UFS testing)
+
+The `.phnx` format was designed for 4Kn (extents use a fixed 512-byte *format*
+addressing unit deliberately decoupled from device geometry; the real logical
+sector size is recorded in `disk.sector_size`), and the device sector size **is**
+discovered correctly (`get_sector_size`, `phoenix-core/src/disk.rs:970`) and
+threaded into the raw **write** path (`PartitionWriter` does a read-modify-write
+bounce for sub-sector I/O). The read path and the geometry math never got the same
+treatment.
+
+**Capture fails on the first read of a 4Kn volume.** Raw disk/volume handles reject
+any read whose length or offset is not a multiple of the *logical* sector size:
+
+- **H1 (critical)** — `PartitionReader::read_at`
+  (`phoenix-capture/src/reader.rs:143-184`) does a bare `ReadFile` with no
+  alignment handling, and every FS parser hands it a hardcoded 512-byte
+  boot-sector buffer: `ntfs.rs:158`, `ntfs.rs:346` (the main capture path),
+  `fat.rs:78`, `fat.rs:506`. `fat.rs:89` rounds a FAT read up to 512 rather than
+  to the device's sector size. All return Win32 87 on 4Kn → backup **and** clone
+  fail before writing a byte. *Fix: give `PartitionReader` a `sector_size` and
+  mirror the RMW bounce that `raw.rs:259-272` already implements.*
+- **H2 (high)** — `extend_ntfs_volume` is passed
+  `PartitionIndexEntry::sector_size`, which is **always the 512-byte format
+  constant**, not the volume's sector size (`phoenix-restore/src/restore.rs:597`;
+  the doc comment on `grow.rs:78` is simply wrong about what that field holds).
+  `FSCTL_EXTEND_VOLUME` wants the *volume's* sectors, so on 4Kn the count is 8×
+  too large. Note `phoenix-clone/src/lib.rs:330` passes the real
+  `target.sector_size` and is correct — restore and clone disagree.
+- **H3 (high)** — `pack_full_disk` reserves the backup GPT with
+  `33 * 512` (`phoenix-restore/src/plan.rs:328-330`). On 4Kn the trailing GPT is
+  33 × 4096, so the anchored last partition **overlaps the backup GPT entry
+  array**. The GUI already gets this right
+  (`phoenix-gui/src/restore_layout.rs:320` uses the real sector size), so planner
+  and GUI disagree on 4Kn.
+- **H4 (medium)** — `set_drive_layout` hardcodes `let sector_size: u64 = 512;`
+  for `StartingUsableOffset` / `UsableLength`
+  (`phoenix-restore/src/partition_table.rs:542-548`). On 4Kn that yields 17,408 —
+  not even a multiple of 4096. Windows writes the actual GPT structures from byte
+  offsets, so the likely failure is IOCTL rejection rather than corruption, but
+  it is wrong.
+- **H5 (medium)** — MBR `HiddenSectors: (entry.offset_bytes / 512)`
+  (`partition_table.rs:488`) is in *device* LBAs; 8× too large on 4Kn. Low
+  exposure (Windows wants GPT for 4Kn boot) but a genuine device assumption.
+- **H6 (medium)** — the mount synthesizer is 512-only and self-consistent
+  (`phoenix-mount/src/{gpt,synthetic,vhd}.rs`, `winfsp_mount.rs:266`
+  `.sector_size(512)`); nothing reads `manifest.disk.sector_size`. A volume
+  captured from 4Kn has `BytesPerSector = 4096` in its BPB, and NTFS **refuses to
+  mount** on a device advertising 512. The fixed-VHD format is inherently
+  512-sector, so real 4Kn mount needs the VHDX path `synthetic.rs:44-49` already
+  flags as unimplemented. Minimum viable fix: detect and **error clearly** instead
+  of producing an unmountable disk.
+
+**All of this reproduces on x64 with a 4Kn VHDX** (`New-VHD -LogicalSectorSize
+4096`) — see TESTING.md → "Tier 2-4Kn". Do it here; it does not need the ARM
+machine.
+
+### P1 — Partial clone (`UpdateExisting`) has no end-to-end test
+
+`CloneTableMode::UpdateExisting` writes into an **existing** target partition and
+rewrites that target's partition table in place. It is the **default** mode on the
+GUI's Clone page (commit `3a4395c`), and it is reachable by drag. Its entire test
+coverage is 5 planning-math unit tests in `phoenix-clone/src/plan.rs`; the write
+path (`phoenix-clone/src/lib.rs:198`, `:259`) is exercised by **no T2 and no T3
+test**.
+
+This is the same class of bug as the partial-restore volume-lock failure that T3B
+`boot_e` caught (a raw write to a still-mounted slot → `ERROR_ACCESS_DENIED`) —
+and the clone path has never been run against a live mounted target. Owed: a T2
+`partial_clone.rs` mirroring `partial_mbr.rs`, then a real-media run.
+
+The packaging, polish, and performance backlog continues in **Backlog** below, after
+the context section. Everything in it ranks *under* the three items above.
+
+### Recommended order of work (2026-07-13)
+
+Platform-independent, and deliberately front-loaded with the things that can be
+done **on the x64 dev box** — none of the top four need the ARM64 laptop.
+
+1. **Fix P0 (NTFS cluster size).** Small, contained, and a data-integrity defect.
+   Return `cluster_size` from `ntfs_plan`; add a T2 test that formats NTFS with
+   64K clusters and shrinks it.
+2. **Build the 4Kn VHDX tier** (TESTING.md → "Tier 2-4Kn"). One `New-VHD` command
+   turns 4Kn from an untestable hardware question into a normal local test. This
+   is the highest-leverage single action available — it converts the entire ARM
+   sector-size risk into work you can do today.
+3. **Fix P1 (4Kn), H1 first.** H1 alone unblocks capture; H2–H5 unblock restore;
+   H6 (mount) can trail. Verify each against the VHDX from step 2.
+4. **Fix P1 (partial-clone coverage).** Write `partial_clone.rs` as a T2 test.
+   A destructive engine mode that is the GUI's default should not be shipping on
+   planning-math unit tests alone.
+5. **Then go to ARM64** ([WINDOWS-ARM64.md](WINDOWS-ARM64.md)) — with 4Kn already
+   fixed, ARM testing tests *ARM*, and a failure there isolates cleanly to the
+   architecture instead of being confounded with sector size.
+6. Resume the packaging backlog (WinFsp installer bundling, BCD fixup).
+
+The one thing that genuinely **requires** the ARM hardware is step 5. Everything
+above it is being blocked on hardware only by habit.
+
+---
 
 ## What's done (for context)
 
@@ -88,8 +234,7 @@ plain `cargo build`/`cargo run` gets the zero-space on-demand mount — the
 stopgap full-size temp-VHD materialization had been silently reachable in dev
 builds (and failed outright on low disk space, violating the never-double-the-
 footprint rule). The fallback now requires an explicit `--no-default-features`.
-CI installs WinFsp (`choco install winfsp`) and builds/tests the feature on
-both targets; `run-system-tests.ps1` builds T2 with it too.
+`run-system-tests.ps1` builds T2 with the feature too.
 
 The GUI Mount page also gained the shared partition map (same widget as
 Backup): the chosen `.phnx`'s layout renders with checkboxes and **only the
@@ -140,11 +285,43 @@ both the backup and clone engines read a locked BitLocker partition through the
 read path, skipping VSS and the volume lock, which don't apply to an unmounted
 locked volume).
 
+### GUI: the app shell is built out (2026-07-11 → 07-13)
+
+Roughly 40 commits of GUI work landed after the engine was declared complete and
+were never recorded here. Summarized so this document stops implying the GUI is a
+thin shell over the CLI:
+
+- **Chromeless window** with a native-behaving custom titlebar, an L-shaped
+  sidebar+status-bar surface, Alt-accelerator navigation, and a theme toggle in
+  the sidebar. The Options page was replaced by About.
+- **Sticky action bar** — a full-width gradient Start button pinned above the
+  status bar. Every main page (Mount included) plugs into it via
+  `current_page_action`; hazard-tape fill when disabled. No page has an inline
+  start button.
+- **Clone page** — disk dropdowns, flow arrow, and drag-to-partial-clone;
+  **partial clone is the default mode**. (Its engine path is the P1 test gap
+  above.)
+- **Restore page** — rebuilt in the Clone page's image, with the layout editor
+  (drag/resize/delete/blank/style-switch), a confirm-the-target dialog, and a
+  backup preview before verifying.
+- **Mount page** — always-visible mounts table, per-partition drive-letter
+  selection, unmount-on-close guard, refusal of double-mounts.
+- **History** as a full-width table with real details; a universal Refresh pill
+  (F5); barber-pole progress bar; green-checkmark completion screens; every
+  finished job gets an explicit verdict, and warnings are surfaced rather than
+  buried in the log.
+- **Disk enumeration** now reports drive type and names the drive behind a USB
+  bridge.
+- The workspace is **rustfmt-clean and clippy-clean** (`-D warnings`) as of
+  `576d6ab` / `d5b22c6`.
+
 ---
 
-## Remaining work (prioritized)
+## Backlog — packaging, polish, performance
 
-### P1 — WinFsp installer bundling
+Everything here ranks below the correctness items at the top of this document.
+
+### P2 — WinFsp installer bundling
 The mount feature requires the WinFsp driver at run time. The binary already
 delay-loads `winfsp-<arch>.dll` and finds it via the registry, so the app just
 needs to **bundle the WinFsp MSI and silent-install it** (`msiexec /i winfsp.msi
@@ -203,20 +380,18 @@ without shrinking GPT coverage (table still spans the whole disk). This closes
 the last real-hardware coverage gap: the engine is now validated on both MBR
 (real USB) and GPT (real fixed disk). See TESTING.md.
 
-### ~~P3 — CI coverage for the winfsp tier~~ (DONE 2026-07) / real-disk tier
-- ~~The `winfsp` feature isn't built in CI~~ — CI now installs WinFsp
-  (`choco install winfsp`, libclang is preinstalled on the runners) and the
-  feature is a GUI/CLI default, so the workspace build + clippy cover the
-  mount code, and the elevated system-tests job runs `--features winfsp`
-  (including the `winfsp_mount` tests).
-- The T3 real-disk tier is inherently manual (it wipes a physical disk); keep it
-  as a documented pre-release step.
+### ~~P3 — CI coverage for the winfsp tier~~ (MOOT — CI deleted 2026-07-13)
+There is no CI. The `winfsp` feature is a GUI/CLI default, so a plain local
+`cargo build` covers the mount code, and `run-system-tests.ps1` runs the
+`winfsp_mount` tests. The T3 real-disk tier is inherently manual (it wipes a
+physical disk); keep it as a documented pre-release step.
 
-### P3 — Automate the manual T3 items (where safe)
-`scripts/live-smoke-checklist.md` covers live VSS system-disk backup/clone,
-boot-the-clone, and 4Kn media manually. The live-system and boot checks are
-hard to automate safely; **4Kn media** could be automated if a 4Kn test device
-(or a 4Kn-emulating VHD) is available.
+### ~~P3 — Automate the manual T3 4Kn item~~ (SUPERSEDED — now P1, above)
+The live-system and boot-the-clone checks in `scripts/live-smoke-checklist.md`
+remain hard to automate safely. **4Kn media is no longer a "nice to automate"
+item** — a 4Kn VHDX is trivially creatable with `New-VHD -LogicalSectorSize 4096`
+(see TESTING.md → "Tier 2-4Kn"), and doing so immediately exposes the P1 4Kn
+defects above. Automate it as part of that fix, not after it.
 
 ### P3 — Engine throughput: pipeline/parallelize backup, restore, AND verify
 **Core work DONE (2026-07)** — see "What's done"; the deliberately deferred
@@ -273,6 +448,12 @@ Remaining avenues (deferred until real-hardware profiling says otherwise):
 
 ## Known caveats (documented, by design)
 
+> Note the distinction: the items below are **deliberate trade-offs**. The 4Kn and
+> NTFS-cluster-size items at the top of this document are **bugs**, not caveats.
+
+- **4Kn (4096-byte logical sector) media is not supported.** Capture fails on the
+  first read. 512e media (4096 physical / 512 logical) is fully supported and is
+  the common case. See "P1 — 4Kn media support".
 - **Mount without the `winfsp` feature** (an explicit `--no-default-features`
   build — the feature is on by default for GUI/CLI) falls back to materializing
   a full-size temp VHD — a **dev-only stopgap**. It's never used in a `winfsp`

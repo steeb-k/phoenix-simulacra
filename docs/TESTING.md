@@ -5,28 +5,52 @@ so testing is tiered and deliberately paranoid. Integrity is verified at three
 levels: the backup file's internal consistency, the backup's fidelity to the
 source, and the full source → backup → restore/clone round-trip byte-for-byte.
 
+> **There is no CI.** `.github/` was deleted 2026-07-13 — every tier below is run
+> locally and manually. Nothing gates a push; the local elevated box is the only
+> gate. Do not add "runs in CI" claims to this document.
+
 ## Test tiers at a glance
 
-| Tier | What | Where | Admin? | Runs in CI? |
-|------|------|-------|--------|-------------|
-| **T1** | Pure unit tests (no disks) | every lib crate + `#[test]` | no | yes |
-| **T2** | System tests on virtual disks (VHDX via diskpart) | `phoenix-systests/tests/` | **yes** | elevated job |
-| **T2-winfsp** | Zero-space WinFsp mount system tests (incl. partition selection) | `phoenix-systests/tests/winfsp_mount.rs` | **yes** | elevated job (CI installs WinFsp) |
-| **T3-auto** | Destructive tests on a **real physical USB disk** | `phoenix-systests/tests/real_disk.rs` | **yes** | no (opt-in, real hardware) |
-| **T3-manual** | Live system-disk VSS backup/clone + boot | `scripts/live-smoke-checklist.md` | **yes** | no (manual, pre-release) |
+| Tier | What | Where | Admin? |
+|------|------|-------|--------|
+| **T1** | Pure unit tests (no disks) | every lib crate + `#[test]` | no |
+| **T2** | System tests on virtual disks (VHDX via diskpart) | `phoenix-systests/tests/` | **yes** |
+| **T2-winfsp** | Zero-space WinFsp mount system tests (incl. partition selection) | `phoenix-systests/tests/winfsp_mount.rs` | **yes** |
+| **T3-auto** | Destructive tests on a **real physical USB disk** | `phoenix-systests/tests/real_disk.rs` | **yes** |
+| **T3B** | Boot-disk cloning from the LIVE system disk | `phoenix-systests/tests/boot_disk.rs` | **yes** |
+| **T3-manual** | Live system-disk VSS backup/clone + boot | `scripts/live-smoke-checklist.md` | **yes** |
 
 `--test-threads=1` is mandatory for every T2/T3 run: diskpart, disk-index
 discovery, and drive-letter assignment are process-global and race in parallel.
 
+### Known coverage gaps (as of 2026-07-13)
+
+These are **not** covered by any tier. Read [ROADMAP.md](ROADMAP.md) before
+trusting a green run to mean "everything works".
+
+| Gap | Why it matters |
+|-----|----------------|
+| **4Kn (4096-byte logical sector) media** | Zero coverage, virtual or real. Every T2 VHD is 512-byte (diskpart `create vdisk` cannot do otherwise) and all T3 hardware to date has been 512e. A 4Kn audit found capture **fails on the first read**. See "Tier 2-4Kn" below — this is now testable on x64 and should be. |
+| **Partial clone (`CloneTableMode::UpdateExisting`)** | The GUI's **default** clone mode, and it rewrites a live target's partition table. It has 5 planning-math unit tests and **no end-to-end test at any tier**. |
+| **Non-4K-cluster NTFS** | Every test formats NTFS at the 4K default, so nothing exercises (e.g.) 64K clusters — which is exactly the case a hardcoded cluster size would break. |
+| **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). |
+
 ---
 
-## Tier 1 — unit tests (68+ tests, no admin)
+## Tier 1 — unit tests (111 tests, no admin)
 
-Pure logic, no real disks. Run everywhere:
+Pure logic, no real disks. Run the **engine crates** — not `--workspace`:
 
-```bash
-cargo test --workspace
+```powershell
+cargo test -p phoenix-core -p phoenix-capture -p phoenix-restore `
+           -p phoenix-clone -p phoenix-mount -p phoenix-vss
 ```
+
+⚠️ `cargo test --workspace` **fails** with `os error 740` ("requires elevation"):
+the `phoenix-cli` and `phoenix-gui` test binaries inherit a `requireAdministrator`
+manifest from their build scripts, so cargo cannot launch them from a normal
+shell. Use the crate list above (or run the whole workspace from an elevated
+shell, which also picks up the `#[ignore]`d T2/T3 tests).
 
 Coverage highlights:
 - **FAT parsing** — FAT12/16/32 cluster-count derivation, EOC-terminal cluster
@@ -126,6 +150,45 @@ cargo test -p phoenix-systests --features winfsp --test winfsp_mount -- --ignore
   surfaces no letter, and the letter is removed again on unmount — the engine
   path behind the GUI Mount page's partition checkboxes and the CLI's
   `mount --partitions`.
+
+---
+
+## Tier 2-4Kn — 4096-byte-sector virtual disks (NOT YET WRITTEN)
+
+**This tier does not exist yet and should.** It is the cheapest way to close the
+single largest coverage gap, and it needs **no special hardware** — a 4Kn disk can
+be emulated on any x64 dev box.
+
+diskpart's `create vdisk` always produces 512-byte logical sectors, which is why
+every T2 test to date is 512-only. The Hyper-V PowerShell module can create a true
+4Kn VHDX. `New-VHD` is present on the dev box (module `Hyper-V`) and, like diskpart,
+**requires an elevated shell** — it fails with "You do not have the required
+permission" otherwise. The Hyper-V *hypervisor* does not need to be enabled; the
+management module is enough.
+
+```powershell
+# elevated
+New-VHD -Path C:\tmp\4kn.vhdx -SizeBytes 8GB -Dynamic `
+        -LogicalSectorSize 4096 -PhysicalSectorSize 4096
+Mount-VHD -Path C:\tmp\4kn.vhdx
+Get-Disk | Select-Object Number, LogicalSectorSize, PhysicalSectorSize  # expect 4096 / 4096
+```
+
+The harness change is small: `TestVhd::create` currently shells diskpart
+(`phoenix-systests/src/lib.rs:107`); a `TestVhd::create_4kn` would shell `New-VHD` +
+`Mount-VHD` instead and reuse the existing disk-number resolution.
+
+Attach it, initialize GPT, format NTFS, and run capture → verify → restore → mount.
+**Expect it to fail immediately at capture** with `Win32 error 87`
+(`ERROR_INVALID_PARAMETER`): the filesystem parsers issue hardcoded 512-byte
+boot-sector reads on a raw handle, and raw handles reject any read that is not a
+multiple of the *logical* sector size. That failure is the first thing to fix; see
+[ROADMAP.md](ROADMAP.md) → "P1 — 4Kn media support" for the full itemized list of
+512-byte assumptions (reader alignment, `FSCTL_EXTEND_VOLUME` sector count, GPT
+reserve math, MBR `HiddenSectors`, and the 512-only mount synthesizer).
+
+Because the whole 4Kn surface reproduces on a VHDX, **none of this work needs the
+ARM64 laptop** — do it here first.
 
 ---
 
@@ -295,13 +358,28 @@ resize restores, mount (WinFsp), and 4Kn / USB media.
 - **T2/T3**: Rust + an **elevated** shell (diskpart, raw disk handles, formatting).
 - **winfsp tests / feature**: LLVM (`libclang`, for `winfsp-sys` bindgen) + WinFsp
   installed (https://winfsp.dev).
+- **T2-4Kn** (when written): the **Hyper-V PowerShell module** for `New-VHD`
+  (management tools only — the hypervisor itself need not be enabled), elevated.
 - **T3-auto**: a spare USB disk you can fully erase.
 - **BitLocker tests** (T2 `bitlocker.rs`, T3 `real_mbr_bitlocker_roundtrip`):
   a Windows SKU with the BitLocker cmdlets (Pro/Enterprise). Data volumes use
   a password protector, so no TPM or group-policy change is needed.
 
-## CI
+## No CI — the local gate
 
-`.github/workflows/windows.yml` runs fmt + clippy (`-D warnings`) + T1 on x64
-(and builds aarch64), plus an elevated job for the T2 suite. The winfsp and T3
-tiers are run manually on hardware.
+`.github/` was **deleted** on 2026-07-13: development is rapid and fully local, and
+the Windows runners were burning credits on a build the maintainer reproduces in
+seconds. Nothing runs on push.
+
+The gate before a commit that touches the engine is, in order:
+
+```powershell
+cargo fmt --all --check
+cargo clippy --workspace -- -D warnings          # the tree is clippy-clean; keep it that way
+cargo test -p phoenix-core -p phoenix-capture -p phoenix-restore `
+           -p phoenix-clone -p phoenix-mount -p phoenix-vss    # T1: 111 tests
+.\scripts\run-system-tests.ps1                   # T2, elevated
+```
+
+T3 / T3B / the manual checklist are pre-release steps on real hardware. Release
+binaries are built manually with `scripts/build-release.ps1`.
