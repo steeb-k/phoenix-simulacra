@@ -151,7 +151,6 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
     let output_display = output_path.display().to_string();
     let disk_index = opts.disk_index;
     let partitions = opts.partition_indices.clone();
-    let use_vss = opts.use_vss;
     let mut job = make_job(JobKind::Backup, progress, move || {
         // Anchor-point logs: every backup run leaves a clear START / END
         // pair in the log so an operator scrolling a multi-run log can
@@ -163,7 +162,6 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
             output = %output_display,
             disk_index,
             partitions = ?partitions,
-            use_vss,
             "spawn_backup: starting backup"
         );
         let started = Instant::now();

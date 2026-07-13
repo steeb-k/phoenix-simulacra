@@ -84,34 +84,31 @@ For a typical Windows 11 disk, EFI + MSR are raw (small); `C:` and `D:` are used
 
 ---
 
-## Runtime: live Windows vs offline (WinPE)
+## How a source is frozen (no switch — the engine picks)
 
-The same `.phnx` format is written in both environments. What changes is **how volumes are opened for reading**.
+A backup is only trustworthy if the bytes it reads can't change underneath it. There is **no user setting** for this: for every partition, the engine takes the strongest freeze the volume allows, in this order.
 
-### Direct read (default)
+### 1. Exclusive volume lock (preferred)
 
-- Opens the volume (`\\.\C:`) or partition on the physical disk (`\\.\PhysicalDriveN` at offset).
-- Appropriate when:
-  - Running from **WinPE** with volumes offline or quiesced.
-  - Backing up **non-system** data drives while nothing critical is locking files.
-  - You have stopped apps that hold exclusive locks (best effort).
+- Opens the volume (`\\.\E:`) and takes `FSCTL_LOCK_VOLUME`, which Windows grants only when nothing else has a file open on it. Windows flushes dirty cache pages before granting it, so the on-disk state is coherent from that moment.
+- Nothing else on the system can read or write the volume until the backup (including verify-after) finishes — the strongest guarantee available, and it needs no shadow storage, no VSS service, and no snapshot to tear down.
+- This is what you get in **WinPE**, and on idle data drives in a running Windows session. The lock is retried for ~8 s before it's considered refused, so a transient antivirus scan doesn't push a backup off this path.
 
-### Live backup with VSS (`--vss` / GUI “Use VSS”)
+### 2. VSS snapshot (automatic fallback when the volume is busy)
 
-- Uses Windows **Volume Shadow Copy Service** to create a point-in-time snapshot, then reads from the shadow copy device.
-- Appropriate when:
-  - Backing up **C:** or other in-use system volumes from a running Windows session.
-  - You need a crash-consistent / application-consistent view without rebooting to WinPE.
+- When the lock is refused — always the case for the **running Windows volume**, and for any volume an app is holding a file open on — the engine creates a **Volume Shadow Copy** of that same volume and reads the frozen snapshot device instead. The volume stays usable while the backup runs.
+- Requires elevation (UAC) and the Volume Shadow Copy service; VSS can only snapshot **NTFS/ReFS** on non-removable media.
 
 **Important:** VSS does **not** change capture mode. It only changes the **read source** to a frozen snapshot. NTFS volumes still use used-block capture when detected; EFI/MSR still use raw.
 
-VSS requires:
+### 3. Neither
 
-- Administrator privileges (UAC).
-- The Volume Shadow Copy service available (standard on desktop Windows).
-- On failure, the tool may fall back to reading the live volume directly (logged); WinPE backups should leave VSS disabled.
+- A **lettered** volume that can neither be locked nor snapshotted (e.g. a busy FAT32 drive) **aborts the backup** with a volume-lock error. Reading a mutating filesystem would produce a torn image that looks valid — closing the app holding the volume, or unmounting it, is the fix.
+- An **un-lettered** volume (EFI System / Recovery via its `\\?\Volume{GUID}` device) that Windows refuses to lock *or* snapshot is captured unfrozen, with a warning. There's no user-closeable handle to remedy, and these partitions are effectively static; verify-after then checks the **image's** integrity instead of re-reading the mutable source.
 
-BitLocker volumes must be **unlocked** (decrypted at the volume layer) for any read path. Suspended or locked volumes are not supported.
+Partitions with no mounted volume at all (MSR, unformatted) are read straight off `\\.\PhysicalDriveN` at their offset — nothing to lock or snapshot.
+
+BitLocker volumes must be **unlocked** (decrypted at the volume layer) for a normal backup. A **locked** volume is captured as raw ciphertext off the physical disk (its bytes are static while it stays locked); the restored volume still requires the original key/recovery password.
 
 ---
 
@@ -121,7 +118,7 @@ BitLocker volumes must be **unlocked** (decrypted at the volume layer) for any r
 2. **Detect filesystem** — Per-volume `GetVolumeInformationW` when a drive letter is mapped; GPT type GUID for EFI/MSR.
 3. **User selection** — Disk index + partition index list (CLI) or checkboxes (GUI).
 4. **Per partition:**
-   - Resolve read path (volume, shadow copy, or disk offset).
+   - Freeze the source: exclusive volume lock, else a VSS shadow, else disk offset (see above).
    - Plan extents (used clusters or full-sector range).
    - Read data in up to **4 MiB** chunks.
    - Compress each chunk with **zstd** (level 3).
@@ -162,7 +159,7 @@ Shows disk index, path, GPT/MBR, and each partition’s index, name, size, detec
 ### Create a backup
 
 ```bash
-carbon-phoenix backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --output <PATH.phnx> [--vss]
+carbon-phoenix backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --output <PATH.phnx> [--no-verify]
 ```
 
 | Option | Required | Description |
@@ -170,19 +167,19 @@ carbon-phoenix backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --ou
 | `--disk` | Yes | Physical disk number (from `list-disks`). |
 | `--partitions` | Yes | Comma-separated partition indices on that disk. |
 | `--output` / `-o` | Yes | Path to the output `.phnx` file. |
-| `--vss` | No | Use VSS snapshots for volume-backed partitions (live system backup). |
+| `--no-verify` | No | Skip the post-backup pass that re-reads the source and confirms the image matches it. |
+
+Locking vs. VSS is not an option — the engine locks the volume when it can and snapshots it when it can't (see above).
 
 **Examples:**
 
 ```bash
-# Data drive only, offline-style read
+# Data drive (idle → captured under an exclusive volume lock)
 carbon-phoenix backup --disk 1 --partitions 2 --output D:\Backups\data.phnx
 
-# System disk: EFI + MSR + Windows partition (indices from list-disks)
-carbon-phoenix backup --disk 0 --partitions 1,2,3 --output C:\Backups\system.phnx --vss
-
-# Single NTFS volume with shadow copy
-carbon-phoenix backup --disk 0 --partitions 3 --output C:\Backups\c-drive.phnx --vss
+# System disk: EFI + MSR + Windows partition (indices from list-disks).
+# The running C: can't be locked, so it's captured through a VSS shadow.
+carbon-phoenix backup --disk 0 --partitions 1,2,3 --output C:\Backups\system.phnx
 ```
 
 ### Verify after backup
@@ -203,8 +200,7 @@ Launch `carbon-phoenix-gui.exe` (Administrator / UAC).
 1. **Disk** — Dropdown of physical drives.
 2. **Partitions** — Checkboxes; only checked partitions are included.
 3. **Save backup to** — Path field; **Browse** or **Start backup** opens a Save dialog.
-4. **Use VSS (live Windows)** — Enable for in-use system volumes on a running OS.
-5. **Progress** — Bottom panel shows phase, detail, and a progress bar while the job runs (background thread).
+4. **Progress** — Bottom panel shows phase, detail, and a progress bar while the job runs (background thread). The "Preparing volumes" step names the freeze it took on each volume (exclusive lock, or a VSS snapshot when the volume is in use).
 
 Controls are disabled until the job finishes.
 
@@ -220,11 +216,11 @@ Include at minimum on the system disk:
 - MSR (if present)
 - Windows NTFS partition (e.g. `C:`)
 
-Use **VSS** when creating the backup from a running system. From WinPE, leave VSS off and ensure you are not backing up the disk you booted from unless intentional.
+From a running system this is captured through a VSS shadow (the OS volume can never be locked); from WinPE the same partitions are captured under an exclusive lock. Either way the choice is the engine's, not yours.
 
 ### Data-only backup
 
-Select only data partitions (e.g. `D:`). VSS optional; often not needed if no heavy writers.
+Select only data partitions (e.g. `D:`). An idle data volume is locked for the backup's duration, which makes it briefly inaccessible to the rest of the system — close anything using it first, or the engine will snapshot it instead.
 
 ### Minimal backup
 
@@ -289,10 +285,11 @@ Useful fields for auditing a backup:
 
 | Question | Suggestion |
 |----------|------------|
-| Backing up `C:` while Windows is running? | Enable **VSS**. |
-| In WinPE? | Disable VSS; select correct `PhysicalDrive`. |
+| Backing up `C:` while Windows is running? | Just run it — the engine snapshots what it can't lock. |
+| In WinPE? | Select the correct `PhysicalDrive`; volumes will be locked, not snapshotted. |
 | Need boot recovery? | Include **EFI + MSR + Windows** partition. |
-| Only files on `D:`? | Select **D:** only; VSS optional. |
+| Only files on `D:`? | Select **D:** only. |
+| Backup aborted with a volume-lock error? | Something has the volume open and it can't be shadowed (FAT/exFAT, removable). Close it, or unmount it. |
 | Backup seems huge? | Run `list`; compare `used_bytes` vs `original_size`; see NTFS bitmap note above. |
 | Progress stuck at low %? | Denominator is partition size, not used size; check output file growth. |
 
@@ -302,7 +299,7 @@ Useful fields for auditing a backup:
 
 ```bash
 carbon-phoenix list-disks
-carbon-phoenix backup --disk 0 --partitions 1,2,3 -o backup.phnx --vss
+carbon-phoenix backup --disk 0 --partitions 1,2,3 -o backup.phnx
 carbon-phoenix list backup.phnx
 carbon-phoenix verify backup.phnx
 ```

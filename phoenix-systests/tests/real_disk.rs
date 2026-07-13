@@ -52,7 +52,6 @@ fn backup_all(idx: u32) -> std::path::PathBuf {
         disk_index: idx,
         partition_indices: parts,
         output: backup.clone(),
-        use_vss: false,
         verify_after: true,
         verify_image: false,
         progress: None,
@@ -162,7 +161,6 @@ fn multifs_roundtrip(disk: &RealDisk, gpt: bool) {
         disk_index: idx,
         partition_indices: parts,
         output: backup.clone(),
-        use_vss: false,
         verify_after: true,
         verify_image: false,
         progress: None,
@@ -603,15 +601,15 @@ fn real_mbr_bitlocker_roundtrip() {
     eprintln!("[T3] real_mbr_bitlocker_roundtrip PASSED");
 }
 
-/// VSS on real media. Adapts to what the hardware supports:
-/// - **Non-removable** target (external/internal HDD): VSS should work — run a
-///   backup with `use_vss: true` while holding an open file handle, which the
-///   engine can only survive by reading a shadow (the live-volume fallback
-///   would fail `FSCTL_LOCK_VOLUME` against our handle). Then restore+verify.
-/// - **Removable** flash: Windows can't shadow removable media, so assert the
-///   fallback contract instead: with a handle open the backup MUST fail with a
-///   lock error; with handles closed it must lock, capture faithfully, and
-///   release.
+/// The lock-then-VSS escalation on real media. Adapts to what the hardware
+/// supports — in both cases we hold a file handle open, which is exactly what
+/// makes `FSCTL_LOCK_VOLUME` fail and forces the engine onto its second arm:
+/// - **Non-removable** target (external/internal HDD): VSS should work, so the
+///   engine must escalate to a shadow and the backup succeeds despite our
+///   handle. Then restore+verify.
+/// - **Removable** flash: Windows can't shadow removable media, so there is no
+///   second arm — the backup MUST abort with a lock error. With handles closed
+///   it must then lock, capture faithfully, and release.
 #[test]
 #[ignore = "DESTRUCTIVE: wipes the real disk; set PHOENIX_T3_DISK"]
 fn real_vss_backup_roundtrip() {
@@ -659,21 +657,21 @@ fn real_vss_backup_roundtrip() {
         disk_index: idx,
         partition_indices: all_partition_indices(idx),
         output: backup.clone(),
-        use_vss: true,
         verify_after: true,
         verify_image: false,
         progress: None,
     });
 
     let backup = if shadow_works {
-        // Shadow media: the held handle proves the shadow was genuinely used.
-        result.expect("use_vss=true backup failed on shadow-capable media");
+        // Shadow media: the held handle blocks the lock, so a success here
+        // proves the engine escalated to a shadow on its own.
+        result.expect("backup failed on shadow-capable media — escalation to VSS did not happen");
         drop(held);
         eprintln!("[T3] VSS shadow backup succeeded with a handle held open");
         backup
     } else {
-        // Removable media: VSS must have fallen back, and the fallback must
-        // have refused to proceed past the held handle.
+        // Removable media: no shadow available, so the unlockable volume must
+        // abort the backup rather than smear a live read.
         match result {
             Err(e) => {
                 let msg = e.to_string().to_lowercase();
@@ -681,25 +679,24 @@ fn real_vss_backup_roundtrip() {
                     msg.contains("lock"),
                     "unexpected failure (wanted lock): {e}"
                 );
-                eprintln!("[T3] fallback correctly enforced the volume lock: {e}");
+                eprintln!("[T3] unfreezable volume correctly aborted the backup: {e}");
             }
             Ok(_) => panic!(
-                "backup succeeded with VSS unavailable and a handle held open — fallback \
-                 did not enforce the volume lock"
+                "backup succeeded with VSS unavailable and a handle held open — the engine \
+                 captured an unfrozen, mutating source instead of aborting"
             ),
         }
         drop(held);
-        // Now with handles closed the locked fallback must produce a good backup.
+        // Now with handles closed the volume must lock and produce a good backup.
         run_backup(BackupOptions {
             disk_index: idx,
             partition_indices: all_partition_indices(idx),
             output: backup.clone(),
-            use_vss: true,
             verify_after: true,
             verify_image: false,
             progress: None,
         })
-        .expect("fallback (locked) backup failed");
+        .expect("locked backup failed");
         std::fs::write(r"R:\post-backup.txt", b"unlocked").expect("volume still locked");
         backup
     };

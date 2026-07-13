@@ -39,7 +39,6 @@ fn backup_to(path: &std::path::Path, disk_index: u32) {
         disk_index,
         partition_indices: parts,
         output: path.to_path_buf(),
-        use_vss: false,
         verify_after: true,
         verify_image: false,
         progress: None,

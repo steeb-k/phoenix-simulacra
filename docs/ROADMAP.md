@@ -11,17 +11,26 @@ partial-restore volume-lock fix are all on `master`.
 
 ## What's done (for context)
 
-### VSS + volume-lock consistency: verified on virtual and real media (2026-07)
+### Automatic lock-then-VSS consistency: verified on virtual and real media (2026-07)
 
-Both consistency strategies are now **proven**, not just plumbed, across T2
-(VHDX) and T3 (real USB flash + real external HDD) — with tests constructed so
-`VssSession`'s silent live-volume fallback *fails* them rather than sneaking
-past (see TESTING.md, `vss.rs` + `real_vss_backup_roundtrip`): point-in-time
-shadow semantics; backup genuinely reading through the shadow (proven by
-succeeding with a file handle held open); the no-VSS fallback enforcing
-`FSCTL_LOCK_VOLUME` in both directions (refuses to start past open handles,
-and blocks external opens/writes for the capture's duration); and byte-exact
-round-trips on every path.
+There is **no user switch** for how a source is frozen (the "Use VSS" checkbox
+and `backup --vss` flag are gone as of 2026-07-12). Per partition the engine
+takes an exclusive `FSCTL_LOCK_VOLUME` when it can, escalates to a VSS shadow
+when the volume is too busy to lock (the running Windows volume always is), and
+**aborts** when a lettered volume can be frozen neither way rather than smear a
+live read into an image the user would trust. Un-lettered volumes (ESP/Recovery)
+that Windows refuses to lock *or* snapshot are the one unfrozen case, and
+verify-after checks the image instead of the source for them.
+
+Both arms are **proven**, not just plumbed, across T2 (VHDX) and T3 (real USB
+flash + real external HDD) — with tests constructed so `VssSession`'s silent
+live-volume fallback *fails* them rather than sneaking past (see TESTING.md,
+`vss.rs` + `real_vss_backup_roundtrip`): point-in-time shadow semantics; a
+backup genuinely escalating to and reading through the shadow (proven by
+succeeding with a file handle held open, which no lock could survive);
+`FSCTL_LOCK_VOLUME` enforced in both directions (an unfreezable volume refuses
+to start, and a locked one blocks external opens/writes for the capture's
+duration); and byte-exact round-trips on every path.
 
 **Field finding — volsnap torn reads:** reading a shadow *device* while the
 live volume takes writes can return a wrong read **once** for a block volsnap

@@ -268,7 +268,6 @@ struct PhoenixApp {
     /// means "not yet provided" — the Backup name input is tinted red and
     /// the Start backup button is disabled until something is typed here.
     backup_name: String,
-    use_vss: bool,
     /// FIFO queue of remaining backup jobs when a multi-disk selection is
     /// in flight. The currently-running job lives in `job`; on completion
     /// we pop the next entry here and spawn it.
@@ -401,7 +400,6 @@ impl PhoenixApp {
             selections: HashSet::new(),
             backup_folder,
             backup_name: demo_backup_name_from_args(),
-            use_vss: false,
             pending_backups: Vec::new(),
             pending_overwrite: None,
             pending_clone: None,
@@ -568,12 +566,11 @@ impl PhoenixApp {
     }
 
     /// Reset the Backup page to its untouched default: nothing selected,
-    /// empty name, the last-used folder, VSS off. The refresh button
-    /// doubles as a page reset on every page that has one.
+    /// empty name, the last-used folder. The refresh button doubles as a
+    /// page reset on every page that has one.
     fn clear_backup_ui_state(&mut self) {
         self.selections.clear();
         self.backup_name.clear();
-        self.use_vss = false;
         self.backup_folder = self
             .settings
             .default_backup_dir
@@ -1863,10 +1860,9 @@ impl PhoenixApp {
                 );
             });
 
-        ui.add_space(8.0);
-
         let grouped = self.group_selections();
         if grouped.len() > 1 {
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!(
                     "{} disks selected — output files will be auto-suffixed with -disk<N>.",
@@ -1875,9 +1871,6 @@ impl PhoenixApp {
                 .color(self.palette.subtle_text),
             );
         }
-
-        let vss_response = ui.checkbox(&mut self.use_vss, "Use VSS (live Windows)");
-        theme::draw_focus_outline(ui, &vss_response, &self.palette);
     }
 
     /// How a disk is named in the history: its model plus the number Windows
@@ -1982,7 +1975,6 @@ impl PhoenixApp {
                 disk_index: disk_idx,
                 partition_indices: parts,
                 output,
-                use_vss: self.use_vss,
                 verify_after: self.settings.verify_after_backup,
                 // Full BLAKE3 hash of the written image — the GUI never runs
                 // the source read-back comparison (CLI-only).

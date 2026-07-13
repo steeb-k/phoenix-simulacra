@@ -74,9 +74,12 @@ CLI and GUI behavior in WinPE are the same; only the PE architecture changes.
 Run the same scenarios you would on x64 (elevated):
 
 1. `carbon-phoenix list-disks`
-2. Backup a small data partition → `list` / `verify`
+2. Backup a small **idle** data partition → `list` / `verify` (this exercises the
+   exclusive-lock arm — the log should show `FSCTL_LOCK_VOLUME acquired`)
 3. GUI: backup with progress bar
-4. Optional: `backup --vss` on a mounted system volume
+4. Backup a mounted **system** volume — it can't be locked, so this exercises the
+   VSS-shadow arm (log: `VSS snapshot created`). VSS on ARM64 is the same
+   `Win32_ShadowCopy` path as x64
 5. Lab restore to a spare disk with `plan` → `restore`
 
 Results should match x64 expectations for the same disks and options.

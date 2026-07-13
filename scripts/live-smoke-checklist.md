@@ -16,8 +16,11 @@ or a spare disk you can afford to overwrite.
 ## 1. Live system-disk backup (VSS)
 
 - [ ] From an elevated prompt, list disks: `carbon-phoenix list-disks`.
-- [ ] Back up the live OS disk with VSS:
-      `carbon-phoenix backup --disk 0 --partitions <sys parts> -o C:\temp\live.phnx --vss`
+- [ ] Back up the live OS disk (the running volume can't be locked, so the engine
+      must escalate to a VSS shadow on its own — there is no flag):
+      `carbon-phoenix backup --disk 0 --partitions <sys parts> -o C:\temp\live.phnx`
+- [ ] Confirm the log shows `volume is in use; reading a VSS shadow instead of the
+      live volume` for the OS volume, and `VSS snapshot created`.
 - [ ] Verify the backup: `carbon-phoenix verify C:\temp\live.phnx` (full).
 - [ ] Confirm `verify --quick` also passes and is fast.
 

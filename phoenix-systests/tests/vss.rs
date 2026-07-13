@@ -1,48 +1,47 @@
-//! Tier-2 VSS verification: prove the shadow-copy path actually WORKS —
-//! not merely that a backup with `use_vss: true` doesn't error.
+//! Tier-2 verification of the engine's consistency policy. There is no user
+//! switch: every backup takes the strongest freeze the volume allows —
+//! `FSCTL_LOCK_VOLUME` first, a VSS shadow when the volume is too busy to
+//! lock, abort when a lettered volume allows neither. These tests pin all
+//! three arms, and prove the shadow path actually WORKS rather than merely
+//! not erroring.
 //!
 //! Why the paranoia: `VssSession::snapshot_volume` deliberately falls back to
-//! the live volume path on any snapshot failure (a failed snapshot shouldn't
-//! abort a backup), which means a naive `use_vss: true` round-trip test could
-//! pass with VSS completely broken. Both tests here are constructed so a
-//! silent fallback makes them FAIL:
+//! returning the live volume path on any snapshot failure, so a naive
+//! round-trip test could pass with VSS completely broken. Each test below is
+//! constructed so a silent fallback makes it FAIL:
 //!
 //! 1. `vss_snapshot_is_point_in_time` asserts the returned device path is a
 //!    real shadow (`HarddiskVolumeShadowCopy`), then modifies a file and reads
 //!    the ORIGINAL bytes back through the shadow — the actual point-in-time
 //!    guarantee VSS exists to provide.
-//! 2. `vss_backup_roundtrip_with_open_handle` runs a real backup with
-//!    `use_vss: true` while holding an open file handle on the volume. If the
-//!    shadow was used, the engine never locks the volume and the backup
-//!    succeeds. If VSS silently fell back, the engine's `FSCTL_LOCK_VOLUME`
-//!    hits our open handle and the backup errors — so a green run proves the
-//!    shadow was genuinely in the read path. The fixture is then restored and
-//!    verified byte-for-byte.
-//!
-//! The FALLBACK (VSS fails → live volume + `FSCTL_LOCK_VOLUME`) is verified
-//! too, forced deterministically: VSS only supports NTFS/ReFS, so
-//! `use_vss: true` on a FAT32 volume always fails snapshot creation and takes
-//! the fallback path.
-//!
-//! 3. `vss_fallback_enforces_volume_lock` — FAT32 + `use_vss: true` + an open
-//!    handle: the backup MUST fail with a lock error. If the fallback skipped
-//!    locking (and smeared a live read), the backup would succeed and the test
-//!    fails.
-//! 4. `vss_fallback_locked_roundtrip` — FAT32 + `use_vss: true`, no open
-//!    handles: the fallback locks, backs up, unlocks (proven by writing to the
-//!    volume afterward), and the restored fixture matches byte-for-byte.
+//! 2. `busy_volume_escalates_to_vss_shadow` runs a real backup of an NTFS
+//!    volume while holding an open file handle on it. The handle makes
+//!    `FSCTL_LOCK_VOLUME` fail, so the backup can only succeed if the engine
+//!    escalated to a shadow on its own — a green run proves the shadow was
+//!    genuinely in the read path. The fixture is then restored and verified
+//!    byte-for-byte.
+//! 3. `busy_volume_without_vss_aborts_backup` — VSS only supports NTFS/ReFS,
+//!    so a FAT32 volume with an open handle can be neither locked nor
+//!    snapshotted. The backup MUST fail with a lock error; if it ever
+//!    succeeds, the engine smeared a live read into an image the user would
+//!    trust.
+//! 4. `idle_fat32_volume_locked_roundtrip` — FAT32, no open handles: the
+//!    engine locks (never reaching the shadow arm it couldn't use anyway),
+//!    backs up, releases the lock (proven by writing to the volume
+//!    afterward), and the restored fixture matches byte-for-byte.
 //!
 //! And the lock's OUTBOUND exclusivity — while the lock is held, the rest of
 //! the system must be unable to open/write files on the volume (that's the
-//! consistency `FSCTL_LOCK_VOLUME` buys when VSS isn't available):
+//! consistency `FSCTL_LOCK_VOLUME` buys, and why it outranks a shadow):
 //!
 //! 5. `volume_lock_blocks_external_writes` — take the lock via the engine's
 //!    own primitive and prove external file creates/opens fail while it's
 //!    held, then succeed after release. Fully deterministic.
-//! 6. `locked_backup_blocks_writers_for_duration` — run a locked (no-VSS)
-//!    backup on a thread while this test hammers write attempts at the
-//!    volume: at least one attempt must be refused during the backup window,
-//!    and writes must succeed again once it completes.
+//! 6. `locked_backup_blocks_writers_for_duration` — back up an idle volume
+//!    (which the engine therefore locks rather than snapshots) on a thread
+//!    while this test hammers write attempts at it: at least one attempt must
+//!    be refused during the backup window, and writes must succeed again once
+//!    it completes.
 //!
 //! Requires an elevated shell (diskpart + VSS need admin):
 //!   cargo test -p phoenix-systests --test vss -- --ignored --test-threads=1 --nocapture
@@ -78,7 +77,7 @@ fn make_ntfs_vhd(letter: char, label: &str) -> TestVhd {
     make_vhd(letter, label, TestFs::Ntfs)
 }
 
-fn backup_disk(disk_index: u32, use_vss: bool) -> phoenix_core::error::Result<std::path::PathBuf> {
+fn backup_disk(disk_index: u32) -> phoenix_core::error::Result<std::path::PathBuf> {
     let disks = phoenix_core::disk::enumerate_disks().unwrap();
     let disk = disks.iter().find(|d| d.index == disk_index).unwrap();
     let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
@@ -88,7 +87,6 @@ fn backup_disk(disk_index: u32, use_vss: bool) -> phoenix_core::error::Result<st
         disk_index,
         partition_indices: parts,
         output: backup_path.clone(),
-        use_vss,
         verify_after: true,
         verify_image: false,
         progress: None,
@@ -190,14 +188,14 @@ fn vss_snapshot_is_point_in_time() {
     eprintln!("[vss] point-in-time semantics verified (shadow serves pre-modification bytes)");
 }
 
-/// End-to-end: a real backup through VSS while the volume has an open file
+/// End-to-end escalation: a real backup of a volume that has an open file
 /// handle. The open handle makes `FSCTL_LOCK_VOLUME` fail, so this backup can
-/// only succeed if the engine read from a shadow (which needs no lock) — a
-/// green run proves the VSS path was genuinely used, then the restored fixture
-/// proves the shadow's bytes were a faithful copy.
+/// only succeed if the engine escalated to a shadow on its own (which needs no
+/// lock) — a green run proves the VSS arm was genuinely taken, then the
+/// restored fixture proves the shadow's bytes were a faithful copy.
 #[test]
 #[ignore = "requires elevation + diskpart + VSS"]
-fn vss_backup_roundtrip_with_open_handle() {
+fn busy_volume_escalates_to_vss_shadow() {
     require_admin();
     let _ = cleanup_leaked_vhds();
 
@@ -216,9 +214,10 @@ fn vss_backup_roundtrip_with_open_handle() {
     held.write_all(b"held open during backup")
         .expect("write held");
 
-    let backup_path = backup_disk(source.disk_index(), true).expect(
-        "run_backup with use_vss=true failed — with a handle held open this almost always \
-         means VSS snapshot creation failed and the engine fell back to a live-volume lock",
+    let backup_path = backup_disk(source.disk_index()).expect(
+        "run_backup failed with a handle held open — the volume can't be locked while we \
+         hold it, so this almost always means the escalation to a VSS shadow failed \
+         (check elevation / the VSS service / shadow storage)",
     );
 
     // Keep the handle alive until after the backup finishes, then release it.
@@ -257,14 +256,14 @@ fn vss_backup_roundtrip_with_open_handle() {
     let _ = std::fs::remove_file(&backup_path);
 }
 
-/// FORCED-FALLBACK exclusivity: VSS can't snapshot FAT32, so `use_vss: true`
-/// on a FAT32 volume always falls back to the live volume — where the engine
-/// must take `FSCTL_LOCK_VOLUME`. With a handle held open, that lock MUST
-/// fail and abort the backup. If this backup ever *succeeds*, the fallback
-/// skipped locking and smeared a live read — exactly the bug this guards.
+/// The third arm of the policy: neither freeze is available, so the backup
+/// must ABORT. VSS can't snapshot FAT32, so a FAT32 volume with a handle held
+/// open can be neither locked nor shadowed. If this backup ever *succeeds*,
+/// the engine smeared a live read into an image the user would trust —
+/// exactly the silent corruption this guards.
 #[test]
 #[ignore = "requires elevation + diskpart"]
-fn vss_fallback_enforces_volume_lock() {
+fn busy_volume_without_vss_aborts_backup() {
     require_admin();
     let _ = cleanup_leaked_vhds();
 
@@ -279,7 +278,7 @@ fn vss_fallback_enforces_volume_lock() {
         .expect("open held file");
     held.write_all(b"held").expect("write held");
 
-    let result = backup_disk(source.disk_index(), true);
+    let result = backup_disk(source.disk_index());
     match result {
         Err(e) => {
             let msg = e.to_string().to_lowercase();
@@ -287,13 +286,13 @@ fn vss_fallback_enforces_volume_lock() {
                 msg.contains("lock"),
                 "backup failed for an unexpected reason (wanted a volume-lock failure): {e}"
             );
-            eprintln!("[vss] fallback correctly enforced the volume lock: {e}");
+            eprintln!("[vss] unfreezable volume correctly aborted the backup: {e}");
         }
         Ok(p) => {
             let _ = std::fs::remove_file(&p);
             panic!(
-                "backup SUCCEEDED with VSS unavailable and a handle held open — the \
-                 live-volume fallback did not enforce FSCTL_LOCK_VOLUME"
+                "backup SUCCEEDED with VSS unavailable and a handle held open — the engine \
+                 captured an unfrozen, mutating source instead of aborting"
             );
         }
     }
@@ -345,11 +344,13 @@ fn volume_lock_blocks_external_writes() {
     eprintln!("[vss] lock released: volume usable again");
 }
 
-/// OUTBOUND lock exclusivity, end-to-end: a locked (no-VSS) backup runs on a
-/// worker thread while this thread hammers write attempts at the volume.
-/// At least one attempt must be refused while the backup window is open —
-/// proving the engine really holds the lock for the capture's duration —
-/// and writes must succeed again after it returns.
+/// OUTBOUND lock exclusivity, end-to-end: an idle volume — which the engine
+/// therefore locks rather than snapshots — is backed up on a worker thread
+/// while this thread hammers write attempts at it. At least one attempt must
+/// be refused while the backup window is open — proving the engine really
+/// holds the lock for the capture's duration — and writes must succeed again
+/// after it returns. (A `refused == 0` failure also catches the engine
+/// wrongly escalating an idle volume to a shadow, which leaves it writable.)
 #[test]
 #[ignore = "requires elevation + diskpart"]
 fn locked_backup_blocks_writers_for_duration() {
@@ -365,7 +366,7 @@ fn locked_backup_blocks_writers_for_duration() {
     // (they, not our writer, are what starved the lock across all 5 retries).
     wait_until_lockable(r"\\.\X:", 30_000);
 
-    let backup_thread = std::thread::spawn(move || backup_disk(disk_index, false));
+    let backup_thread = std::thread::spawn(move || backup_disk(disk_index));
 
     // Give the engine's pre-flight lock a brief contention-free window to land
     // before we start hammering — the writer's own transient handles can
@@ -409,29 +410,28 @@ fn locked_backup_blocks_writers_for_duration() {
     eprintln!("[vss] locked backup held exclusivity for its duration and restored faithfully");
 }
 
-/// FORCED-FALLBACK round-trip: FAT32 + `use_vss: true`, no open handles. The
-/// fallback must lock the live volume, produce a faithful backup
-/// (verify-after re-reads under the same lock), release the lock on
+/// The preferred arm, on a volume that has no shadow to fall back to: FAT32,
+/// no open handles. The engine must lock the live volume, produce a faithful
+/// backup (verify-after re-reads under the same lock), release the lock on
 /// completion (proven by writing to the volume afterward), and restore
 /// byte-for-byte.
 #[test]
 #[ignore = "requires elevation + diskpart"]
-fn vss_fallback_locked_roundtrip() {
+fn idle_fat32_volume_locked_roundtrip() {
     require_admin();
     let _ = cleanup_leaked_vhds();
 
     let source = make_vhd('X', "VSSFB2", TestFs::Fat32);
     let digest = fill_fixture('X', 0x7777).expect("fill fixture");
 
-    let backup_path =
-        backup_disk(source.disk_index(), true).expect("fallback (live-volume lock) backup failed");
+    let backup_path = backup_disk(source.disk_index()).expect("live-volume lock backup failed");
 
     // The lock must be released once the backup completes.
     std::fs::write(r"X:\post-backup-write.txt", b"unlocked again")
         .expect("volume still locked after backup returned");
 
     restore_and_verify(&backup_path, &digest);
-    eprintln!("[vss] forced-fallback locked backup round-trip verified (lock taken + released)");
+    eprintln!("[vss] idle-volume lock round-trip verified (lock taken + released)");
 
     let _ = std::fs::remove_file(&backup_path);
 }

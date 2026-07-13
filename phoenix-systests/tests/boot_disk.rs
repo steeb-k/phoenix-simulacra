@@ -385,7 +385,6 @@ fn boot_a_capture_image() {
         disk_index: src,
         partition_indices: parts,
         output: image.clone(),
-        use_vss: true,
         verify_after: true,
         verify_image: false,
         progress: Some(progress.handle()),

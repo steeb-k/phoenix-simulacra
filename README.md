@@ -21,7 +21,10 @@ Windows disk backup tool written in Rust. Creates single-file `.phnx` backups wi
   every chunk matches — proving the image faithfully captured the disk, not just that
   the file is internally consistent (opt out with `backup --no-verify`)
 - Verify-on-restore (default) and optional read-back verification on clone
-- VSS support for live Windows backups (`--vss` / GUI checkbox)
+- **Automatic source freeze — no switch to get wrong:** every backup takes an exclusive
+  volume lock when it can, falls back to a VSS shadow when the volume is in use (the
+  running Windows volume always is), and refuses to capture a lettered volume it can
+  freeze neither way
 - CLI and egui GUI (WinPE-friendly, no WebView2)
 
 > **Mounting requires WinFsp** — the `winfsp` build feature is **on by default**
@@ -64,11 +67,10 @@ Packaged copies from the release script: `dist/<target>/`.
 # List disks (UAC prompt appears automatically when launching the exe)
 carbon-phoenix list-disks
 
-# Backup partitions 1,2,3 on disk 0
+# Backup partitions 1,2,3 on disk 0. Idle volumes are captured under an exclusive
+# lock; volumes in use (the live C: among them) are captured through a VSS shadow —
+# there is nothing to choose.
 carbon-phoenix backup --disk 0 --partitions 1,2,3 --output backup.phnx
-
-# Live backup with VSS
-carbon-phoenix backup --disk 0 --partitions 2 --output c.phnx --vss
 
 # Inspect backup
 carbon-phoenix list backup.phnx

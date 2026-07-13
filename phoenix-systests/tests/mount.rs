@@ -147,7 +147,6 @@ fn mount_backup_and_browse_files() {
         disk_index: source.disk_index(),
         partition_indices: parts,
         output: backup_path.clone(),
-        use_vss: false,
         verify_after: true,
         verify_image: false,
         progress: None,

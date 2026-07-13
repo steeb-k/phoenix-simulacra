@@ -26,7 +26,6 @@ pub struct BackupOptions {
     pub disk_index: u32,
     pub partition_indices: Vec<u32>,
     pub output: std::path::PathBuf,
-    pub use_vss: bool,
     /// After capture, re-read the source and confirm every chunk still hashes
     /// to what was recorded — proving the backup faithfully captured the disk.
     /// Done while the VSS snapshot / volume lock is still held so the source
@@ -181,12 +180,26 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 
     // ---- PHASE 1: pre-flight ----
     //
-    // For every selected partition: resolve the read path (VSS shadow when
-    // available, otherwise live volume / raw disk), open the reader, and if
-    // we ended up on a live mounted volume hold an exclusive
-    // `FSCTL_LOCK_VOLUME` on it. We do this entirely up front so that a
-    // lock failure on partition N can't strand a backup that has already
-    // burned hours streaming partitions 1..N-1.
+    // For every selected partition: open a reader on a source we can trust to
+    // hold still, and plan the capture. We do this entirely up front so that a
+    // failure on partition N can't strand a backup that has already burned
+    // hours streaming partitions 1..N-1.
+    //
+    // The freeze strategy is not a user choice — the engine takes the
+    // strongest one the volume allows, in this order:
+    //
+    //   1. Exclusive `FSCTL_LOCK_VOLUME` on the live volume. Cheapest and
+    //      strongest: no shadow storage, no VSS writers, no snapshot to tear
+    //      down, and the OS flushes dirty cache pages before granting it.
+    //   2. A VSS shadow, when the lock is refused because files are open —
+    //      the normal case for the running Windows volume and for any volume
+    //      an app is using. The shadow is frozen by construction.
+    //   3. Neither: capture unfrozen. Tolerated only for un-lettered volumes
+    //      (ESP/Recovery), where Windows can refuse both and there is no open
+    //      file for the user to close; verify-after then checks the image
+    //      rather than re-reading the mutable source. A *lettered* volume that
+    //      can't be locked or snapshotted aborts the backup — a smeared read
+    //      would silently corrupt an image the user believes in.
     //
     // On any error (cancel, lock failure, open failure) the partial
     // `prepared` Vec drops below, which releases every lock we already
@@ -214,47 +227,37 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             );
         }
 
-        let original_volume = part.volume_path.clone();
         // A locked BitLocker volume must be read through the PHYSICAL disk
         // handle at the partition offset: fvevol rejects reads through the
         // volume device with FVE_E_LOCKED_VOLUME (0x80310000) until the
         // volume is unlocked (observed live in the T2 bitlocker systest).
         // That also rules out VSS (no mounted filesystem to snapshot) and
-        // FSCTL_LOCK_VOLUME (nothing is mounted; and `is_live` below is
-        // false for the PhysicalDrive path). The ciphertext can't change
+        // FSCTL_LOCK_VOLUME (nothing is mounted). The ciphertext can't change
         // underneath us unless someone unlocks and writes mid-backup — and
         // verify-after-backup re-reads the source, so even that tampering
         // window fails loudly instead of corrupting the image silently.
         let locked_bitlocker = part.bitlocker == BitlockerState::Locked;
-        let read_path = if locked_bitlocker {
-            disk.path.clone()
-        } else if opts.use_vss {
-            if let Some(ref vol) = original_volume {
-                vss.snapshot_volume(vol)?
-            } else {
-                disk.path.clone()
-            }
-        } else if let Some(ref vol) = original_volume {
-            vol.clone()
-        } else {
-            disk.path.clone()
+        let volume = match &part.volume_path {
+            Some(vol) if !locked_bitlocker => Some(vol.clone()),
+            // No mounted volume (MSR, unformatted, BitLocker-locked): read the
+            // partition's bytes straight off `\\.\PhysicalDriveN`. Nothing to
+            // lock and nothing to snapshot.
+            _ => None,
         };
 
-        // Live iff we ended up reading the partition's original mounted
-        // drive-letter path. When VSS Create succeeded `read_path` is
-        // rewritten to `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN`
-        // (already a frozen snapshot — no lock needed). When VSS was off
-        // or fell back, `read_path` equals `original_volume` and we want
-        // the lock.
-        let is_live = original_volume
-            .as_deref()
-            .map(|orig| orig == read_path.as_str())
-            .unwrap_or(false);
+        let mut is_live = false;
+        let mut frozen = locked_bitlocker;
 
-        let mut reader = if read_path.contains("PhysicalDrive") {
-            PartitionReader::open_disk_partition(&read_path, part.offset_bytes, part.size_bytes)?
-        } else {
-            PartitionReader::open_volume(&read_path)?
+        let mut reader = match &volume {
+            Some(vol) => {
+                is_live = true;
+                PartitionReader::open_volume(vol)?
+            }
+            None => PartitionReader::open_disk_partition(
+                &disk.path,
+                part.offset_bytes,
+                part.size_bytes,
+            )?,
         };
 
         // Plan BEFORE locking. For NTFS, `plan_capture` issues
@@ -264,60 +267,84 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         // ordering is irrelevant — they only do raw reads, which work on
         // either a locked or unlocked handle — but doing the planning
         // uniformly up front keeps the lifecycle simple to reason about.
-        let (extents, bytes_per_cluster, capture_mode, fs_kind, bitmap_hash) =
+        let (mut extents, mut bytes_per_cluster, mut capture_mode, mut fs_kind, mut bitmap_hash) =
             plan_capture(part, &mut reader)?;
 
-        // Frozen-source bookkeeping: a VSS shadow is frozen by definition,
-        // and a locked-BitLocker partition's ciphertext is static while it
-        // stays locked. A live volume becomes frozen only if the lock below
-        // succeeds.
-        let mut frozen = original_volume
-            .as_deref()
-            .map(|orig| orig != read_path.as_str())
-            .unwrap_or(false)
-            || locked_bitlocker;
-
-        if is_live {
-            // Use the original volume path as the user-facing label
-            // (e.g. `\\.\E:`); we don't want shadow GLOBALROOT junk in the
-            // error message even though we'd never actually take this
-            // branch with a shadow path.
-            let label = original_volume
-                .as_deref()
-                .unwrap_or(read_path.as_str())
-                .to_string();
+        if let Some(vol) = &volume {
             if let Some(ref progress) = opts.progress {
                 // Sub-message under the "Preparing volumes" step — keep the
                 // step itself fixed and surface the per-volume lock as detail.
                 progress.set_detail(format!(
                     "Locking {} for exclusive backup access ({}/{})",
-                    label,
+                    vol,
                     idx + 1,
                     partition_count
                 ));
             }
-            match reader.lock_volume(&label) {
+            match reader.lock_volume(vol) {
                 Ok(()) => frozen = true,
-                Err(e) => {
-                    // Lettered volumes: a lock failure means files are open
-                    // and the filesystem is actively mutating — abort before
-                    // any bytes are streamed (`prepared` drops, releasing
-                    // earlier locks). Un-lettered volumes (ESP/Recovery via
-                    // their \\?\Volume{GUID} device): Windows can refuse the
-                    // lock outright (observed: ERROR_ACCESS_DENIED on the
-                    // ESP), and there is no user-closeable "open file" to
-                    // remedy — capture unfrozen instead, and verify-after
-                    // checks the image's integrity rather than re-reading
-                    // the (mutable) source.
-                    if parse_drive_letter(&label).is_some() {
-                        return Err(e);
+                Err(lock_err) => {
+                    // The volume is busy (the running system volume always is,
+                    // and so is any volume with an app holding a file open).
+                    // Fall back to a shadow copy of the same volume, which
+                    // freezes it without evicting anyone.
+                    if let Some(ref progress) = opts.progress {
+                        progress.set_detail(format!(
+                            "{} is in use — taking a VSS snapshot instead ({}/{})",
+                            vol,
+                            idx + 1,
+                            partition_count
+                        ));
                     }
-                    warn!(
-                        volume = label.as_str(),
-                        error = %e,
-                        "cannot lock un-lettered volume; capturing without a frozen source \
-                         (verify-after will check image integrity instead of source match)"
-                    );
+                    // `snapshot_volume` never errors on Windows: on any failure
+                    // it hands back the live path it was given, so an unchanged
+                    // path means "no shadow for this volume" (FAT/exFAT, which
+                    // VSS cannot snapshot; removable media; no shadow storage).
+                    let shadow = vss.snapshot_volume(vol)?;
+                    if shadow != *vol {
+                        info!(
+                            volume = vol.as_str(),
+                            error = %lock_err,
+                            "volume is in use; reading a VSS shadow instead of the live volume"
+                        );
+                        // Re-plan against the shadow: its bitmap is the frozen
+                        // one we're about to stream, and it can differ from the
+                        // live bitmap we read a moment ago. Assigning `reader`
+                        // drops the live handle.
+                        reader = PartitionReader::open_volume(&shadow)?;
+                        (
+                            extents,
+                            bytes_per_cluster,
+                            capture_mode,
+                            fs_kind,
+                            bitmap_hash,
+                        ) = plan_capture(part, &mut reader)?;
+                        is_live = false;
+                        frozen = true;
+                    } else if parse_drive_letter(vol).is_some() {
+                        // Lettered volume we could neither lock nor snapshot:
+                        // files are open and the filesystem is actively
+                        // mutating. Abort before any bytes are streamed
+                        // (`prepared` drops, releasing earlier locks) rather
+                        // than write a torn image. The lock error names the
+                        // drive and is the actionable one to surface.
+                        return Err(lock_err);
+                    } else {
+                        // Un-lettered volumes (ESP/Recovery via their
+                        // \\?\Volume{GUID} device): Windows can refuse the lock
+                        // outright (observed: ERROR_ACCESS_DENIED on the ESP)
+                        // and VSS can refuse to snapshot them too, and there is
+                        // no user-closeable "open file" to remedy either.
+                        // Capture unfrozen; verify-after checks the image's
+                        // integrity instead of re-reading the mutable source.
+                        warn!(
+                            volume = vol.as_str(),
+                            error = %lock_err,
+                            "cannot lock or snapshot un-lettered volume; capturing without a \
+                             frozen source (verify-after will check image integrity instead of \
+                             source match)"
+                        );
+                    }
                 }
             }
         }
