@@ -426,6 +426,46 @@ thin shell over the CLI:
 
 Everything here ranks below the correctness items at the top of this document.
 
+### P2 — Updater (self-update, wired to "Check for updates")
+
+The GUI's About page already has the button, and it already returns a click to
+`ui_about` — which today answers `"Update checks aren't wired up yet."`
+(`phoenix-gui/src/main.rs`, `about_panel::show`). So the UI hook exists and the
+work is the machinery behind it.
+
+**Shape:**
+
+- **Release feed.** GitHub Releases is the obvious source (the repo is already
+  there, and `build-release.ps1` already produces the per-target binaries). Query
+  the latest release, compare its tag against `CARGO_PKG_VERSION` — which the
+  running binary already knows via `version::BUILD_INFO`, alongside its git hash
+  and build timestamp.
+- **Manual check** (the button): report *up to date* / *update available* /
+  *check failed* in the status line, and offer to download + apply.
+- **Optional check on startup**, off by default and behind a setting. Silent when
+  there's nothing to say; a non-modal nudge when there is. It must never block the
+  app from starting, and it must never phone home if the user hasn't opted in.
+- **Applying it.** The exe is running, so it cannot overwrite itself in place:
+  download to a temp path, verify, then hand off to a small side process (or a
+  `MoveFileEx` reboot-time replace) that swaps the binary and relaunches. This is
+  the fiddly part and where the design should be settled before any code.
+
+**Non-negotiables, given what this app is:**
+
+- **Verify what you downloaded before you run it.** A backup tool runs elevated
+  and has raw disk access — an updater that will execute whatever the network hands
+  it is a far worse vulnerability here than in an ordinary app. HTTPS is table
+  stakes; a signature or a published hash checked against the release is the actual
+  bar.
+- **Never auto-update while an operation is in flight.** A backup, restore, or
+  clone that gets its binary swapped mid-run is a data-loss bug wearing a feature's
+  clothes. The updater must refuse outright when a job is active.
+- **Opt-in, and visible.** Automatic checking is off unless the user turns it on,
+  and the About page should say plainly what it does and doesn't send.
+
+Not started. The button is a placeholder, and the status line says so — which is
+the right state to be in until the download-and-swap design is nailed down.
+
 ### P2 — WinFsp installer bundling
 The mount feature requires the WinFsp driver at run time. The binary already
 delay-loads `winfsp-<arch>.dll` and finds it via the registry, so the app just
