@@ -268,6 +268,7 @@ mod tests {
             disk_signature: index as u64,
             sector_size: 512,
             model: None,
+            drive_type: None,
             partitions: parts,
         }
     }

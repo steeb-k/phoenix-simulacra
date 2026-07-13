@@ -1,7 +1,7 @@
 //! Windows physical disk and partition enumeration.
 
 use std::ffi::OsStr;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
@@ -12,15 +12,23 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetVolumeInformationW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE,
     IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
+use windows_sys::Win32::Storage::IscsiDisc::{
+    IOCTL_SCSI_PASS_THROUGH_DIRECT, SCSI_IOCTL_DATA_IN, SCSI_PASS_THROUGH_DIRECT,
+};
 use windows_sys::Win32::System::Ioctl::{
-    PropertyStandardQuery, StorageDeviceProperty, DRIVE_LAYOUT_INFORMATION_EX,
-    IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
-    PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT, STORAGE_DEVICE_DESCRIPTOR,
-    STORAGE_PROPERTY_QUERY,
+    PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+    IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY, PARTITION_INFORMATION_EX,
+    PARTITION_STYLE_GPT, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 use crate::error::{PhoenixError, Result};
+
+/// Ceiling on how long a single media-identification SCSI command may take.
+/// Generous for a query that returns immediately from any healthy device, and
+/// short enough that a wedged USB bridge can't stall disk enumeration.
+const SCSI_TIMEOUT_SECS: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -162,6 +170,13 @@ pub struct DiskInfo {
     /// the IOCTL itself fails — the GUI then omits the trailing
     /// " - <model>" segment in the disk label.
     pub model: Option<String>,
+    /// What the device *is* rather than what it's called: bus plus media class
+    /// ("NVMe SSD", "SATA HDD", "USB Flash Drive"). Derived from the descriptor's
+    /// `BusType`/`RemovableMedia` plus the seek-penalty IOCTL — the only
+    /// generally-available signal that separates a spinning disk from an SSD.
+    /// `None` when the device descriptor IOCTL itself fails, in which case the
+    /// GUI card simply omits the row.
+    pub drive_type: Option<String>,
     pub partitions: Vec<PartitionInfo>,
 }
 
@@ -212,6 +227,26 @@ pub fn open_disk_readonly(path: &str) -> Result<HANDLE> {
         return Err(PhoenixError::Disk(format!("cannot open {path}")));
     }
     Ok(handle)
+}
+
+/// Open a disk for read *and* write. Only [`probe_media`] needs this: SCSI
+/// pass-through is refused outright on a read-only handle, even for the
+/// data-in queries we issue. Returns `None` rather than an error because every
+/// caller treats a refusal as "we just don't learn anything".
+fn open_disk_readwrite(path: &str) -> Option<HANDLE> {
+    let wide = to_wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0xc000_0000, // GENERIC_READ | GENERIC_WRITE
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    (handle != INVALID_HANDLE_VALUE).then_some(handle)
 }
 
 pub fn open_volume_readonly(path: &str) -> Result<HANDLE> {
@@ -395,8 +430,34 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
     let size_bytes = get_disk_length(handle)?;
     let layout = get_drive_layout(handle)?;
     let sector_size = get_sector_size(handle);
-    // Failure here is non-fatal: the disk still enumerates without a model.
-    let model = query_disk_model(handle);
+    // Failure here is non-fatal: the disk still enumerates, just without a
+    // model or drive type.
+    let descriptor = query_device_descriptor(handle);
+    // The storage stack's own answer on spinning-vs-solid-state, and the only
+    // one that internal disks need.
+    let seek_penalty = query_seek_penalty(handle);
+    // USB bridges answer nothing above (Windows itself shows them as media type
+    // "Unspecified"), so ask the device directly. Gated on the seek penalty
+    // coming back unknown, which keeps the read/write handle `probe_media`
+    // needs off every internal disk on a routine enumeration.
+    let probe = if seek_penalty.is_none() {
+        probe_media(path)
+    } else {
+        MediaProbe::default()
+    };
+
+    let descriptor_model = descriptor.as_ref().map(|d| {
+        d.model
+            .clone()
+            .unwrap_or_else(|| bus_type_label(d.bus_type, d.removable))
+    });
+    // A drive behind a USB bridge names itself far more usefully than the
+    // enclosure does ("ST4000LM024-2AN17V" beats "Seagate Expansion"), so the
+    // probed model wins when we got one.
+    let model = probe.model.or(descriptor_model);
+    let drive_type = descriptor
+        .as_ref()
+        .map(|d| drive_type_label(d.bus_type, d.removable, seek_penalty.or(probe.spins)));
 
     let (is_gpt, disk_guid, disk_signature, partitions) = match layout {
         LayoutInfo::Gpt { disk_guid, entries } => {
@@ -492,24 +553,32 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
         disk_signature,
         sector_size,
         model,
+        drive_type,
         partitions,
     })
 }
 
-/// Ask the storage driver for the device's vendor + product strings via
-/// `IOCTL_STORAGE_QUERY_PROPERTY`. When those are blank (common for USB
-/// bridges, virtual disks, and some RAID controllers) fall back to a label
-/// derived from `BusType` / `RemovableMedia` so the GUI dropdown still has
-/// *something* useful to show. Any IOCTL or parse failure produces `None`,
-/// which the caller treats as "this disk has no model" — the dropdown just
-/// omits the trailing segment.
+/// The parts of `STORAGE_DEVICE_DESCRIPTOR` we care about, lifted out of the
+/// raw buffer so the pointer arithmetic stays in one place.
+struct DeviceDescriptor {
+    /// Vendor + product strings, when the device exposes them. Blank for many
+    /// USB bridges, virtual disks, and RAID controllers.
+    model: Option<String>,
+    bus_type: i32,
+    removable: u8,
+}
+
+/// Ask the storage driver for the device descriptor via
+/// `IOCTL_STORAGE_QUERY_PROPERTY`. Any IOCTL or parse failure produces `None`,
+/// which the caller treats as "nothing is known about this device" — the GUI
+/// then omits both the model and the drive-type row.
 ///
 /// The 1024-byte buffer is intentionally generous: the descriptor header
 /// is ~40 bytes and Windows packs the four ASCIIZ strings (vendor, product,
 /// revision, serial) at the offsets it returns, all of which sit well
 /// inside that limit on every real device we've seen. If a device ever
 /// returns a longer descriptor we silently truncate at the buffer end.
-fn query_disk_model(handle: HANDLE) -> Option<String> {
+fn query_device_descriptor(handle: HANDLE) -> Option<DeviceDescriptor> {
     const BUF_SIZE: usize = 1024;
     let query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageDeviceProperty,
@@ -559,7 +628,7 @@ fn query_disk_model(handle: HANDLE) -> Option<String> {
         }
     };
 
-    let combined = match (read_at(vendor_off), read_at(product_off)) {
+    let model = match (read_at(vendor_off), read_at(product_off)) {
         (Some(v), Some(p)) if v.eq_ignore_ascii_case(&p) => Some(p),
         (Some(v), Some(p)) => Some(format!("{v} {p}")),
         (Some(v), None) => Some(v),
@@ -567,7 +636,275 @@ fn query_disk_model(handle: HANDLE) -> Option<String> {
         (None, None) => None,
     };
 
-    combined.or_else(|| Some(bus_type_label(bus_type, removable)))
+    Some(DeviceDescriptor {
+        model,
+        bus_type,
+        removable,
+    })
+}
+
+/// Ask whether the device incurs a seek penalty — i.e. whether it spins.
+/// This is the only signal Windows offers every storage driver for telling a
+/// hard disk from a solid-state one, and it is genuinely optional: plenty of
+/// USB bridges and virtual disks reject the query, hence `None` for "unknown"
+/// rather than a guess.
+fn query_seek_penalty(handle: HANDLE) -> Option<bool> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0u8; 1],
+    };
+    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR {
+        Version: 0,
+        Size: 0,
+        IncursSeekPenalty: 0,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *const _,
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            &mut descriptor as *mut _ as *mut _,
+            size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 || (returned as usize) < size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() {
+        debug!(
+            last_error = unsafe { GetLastError() },
+            "seek-penalty query failed; SSD/HDD class unknown"
+        );
+        return None;
+    }
+    Some(descriptor.IncursSeekPenalty != 0)
+}
+
+/// What a device says about itself when the storage stack has nothing to say —
+/// the result of talking SCSI to it directly.
+#[derive(Default)]
+struct MediaProbe {
+    /// `Some(true)` spins, `Some(false)` is solid-state, `None` wouldn't say.
+    spins: Option<bool>,
+    /// The model of the drive *behind* a bridge, when it can be reached.
+    model: Option<String>,
+}
+
+/// Ask a device what medium it is by issuing SCSI commands to it, for the
+/// devices Windows can't classify (in practice: everything on USB).
+///
+/// Two routes, because neither covers every enclosure:
+///   * INQUIRY VPD page 0xB1 (Block Device Characteristics), whose rotation
+///     rate field the bridge answers itself; and
+///   * SAT ATA PASS-THROUGH of IDENTIFY DEVICE, which reaches past the bridge
+///     to the drive, yielding both the rate and the drive's real model.
+///
+/// Both are read-only queries. A device that implements neither (typically a
+/// thumb drive) leaves everything `None` and the caller falls back to the bus.
+fn probe_media(path: &str) -> MediaProbe {
+    // SPTD rejects a read-only handle with ACCESS_DENIED even though we only
+    // ever issue data-in commands, so this handle asks for write access it
+    // never uses. If that's refused, we simply learn nothing.
+    let Some(handle) = open_disk_readwrite(path) else {
+        debug!(
+            path,
+            "no read/write handle; skipping media pass-through probe"
+        );
+        return MediaProbe::default();
+    };
+
+    let vpd_rate = inquiry_rotation_rate(handle);
+    let identify = ata_identify(handle);
+    unsafe { CloseHandle(handle) };
+
+    let ata_rate = identify
+        .as_ref()
+        .and_then(|id| id.get(434..436))
+        .map(|w| u16::from_le_bytes([w[0], w[1]]));
+    // Words 27..46 hold the model. The two sources agree when both answer, so
+    // either order works; VPD is the cheaper and more standard one.
+    let model = identify.as_ref().and_then(|id| ata_string(id, 27, 20));
+
+    MediaProbe {
+        spins: vpd_rate
+            .and_then(rate_spins)
+            .or(ata_rate.and_then(rate_spins)),
+        model,
+    }
+}
+
+/// Interpret a SCSI/ATA nominal rotation rate. Both standards use the same
+/// encoding: 1 means the medium doesn't rotate, a plain RPM value means it
+/// does, and everything else (notably 0, "not reported") means the device
+/// declined to say — which is emphatically not the same as "solid state".
+fn rate_spins(rate: u16) -> Option<bool> {
+    match rate {
+        0x0001 => Some(false),
+        0x0401..=0xfffe => Some(true),
+        _ => None,
+    }
+}
+
+/// Pull an ATA string out of an IDENTIFY DEVICE response. ATA stores them
+/// byte-swapped within each 16-bit word, and pads with spaces.
+fn ata_string(identify: &[u8], word_start: usize, words: usize) -> Option<String> {
+    let bytes = identify.get(word_start * 2..(word_start + words) * 2)?;
+    let s: String = bytes
+        .chunks_exact(2)
+        .flat_map(|w| [w[1], w[0]])
+        .map(|b| if b.is_ascii_graphic() { b as char } else { ' ' })
+        .collect();
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// INQUIRY for VPD page 0xB1, returning its MEDIUM ROTATION RATE field.
+fn inquiry_rotation_rate(handle: HANDLE) -> Option<u16> {
+    // opcode, EVPD=1, page 0xB1, 2-byte allocation length, control.
+    const ALLOC: u16 = 64;
+    let cdb = [
+        0x12,
+        0x01,
+        0xb1,
+        (ALLOC >> 8) as u8,
+        (ALLOC & 0xff) as u8,
+        0x00,
+    ];
+    let data = scsi_data_in(handle, &cdb, ALLOC as u32)?;
+    Some(u16::from_be_bytes([*data.get(4)?, *data.get(5)?]))
+}
+
+/// IDENTIFY DEVICE (ATA 0xEC) wrapped in a SAT ATA PASS-THROUGH command, which
+/// a SCSI/ATA-translating bridge forwards to the drive it fronts. Bridges vary
+/// in which CDB length they accept, so try the 16-byte form and then the 12.
+fn ata_identify(handle: HANDLE) -> Option<Vec<u8>> {
+    // byte 1: protocol 4 (PIO data-in) << 1. byte 2: T_DIR=from device,
+    // BYT_BLOK=blocks, T_LENGTH=in the sector-count field. Sector count 1,
+    // command 0xEC — i.e. "send me one 512-byte block of IDENTIFY data".
+    const CDB16: [u8; 16] = [0x85, 0x08, 0x0e, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xec, 0];
+    const CDB12: [u8; 12] = [0xa1, 0x08, 0x0e, 0, 1, 0, 0, 0, 0, 0, 0xec, 0];
+    scsi_data_in(handle, &CDB16, 512).or_else(|| scsi_data_in(handle, &CDB12, 512))
+}
+
+/// A pass-through request and its sense buffer in one allocation — the sense
+/// data is addressed as an offset into the very struct we submit.
+#[repr(C)]
+struct SptdWithSense {
+    sptd: SCSI_PASS_THROUGH_DIRECT,
+    sense: [u8; 32],
+}
+
+/// SPTD hands the data buffer to the adapter, which enforces its own alignment
+/// mask; 512 clears anything a real controller asks for.
+#[repr(C, align(512))]
+struct AlignedBuf([u8; 512]);
+
+/// Issue one data-in SCSI command and hand back the bytes the device returned.
+/// A device that doesn't implement the command answers with a CHECK CONDITION
+/// rather than a transport failure, so both are folded into `None`.
+fn scsi_data_in(handle: HANDLE, cdb: &[u8], transfer_len: u32) -> Option<Vec<u8>> {
+    debug_assert!(cdb.len() <= 16 && transfer_len as usize <= 512);
+    let mut buf = AlignedBuf([0u8; 512]);
+    let mut req = SptdWithSense {
+        sptd: SCSI_PASS_THROUGH_DIRECT {
+            Length: size_of::<SCSI_PASS_THROUGH_DIRECT>() as u16,
+            ScsiStatus: 0,
+            PathId: 0,
+            TargetId: 0,
+            Lun: 0,
+            CdbLength: cdb.len() as u8,
+            SenseInfoLength: 32,
+            DataIn: SCSI_IOCTL_DATA_IN as u8,
+            DataTransferLength: transfer_len,
+            TimeOutValue: SCSI_TIMEOUT_SECS,
+            DataBuffer: buf.0.as_mut_ptr() as *mut _,
+            SenseInfoOffset: offset_of!(SptdWithSense, sense) as u32,
+            Cdb: [0u8; 16],
+        },
+        sense: [0u8; 32],
+    };
+    req.sptd.Cdb[..cdb.len()].copy_from_slice(cdb);
+
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_SCSI_PASS_THROUGH_DIRECT,
+            &mut req as *mut _ as *mut _,
+            size_of::<SptdWithSense>() as u32,
+            &mut req as *mut _ as *mut _,
+            size_of::<SptdWithSense>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        debug!(
+            opcode = cdb[0],
+            last_error = unsafe { GetLastError() },
+            "SCSI pass-through failed"
+        );
+        return None;
+    }
+    if req.sptd.ScsiStatus != 0 {
+        debug!(
+            opcode = cdb[0],
+            scsi_status = req.sptd.ScsiStatus,
+            sense_key = req.sense[2] & 0x0f,
+            asc = req.sense[12],
+            "device rejected SCSI command"
+        );
+        return None;
+    }
+    Some(buf.0[..transfer_len as usize].to_vec())
+}
+
+/// Human drive type for the disk cards: the bus, plus the media class where
+/// the bus alone doesn't imply it. `seek_penalty` is the SSD/HDD discriminator
+/// (`Some(true)` spins, `Some(false)` doesn't, `None` wouldn't say), so a bus
+/// that carries both kinds — SATA, SAS, USB — degrades to the bare bus name
+/// rather than inventing a media class it can't know.
+fn drive_type_label(bus_type: i32, removable: u8, seek_penalty: Option<bool>) -> String {
+    // "SATA" -> "SATA SSD" / "SATA HDD" / "SATA" (unknown).
+    let with_media = |bus: &str| match seek_penalty {
+        Some(true) => format!("{bus} HDD"),
+        Some(false) => format!("{bus} SSD"),
+        None => bus.to_string(),
+    };
+    match bus_type {
+        0x01 => with_media("SCSI"),
+        0x02 | 0x03 => with_media("ATA"),
+        0x04 => "FireWire".into(),
+        0x06 => "Fibre Channel".into(),
+        // A USB SSD/HDD enclosure reports the bridge's seek penalty when it has
+        // one; thumb drives typically answer nothing and are flagged removable.
+        0x07 => match seek_penalty {
+            Some(true) => "USB HDD".into(),
+            Some(false) => "USB SSD".into(),
+            None if removable != 0 => "USB Flash Drive".into(),
+            None => "USB Drive".into(),
+        },
+        0x08 => "RAID".into(),
+        0x09 => "iSCSI".into(),
+        0x0A => with_media("SAS"),
+        0x0B => with_media("SATA"),
+        0x0C => "SD Card".into(),
+        0x0D => "eMMC".into(),
+        0x0E | 0x0F => "Virtual Disk".into(),
+        0x10 => "Storage Space".into(),
+        // NVMe and UFS are solid-state by definition, so the bus names the media.
+        0x11 => "NVMe SSD".into(),
+        0x12 => "Persistent Memory".into(),
+        0x13 => "UFS".into(),
+        _ => match (seek_penalty, removable) {
+            (Some(true), _) => "HDD".into(),
+            (Some(false), _) => "SSD".into(),
+            (None, r) if r != 0 => "Removable".into(),
+            (None, _) => "Fixed Disk".into(),
+        },
+    }
 }
 
 /// Map `STORAGE_BUS_TYPE` values (defined in `ntddstor.h`) to a short
@@ -1384,6 +1721,52 @@ pub fn guid_from_string(s: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bus types (SATA, USB) that carry either medium must never invent one:
+    /// "not reported" is not "solid state".
+    #[test]
+    fn rotation_rate_only_claims_what_the_device_said() {
+        assert_eq!(rate_spins(0x0001), Some(false)); // non-rotating
+        assert_eq!(rate_spins(7200), Some(true));
+        assert_eq!(rate_spins(5526), Some(true)); // real ST4000LM024 value
+        assert_eq!(rate_spins(0x0000), None); // "not reported"
+        assert_eq!(rate_spins(0x0200), None); // reserved
+        assert_eq!(rate_spins(0xffff), None); // reserved
+    }
+
+    #[test]
+    fn drive_type_names_media_only_when_it_is_known() {
+        assert_eq!(drive_type_label(0x0b, 0, Some(true)), "SATA HDD");
+        assert_eq!(drive_type_label(0x0b, 0, Some(false)), "SATA SSD");
+        assert_eq!(drive_type_label(0x0b, 0, None), "SATA");
+        // NVMe is solid-state by definition; no probe needed.
+        assert_eq!(drive_type_label(0x11, 0, None), "NVMe SSD");
+        // A USB HDD, once the pass-through probe reaches the drive behind it.
+        assert_eq!(drive_type_label(0x07, 0, Some(true)), "USB HDD");
+        // A thumb drive answers nothing, but flags itself removable.
+        assert_eq!(drive_type_label(0x07, 1, None), "USB Flash Drive");
+        assert_eq!(drive_type_label(0x07, 0, None), "USB Drive");
+    }
+
+    /// ATA packs its strings byte-swapped within each 16-bit word, and pads
+    /// them out with spaces.
+    #[test]
+    fn ata_string_unswaps_and_trims() {
+        let model = b"ST4000LM024-2AN17V  ";
+        let mut identify = vec![0u8; 512];
+        for (word, pair) in model.chunks_exact(2).enumerate() {
+            identify[54 + word * 2] = pair[1];
+            identify[54 + word * 2 + 1] = pair[0];
+        }
+        assert_eq!(
+            ata_string(&identify, 27, 10).as_deref(),
+            Some("ST4000LM024-2AN17V")
+        );
+        // A drive that reports nothing yields nothing, not an empty string.
+        assert_eq!(ata_string(&vec![0u8; 512], 27, 20), None);
+        // Short or truncated responses are refused rather than panicking.
+        assert_eq!(ata_string(&[0u8; 4], 27, 20), None);
+    }
 
     fn boot_sector_with(oem: &[u8; 8]) -> [u8; 512] {
         let mut buf = [0u8; 512];

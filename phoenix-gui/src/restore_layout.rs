@@ -163,6 +163,8 @@ pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
         disk_signature: reader.header.disk_signature,
         sector_size: 512,
         model: Some(reader.manifest.hostname.clone()),
+        // A backup image is not a physical device — nothing to report.
+        drive_type: None,
         partitions,
     }
 }
@@ -616,6 +618,7 @@ impl RestoreLayoutState {
             disk_signature: target.disk_signature,
             sector_size: target.sector_size,
             model: target.model.clone(),
+            drive_type: target.drive_type.clone(),
             partitions,
         }
     }

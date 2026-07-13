@@ -230,13 +230,23 @@ pub fn draw_disk_info_card(
     } else {
         "Basic MBR"
     };
-    painter.text(
-        egui::pos2(text_x, rect.top() + 58.0),
-        Align2::LEFT_TOP,
-        style,
-        fonts::regular(11.0),
-        palette.subtle_text,
-    );
+    // Drive type sits above the partition style, and only when it's known — a
+    // backup image has no physical device behind it, so that card keeps the
+    // single subtitle line it has always had, in its original spot. Two lines
+    // start slightly higher so the pair stays centered under the size.
+    let drive_type = disk.drive_type.as_deref();
+    let first_row = if drive_type.is_some() { 55.0 } else { 58.0 };
+    let mut y = rect.top() + first_row;
+    for line in drive_type.into_iter().chain([style]) {
+        painter.text(
+            egui::pos2(text_x, y),
+            Align2::LEFT_TOP,
+            line,
+            fonts::regular(11.0),
+            palette.subtle_text,
+        );
+        y += 17.0;
+    }
 }
 
 /// Segment-level map renderer: the callback sees every segment — partitions
