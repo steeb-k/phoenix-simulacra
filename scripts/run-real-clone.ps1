@@ -43,7 +43,14 @@ param(
     [double] $MinGB = 16,
     [double] $MaxGB = 4200,
     [string] $Test,
-    [switch] $WhatIf
+    [switch] $WhatIf,
+    # Skip the typed confirmation, for when consent was given out of band (an
+    # operator watching a scripted run, or an automated rig). This ONLY skips the
+    # prompt — every real guard still applies: boot/system disks are refused, the
+    # size window is enforced, and a non-removable disk still needs -AllowFixed
+    # plus a matching serial. It cannot make this run touch a disk it otherwise
+    # wouldn't have.
+    [switch] $Yes
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,8 +125,12 @@ if ($WhatIf) {
 }
 
 Write-Host "BOTH disks above will be ERASED. Ctrl-C now if that is not what you want." -ForegroundColor Red
-$answer = Read-Host "Type the TARGET disk number ($TargetDisk) to proceed"
-if ($answer.Trim() -ne "$TargetDisk") { throw "Aborted (got '$answer')." }
+if ($Yes) {
+    Write-Host "-Yes given: proceeding without the typed confirmation." -ForegroundColor Yellow
+} else {
+    $answer = Read-Host "Type the TARGET disk number ($TargetDisk) to proceed"
+    if ($answer.Trim() -ne "$TargetDisk") { throw "Aborted (got '$answer')." }
+}
 
 $logdir = Join-Path $repo "target\t3-clone"
 New-Item -ItemType Directory -Force -Path $logdir | Out-Null

@@ -453,18 +453,16 @@ fn env_gb(name: &str) -> Option<f64> {
 /// via `PHOENIX_T3_MIN_GB` / `PHOENIX_T3_MAX_GB` for a larger fixed test disk.
 ///
 /// Unknown/blank `MediaType` fails safe: treated as NON-removable (strict).
-fn validate_real_disk(index: u32) -> Result<ValidatedDisk> {
-    validate_real_disk_pinned(index, "PHOENIX_T3_SERIAL")
-}
-
-/// As [`validate_real_disk`], but reads the serial pin from `serial_var`.
+/// Validate a real disk, reading its serial pin from `serial_var`.
 ///
-/// A disk-to-disk clone needs **two** real disks, and the second one must be
-/// gated exactly as hard as the first — it is about to be read from, yes, but
-/// the tests also lay a fresh fixture down on it, so it is just as destroyable.
-/// Giving the source its own serial variable is what lets both be pinned
-/// independently; sharing one would mean the two gates could only ever agree by
-/// accident.
+/// There is deliberately **no** convenience wrapper that defaults `serial_var` to
+/// `PHOENIX_T3_SERIAL`. A disk-to-disk clone has two real disks with two
+/// independent pins, and the first version of this had exactly that wrapper — so
+/// `RealDisk::clean()` on the *source* re-checked disk 2's serial against the
+/// *target's* pin and refused to run. That was the harmless direction. With the
+/// roles reversed it is the other kind of bug entirely, so the pin now travels
+/// with the disk and there is no way to ask this question without saying which
+/// disk you mean.
 fn validate_real_disk_pinned(index: u32, serial_var: &str) -> Result<ValidatedDisk> {
     let info = powershell(&format!(
         "$d = Get-Disk -Number {index} -ErrorAction Stop; \
@@ -539,6 +537,16 @@ fn validate_real_disk_pinned(index: u32, serial_var: &str) -> Result<ValidatedDi
 pub struct RealDisk {
     index: u32,
     is_removable: bool,
+    /// The env var holding *this* disk's serial pin — `PHOENIX_T3_SERIAL` for the
+    /// target, `PHOENIX_T3_SRC_SERIAL` for a clone's source.
+    ///
+    /// Carried on the disk rather than looked up at the point of use, because
+    /// every destructive method re-validates before it writes, and a re-check
+    /// against the *other* disk's serial is not a safety check — it is a
+    /// coin-flip that either refuses a disk it should allow (which is how this
+    /// field came to exist) or, with the roles reversed, allows one it should
+    /// refuse.
+    serial_var: String,
 }
 
 impl RealDisk {
@@ -570,8 +578,13 @@ impl RealDisk {
             .parse()
             .with_context(|| format!("{disk_var} must be a disk number"))?;
         let v = validate_real_disk_pinned(index, serial_var)?;
+        let role = if disk_var.contains("SRC") {
+            "source"
+        } else {
+            "target"
+        };
         eprintln!(
-            "[T3] target = disk {index}, {}, serial {} — safety gates passed",
+            "[T3] {role} = disk {index}, {}, serial {} — safety gates passed",
             if v.is_removable {
                 "removable (USB flash)"
             } else {
@@ -593,12 +606,23 @@ impl RealDisk {
              if ($d.IsOffline) {{ Set-Disk -Number {index} -IsOffline $false; 'onlined' }}"
         ));
         if matches!(onlined.as_deref().map(str::trim), Ok("onlined")) {
-            eprintln!("[T3] target disk {index} was offline — brought it online");
+            eprintln!("[T3] {role} disk {index} was offline — brought it online");
         }
         Ok(Some(Self {
             index,
             is_removable: v.is_removable,
+            serial_var: serial_var.to_string(),
         }))
+    }
+
+    /// Re-run every safety gate against **this** disk's own serial pin.
+    ///
+    /// Called before each destructive operation, so a disk that was swapped,
+    /// re-numbered, or brought online as the boot disk between acquisition and
+    /// use cannot slip through on a stale check.
+    fn revalidate(&self) -> Result<()> {
+        validate_real_disk_pinned(self.index, &self.serial_var)?;
+        Ok(())
     }
 
     pub fn index(&self) -> u32 {
@@ -620,7 +644,7 @@ impl RealDisk {
     /// to `Clear-Disk`, which force-dismounts volumes and has succeeded on
     /// disks diskpart refused.
     pub fn clean(&self) -> Result<()> {
-        validate_real_disk(self.index)?;
+        self.revalidate()?;
         let mut last_err = None;
         for attempt in 1u32..=3 {
             match run_diskpart(&format!("select disk {}\nclean\n", self.index)) {
@@ -633,7 +657,7 @@ impl RealDisk {
             }
         }
         eprintln!("[T3] falling back to Clear-Disk");
-        validate_real_disk(self.index)?;
+        self.revalidate()?;
         powershell(&format!(
             "Clear-Disk -Number {} -RemoveData -RemoveOEM -Confirm:$false",
             self.index
@@ -652,7 +676,7 @@ impl RealDisk {
     /// Lay out partitions on the disk (re-validates safety first). Uses the
     /// PowerShell storage cmdlets, which work on removable USB media.
     pub fn layout(&self, gpt: bool, parts: &[PartSpec]) -> Result<()> {
-        validate_real_disk(self.index)?;
+        self.revalidate()?;
         powershell_layout(self.index, gpt, parts)
     }
 }
