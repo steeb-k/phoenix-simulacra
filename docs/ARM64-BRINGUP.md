@@ -160,6 +160,27 @@ them.
 | **WinFsp (ARM64 MSI)** | The `winfsp` feature is a **default feature**. Needed at build *and* run time. | https://winfsp.dev |
 | Git | `build.rs` stamps provenance into the binary. | Without it the banner says `unknown`, which is survivable. |
 
+> **Already installed on the reference Snapdragon box (2026-07-14).** Don't redo
+> this. Present and working:
+>
+> - **rustup 1.97.0**, host `aarch64-pc-windows-msvc` (native, not emulated).
+> - **VS Build Tools, MSVC 14.44.35207** with the native `Hostarm64\arm64` toolset
+>   and **Windows 11 SDK 22621**.
+>
+> Cargo needs the MSVC environment, so prefix it:
+>
+> ```powershell
+> & "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" arm64
+> cargo test -p phoenix-core   # etc.
+> ```
+>
+> **Not** installed, deliberately: **LLVM/libclang** and the **WinFsp MSI**. So
+> everything except `phoenix-mount`, `phoenix-gui`, and `phoenix-systests
+> --features winfsp` builds and tests natively here today. That is enough to
+> iterate on a core-layer fix against real 4Kn hardware without a round trip to
+> the x64 box — which is exactly what it was used for. It does **not** change the
+> default lane: cross-building on x64 is still faster and still preferred.
+
 ---
 
 ## Phase 2 — Build natively (SKIP THIS if you cross-built), and prove the binary is really ARM64
