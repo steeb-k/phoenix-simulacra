@@ -6,6 +6,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use tracing::{debug, warn};
+use windows_sys::core::GUID;
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO,
+    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
@@ -180,18 +186,234 @@ pub struct DiskInfo {
     pub partitions: Vec<PartitionInfo>,
 }
 
+/// `GUID_DEVINTERFACE_DISK` ? the device-interface class every disk Windows is
+/// willing to call a disk registers itself under. Spelled out rather than
+/// imported so the identity of the thing we enumerate is visible right here.
+const GUID_DEVINTERFACE_DISK: GUID = GUID {
+    data1: 0x53f5_6307,
+    data2: 0xb6bf,
+    data3: 0x11d0,
+    data4: [0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b],
+};
+
+/// Every disk Windows recognizes, as `\\.\PhysicalDriveN` indices, ascending.
+///
+/// **Why this is not a `0..64` scan of the `\\.\PhysicalDriveN` namespace.**
+/// That namespace is a *legacy alias table*, not the list of disks: the
+/// partition manager hands a `PhysicalDriveN` name to block devices that
+/// Windows itself does not surface as disks, and opening one succeeds. On a
+/// Snapdragon/UFS machine that is not hypothetical ? the UFS chip exposes its
+/// firmware LUNs (boot, persist, modem, ?) as `PhysicalDrive1..5`, all reporting
+/// the same vendor/product as the real disk and differing only by SCSI LUN.
+/// They carry real GPTs full of real (tiny) firmware partitions, so nothing
+/// downstream can tell them apart from a disk by inspection. A brute-force scan
+/// therefore offered them as backup sources and, far worse, as clone/restore
+/// **targets** ? and the boot/system-disk gate does not catch them, because a
+/// firmware LUN is neither. Writing one bricks the machine.
+///
+/// Enumerating the `GUID_DEVINTERFACE_DISK` class asks Windows the question we
+/// actually mean ? *what are the disks?* ? and gets the same answer Disk
+/// Management, `Get-Disk`, and `Win32_DiskDrive` give. The firmware LUNs never
+/// register the interface, so they are excluded by construction rather than by a
+/// heuristic we would have to keep tuning. Attached VHDX disks and USB sticks do
+/// register it, so the T2/T3 suites are unaffected.
+///
+/// The interface class is unordered; the returned indices are sorted and
+/// deduplicated so callers still see disks in the order a user expects.
+fn enumerate_disk_indices() -> Result<Vec<u32>> {
+    // SetupAPI reports failure as INVALID_HANDLE_VALUE, but `HDEVINFO` is an
+    // `isize` in windows-sys (not a pointer like `HANDLE`), so the sentinel has
+    // to be spelled as the bare -1 rather than compared to INVALID_HANDLE_VALUE.
+    const INVALID_HDEVINFO: HDEVINFO = -1;
+
+    let set = unsafe {
+        SetupDiGetClassDevsW(
+            &GUID_DEVINTERFACE_DISK,
+            ptr::null(),
+            ptr::null_mut(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+    };
+    if set == INVALID_HDEVINFO {
+        return Err(PhoenixError::Disk(format!(
+            "SetupDiGetClassDevs(GUID_DEVINTERFACE_DISK) failed (Win32 error {})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let mut indices = Vec::new();
+    for member in 0.. {
+        let mut iface = SP_DEVICE_INTERFACE_DATA {
+            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            InterfaceClassGuid: GUID_DEVINTERFACE_DISK,
+            Flags: 0,
+            Reserved: 0,
+        };
+        let more = unsafe {
+            SetupDiEnumDeviceInterfaces(
+                set,
+                ptr::null(),
+                &GUID_DEVINTERFACE_DISK,
+                member,
+                &mut iface,
+            )
+        };
+        // Exhausted the class (ERROR_NO_MORE_ITEMS).
+        if more == 0 {
+            break;
+        }
+        if let Some(path) = interface_device_path(set, &iface) {
+            match device_number(&path) {
+                Some(index) => indices.push(index),
+                // A disk-class interface with no device number is a device in
+                // the middle of arriving or departing. Skip it rather than
+                // guessing an index that may belong to something else.
+                None => debug!(
+                    device = path.as_str(),
+                    "disk interface has no device number; skipping"
+                ),
+            }
+        }
+    }
+    unsafe { SetupDiDestroyDeviceInfoList(set) };
+
+    indices.sort_unstable();
+    indices.dedup();
+    Ok(indices)
+}
+
+/// Pull the `DevicePath` out of one `GUID_DEVINTERFACE_DISK` member.
+///
+/// `SP_DEVICE_INTERFACE_DETAIL_DATA_W` is a variable-length struct ? a fixed
+/// header followed by an inline NUL-terminated `WCHAR` path ? so it is sized by
+/// a first call, then filled into a byte buffer. `cbSize` must describe the
+/// *header* (never the buffer), which is what the struct's own `size_of` is.
+fn interface_device_path(set: HDEVINFO, iface: &SP_DEVICE_INTERFACE_DATA) -> Option<String> {
+    let mut needed = 0u32;
+    // Expected to fail with ERROR_INSUFFICIENT_BUFFER; we only want `needed`.
+    unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            set,
+            iface,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+            ptr::null_mut(),
+        )
+    };
+    if (needed as usize) <= size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; needed as usize];
+    let detail = buffer.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+    unsafe { (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32 };
+    let ok = unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            set,
+            iface,
+            detail,
+            needed,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        debug!(
+            last_error = unsafe { GetLastError() },
+            "SetupDiGetDeviceInterfaceDetail failed; skipping disk interface"
+        );
+        return None;
+    }
+
+    // The path is inline at the tail of the struct, within the buffer we own.
+    let path_ptr = unsafe { ptr::addr_of!((*detail).DevicePath) } as *const u16;
+    let mut wide = Vec::new();
+    for i in 0.. {
+        let c = unsafe { *path_ptr.add(i) };
+        if c == 0 {
+            break;
+        }
+        wide.push(c);
+    }
+    Some(String::from_utf16_lossy(&wide))
+}
+
+/// The `PhysicalDriveN` index behind a device path, via
+/// `IOCTL_STORAGE_GET_DEVICE_NUMBER`.
+///
+/// Opened with **zero** access rights: this is a query the storage stack answers
+/// without granting any read or write capability on the medium, so it does not
+/// need the elevation a `GENERIC_READ` handle to a physical disk would.
+fn device_number(device_path: &str) -> Option<u32> {
+    // CTL_CODE(IOCTL_STORAGE_BASE, 0x0420, METHOD_BUFFERED, FILE_ANY_ACCESS).
+    const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002d_1080;
+    #[repr(C)]
+    struct StorageDeviceNumber {
+        device_type: u32,
+        device_number: u32,
+        partition_number: u32,
+    }
+
+    let wide = to_wide(device_path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0, // query only ? no GENERIC_READ, so no elevation required
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut info = StorageDeviceNumber {
+        device_type: 0,
+        device_number: 0,
+        partition_number: 0,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            ptr::null(),
+            0,
+            &mut info as *mut _ as *mut _,
+            size_of::<StorageDeviceNumber>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 || (returned as usize) < size_of::<StorageDeviceNumber>() {
+        return None;
+    }
+    Some(info.device_number)
+}
+
 pub fn enumerate_disks() -> Result<Vec<DiskInfo>> {
     let mut disks = Vec::new();
-    for i in 0..64 {
-        let path = format!(r"\\.\PhysicalDrive{i}");
+    for index in enumerate_disk_indices()? {
+        let path = format!(r"\\.\PhysicalDrive{index}");
         match open_disk_readonly(&path) {
             Ok(handle) => {
-                if let Ok(disk) = read_disk_info(i, &path, handle) {
+                if let Ok(disk) = read_disk_info(index, &path, handle) {
                     disks.push(disk);
                 }
                 unsafe { CloseHandle(handle) };
             }
-            Err(_) => continue,
+            // Windows named this disk but won't let us open it ? a device that
+            // departed mid-enumeration, or one held exclusively. Not fatal;
+            // the rest of the disks are still worth reporting.
+            Err(e) => {
+                warn!(disk = path.as_str(), error = %e, "skipping disk that could not be opened");
+                continue;
+            }
         }
     }
     for disk in &mut disks {
