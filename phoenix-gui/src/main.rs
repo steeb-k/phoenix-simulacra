@@ -99,6 +99,10 @@ fn main() -> eframe::Result<()> {
 
     let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
     let options = eframe::NativeOptions {
+        // DX12 (via wgpu), not OpenGL. Windows on ARM has no desktop GL driver
+        // above the 1.1 software fallback, so a glow build cannot start there
+        // at all. Same backend on both arches — see phoenix-gui/Cargo.toml.
+        renderer: eframe::Renderer::Wgpu,
         // Chromeless: no OS titlebar. `titlebar::show` floats a Win11-style
         // control box over the top-right corner and, on Windows, a wndproc
         // subclass restores all native frame behavior (drag, edge resize,
@@ -1245,7 +1249,7 @@ impl eframe::App for PhoenixApp {
     /// so the app never exits while one is up. Covers the paths that skip the
     /// close dialog (a mount can only exist there if the user confirmed, but
     /// `on_exit` also runs on OS session-end).
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.unmount_all();
     }
 }

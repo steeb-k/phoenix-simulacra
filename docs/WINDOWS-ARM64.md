@@ -4,13 +4,15 @@ Carbon Phoenix targets **x86_64** and **ARM64** Windows from one source tree: th
 same CLI flags, GUI, capture modes, VSS behavior, and `.phnx` format. There are
 no `#[cfg(target_arch)]` branches in application logic.
 
-**Status (2026-07-13): ARM64 is BUILD-VERIFIED, NOT RUN-VERIFIED.** Every claim
-below about ARM64 *runtime* behavior is an expectation derived from the code, not
-an observation — no Carbon Phoenix binary has ever been executed on ARM64
-hardware. Treat the checklist at the bottom as the plan to *establish* parity,
-not as a record of it. Two things in particular are untested on real hardware
-anywhere, on any arch: **4Kn (4096-byte logical sector) media** and **UFS
-storage**.
+**Status (2026-07-14): first contact with real ARM64 hardware. The GUI did not
+start** — and the reason was the renderer, not our code. See "The OpenGL problem"
+below; the fix (glow → wgpu) is in, but **is not yet render-verified on either
+arch**. Everything else below about ARM64 *runtime* behavior remains an
+expectation derived from the code rather than an observation: apart from that one
+GUI launch, no Carbon Phoenix binary has been meaningfully exercised on ARM64.
+Treat the checklist at the bottom as the plan to *establish* parity, not as a
+record of it. Two things in particular are untested on real hardware anywhere, on
+any arch: **4Kn (4096-byte logical sector) media** and **UFS storage**.
 
 ## Parity contract
 
@@ -18,7 +20,7 @@ storage**.
 |------|---------|
 | One codebase | ✅ No `#[cfg(target_arch)]` in application logic. The only OS gate is `#[cfg(windows)]` / `target_os = "windows"` (GUI fonts, titlebar, theme). |
 | Same binaries per arch | ✅ `carbon-phoenix.exe` + `carbon-phoenix-gui.exe` per target; native PE, not x64 emulation. |
-| Same GUI stack | ✅ `eframe = { default-features = false, features = ["glow"] }` (phoenix-gui/Cargo.toml) — glow on both, wgpu on neither. |
+| Same GUI stack | ✅ `eframe = { default-features = false, features = ["wgpu"] }` (phoenix-gui/Cargo.toml) — **wgpu (DX12) on both, glow on neither**. It *was* glow, until glow turned out not to start on ARM64 at all. See "The OpenGL problem". |
 | Same Win32 APIs | ✅ Disk IOCTLs, volume locking, and the admin manifest are arch-neutral. |
 | Same VSS mechanism | ✅ …but **not** `vssadmin`. See below. |
 | Arch-sensitive dependencies | ⚠️ **`winfsp` / `winfsp-sys` only.** These *do* branch on `target_arch`, and they are the one place ARM64 can break. See "The WinFsp problem". |
@@ -53,6 +55,46 @@ low-powered ARM laptop than on a desktop.
 32-bit Windows is out of scope by design.
 
 ---
+
+## The OpenGL problem (found on real hardware, 2026-07-14)
+
+The first time the GUI was ever launched on a Windows 11 ARM machine, it refused
+to start:
+
+```
+Failed to set swap interval due to error: swap control extensions are not supported
+Exiting because of error: egui_glow: OpenGL: egui_glow requires opengl 2.0+
+```
+
+**This is the platform, not a bug in our code, and no driver update fixes it.**
+Windows on ARM ships **no desktop OpenGL driver**. `opengl32.dll` falls back to
+Microsoft's GDI generic software rasterizer, which is **OpenGL 1.1** — so there is
+no `WGL_EXT_swap_control` (hence the first warning) and no GL 2.0 (hence the hard
+error). Qualcomm's Adreno driver exposes **D3D11/12 and Vulkan**, not a desktop GL
+ICD. Any renderer that asks for desktop OpenGL is dead on arrival here, and
+`egui_glow` asks.
+
+**Fix: the GUI now uses eframe's `wgpu` backend, which targets DX12 on Windows.**
+Both arches use it — the alternative, gating the renderer on `target_arch`, would
+have broken the parity contract at the top of this document *and* left the x64
+build as the only one anyone had ever seen render.
+
+Three notes for whoever touches this next:
+
+- **Do not "fix" this by shipping an OpenGL implementation.** ANGLE gives GL *ES*,
+  not desktop GL, and Mesa's `opengl32.dll` (llvmpipe) is a software rasterizer —
+  we would be shipping a DLL to make the GUI slower on the machine that needs the
+  most help. wgpu talks to the driver that actually exists.
+- **The `on_exit` signature changes with the backend.** eframe hands `on_exit` a
+  `glow::Context` only when the `glow` feature is on; with wgpu it takes no
+  argument. If a future eframe bump reintroduces a build error there, that is why.
+- **`glow` and `wgpu` can both be compiled in**, with the renderer chosen at
+  runtime via `NativeOptions::renderer`. We deliberately don't: one backend on one
+  code path is the whole point of the parity contract, and a fallback nobody
+  exercises is a fallback nobody can trust.
+
+**Still unverified:** that wgpu actually *renders* — on either arch. It builds on
+both (ARM64 PE `Machine = 0xAA64`), and that is all we know as of this writing.
 
 ## The WinFsp problem (read this before building on ARM64)
 

@@ -17,7 +17,12 @@ phoenix-vss.workspace = true
 phoenix-restore.workspace = true
 phoenix-clone.workspace = true
 phoenix-mount.workspace = true
-eframe = { version = "0.29", default-features = false, features = ["glow"] }
+# `wgpu`, not `glow`. Windows on ARM ships no desktop OpenGL driver: opengl32
+# falls back to Microsoft's GDI software rasterizer, which is OpenGL 1.1, and
+# egui_glow needs 2.0+ — so the glow build died at startup on ARM64 hardware
+# (2026-07-14). wgpu targets DX12 here, which every Win11 ARM and x64 box has.
+# Both arches use the same backend on purpose; see docs/WINDOWS-ARM64.md.
+eframe = { version = "0.29", default-features = false, features = ["wgpu"] }
 egui = "0.29"
 anyhow.workspace = true
 chrono.workspace = true

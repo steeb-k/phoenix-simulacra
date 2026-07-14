@@ -181,21 +181,35 @@ drive-type/USB-bridge naming on ARM64. Cross-check against Phase 0's `Get-Disk`
 output — **if `list-disks` and `Get-Disk` disagree about the sector size, stop.**
 Everything downstream trusts that number.
 
-### The GUI — first-ever run of glow/OpenGL on ARM64
+### The GUI — the renderer already bit us once
 
 ```powershell
 .\target\release\carbon-phoenix-gui.exe          # UAC prompt expected: it requires admin
 ```
 
-The plausible failure here is **the GL context, not our code**. `eframe` is
-configured `default-features = false, features = ["glow"]` — glow on both arches,
-wgpu on neither. If it dies, capture the error verbatim; a GL-context failure on
-Snapdragon would be a real portability finding.
+> **This phase has already produced one finding (2026-07-14).** The first launch
+> on Windows 11 ARM died instantly: `egui_glow requires opengl 2.0+`, preceded by
+> `swap control extensions are not supported`. **Windows on ARM ships no desktop
+> OpenGL driver** — `opengl32` is Microsoft's GDI software rasterizer at OpenGL
+> 1.1, and Adreno exposes D3D12/Vulkan instead. The GUI was switched from eframe's
+> `glow` backend to **`wgpu` (DX12)** on both arches. Full story:
+> [WINDOWS-ARM64.md](WINDOWS-ARM64.md) → "The OpenGL problem".
+>
+> **So the question in this phase is no longer "does OpenGL work" — it is "does
+> wgpu/DX12 actually render?"** As of this writing that is unverified on *both*
+> arches; it only builds. If the window comes up, you are the first person to see
+> this app draw a pixel on ARM64.
 
 If it renders, check: the sidebar, the disk cards, the theme toggle, and the
 sticky action bar (the full-width gradient Start bar pinned above the status
 bar). Jump straight to a page with `--page clone` / `--page mount` / etc., and
 exercise the mounts table without a real mount using `--demo-mounts`.
+
+If it *doesn't*, capture the error verbatim — and note that a wgpu failure will
+name an adapter/backend (DX12, Vulkan) rather than a GL version. Do **not**
+"solve" it by reinstating glow or shipping an OpenGL DLL (ANGLE is GL ES; Mesa
+llvmpipe is software) — that trades a hard failure for a slow one on the machine
+least able to afford it.
 
 Take screenshots. Font rendering and DPI on ARM64 are worth an eyeball.
 
@@ -334,7 +348,8 @@ failure. Then, specifically:
 2. **Which WinFsp registry key the ARM64 MSI wrote**, and whether the build
    panicked before you mirrored it.
 3. **T1 count** — anything other than 111/111 is the headline.
-4. **Whether the GUI renders** (glow/OpenGL on ARM64), with screenshots.
+4. **Whether the GUI renders** on the wgpu/DX12 backend, with screenshots. (The
+   glow/OpenGL backend is already known dead here — that finding is closed.)
 5. **Whether `winfsp-a64.dll` mounts** — first run ever.
 6. **Throughput numbers.** Every `ConsoleProgress`-wrapped operation prints
    elapsed + MB/s, and one CSV row per operation lands in `target/perf-log.csv`
