@@ -1411,18 +1411,30 @@ fn detect_volume_fs_via_get_volume_information(volume_path: &str) -> Option<File
     }
 }
 
-/// Open the partition by its `\\.\X:` path and read the first 512 bytes; match
-/// well-known signatures in the boot sector / VBR. This sidesteps
-/// `GetVolumeInformationW` entirely, so it works for BitLocker-protected NTFS
-/// volumes whose decrypted view the filter driver hides from the FS query.
+/// Open the partition by its `\\.\X:` path and read its boot sector / VBR, then
+/// match well-known signatures. This sidesteps `GetVolumeInformationW` entirely,
+/// so it works for partitions with no drive letter (Recovery, ESP) ? which
+/// `GetVolumeInformationW` cannot even be asked about ? and for
+/// BitLocker-protected NTFS volumes whose decrypted view the filter driver hides
+/// from the FS query.
 ///
-/// Magic bytes:
+/// Magic bytes (all within the first 512 bytes):
 /// - `NTFS    ` at offset 3 (8 bytes) -> NTFS
 /// - `EXFAT   ` at offset 3           -> exFAT
 /// - `FAT32   ` at offset 82          -> FAT32
 /// - `FAT12   ` / `FAT16   ` at offset 54 -> FAT
 /// - `-FVE-FS-` at offset 3           -> BitLocker (locked or
 ///   metadata-shadowed view; we can't read the underlying NTFS).
+///
+/// **Reads a whole sector, not 512 bytes.** A read through a volume *device*
+/// handle must transfer a multiple of the volume's logical sector size, so on
+/// 4Kn media a 512-byte `ReadFile` fails outright with `ERROR_INVALID_PARAMETER`
+/// (87) ? it does not return a short read. That made this function fail on
+/// *every* volume of a 4Kn disk, which silently disabled both the no-drive-letter
+/// FS detection and all BitLocker volume-view detection (the only thing that
+/// spots `-FVE-FS-` here). A 4096-byte read is legal on 512-byte media too (it
+/// is a multiple of 512, at aligned offset 0), so the larger read is correct on
+/// both rather than conditional. Only the first 512 bytes are ever classified.
 ///
 /// Returns `None` when the volume can't be opened (typically locked
 /// BitLocker, raw EFI/MSR, or otherwise unmounted).
@@ -1448,13 +1460,17 @@ pub fn detect_volume_fs_via_boot_sector(volume_path: &str) -> Option<FilesystemK
         return None;
     }
 
-    let mut buf = [0u8; 512];
+    // One sector, sized to the volume itself; `get_sector_size` falls back to
+    // 512 if the device won't answer, and `max` keeps the transfer legal on the
+    // 4Kn media where that fallback would otherwise be too small.
+    let read_len = get_sector_size(handle).max(512) as usize;
+    let mut buf = vec![0u8; read_len];
     let mut read = 0u32;
     let ok = unsafe {
         ReadFile(
             handle,
             buf.as_mut_ptr(),
-            buf.len() as u32,
+            read_len as u32,
             &mut read,
             ptr::null_mut(),
         )
@@ -1478,7 +1494,7 @@ pub fn detect_volume_fs_via_boot_sector(volume_path: &str) -> Option<FilesystemK
         return None;
     }
 
-    let result = classify_boot_sector(&buf);
+    let result = classify_boot_sector(&buf[..512]);
     if result.is_none() {
         warn!(
             volume = volume_path,
