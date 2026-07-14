@@ -144,8 +144,35 @@ ARM64 PE test executables (`Machine = 0xAA64`).
 What the ARM64 box **still** needs, because these are *runtime*, not build-time:
 
 - **Elevation** for T2/T3 (diskpart, raw disk handles).
-- **WinFsp (ARM64 MSI)** if you are exercising mount — `winfsp-a64.dll` is
-  delay-loaded, so the app starts without it and only *mounting* fails.
+- **WinFsp** if you are exercising mount — `winfsp-a64.dll` is delay-loaded, so
+  the app starts without it and only *mounting* fails.
+
+> **WinFsp on ARM64: the stock MSI is all you need. Verified 2026-07-14.**
+>
+> There is no separate "ARM64 WinFsp" to hunt for. The ordinary release MSI
+> (tested: **2.1.25156**) is a single multi-arch package that installs the ARM64
+> binaries *and registers the ARM64 kernel driver*:
+>
+> ```text
+> C:\Program Files (x86)\WinFsp\bin\winfsp-a64.dll     202 KB   2.1.25156
+> C:\Program Files (x86)\WinFsp\bin\winfsp-a64.sys     168 KB   2.1.25156
+>
+> Service  WinFsp+<sxs-stamp>   Type=2 (file system driver)  Start=3 (on demand)
+>   ImagePath = ...\SxS\...\bin\winfsp-a64.sys        <-- the ARM64 driver
+> Service  WinFsp.Launcher      launcher-a64.exe, running
+> ```
+>
+> It is the **runtime** MSI, not the dev/SDK package. That is the right one: the
+> SDK is only needed on the machine that *builds* (for `winfsp-sys`' bindgen and
+> link libs), which under the cross-build lane is the x64 box.
+>
+> The runtime lookup resolves correctly on aarch64 — `winfsp-rs`'s
+> `get_system_winfsp()` reads `SOFTWARE\WOW6432Node\WinFsp` **first** (falling
+> back to the native key), then appends `bin\winfsp-a64.dll` under
+> `cfg!(target_arch = "aarch64")`. Both halves match what the MSI actually wrote.
+>
+> Implication for shipping: **the stock MSI can be bundled with our installer as-is
+> for ARM64.** No custom build, no arch-specific variant.
 
 ### Native-toolchain lane (only if you really need it)
 
@@ -174,12 +201,17 @@ them.
 > cargo test -p phoenix-core   # etc.
 > ```
 >
-> **Not** installed, deliberately: **LLVM/libclang** and the **WinFsp MSI**. So
-> everything except `phoenix-mount`, `phoenix-gui`, and `phoenix-systests
-> --features winfsp` builds and tests natively here today. That is enough to
-> iterate on a core-layer fix against real 4Kn hardware without a round trip to
-> the x64 box — which is exactly what it was used for. It does **not** change the
-> default lane: cross-building on x64 is still faster and still preferred.
+> **Not** installed: **LLVM/libclang**. `winfsp-sys` really does run bindgen —
+> its `lib.rs` is `include!(concat!(env!("OUT_DIR"), "/bindings.rs"))`, and the
+> `src/bindings.rs` it ships is `docsrs`-only — so `phoenix-mount`, `phoenix-gui`
+> and `phoenix-systests --features winfsp` cannot be built natively here without
+> it. Everything else builds and tests natively today, which is enough to iterate
+> on a core-layer fix against real 4Kn hardware without a round trip to the x64
+> box. It does **not** change the default lane: cross-building on x64 is still
+> faster and still preferred.
+>
+> The **WinFsp MSI (2.1) is installed** — see Phase 1's WinFsp row. That is a
+> *runtime* dependency and is all the ARM64 box needs to mount.
 
 ---
 
@@ -188,22 +220,37 @@ them.
 > Skip straight to "Prove it is native" below if you took the cross-build lane —
 > that check still matters, and it is the only part of this phase that does.
 
-### The failure you should expect first
+### The failure this document used to tell you to expect — it does not happen
 
-`winfsp-sys-0.12.1/build.rs` reads **only** `HKLM\SOFTWARE\WOW6432Node\WinFsp`
-and `.expect("WinFsp installation directory not found.")`. It has **no fallback**
-to the native `SOFTWARE\WinFsp` key — the key an ARM64-native installer is
-likely to write. Cross-compiling from x64 never hits this (the x64 MSI populates
-WOW6432Node). **Building natively on ARM64 probably does.**
+**This section was a prediction, and the prediction was wrong. Measured
+2026-07-14; corrected here so nobody spends a day on it.**
 
-Resolving it is itself a test result. Record which key the ARM64 MSI actually
-wrote:
+`winfsp-sys-0.12.1/build.rs` does read **only**
+`HKLM\SOFTWARE\WOW6432Node\WinFsp`, with a hard
+`.expect("WinFsp installation directory not found.")` and no fallback to the
+native `SOFTWARE\WinFsp` key. That part is true. What was *assumed* — that an
+ARM64 installer would write the native key and so break the build — is false:
+
+```text
+HKLM\SOFTWARE\WOW6432Node\WinFsp   InstallDir = C:\Program Files (x86)\WinFsp\   ✅
+HKLM\SOFTWARE\WinFsp               ABSENT                                        ❌
+```
+
+**The WinFsp MSI writes WOW6432Node on ARM64 too.** It is a single MSI carrying
+every architecture, not an arch-specific installer, and it puts itself under
+`Program Files (x86)` regardless. So the build script finds what it wants, and
+**there is nothing to work around.** Do not mirror the registry key; there is no
+native key to mirror *from*.
+
+If a future WinFsp release *does* start writing the native key, the panic will
+say `WinFsp installation directory not found.` — and then, and only then, this is
+the mirror:
 
 ```powershell
 Get-ItemProperty 'HKLM:\SOFTWARE\WinFsp'             -Name InstallDir -EA SilentlyContinue
 Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name InstallDir -EA SilentlyContinue
 
-# If only the native key exists, mirror it so winfsp-sys' build.rs finds it:
+# ONLY if the native key exists and WOW6432Node does not:
 New-Item -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Force | Out-Null
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name InstallDir `
   -Value (Get-ItemProperty 'HKLM:\SOFTWARE\WinFsp').InstallDir
@@ -420,11 +467,13 @@ Notes:
 - **`sector_4kn.rs` is not hardware-dependent** — it synthesizes a true 4Kn VHDX
   via `CreateVirtualDisk` (core Win32, every SKU). It should pass regardless of
   what Phase 0 said about the internal drive.
-- **`winfsp_mount.rs` is the first-ever run of `winfsp-a64.dll`.** The crate's
-  runtime DLL selection *is* ARM64-correct (it resolves via the registry and
-  picks `winfsp-a64.dll` on aarch64, with a documented fallback for exactly the
-  native-key case that bites the build script). Expected to work — but expected
-  is not observed. This is a headline result either way.
+- **`winfsp_mount.rs` is the first-ever run of `winfsp-a64.dll`.** Everything
+  *around* it is now confirmed on this box (2026-07-14): the ARM64 DLL and the
+  ARM64 kernel driver are installed and registered by the stock MSI, and
+  `winfsp-rs` resolves `bin\winfsp-a64.dll` from the key the MSI actually wrote —
+  see the WinFsp box in Phase 1. So the pieces line up. **But lining up is not
+  running.** Nobody has yet watched a `.phnx` mount through `winfsp-a64.sys` and
+  handed Windows a working drive letter. This is a headline result either way.
 
 ---
 
