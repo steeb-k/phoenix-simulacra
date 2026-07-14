@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use uuid::Uuid;
@@ -381,6 +381,13 @@ pub fn decompress_chunk(data: &[u8], uncompressed_len: usize) -> Result<Vec<u8>>
 
 pub struct PhnxWriter {
     file: File,
+    /// Where we are writing, kept so a failed write can *name* the destination.
+    /// Every public entry point below routes its error through
+    /// [`PhoenixError::destination_context`], which turns a "device is gone" OS
+    /// code into [`PhoenixError::DestinationLost`] pointing at this path. Doing
+    /// it here — rather than at the top of `run_backup` — is what keeps a source
+    /// disk that disappears from being blamed on the destination.
+    path: PathBuf,
     header: Header,
     index_entries: Vec<PartitionIndexEntry>,
     current_offset: u64,
@@ -420,6 +427,10 @@ impl PhnxWriter {
         header: Header,
         progress: Option<ProgressHandle>,
     ) -> Result<Self> {
+        Self::create_inner(path, header, progress).map_err(|e| e.destination_context(path))
+    }
+
+    fn create_inner(path: &Path, header: Header, progress: Option<ProgressHandle>) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         // Hold the backup file EXCLUSIVELY while writing (other processes may
@@ -438,6 +449,7 @@ impl PhnxWriter {
         let file = options.open(path)?;
         let mut w = Self {
             file,
+            path: path.to_path_buf(),
             header,
             index_entries: Vec::new(),
             current_offset: HEADER_SIZE as u64,
@@ -450,6 +462,15 @@ impl PhnxWriter {
     }
 
     pub fn begin_partition_stream(
+        &mut self,
+        spec: PartitionStreamSpec<'_>,
+    ) -> Result<PartitionStreamWriter<'_>> {
+        let path = self.path.clone();
+        self.begin_partition_stream_inner(spec)
+            .map_err(|e| e.destination_context(&path))
+    }
+
+    fn begin_partition_stream_inner(
         &mut self,
         spec: PartitionStreamSpec<'_>,
     ) -> Result<PartitionStreamWriter<'_>> {
@@ -513,7 +534,17 @@ impl PhnxWriter {
         }
     }
 
-    pub fn finalize(mut self, manifest: &BackupManifest) -> Result<()> {
+    pub fn finalize(self, manifest: &BackupManifest) -> Result<()> {
+        let path = self.path.clone();
+        self.finalize_inner(manifest)
+            .map_err(|e| e.destination_context(&path))
+    }
+
+    /// The last write of the backup, and the one most worth classifying: it ends
+    /// in `sync_all`, which is where Windows finally reports a *delayed* write
+    /// failure it had already acknowledged to us. A destination that died
+    /// mid-stream can surface here rather than at the chunk that actually lost.
+    fn finalize_inner(mut self, manifest: &BackupManifest) -> Result<()> {
         let manifest_bytes = manifest.to_json()?;
         let manifest_hash = hash::hash_bytes(&manifest_bytes);
         let manifest_offset = self.current_offset;
@@ -575,6 +606,15 @@ impl PartitionStreamWriter<'_> {
     }
 
     pub fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
+        // Borrow the path only on the error path — cloning it per chunk would be
+        // an allocation on the hot loop for no benefit.
+        match self.write_chunk_inner(plaintext) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.destination_context(&self.writer.path)),
+        }
+    }
+
+    fn write_chunk_inner(&mut self, plaintext: &[u8]) -> Result<()> {
         // Single cancel chokepoint for every capture path. `capture_raw`,
         // `capture_fat`, and `capture_ntfs` all funnel each chunk through
         // here, so a check before we enqueue aborts the backup at the next
@@ -606,6 +646,12 @@ impl PartitionStreamWriter<'_> {
     }
 
     pub fn finish(self) -> Result<(Vec<ChunkRecord>, u64)> {
+        let path = self.writer.path.clone();
+        self.finish_inner()
+            .map_err(|e| e.destination_context(&path))
+    }
+
+    fn finish_inner(self) -> Result<(Vec<ChunkRecord>, u64)> {
         // Join the pipeline first: every compressed chunk is on disk and the
         // tables are complete (in submission order, same as the old serial
         // loop) before we lay the chunk-index table down after the data.

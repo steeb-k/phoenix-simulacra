@@ -310,7 +310,7 @@ cargo build --release                    # exercises the winfsp default feature
 cargo test -p phoenix-core -p phoenix-capture -p phoenix-restore `
            -p phoenix-clone -p phoenix-mount -p phoenix-vss     # T1, no admin
 ```
-T1 is pure logic and should be **111/111 green** — identical to x64. Any T1 delta
+T1 is pure logic and should be **114/114 green** — identical to x64. Any T1 delta
 is a genuine arch bug (endianness, struct layout, integer width) and is the
 highest-value thing this whole exercise could find.
 
