@@ -4,3 +4,6 @@
 *.swp
 .idea/
 .vscode/
+# Breadcrumb logs from the staged system-test runner.
+t2-staged.log
+arm64-t2.log
