@@ -129,6 +129,20 @@ impl RestorePlan {
                     required: part.used_bytes,
                 });
             }
+
+            // TODO(cross-sector-size restore): this is where a
+            // source-vs-target logical-sector-size guard belongs, but it can't
+            // live here yet — this method only has the manifest, not the target
+            // DiskInfo. Used-block capture copies the boot sector verbatim, so a
+            // 4Kn source's `BPB.BytesPerSector = 4096` lands unchanged on a 512e
+            // target and (per Windows NTFS) the volume likely comes up RAW.
+            // Nothing currently detects, warns, or refuses this. Thread the
+            // target disk's sector size in (run_restore has it) and reject a
+            // mismatch for NTFS/FAT/exFAT with a clear error — the manifest disk
+            // block already records the source's real sector size. A true
+            // cross-sector conversion (rewrite BytesPerSector + dependent BPB
+            // fields) is a larger, separate change. Surfaced 2026-07-14 by a
+            // 4Kn-UFS -> 512e-NVMe restore; see docs/ROADMAP.md.
         }
         Ok(())
     }

@@ -439,7 +439,42 @@ These attach real VHDX disks via diskpart and run the production engine against
 genuine NTFS/FAT/exFAT volumes. **No risk to the host's real disks.** Elevated
 shell required.
 
+> ### ✅ T2 PASSES ON ARM64 (2026-07-14) — 11/12 binaries, 32 tests green
+>
+> First full T2 sweep on ARM64, staged, no hangs. On the 4Kn Snapdragon box:
+>
+> ```text
+> resize_roundtrip  sector_4kn  backup_restore_roundtrip  clone  fat_family
+> gpt_identity  partial_mbr  partial_clone  mount  vhdx_container  vss     all PASS
+> bitlocker                                                                    FAIL
+> ```
+>
+> - **`vss` went 6/6 — including `locked_backup_blocks_writers_for_duration`,**
+>   the one known-flaky test, on the first run on a *slow* machine. The runbook
+>   feared it would be worse here; it wasn't. (Re-run it a few times before
+>   trusting that — one clean pass isn't proof a race is gone.)
+> - **`vhdx_container` passed both arms** — Windows attached our synthesized 4Kn
+>   *and* 512 VHDX and reported the right `LogicalSectorSize` for each.
+> - **`sector_4kn` 5/5** — 4Kn backup/restore/clone, now on hardware that is 4Kn.
+> - **`bitlocker` FAILED as expected**, and only because it is Home SKU:
+>   `Enable-BitLocker` -> `0x8031005A "This version of Windows does not support
+>   this feature"`. That is the *test* failing to build its fixture, not the
+>   product. Read it as skipped-and-why. **BitLocker still has zero ARM64
+>   coverage** as a result.
+> - `winfsp_mount` was **not** in this run (needs `--features winfsp`, hence LLVM
+>   on the box). The mount itself is already proven by hand — see Phase 8.
+>
+> Wall time was substantial (several minutes per binary; `partial_clone` ~363 s).
+> That is a real low-power-ARM data point, not a problem.
+
 ### ⚠️ Run it STAGED. A single one-shot run has hard-hung Windows — twice.
+
+**There is now a script for this: `scripts\run-system-tests-staged.ps1`** (one
+cargo process per binary, a settle between, and a breadcrumb log). Prefer it. Run
+`scripts\arm64-dev-env.ps1` first to put the native ARM64 MSVC toolchain on PATH
+(`& vcvarsall.bat arm64` does **not** work from PowerShell — it sets the vars in a
+child cmd that then exits). The manual loop below is what the script automates,
+kept here so the mechanism is legible.
 
 Not a specific test: **cumulative VHD attach/detach churn** inside one uptime
 exhausts the storage stack (the crashes correlated with Windows handing out
@@ -448,11 +483,16 @@ reboot. So do **not** use `scripts\run-system-tests.ps1` here — it is a single
 cargo invocation. Drive one cargo process per test binary, with a settle between:
 
 ```powershell
+# `vhdx_container` is a real T2 binary; the old list omitted it. `winfsp_mount`
+# is left OUT here because it is #![cfg(feature = "winfsp")] — without
+# --features winfsp it compiles to an empty binary and reports zero tests
+# (misleading), and *with* it you need libclang on this box. Add it only when
+# you have LLVM, via the script's -Winfsp switch.
 foreach ($b in @('resize_roundtrip','sector_4kn','backup_restore_roundtrip','clone',
-                 'fat_family','gpt_identity','partial_mbr','partial_clone','mount','vss',
-                 'bitlocker','winfsp_mount')) {
+                 'fat_family','gpt_identity','partial_mbr','partial_clone','mount',
+                 'vhdx_container','vss','bitlocker')) {
     Add-Content arm64-t2.log "START $b $(Get-Date -Format o)"
-    cargo test -p phoenix-systests --features winfsp --test $b -- --ignored --test-threads=1
+    cargo test -p phoenix-systests --test $b -- --ignored --test-threads=1
     Add-Content arm64-t2.log "END   $b exit=$LASTEXITCODE $(Get-Date -Format o)"
     Start-Sleep -Seconds 5   # VHD detach is asynchronous; let it finish
 }

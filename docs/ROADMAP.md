@@ -84,6 +84,40 @@ Two things that cost real time there, both worth remembering:
   same undiagnosable rejection. Found by dumping the metadata table of a VHDX Windows
   built itself and reading the two side by side (`vhdx_diff.rs` — keep it).
 
+### P1 — Restore across a sector-size boundary is unguarded (OPEN, found 2026-07-14)
+
+**4Kn is fully supported — as long as source and target agree on sector size.**
+Restore to a disk with a *different* logical sector size is neither handled nor
+refused. Surfaced by the first real cross-arch restore: a **4Kn UFS** image onto a
+**512e NVMe**.
+
+Same mechanism as the mount-RAW bug above, one step meaner. Used-block capture
+copies the boot sector verbatim, so a 4Kn source's `BPB.BytesPerSector = 4096`
+lands unchanged on the 512e target; Windows NTFS treats a boot sector whose sector
+size disagrees with the device as invalid and the volume comes up **RAW**. The
+mount path *solved* its version by synthesizing a VHDX whose metadata states the
+right sector size — but a **physical** restore target has no such knob. Its sector
+size is whatever the drive is, so we cannot make the source's boot sector true by
+choosing a container; we would have to **rewrite** it.
+
+Two things make this worse than a normal failure:
+
+- **It is silent.** Nothing detects, warns, or refuses. The other imaging tools
+  the user runs block cross-sector-size clones up front; we don't.
+- **`verify-after` can still pass.** Restore verify re-reads raw partition sectors
+  and hashes them against the image — those bytes are correct — so a volume that
+  will never mount can report a clean restore.
+
+**Fix, in two sizes.** (a) *Guard* — a pre-flight check in
+`RestorePlan::validate_against_backup` (`phoenix-restore/src/plan.rs`, TODO marked
+there) comparing the source partition's real sector size (manifest disk block)
+against the target disk's, refusing NTFS/FAT/exFAT on a mismatch with a clear
+error. Cheap, turns a mystery-RAW-three-hours-later into a two-second refusal, and
+is where to start. (b) *Convert* — rewrite `BPB.BytesPerSector` and recompute the
+dependent BPB fields so the volume is genuinely valid at the target geometry. A
+real format-aware transform, much larger, and a separate item. **Empirical result
+of the 4Kn→512e restore pending; confirm RAW-vs-mounts before choosing (b).**
+
 And the GPT had to learn the same lesson as everything else: its 34/33-sector reserve
 is a *512-byte* fact. The entry array is 16 KiB regardless — 32 sectors of 512, but
 only **4** of 4096 — so a 4Kn GPT reserves 6 and 5, and every LBA in it moves.
