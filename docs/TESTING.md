@@ -81,7 +81,7 @@ trusting a green run to mean "everything works".
 
 | Gap | Why it matters |
 |-----|----------------|
-| **ARM64 at runtime** | The **GUI runs** on ARM64 as of 2026-07-14 (after two renderer crashes: no desktop OpenGL on Windows-on-ARM, then wgpu shipping without DX12). The **engine does not** — no backup, restore, clone, mount or VSS, and not one test tier, has ever executed on ARM64. [ARM64-BRINGUP.md](ARM64-BRINGUP.md) is the runbook that closes this gap; [WINDOWS-ARM64.md](WINDOWS-ARM64.md) is the parity contract behind it. |
+| **ARM64 at runtime — partially closed (2026-07-14)** | **Backup, VSS and mount now run on ARM64**, on a true-4Kn UFS Snapdragon box: the live system disk images (VSS escalation on C:, volume lock on Recovery, used-block capture off a 4Kn bitmap) and the `.phnx` mounts through `winfsp-a64.sys` with drive letters and no space blow-up. **T1 is 103/103 natively** (`phoenix-mount`'s 11 need LLVM on that box). It cost three real bugs — UFS firmware LUNs enumerating as disks, a 512-byte boot-sector read that is illegal on 4Kn, and an unreadable destination-lost error. **Still unrun on ARM64: restore, clone, T2, T3.** **BitLocker has no ARM64 coverage at all** — that box is Home, and `Enable-BitLocker` (which the *test* needs to build its fixture) is Pro+; the product's BitLocker handling is not SKU-gated. [ARM64-BRINGUP.md](ARM64-BRINGUP.md) carries the results inline. |
 
 ---
 
@@ -270,8 +270,23 @@ a sector size. A 4Kn backup is now served as a **VHDX**, which states its logica
 size in metadata; 512e keeps the simpler VHD. Windows attaches it, reports a 4096-byte
 sector, parses the GPT we synthesized at 4096-byte LBAs, and mounts the NTFS inside.
 
-The whole 4Kn surface reproduced here, so **none of this needed the ARM64 laptop** —
-not the engine fixes, and not the mount.
+Most of the 4Kn surface reproduced here without the ARM64 laptop — the engine fixes
+above, and the mount.
+
+**But not all of it, and that is worth being honest about.** When real 4Kn hardware
+finally arrived (2026-07-14), it immediately produced a 4Kn bug this synthesized
+fixture had never caught: `detect_volume_fs_via_boot_sector` read exactly **512
+bytes** through a volume device handle, which a 4Kn volume rejects outright with
+`ERROR_INVALID_PARAMETER` — it does not return a short read. It was failing on
+*every volume of the disk*, silently disabling no-drive-letter FS detection (a
+Recovery partition captured raw instead of used-block) and **all BitLocker
+volume-view detection**.
+
+The synthesized VHDX missed it for a mundane reason: these tests exercise the
+*capture and restore* paths, and nothing in them calls the enumeration path that
+does that read. A fixture only covers the code you point it at. The lesson is not
+"synthesized 4Kn is useless" — it caught plenty — but that **"the surface is
+covered" is a claim about the tests, not about the hardware.**
 
 ---
 

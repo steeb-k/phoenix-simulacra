@@ -2,10 +2,27 @@
 
 **Read this on the ARM64 machine. It is written to be executed, not skimmed.**
 
-Carbon Phoenix has never been *run* on ARM64 hardware. It has been *built* for
-ARM64 (cross-compiled from x64, PE `Machine = 0xAA64`), and every unit test
-passes on x64. That is all we know. This document is the plan to turn "it
-compiles" into "it works" — or to find out where it doesn't.
+This document was written when Carbon Phoenix had never been *run* on ARM64. That
+is no longer true, and the phases below now carry their results inline.
+
+> ### Where it stands (2026-07-14)
+>
+> **Backup and mount work on ARM64, end to end, on true 4Kn UFS hardware.** The
+> GUI renders (wgpu/DX12), the live system disk images correctly (VSS escalation
+> on C:, `FSCTL_LOCK_VOLUME` on Recovery, used-block capture off a 4Kn bitmap),
+> and the result mounts through `winfsp-a64.sys` with drive letters and **no
+> space blow-up** — the zero-space path, not the materialize fallback. T1 is
+> 103/103 natively. VSS works on a Home SKU.
+>
+> It cost **three real bugs**, all of which only this hardware could have found:
+> the `PhysicalDriveN` scan reporting UFS **firmware LUNs** as disks (and
+> offering them as clone/restore *targets* — writing one bricks the machine); a
+> **512-byte boot-sector read that is illegal on 4Kn**, which had silently killed
+> both no-drive-letter FS detection and all BitLocker volume-view detection; and
+> an unreadable error when the backup **destination** fell off the USB bus.
+>
+> **Still unrun here: restore, clone, T2, T3, and BitLocker** (Home SKU can't
+> build the fixture). Those phases below are still a plan, not a record.
 
 Companion documents, for the *why* behind the rules here:
 
@@ -560,6 +577,26 @@ Confirm: the drive letter appears, files read back correctly, **free disk space
 does not drop by the size of the backup** (if it does, you are on the degraded
 non-winfsp fallback — see Phase 2), and the letter disappears on unmount.
 
+> ### ✅ MOUNT PASSES ON ARM64 (2026-07-14) — the first run of `winfsp-a64.sys`, ever
+>
+> A GUI backup of the live 4Kn system disk, mounted through WinFsp:
+>
+> - **All partitions got drive letters.**
+> - **Zero-space confirmed by arithmetic, not by eyeball.** Destination: 238.4 GB
+>   total, image 31.31 GB, 207.0 GB free afterwards — the `.phnx` is the *only*
+>   thing consuming space. The materialize fallback would have cost ~119 GB more.
+> - **Clean unmount**: no stray drive letters, no lingering attached virtual disk.
+> - **No leaked VSS shadows** — `VssSession::Drop` did its job.
+> - The driver is real and it ran: service `WinFsp+<sxs>` → `State: Running`,
+>   `ImagePath = ...\bin\winfsp-a64.sys`.
+>
+> The backup that fed it is itself a result: **61 GB used → a 31.3 GB image**,
+> with VSS escalation on C:, `FSCTL_LOCK_VOLUME` on Recovery, and unfrozen +
+> verify-image on the un-lettered ESP. All three freeze arms, correct, first try.
+>
+> **Restore is still unrun.** Mount proves we can *read* a `.phnx` back on ARM64;
+> it does not prove we can write one back to a disk.
+
 **Restore**: take the Phase 7 backup back onto the USB stick **through the GUI**,
 exercising the layout editor (drag to resize a partition), then confirm the
 fixture and run `chkdsk`. This exercises the restore path and the ARM64 GUI's
@@ -572,14 +609,20 @@ pointer math in one shot.
 Per phase: **pass / fail / skipped-and-why**, plus the **exact error text** on any
 failure. Then, specifically:
 
-1. **The Phase 0 machine characterization**, verbatim. Especially
-   `LogicalSectorSize`.
-2. **Which WinFsp registry key the ARM64 MSI wrote**, and whether the build
-   panicked before you mirrored it.
-3. **T1 count** — anything other than 114/114 is the headline.
-4. **Whether the GUI renders** on the wgpu/DX12 backend, with screenshots. (The
-   glow/OpenGL backend is already known dead here — that finding is closed.)
-5. **Whether `winfsp-a64.dll` mounts** — first run ever.
+Items 1, 2, 4 and 5 below are **answered** — recorded in the phases above, and
+kept here only so a future run on *different* ARM64 hardware knows to re-check
+them. The open ones are **3** (on a machine that can build `phoenix-mount`) and
+**6**, plus everything in Phases 5–8 that is still marked unrun.
+
+1. ~~**The Phase 0 machine characterization.**~~ Done: true 4Kn, UFS, Snapdragon
+   7c Gen 2, 3.68 GB RAM, Windows 10 **Home**. See Phase 0.
+2. ~~**Which WinFsp registry key the ARM64 MSI wrote.**~~ `WOW6432Node` — same as
+   x64. The predicted build panic does not happen. See Phase 2.
+3. **T1 count** — anything other than 114/114 is the headline. *(103/103 observed
+   natively; `phoenix-mount`'s 11 need LLVM on the box, or a cross-built exe.)*
+4. ~~**Whether the GUI renders**~~ — yes, wgpu/DX12.
+5. ~~**Whether `winfsp-a64.dll` mounts**~~ — **yes.** Zero-space, drive letters,
+   clean unmount. See Phase 8.
 6. **Throughput numbers.** Every `ConsoleProgress`-wrapped operation prints
    elapsed + MB/s, and one CSV row per operation lands in `target/perf-log.csv`
    (`timestamp,label,elapsed_s,bytes,mb_per_s,workers`; override with
@@ -587,6 +630,10 @@ failure. Then, specifically:
    Real ARM64-on-UFS numbers are new data — the worker defaults were tuned on an
    x64 desktop, and this is the machine that can tell us they're wrong.
 
-If everything passes, say so plainly — and then
-[WINDOWS-ARM64.md](WINDOWS-ARM64.md) and [TESTING.md](TESTING.md) both need their
-"never run on ARM64" caveats deleted, because they will no longer be true.
+[WINDOWS-ARM64.md](WINDOWS-ARM64.md)'s "the engine remains unrun there" caveat is
+**gone** as of 2026-07-14 — backup and mount are observed, and that document now
+carries the evidence table. It is *not* fully retired: restore, clone, T2, T3 and
+BitLocker are still expectation rather than observation, and both documents say
+so. Delete a caveat only when the thing it warns about has actually been watched
+working. Deleting the rest early would be the single easiest way to throw away
+everything this exercise bought.
