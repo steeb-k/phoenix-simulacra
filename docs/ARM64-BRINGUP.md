@@ -21,6 +21,11 @@ Companion documents, for the *why* behind the rules here:
 You are being handed a machine nobody has run this software on. Your job is to
 **find out what is true**, not to produce a green checklist.
 
+**This machine is a test target, not a dev box.** Binaries — app *and* tests — are
+cross-built on the x64 machine and copied here (Phase 1). Do not sink hours into
+standing up a native Rust/MSVC/LLVM toolchain unless someone explicitly asks for
+it; that is not where the value is.
+
 1. **A failure is a result.** Do not "fix" a failing test by relaxing it,
    skipping it, or rerunning until it passes. Capture the exact error text and
    report it. An ARM64-only failure is the single most valuable thing this
@@ -71,6 +76,52 @@ Do not assume 4Kn because the drive is UFS. **Measure.**
 
 ## Phase 1 — Toolchain
 
+> **Default lane: DON'T build on the ARM64 box.** It is a **test target, not a dev
+> box** — low-powered, and a native build needs the whole stack below plus a
+> `winfsp-sys` registry workaround. Cross-build everything on the x64 machine and
+> copy the binaries over. See "Cross-build lane" immediately below; do Phase 2
+> (native build) only if you actually need it.
+
+### Cross-build lane (preferred)
+
+Both the app **and the tests** cross-compile. Run these on the **x64** box:
+
+```powershell
+# App binaries
+cargo build --release --target aarch64-pc-windows-msvc
+
+# Test binaries — compiles them WITHOUT running; prints each exe's path
+cargo test --no-run --target aarch64-pc-windows-msvc `
+    -p phoenix-core -p phoenix-capture -p phoenix-restore `
+    -p phoenix-clone -p phoenix-mount -p phoenix-vss          # T1
+cargo test --no-run --target aarch64-pc-windows-msvc `
+    -p phoenix-systests --features winfsp                     # T2/T3
+```
+
+Copy the resulting `.exe`s to the ARM64 machine and run them **directly** — they
+are self-contained, so no Rust, no MSVC, no LLVM over there:
+
+```powershell
+.\phoenix_core-<hash>.exe                                   # T1: just run it
+.\<systest>-<hash>.exe --ignored --test-threads=1 --nocapture   # T2/T3, ELEVATED
+```
+
+Cargo's usual flags still apply because they are the **test harness's** flags, not
+cargo's: `--ignored`, `--test-threads=1`, `--nocapture`, and a filter substring all
+work when passed straight to the exe. Env vars (`PHOENIX_T3_DISK`,
+`PHOENIX_WORKERS`, …) are read at runtime, so set them in the ARM64 shell as usual.
+
+Verified 2026-07-14: `cargo test --no-run --target aarch64-pc-windows-msvc` emits
+ARM64 PE test executables (`Machine = 0xAA64`).
+
+What the ARM64 box **still** needs, because these are *runtime*, not build-time:
+
+- **Elevation** for T2/T3 (diskpart, raw disk handles).
+- **WinFsp (ARM64 MSI)** if you are exercising mount — `winfsp-a64.dll` is
+  delay-loaded, so the app starts without it and only *mounting* fails.
+
+### Native-toolchain lane (only if you really need it)
+
 Everything ARM64-native. Do not install x64 builds and hope emulation carries
 them.
 
@@ -84,7 +135,10 @@ them.
 
 ---
 
-## Phase 2 — Build natively, and prove the binary is really ARM64
+## Phase 2 — Build natively (SKIP THIS if you cross-built), and prove the binary is really ARM64
+
+> Skip straight to "Prove it is native" below if you took the cross-build lane —
+> that check still matters, and it is the only part of this phase that does.
 
 ### The failure you should expect first
 
@@ -146,11 +200,17 @@ layout, integer width — would surface, and it is the highest-value thing this
 whole exercise could find.
 
 ```powershell
+# Cross-build lane: just run the exes you copied over
+.\phoenix_core-<hash>.exe
+.\phoenix_capture-<hash>.exe        # …and the rest
+
+# Native lane:
 cargo test -p phoenix-core -p phoenix-capture -p phoenix-restore `
            -p phoenix-clone -p phoenix-mount -p phoenix-vss
 ```
 
-**Pass criterion: 111/111 green, identical to x64.** Any delta is a real bug.
+**Pass criterion: 111/111 green, identical to x64** (summed across the binaries if
+you are running them individually). Any delta is a real bug.
 Report it with the failing test name and full output; do not proceed to
 destructive phases until you understand it.
 
