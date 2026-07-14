@@ -81,7 +81,7 @@ trusting a green run to mean "everything works".
 
 | Gap | Why it matters |
 |-----|----------------|
-| **ARM64 at runtime** | Never executed on ARM64 hardware. See [WINDOWS-ARM64.md](WINDOWS-ARM64.md). The last wholly-unrun platform. |
+| **ARM64 at runtime** | Never executed on ARM64 hardware — the last wholly-unrun platform. [ARM64-BRINGUP.md](ARM64-BRINGUP.md) is the runbook that closes this gap; [WINDOWS-ARM64.md](WINDOWS-ARM64.md) is the parity contract behind it. |
 
 ---
 

@@ -186,6 +186,13 @@ Memory is bounded by design, so 4 GB is workable:
 
 ## ARM64 hardware test plan
 
+> **Executing this on the ARM64 machine? Use
+> [ARM64-BRINGUP.md](ARM64-BRINGUP.md) instead.** It is the same plan written as a
+> self-contained runbook — exact commands, pass criteria, the known traps, and a
+> reporting template — and it is what to hand to an agent sitting on that box. The
+> summary below stays here for readers who want the plan next to the parity
+> contract that motivates it.
+
 Run everything from an **elevated** shell. Each phase gates the next: do not skip
 ahead, because a failure in phase 0 or 1 invalidates everything after it.
 

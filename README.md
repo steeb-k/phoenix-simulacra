@@ -91,6 +91,7 @@ carbon-phoenix restore backup.phnx --plan plan.toml
 - [docs/ROADMAP.md](docs/ROADMAP.md) — **remaining work, known caveats, and out-of-scope items**
 - [BACKUP.md](BACKUP.md) — Backup process, capture modes, VSS, and options
 - [docs/WINDOWS-ARM64.md](docs/WINDOWS-ARM64.md) — x64 / ARM64 parity and build matrix
+- [docs/ARM64-BRINGUP.md](docs/ARM64-BRINGUP.md) — runbook for bringing the app up on an ARM64 machine
 - [docs/phnx-format.md](docs/phnx-format.md) — `.phnx` file format specification
 - [scripts/live-smoke-checklist.md](scripts/live-smoke-checklist.md) — manual pre-release live-system checklist
 
