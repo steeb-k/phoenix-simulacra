@@ -4,18 +4,31 @@ Carbon Phoenix targets **x86_64** and **ARM64** Windows from one source tree: th
 same CLI flags, GUI, capture modes, VSS behavior, and `.phnx` format. There are
 no `#[cfg(target_arch)]` branches in application logic.
 
-**Status (2026-07-14): the GUI RUNS on ARM64.** First contact with real Windows 11
-ARM hardware took two crashes to get there — both in the renderer, neither in our
-engine — and the fix (glow → wgpu, then DX12 by name) is in and **observed
-rendering on both arches**. See "The OpenGL problem" below.
+**Status (2026-07-14): the engine RUNS on ARM64 — backup and mount, end to end.**
+On a Snapdragon 7c Gen 2 / Windows 10 Home box whose internal UFS disk is **true
+4Kn**, Carbon Phoenix imaged the live system disk and mounted the result:
 
-That is the *only* thing ARM64 has proven. **The engine remains unrun there**: no
-backup, no restore, no clone, no mount, no VSS, and not one test tier. Every claim
-below about ARM64 engine behavior is still an expectation derived from the code
-rather than an observation, so treat the checklist at the bottom as the plan to
-*establish* parity, not a record of it. Two things in particular are untested on
-real hardware anywhere, on any arch: **4Kn (4096-byte logical sector) media** and
-**UFS storage**.
+| Proven on ARM64 hardware | Evidence |
+|---|---|
+| **GUI renders** | wgpu/DX12, after two renderer crashes (glow → wgpu, then DX12 by name). See "The OpenGL problem". |
+| **Disk enumeration** | …after a real bug: the `PhysicalDriveN` scan was reporting the UFS **firmware LUNs** as disks, and offering them as clone/restore *targets*. Now enumerates `GUID_DEVINTERFACE_DISK`. |
+| **Backup, live system disk** | All three freeze arms fired correctly: `FSCTL_LOCK_VOLUME` on Recovery, **VSS escalation** on C:, unfrozen+verify-image on the un-lettered ESP. Used-block NTFS capture off a 4Kn bitmap. 61 GB used → 31.3 GB image. |
+| **Mount (`winfsp-a64.sys`)** | First-ever run of the ARM64 WinFsp driver. All partitions got drive letters; **destination free space dropped by the image size and nothing more**, so the zero-space path — not the materialize fallback — is what ran. Clean unmount, no leaked shadows. |
+| **VSS on a Home SKU** | `Win32_ShadowCopy.Create` → 0. (`vssadmin create shadow` isn't even a supported command on a client SKU — which is exactly why we don't use it.) |
+| **T1 unit tests, natively** | 103/103 across `core`/`capture`/`restore`/`clone`/`vss`. |
+
+**4Kn and UFS are no longer untested-on-any-hardware.** They are this machine's
+ordinary case, and they cost two real bugs — the firmware-LUN enumeration above,
+and a 512-byte boot-sector read that is *illegal* on 4Kn and had silently
+disabled both no-drive-letter FS detection and all BitLocker volume-view
+detection.
+
+**Still unrun on ARM64, and therefore still expectation rather than observation:**
+**restore**, **clone**, the **T2 virtual-disk** and **T3 destructive** tiers, and
+`phoenix-mount`'s own unit tests. **BitLocker has no ARM64 coverage at all** — the
+test needs `Enable-BitLocker` to build its fixture, and that cmdlet is Pro+ while
+this box is Home. (The *product's* BitLocker handling is not SKU-gated; the test
+is.) Treat the checklist at the bottom as the plan for what remains.
 
 ## Parity contract
 
@@ -26,7 +39,7 @@ real hardware anywhere, on any arch: **4Kn (4096-byte logical sector) media** an
 | Same GUI stack | ✅ `eframe = { default-features = false, features = ["wgpu"] }` (phoenix-gui/Cargo.toml) — **wgpu (DX12) on both, glow on neither**. It *was* glow, until glow turned out not to start on ARM64 at all. See "The OpenGL problem". |
 | Same Win32 APIs | ✅ Disk IOCTLs, volume locking, and the admin manifest are arch-neutral. |
 | Same VSS mechanism | ✅ …but **not** `vssadmin`. See below. |
-| Arch-sensitive dependencies | ⚠️ **`winfsp` / `winfsp-sys` only.** These *do* branch on `target_arch`, and they are the one place ARM64 can break. See "The WinFsp problem". |
+| Arch-sensitive dependencies | ✅ **`winfsp` / `winfsp-sys` only.** These *do* branch on `target_arch` — and as of 2026-07-14 that branch is **observed correct**: a cross-built ARM64 binary delay-loads `winfsp-a64.dll` and mounts through `winfsp-a64.sys`. The stock WinFsp MSI is multi-arch and ships both. See "The WinFsp problem". |
 | CI builds both | ❌ **There is no CI.** `.github/` was deleted 2026-07-13; all builds and validation are local and manual. |
 
 If an x64 and an ARM64 build of the same commit behave differently, that is a bug
