@@ -72,6 +72,33 @@ Get-Volume | Select-Object DriveLetter, FileSystem, SizeRemaining, Size
 
 Do not assume 4Kn because the drive is UFS. **Measure.**
 
+### Measured, 2026-07-14 — the reference machine
+
+> **This machine is TRUE 4Kn.** Not 512e. Every 4Kn code path that until now had
+> only ever run against a *synthesized* VHDX is, on this box, the ordinary case.
+>
+> ```text
+> Disk 0   SAMSUNG KM5V8001DM-B622   BusType UFS   GPT   127,758,499,840 bytes
+>          LogicalSectorSize  4096      PhysicalSectorSize 4096
+> fsutil C:  Bytes Per Sector 4096   Bytes Per Cluster 4096
+>
+> CPU      Snapdragon (TM) 7c Gen 2 @ 2.55 GHz — 8 cores / 8 logical
+> RAM      3.68 GB              OS   Windows 10 **Home**, ARM 64-bit
+> BitLocker  C: FullyDecrypted, protection Off  (no encrypted volume on this box)
+> Volumes  C: NTFS 117.8 GB, 68 GB free
+> ```
+>
+> Consequences, all of which bind the phases below:
+>
+> - **4Kn is live.** Treat any 4Kn failure as a first-class finding.
+> - **3.68 GB of RAM.** The default worker count is `min(cores, 8)` = **8** here,
+>   which targets ~128 MiB of in-flight buffers on a machine with under 4 GB.
+>   Expect to need `$env:PHOENIX_WORKERS = "2"`.
+> - **Home SKU.** See the note in Phase 5 on `bitlocker.rs` — it is a *test
+>   fixture* limitation, **not** a product limitation. Nothing in the shipping
+>   product is gated on a Pro/Enterprise SKU, and VSS is confirmed working here
+>   (Phase 6).
+
 ---
 
 ## Phase 1 — Toolchain
@@ -241,6 +268,39 @@ drive-type/USB-bridge naming on ARM64. Cross-check against Phase 0's `Get-Disk`
 output — **if `list-disks` and `Get-Disk` disagree about the sector size, stop.**
 Everything downstream trusts that number.
 
+> ### FINDING (2026-07-14, FIXED) — six disks on a one-disk machine
+>
+> The GUI's Select Source page listed **Disk 0 through Disk 5**. Only Disk 0 is
+> real. `Get-Disk`, `Win32_DiskDrive`, and Disk Management each report exactly
+> one disk.
+>
+> They were not phantoms. `\\.\PhysicalDrive1..5` **open successfully** and carry
+> genuine GPTs full of genuine (tiny) partitions. They are the **UFS firmware
+> LUNs**: same Samsung UFS chip, same SCSI port/path/target, differing only by
+> **LUN 1–5** — 8 MB, 8 MB, 4 MB, 152 MB, 12 MB of Snapdragon boot/firmware
+> partitions (`xbl`, `tz`, `hyp`, `abl`, `devcfg`, modem, …). Windows names them
+> in the legacy `PhysicalDriveN` alias table but does not surface them as disks.
+>
+> `enumerate_disks()` brute-forced `\\.\PhysicalDrive0..63` and reported whatever
+> opened. That namespace is **an alias table, not the list of disks.** So the
+> firmware LUNs were offered as backup sources — and, because `enumerate_disks()`
+> also feeds the clone and restore target pickers, **as write targets.** The
+> boot/system-disk gate does not catch them: a firmware LUN is neither.
+> **Writing one bricks the machine.**
+>
+> **Fix:** enumerate the `GUID_DEVINTERFACE_DISK` device-interface class — the
+> question we actually mean, *what are the disks?* — and map each interface to
+> its index with `IOCTL_STORAGE_GET_DEVICE_NUMBER`. That is the same source Disk
+> Management, `Get-Disk`, and `Win32_DiskDrive` use. The firmware LUNs never
+> register the interface, so they are excluded **by construction**, not by a
+> size/name heuristic we would have to keep tuning. Verified on this box: the
+> class returns Disk 0 alone, and an attached VHDX still enumerates (so the T2
+> suite is unaffected).
+>
+> **This is not ARM-specific.** Any multi-LUN device — some USB card readers,
+> eMMC/UFS phones in mass-storage mode — could have done this on x64. ARM64 is
+> just where we finally pointed the tool at hardware that has one.
+
 ### The GUI — the renderer already bit us once
 
 ```powershell
@@ -324,9 +384,18 @@ Notes:
 - **This machine is likely slower and lower-memory than the x64 box.** If it
   thrashes, throttle the pipeline: `$env:PHOENIX_WORKERS = "2"` (clamped 1..=64;
   in-flight buffers cap around 128 MiB at the default `min(cores, 8)`).
-- **`bitlocker.rs` needs a Pro/Enterprise SKU** (the BitLocker cmdlets). It uses a
-  password protector on a data volume — no TPM or policy change needed. On Home,
-  it can't run; say so rather than reporting it as a failure.
+- **`bitlocker.rs` needs a Pro/Enterprise SKU — the *test* does, the *product*
+  does not.** The test calls `Enable-BitLocker` to *create* an encrypted fixture
+  volume to back up, and that cmdlet is Pro+. Carbon Phoenix's BitLocker
+  *handling* — detecting `-FVE-FS-`, choosing plaintext-vs-ciphertext capture —
+  is pure sector inspection and is not gated on any SKU. **This machine is Home,
+  so the test cannot run here.** Report it as `skipped-and-why`, not as a
+  failure, and do not let it become a claim that BitLocker support needs Pro.
+  It also means we currently have **no BitLocker coverage on ARM64** — say so.
+- **Nothing in the shipping product is gated on a Windows SKU.** If you ever find
+  a normal backup/restore/clone/mount path that needs Pro+, that is a bug, and a
+  serious one — Home is a first-class target. (Audited 2026-07-14: every Pro+
+  dependency in the tree lives in `phoenix-systests`, never in product code.)
 - **`sector_4kn.rs` is not hardware-dependent** — it synthesizes a true 4Kn VHDX
   via `CreateVirtualDisk` (core Win32, every SKU). It should pass regardless of
   what Phase 0 said about the internal drive.
@@ -345,6 +414,23 @@ the CIM method `Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create`
 Both PowerShell and WMI are native on ARM64, so the mechanism is expected to
 work — but it is **PowerShell-startup-latency sensitive**, and that latency is far
 more noticeable on a low-powered ARM laptop than on a desktop.
+
+> **Confirmed on this machine, 2026-07-14 (ARM64, Windows 10 Home).** The CIM
+> call is the right one and it works:
+>
+> ```text
+> Invoke-CimMethod Win32_ShadowCopy Create  -> ReturnValue 0
+>   ShadowID     {38B6926F-...}
+>   DeviceObject \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1
+>
+> vssadmin create shadow /for=C:           -> "Error: Invalid command."
+> ```
+>
+> The second line is the point: `vssadmin` does not even *list* `create shadow`
+> as a supported command on a client SKU. That is the exact silent failure this
+> module was rewritten to escape, and it reproduces here. **The snapshot
+> mechanism itself is therefore proven on ARM64 + Home.** What remains open in
+> this phase is *latency and the escalation arms*, not whether VSS works.
 
 `vss.rs` in Phase 5 covers it, but watch the three arms explicitly, because the
 escalation is not a user choice — the engine locks, escalates, or aborts:
