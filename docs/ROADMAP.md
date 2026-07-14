@@ -113,10 +113,24 @@ Two things make this worse than a normal failure:
 there) comparing the source partition's real sector size (manifest disk block)
 against the target disk's, refusing NTFS/FAT/exFAT on a mismatch with a clear
 error. Cheap, turns a mystery-RAW-three-hours-later into a two-second refusal, and
-is where to start. (b) *Convert* — rewrite `BPB.BytesPerSector` and recompute the
-dependent BPB fields so the volume is genuinely valid at the target geometry. A
-real format-aware transform, much larger, and a separate item. **Empirical result
-of the 4Kn→512e restore pending; confirm RAW-vs-mounts before choosing (b).**
+is where to start. (b) *Convert* (4Kn→512e, NTFS) — rewrite the BPB so the volume
+is valid at the target geometry.
+
+**(b) is proven feasible on real hardware (2026-07-14).** Spiked directly on the
+RAW restored NVMe: patched the two NTFS partitions' boot sectors in place and it
+**mounted, read files, and passed `chkdsk /scan` (exit 0, "no problems")** with
+cluster size and cluster count identical to the source. It is a **metadata-only**
+rewrite — no data moves — because NTFS is cluster-addressed and we preserve the
+cluster size in bytes. Exact recipe (for a 4096→512 flip, every field literally
+×8): `BytesPerSector 4096→512`, `SectorsPerCluster ×8`, `HiddenSectors ×8`,
+`TotalSectors ×8`, and write the patched VBR to both the primary and the backup
+boot sector (which lands at the same offset, since `new_Total×512 ==
+old_Total×4096`). The MFT-record fixup stride is always 512 regardless of volume
+sector size (see `grow.rs`), so MFT records need no change. Productize by doing
+this in the restore path *after* the data lands, behind an explicit opt-in, gated
+to NTFS + 4Kn→512e. FAT/exFAT are sector-denominated in more places (FAT tables,
+exFAT boot checksum) and are a separate, later effort. Direction stays
+one-way: 512e→4Kn remains out (sub-4096 clusters and alignment can't be faked).
 
 And the GPT had to learn the same lesson as everything else: its 34/33-sector reserve
 is a *512-byte* fact. The entry array is 16 KiB regardless — 32 sectors of 512, but
