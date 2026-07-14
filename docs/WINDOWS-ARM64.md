@@ -4,15 +4,18 @@ Carbon Phoenix targets **x86_64** and **ARM64** Windows from one source tree: th
 same CLI flags, GUI, capture modes, VSS behavior, and `.phnx` format. There are
 no `#[cfg(target_arch)]` branches in application logic.
 
-**Status (2026-07-14): first contact with real ARM64 hardware. The GUI did not
-start** — and the reason was the renderer, not our code. See "The OpenGL problem"
-below; the fix (glow → wgpu) is in, but **is not yet render-verified on either
-arch**. Everything else below about ARM64 *runtime* behavior remains an
-expectation derived from the code rather than an observation: apart from that one
-GUI launch, no Carbon Phoenix binary has been meaningfully exercised on ARM64.
-Treat the checklist at the bottom as the plan to *establish* parity, not as a
-record of it. Two things in particular are untested on real hardware anywhere, on
-any arch: **4Kn (4096-byte logical sector) media** and **UFS storage**.
+**Status (2026-07-14): the GUI RUNS on ARM64.** First contact with real Windows 11
+ARM hardware took two crashes to get there — both in the renderer, neither in our
+engine — and the fix (glow → wgpu, then DX12 by name) is in and **observed
+rendering on both arches**. See "The OpenGL problem" below.
+
+That is the *only* thing ARM64 has proven. **The engine remains unrun there**: no
+backup, no restore, no clone, no mount, no VSS, and not one test tier. Every claim
+below about ARM64 engine behavior is still an expectation derived from the code
+rather than an observation, so treat the checklist at the bottom as the plan to
+*establish* parity, not a record of it. Two things in particular are untested on
+real hardware anywhere, on any arch: **4Kn (4096-byte logical sector) media** and
+**UFS storage**.
 
 ## Parity contract
 
@@ -124,9 +127,10 @@ Three notes for whoever touches this next:
   code path is the whole point of the parity contract, and a fallback nobody
   exercises is a fallback nobody can trust.
 
-**Verified:** the wgpu GUI **renders on x64** (2026-07-14). **Unverified: ARM64
-render.** The DX12-enabled build exists and links the D3D12 imports, but no one
-has yet watched it draw on Snapdragon — that is the open question.
+**Verified 2026-07-14: the wgpu/DX12 GUI renders on BOTH arches**, ARM64 included —
+observed on real Windows 11 ARM hardware, not inferred. That is the first time any
+Carbon Phoenix binary has drawn a pixel on ARM64. It says nothing yet about the
+*engine* on ARM64: see the test plan below, all of which is still unrun.
 
 ## The WinFsp problem (read this before building on ARM64)
 

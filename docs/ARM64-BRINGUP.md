@@ -201,9 +201,12 @@ Everything downstream trusts that number.
 >    and eframe asks for neither. `phoenix-gui` now depends on wgpu directly with
 >    `features = ["dx12", "wgsl"]`.
 >
-> Both are fixed; full story in [WINDOWS-ARM64.md](WINDOWS-ARM64.md) → "The OpenGL
-> problem". **x64 renders. ARM64 render is still unwitnessed** — that is what this
-> phase now exists to answer.
+> Both are fixed, and **the GUI now renders on ARM64** (observed 2026-07-14 — the
+> first pixel this app has ever drawn on the architecture). Full story in
+> [WINDOWS-ARM64.md](WINDOWS-ARM64.md) → "The OpenGL problem".
+>
+> **This phase is therefore CLEARED for the GUI.** Re-run it only to confirm your
+> build renders; the open questions all live in the phases after this one.
 
 **Read the error text, not just the exit.** These two crashes looked similar and
 had completely different causes; the diagnosis lived in *which backends wgpu

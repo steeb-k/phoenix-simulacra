@@ -81,7 +81,7 @@ trusting a green run to mean "everything works".
 
 | Gap | Why it matters |
 |-----|----------------|
-| **ARM64 at runtime** | Essentially unrun. First contact 2026-07-14 got exactly one result: the GUI **would not start**, because Windows on ARM has no desktop OpenGL driver (renderer since switched glow → wgpu/DX12; not yet render-verified). Nothing else — no engine path, no test tier — has executed on ARM64. [ARM64-BRINGUP.md](ARM64-BRINGUP.md) is the runbook that closes this gap; [WINDOWS-ARM64.md](WINDOWS-ARM64.md) is the parity contract behind it. |
+| **ARM64 at runtime** | The **GUI runs** on ARM64 as of 2026-07-14 (after two renderer crashes: no desktop OpenGL on Windows-on-ARM, then wgpu shipping without DX12). The **engine does not** — no backup, restore, clone, mount or VSS, and not one test tier, has ever executed on ARM64. [ARM64-BRINGUP.md](ARM64-BRINGUP.md) is the runbook that closes this gap; [WINDOWS-ARM64.md](WINDOWS-ARM64.md) is the parity contract behind it. |
 
 ---
 
