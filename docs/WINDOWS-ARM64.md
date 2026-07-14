@@ -79,6 +79,37 @@ Both arches use it — the alternative, gating the renderer on `target_arch`, wo
 have broken the parity contract at the top of this document *and* left the x64
 build as the only one anyone had ever seen render.
 
+### …and DX12 must be asked for BY NAME (the second crash, same day)
+
+Switching to wgpu was necessary but **not sufficient**. The first wgpu build
+crashed on ARM64 too:
+
+```
+wgpu_hal::vulkan::instance: Unable to find extension: VK_KHR_surface, VK_KHR_win32_surface, …
+wgpu_hal::gles::adapter: Returned GL context is 1.1, when 3.3+ is needed
+eframe::native::run: Exiting because of error: WGPU error: Failed to create wgpu adapter, no suitable adapter found
+```
+
+Read what it *tried*: Vulkan, then GLES. **Never DX12** — because DX12 wasn't in
+the binary. In wgpu 22, **`dx12` is an opt-in cargo feature**, while Vulkan and
+GLES enable themselves by target cfg; and eframe 0.29 pulls wgpu with only
+`metal` + `webgpu`, which on Windows amounts to **no backend at all**. So the
+build offered Vulkan and GLES and nothing else.
+
+That is invisible on x64 (Vulkan works on Intel/AMD/NVIDIA — the x64 GUI rendered
+fine). On Snapdragon it is fatal: the Adreno Vulkan ICD exposed no usable surface
+extensions, GLES fell straight back into the same OpenGL 1.1 software rasterizer,
+and wgpu correctly concluded there was no adapter it could use.
+
+Fix: `phoenix-gui` now depends on `wgpu` **directly**, with
+`features = ["dx12", "wgsl"]`, so cargo's feature unification turns DX12 on inside
+eframe's copy of wgpu. Confirmed linked, not merely flagged — the ARM64 PE imports
+`D3D12CreateDevice`, `d3d12.dll`, and `dxgi.dll`.
+
+**The lesson generalizes:** an x64 box has three working backends and hides this
+class of bug completely. If the renderer stack ever changes again, check what wgpu
+*enumerates*, not just that it builds.
+
 Three notes for whoever touches this next:
 
 - **Do not "fix" this by shipping an OpenGL implementation.** ANGLE gives GL *ES*,
@@ -93,8 +124,9 @@ Three notes for whoever touches this next:
   code path is the whole point of the parity contract, and a fallback nobody
   exercises is a fallback nobody can trust.
 
-**Still unverified:** that wgpu actually *renders* — on either arch. It builds on
-both (ARM64 PE `Machine = 0xAA64`), and that is all we know as of this writing.
+**Verified:** the wgpu GUI **renders on x64** (2026-07-14). **Unverified: ARM64
+render.** The DX12-enabled build exists and links the D3D12 imports, but no one
+has yet watched it draw on Snapdragon — that is the open question.
 
 ## The WinFsp problem (read this before building on ARM64)
 

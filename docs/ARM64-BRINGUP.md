@@ -187,18 +187,28 @@ Everything downstream trusts that number.
 .\target\release\carbon-phoenix-gui.exe          # UAC prompt expected: it requires admin
 ```
 
-> **This phase has already produced one finding (2026-07-14).** The first launch
-> on Windows 11 ARM died instantly: `egui_glow requires opengl 2.0+`, preceded by
-> `swap control extensions are not supported`. **Windows on ARM ships no desktop
-> OpenGL driver** — `opengl32` is Microsoft's GDI software rasterizer at OpenGL
-> 1.1, and Adreno exposes D3D12/Vulkan instead. The GUI was switched from eframe's
-> `glow` backend to **`wgpu` (DX12)** on both arches. Full story:
-> [WINDOWS-ARM64.md](WINDOWS-ARM64.md) → "The OpenGL problem".
+> **This phase has already produced TWO findings (2026-07-14), and it is the most
+> productive phase in this document so far.**
 >
-> **So the question in this phase is no longer "does OpenGL work" — it is "does
-> wgpu/DX12 actually render?"** As of this writing that is unverified on *both*
-> arches; it only builds. If the window comes up, you are the first person to see
-> this app draw a pixel on ARM64.
+> 1. The first launch died on `egui_glow requires opengl 2.0+`. **Windows on ARM
+>    ships no desktop OpenGL driver** — `opengl32` is Microsoft's GDI software
+>    rasterizer at OpenGL 1.1. The GUI moved from eframe's `glow` backend to
+>    **`wgpu`**.
+> 2. The first *wgpu* build then died on **`no suitable adapter found`**, having
+>    tried Vulkan (no usable surface extensions on Adreno) and GLES (back to the
+>    same GL 1.1) — but **never DX12, because DX12 wasn't compiled in.** wgpu 22
+>    makes `dx12` an opt-in feature while Vulkan/GLES self-enable by target cfg,
+>    and eframe asks for neither. `phoenix-gui` now depends on wgpu directly with
+>    `features = ["dx12", "wgsl"]`.
+>
+> Both are fixed; full story in [WINDOWS-ARM64.md](WINDOWS-ARM64.md) → "The OpenGL
+> problem". **x64 renders. ARM64 render is still unwitnessed** — that is what this
+> phase now exists to answer.
+
+**Read the error text, not just the exit.** These two crashes looked similar and
+had completely different causes; the diagnosis lived in *which backends wgpu
+enumerated before giving up*. If it fails again, capture every `wgpu_hal` line —
+they name the backends tried, and that list is the finding.
 
 If it renders, check: the sidebar, the disk cards, the theme toggle, and the
 sticky action bar (the full-width gradient Start bar pinned above the status
