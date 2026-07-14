@@ -85,7 +85,7 @@ trusting a green run to mean "everything works".
 
 ---
 
-## Tier 1 — unit tests (111 tests, no admin)
+## Tier 1 — unit tests (114 tests, no admin)
 
 Pure logic, no real disks. Run the **engine crates** — not `--workspace`:
 
@@ -501,7 +501,7 @@ The gate before a commit that touches the engine is, in order:
 cargo fmt --all --check
 cargo clippy --workspace -- -D warnings          # the tree is clippy-clean; keep it that way
 cargo test -p phoenix-core -p phoenix-capture -p phoenix-restore `
-           -p phoenix-clone -p phoenix-mount -p phoenix-vss    # T1: 111 tests
+           -p phoenix-clone -p phoenix-mount -p phoenix-vss    # T1: 114 tests
 .\scripts\run-system-tests.ps1                   # T2, elevated
 ```
 

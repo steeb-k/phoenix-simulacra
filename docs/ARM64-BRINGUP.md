@@ -257,7 +257,7 @@ cargo test -p phoenix-core -p phoenix-capture -p phoenix-restore `
            -p phoenix-clone -p phoenix-mount -p phoenix-vss
 ```
 
-**Pass criterion: 111/111 green, identical to x64** (summed across the binaries if
+**Pass criterion: 114/114 green, identical to x64** (summed across the binaries if
 you are running them individually). Any delta is a real bug.
 Report it with the failing test name and full output; do not proceed to
 destructive phases until you understand it.
@@ -527,7 +527,7 @@ failure. Then, specifically:
    `LogicalSectorSize`.
 2. **Which WinFsp registry key the ARM64 MSI wrote**, and whether the build
    panicked before you mirrored it.
-3. **T1 count** — anything other than 111/111 is the headline.
+3. **T1 count** — anything other than 114/114 is the headline.
 4. **Whether the GUI renders** on the wgpu/DX12 backend, with screenshots. (The
    glow/OpenGL backend is already known dead here — that finding is closed.)
 5. **Whether `winfsp-a64.dll` mounts** — first run ever.
