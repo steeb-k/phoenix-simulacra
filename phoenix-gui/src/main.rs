@@ -1,3 +1,9 @@
+// Ship as a GUI-subsystem binary: double-clicking the exe (or launching it from
+// the launcher) must NOT flash a console window. The console is opt-in at run
+// time via `--debug`, which calls `attach_debug_console()` before logging is
+// set up — see `main`.
+#![windows_subsystem = "windows"]
+
 mod about_panel;
 mod action_bar;
 mod clone_panel;
@@ -94,7 +100,16 @@ const STATUS_BAR_HEIGHT_ESTIMATE: f32 = 40.0;
 const MIN_WINDOW_WIDTH: f32 = 640.0;
 
 fn main() -> eframe::Result<()> {
-    let _log_guard = init_logging();
+    // `--debug` re-enables the console this GUI-subsystem build normally
+    // suppresses. Attach it BEFORE logging init so the stderr layer binds to a
+    // live console handle (Rust resolves the std handles lazily per write, and
+    // AllocConsole/AttachConsole populate them for a windowed process).
+    let debug = debug_from_args();
+    #[cfg(windows)]
+    if debug {
+        attach_debug_console();
+    }
+    let _log_guard = init_logging(debug);
 
     let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
     let options = eframe::NativeOptions {
@@ -120,9 +135,10 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Sets up tracing to BOTH stderr (for users who launch from a terminal) and
-/// a rolling log file in `%LOCALAPPDATA%\PhoenixSimulacra\logs\` so users who
-/// double-click the .exe can still hand us a log when something goes wrong.
+/// Sets up tracing to a rolling log file in `%LOCALAPPDATA%\PhoenixSimulacra\
+/// logs\` (always) and, when `debug` is set, also to the console `--debug`
+/// attached — so users who double-click the .exe can still hand us a log, while
+/// `--debug` runs additionally stream it live.
 ///
 /// The default filter is deliberately *verbose* — `info` for every Phoenix
 /// crate — so a fresh log file is immediately useful even if the user never
@@ -131,7 +147,7 @@ fn main() -> eframe::Result<()> {
 /// silent (no log writes between startup and shutdown) which led us down
 /// multiple "the binary must be stale" rabbit holes. Anything truly noisy
 /// (per-chunk debug) is gated behind explicit `debug!`/`trace!` levels.
-fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+fn init_logging(debug: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -150,9 +166,14 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         })
         .unwrap_or_else(|_| std::env::temp_dir().join("PhoenixSimulacra").join("logs"));
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(true);
+    // Only attach the stderr layer in `--debug` runs. In the normal
+    // GUI-subsystem build there is no console, so this would otherwise write to
+    // a dead handle. `Option<Layer>` is itself a `Layer` (a no-op when `None`).
+    let stderr_layer = debug.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(true)
+    });
 
     let (file_layer, guard) = match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
@@ -2871,6 +2892,30 @@ impl PhoenixApp {
                 self.status = "Update checks aren't wired up yet.".into();
             }
         });
+    }
+}
+
+/// `--debug`: re-enable the console that this GUI-subsystem build suppresses by
+/// default, and stream logs to it. This is the flag the eventual "Simulacra
+/// (Debug)" Start-menu entry passes through the launcher.
+fn debug_from_args() -> bool {
+    std::env::args().skip(1).any(|a| a == "--debug")
+}
+
+/// Give the process a console when launched with `--debug`. Prefer the invoking
+/// terminal's console (a developer running the exe from a shell); fall back to a
+/// fresh console window (double-clicked, or launched elevated via the launcher,
+/// where there is no parent console to attach to).
+#[cfg(windows)]
+fn attach_debug_console() {
+    use windows_sys::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+
+    // SAFETY: both are argument-free FFI calls. AttachConsole returns 0 (false)
+    // when there is no parent console, in which case we allocate our own.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
     }
 }
 

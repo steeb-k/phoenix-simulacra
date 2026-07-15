@@ -9,6 +9,7 @@ members = [
     "phoenix-mount",
     "phoenix-cli",
     "phoenix-gui",
+    "phoenix-launcher",
     "phoenix-systests",
 ]
 

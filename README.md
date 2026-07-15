@@ -59,7 +59,17 @@ Binaries embed a `requireAdministrator` manifest (UAC on launch). Paths depend o
 | `x86_64-pc-windows-msvc` | `target/x86_64-pc-windows-msvc/release/...` | same |
 | `aarch64-pc-windows-msvc` | `target/aarch64-pc-windows-msvc/release/...` | same |
 
-Packaged copies from the release script: `dist/<target>/`.
+The release script assembles a single shippable bundle in `dist/simulacra/` holding both architectures plus an arch-selecting launcher:
+
+| File | Arch | What |
+|------|------|------|
+| `simulacra-launcher.exe` | x64* | Picks and launches the right GUI for the machine |
+| `simulacra.exe` | x64 | GUI |
+| `simulacra-cli.exe` | x64 | CLI |
+| `simulacra-arm.exe` | ARM64 | GUI |
+| `simulacra-cli-arm.exe` | ARM64 | CLI |
+
+\* The launcher ships as x64 only — Windows-on-ARM64 runs it under emulation, so one binary detects the native machine (`IsWow64Process2`) and launches `simulacra.exe` or `simulacra-arm.exe` accordingly. It is the normal entry point; the per-arch exes can also be run directly.
 
 ## CLI Usage
 
