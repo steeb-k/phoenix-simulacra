@@ -202,8 +202,10 @@ WinFsp MSI, both ARM64 builds.
 ```powershell
 .\scripts\build-release.ps1
 ```
-Produces `dist/<target>/simulacra.exe` and `simulacra-gui.exe` for both
-targets.
+Produces the shippable bundle in `dist/simulacra/`: `simulacra.exe` /
+`simulacra-cli.exe` (x64 GUI / CLI), `simulacra-arm.exe` /
+`simulacra-cli-arm.exe` (ARM64 GUI / CLI), and the x64-only
+`simulacra-launcher.exe` (arch-selecting entry point).
 
 ✅ **Verified working, x64 host → both targets (2026-07-13.)** All four binaries
 build from an ordinary shell, and the PE `Machine` field confirms them: `0x8664`

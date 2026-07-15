@@ -125,7 +125,7 @@ BitLocker volumes must be **unlocked** (decrypted at the volume layer) for a nor
    - Hash uncompressed chunk with **BLAKE3**; record in manifest.
 5. **Finalize** — Write partition index table, JSON manifest, footer with manifest hash.
 
-Integrity is recorded **during** backup; use `simulacra verify` afterward for a full re-read check.
+Integrity is recorded **during** backup; use `simulacra-cli verify` afterward for a full re-read check.
 
 ---
 
@@ -139,7 +139,7 @@ Integrity is recorded **during** backup; use `simulacra verify` afterward for a 
 After backup, inspect contents:
 
 ```bash
-simulacra list backup.phnx
+simulacra-cli list backup.phnx
 ```
 
 Look at `used_bytes` vs `original_size` per partition to see how much logical data was captured versus partition capacity.
@@ -151,7 +151,7 @@ Look at `used_bytes` vs `original_size` per partition to see how much logical da
 ### List disks and partitions
 
 ```bash
-simulacra list-disks
+simulacra-cli list-disks
 ```
 
 Shows disk index, path, GPT/MBR, and each partition’s index, name, size, detected filesystem, and capture mode.
@@ -159,7 +159,7 @@ Shows disk index, path, GPT/MBR, and each partition’s index, name, size, detec
 ### Create a backup
 
 ```bash
-simulacra backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --output <PATH.phnx> [--no-verify]
+simulacra-cli backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --output <PATH.phnx> [--no-verify]
 ```
 
 | Option | Required | Description |
@@ -175,18 +175,18 @@ Locking vs. VSS is not an option — the engine locks the volume when it can and
 
 ```bash
 # Data drive (idle → captured under an exclusive volume lock)
-simulacra backup --disk 1 --partitions 2 --output D:\Backups\data.phnx
+simulacra-cli backup --disk 1 --partitions 2 --output D:\Backups\data.phnx
 
 # System disk: EFI + MSR + Windows partition (indices from list-disks).
 # The running C: can't be locked, so it's captured through a VSS shadow.
-simulacra backup --disk 0 --partitions 1,2,3 --output C:\Backups\system.phnx
+simulacra-cli backup --disk 0 --partitions 1,2,3 --output C:\Backups\system.phnx
 ```
 
 ### Verify after backup
 
 ```bash
-simulacra verify backup.phnx          # Full: re-hash every chunk
-simulacra verify backup.phnx --quick  # Metadata + manifest hash only
+simulacra-cli verify backup.phnx          # Full: re-hash every chunk
+simulacra-cli verify backup.phnx --quick  # Metadata + manifest hash only
 ```
 
 ---
@@ -298,10 +298,10 @@ Useful fields for auditing a backup:
 ## Related commands
 
 ```bash
-simulacra list-disks
-simulacra backup --disk 0 --partitions 1,2,3 -o backup.phnx
-simulacra list backup.phnx
-simulacra verify backup.phnx
+simulacra-cli list-disks
+simulacra-cli backup --disk 0 --partitions 1,2,3 -o backup.phnx
+simulacra-cli list backup.phnx
+simulacra-cli verify backup.phnx
 ```
 
 Restore workflow: `plan` → edit TOML → `restore` (documented in [README.md](README.md)).

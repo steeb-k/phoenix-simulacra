@@ -15,26 +15,26 @@ or a spare disk you can afford to overwrite.
 
 ## 1. Live system-disk backup (VSS)
 
-- [ ] From an elevated prompt, list disks: `simulacra list-disks`.
+- [ ] From an elevated prompt, list disks: `simulacra-cli list-disks`.
 - [ ] Back up the live OS disk (the running volume can't be locked, so the engine
       must escalate to a VSS shadow on its own — there is no flag):
-      `simulacra backup --disk 0 --partitions <sys parts> -o C:\temp\live.phnx`
+      `simulacra-cli backup --disk 0 --partitions <sys parts> -o C:\temp\live.phnx`
 - [ ] Confirm the log shows `volume is in use; reading a VSS shadow instead of the
       live volume` for the OS volume, and `VSS snapshot created`.
-- [ ] Verify the backup: `simulacra verify C:\temp\live.phnx` (full).
+- [ ] Verify the backup: `simulacra-cli verify C:\temp\live.phnx` (full).
 - [ ] Confirm `verify --quick` also passes and is fast.
 
 ## 2. Restore to a spare disk and boot
 
 - [ ] Attach a spare disk (>= source used size).
-- [ ] `simulacra plan C:\temp\live.phnx --disk <spare> -o plan.toml`
-- [ ] Review `plan.toml` sizes/offsets, then `simulacra restore C:\temp\live.phnx --plan plan.toml`.
+- [ ] `simulacra-cli plan C:\temp\live.phnx --disk <spare> -o plan.toml`
+- [ ] Review `plan.toml` sizes/offsets, then `simulacra-cli restore C:\temp\live.phnx --plan plan.toml`.
 - [ ] Move the spare disk to a test machine (or set as boot device) and confirm Windows boots.
 - [ ] If boot fails, note whether Startup Repair / `bcdedit` fixes it (expected for dissimilar hardware).
 
 ## 3. Live system-disk clone (VSS)
 
-- [ ] `simulacra clone --source-disk 0 --target-disk <spare> --verify`
+- [ ] `simulacra-cli clone --source-disk 0 --target-disk <spare> --verify`
 - [ ] Confirm the destructive-action confirmation prompt appears and requires typed confirmation.
 - [ ] After completion, `chkdsk <letter>: /scan` on each restored volume is clean.
 - [ ] Boot the cloned disk; confirm Windows starts and data is intact.
@@ -46,7 +46,7 @@ or a spare disk you can afford to overwrite.
 
 ## 5. Mount
 
-- [ ] `simulacra mount C:\temp\live.phnx` (with WinFsp installed).
+- [ ] `simulacra-cli mount C:\temp\live.phnx` (with WinFsp installed).
 - [ ] Browse the mounted volume(s) in Explorer; open a few files; compare hashes to source.
 - [ ] Unmount (Ctrl-C) and confirm the drive letters disappear cleanly.
 - [ ] With WinFsp NOT installed, confirm the CLI/GUI shows a clear "install WinFsp" message.

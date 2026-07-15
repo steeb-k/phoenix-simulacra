@@ -73,26 +73,29 @@ The release script assembles a single shippable bundle in `dist/simulacra/` hold
 
 ## CLI Usage
 
+The CLI ships as `simulacra-cli` (the `-cli` binary in the bundle; a dev
+`cargo build` produces it as `simulacra.exe`).
+
 ```bash
 # List disks (UAC prompt appears automatically when launching the exe)
-simulacra list-disks
+simulacra-cli list-disks
 
 # Backup partitions 1,2,3 on disk 0. Idle volumes are captured under an exclusive
 # lock; volumes in use (the live C: among them) are captured through a VSS shadow —
 # there is nothing to choose.
-simulacra backup --disk 0 --partitions 1,2,3 --output backup.phnx
+simulacra-cli backup --disk 0 --partitions 1,2,3 --output backup.phnx
 
 # Inspect backup
-simulacra list backup.phnx
+simulacra-cli list backup.phnx
 
 # Verify
-simulacra verify backup.phnx
-simulacra verify backup.phnx --quick
+simulacra-cli verify backup.phnx
+simulacra-cli verify backup.phnx --quick
 
 # Restore
-simulacra plan backup.phnx --disk 1 --output plan.toml
+simulacra-cli plan backup.phnx --disk 1 --output plan.toml
 # Edit plan.toml (partition sizes/offsets)
-simulacra restore backup.phnx --plan plan.toml
+simulacra-cli restore backup.phnx --plan plan.toml
 ```
 
 ## Documentation
