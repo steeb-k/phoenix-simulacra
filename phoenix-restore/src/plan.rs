@@ -141,8 +141,10 @@ impl RestorePlan {
             // mismatch for NTFS/FAT/exFAT with a clear error — the manifest disk
             // block already records the source's real sector size. A true
             // cross-sector conversion (rewrite BytesPerSector + dependent BPB
-            // fields) is a larger, separate change. Surfaced 2026-07-14 by a
-            // 4Kn-UFS -> 512e-NVMe restore; see docs/ROADMAP.md.
+            // fields) is a larger, separate change — proven on hardware for both
+            // NTFS and FAT32, per-partition (not full-disk-only). Full build plan
+            // in docs/SECTOR-SIZE-CONVERSION.md. Surfaced 2026-07-14 by a
+            // 4Kn-UFS -> 512e-NVMe restore.
         }
         Ok(())
     }
