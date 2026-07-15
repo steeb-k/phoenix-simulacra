@@ -116,4 +116,4 @@ simulacra-cli restore backup.phnx --plan plan.toml
 
 ## License
 
-MIT
+GNU General Public License v3.0 or later (GPL-3.0-or-later). See [LICENSE](LICENSE).
