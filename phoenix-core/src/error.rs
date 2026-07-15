@@ -115,6 +115,55 @@ pub enum PhoenixError {
          on a different cable or port."
     )]
     DestinationLost { path: String, last_error: i32 },
+    /// The backup's source disk and the restore/clone target use logical sector
+    /// sizes that can't be reconciled. The **only** convertible direction is
+    /// 4Kn (4096) → 512e (512); the reverse (and every other mismatch) is a hard
+    /// refusal, because a coarser sector size can't represent a finer one —
+    /// sub-4096-byte clusters simply have no valid 4Kn form, and 512-but-not-
+    /// 4096-aligned on-disk structures can't be placed. No override exists.
+    #[error(
+        "cannot restore/clone a {source_sector}-byte-logical-sector backup onto a \
+         {target_sector}-byte-logical-sector disk: this sector-size change cannot be \
+         represented. Only 4Kn (4096) → 512e (512) is convertible; the reverse and every other \
+         mismatch is refused because a coarser sector size cannot faithfully hold a finer one. \
+         Restore onto a disk whose logical sector size matches the source, or a 512e disk if the \
+         source was 4Kn."
+    )]
+    SectorSizeUnsupported {
+        source_sector: u32,
+        target_sector: u32,
+    },
+    /// A convertible 4Kn → 512e restore/clone was detected, but the user has not
+    /// opted in. Conversion rewrites filesystem boot sectors, so the result is a
+    /// *converted copy*, not a byte-identical restore — an explicit choice, not a
+    /// silent default. The CLI names the `--convert-sector-size` flag; the GUI
+    /// raises its acknowledgement hazard dialog.
+    #[error(
+        "this backup is from a {source_sector}-byte-logical-sector (4Kn) disk and the target \
+         uses {target_sector}-byte logical sectors (512e). To make the restored/cloned disk \
+         mountable, the filesystem boot sectors must be rewritten — the result is a converted \
+         copy, not a byte-identical restore. Re-run with --convert-sector-size to opt in."
+    )]
+    SectorConversionRequired {
+        source_sector: u32,
+        target_sector: u32,
+    },
+    /// A 4Kn → 512e conversion was requested, but a partition it would convert is
+    /// being restored into a slot *smaller* than its source volume. Shrinking a
+    /// converted partition is out of scope for v1: the NTFS shrink relocation /
+    /// metadata rewrite path isn't sector-size-aware, so combining it with a
+    /// boot-sector conversion is refused rather than risk a subtly corrupt volume.
+    #[error(
+        "cross-sector-size conversion (4Kn → 512e) cannot also shrink a converted partition in \
+         this version: partition {partition_index} would restore into {target_size} bytes but its \
+         source volume is {source_size} bytes. Restore onto a disk at least as large as the \
+         source, or restore without conversion onto matching-sector-size media."
+    )]
+    SectorConversionShrinkUnsupported {
+        partition_index: u32,
+        target_size: u64,
+        source_size: u64,
+    },
     #[error("{0}")]
     Other(String),
 }

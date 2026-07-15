@@ -224,7 +224,14 @@ pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
             progress: Some(progress_worker),
             ..opts
         })
-        .map(|_summary| "Restore completed".to_string())
+        .map(|s| {
+            let mut msg = "Restore completed".to_string();
+            msg.push_str(&conversion_note(
+                s.partitions_converted,
+                s.conversion_bootable,
+            ));
+            msg
+        })
         .map_err(|e| e.to_string())
     })
 }
@@ -256,12 +263,28 @@ pub fn spawn_clone(opts: phoenix_clone::CloneOptions) -> BackgroundJob {
         })
         .map(|s| {
             format!(
-                "Clone complete: {} partition(s) copied, {} resized",
-                s.partitions_cloned, s.partitions_resized
+                "Clone complete: {} partition(s) copied, {} resized{}",
+                s.partitions_cloned,
+                s.partitions_resized,
+                conversion_note(s.partitions_converted, s.conversion_bootable),
             )
         })
         .map_err(|e| e.to_string())
     })
+}
+
+/// A short results-line suffix describing a 4Kn → 512e conversion (Alert G), or
+/// empty when none ran (`bootable` is `None`).
+fn conversion_note(converted: u32, bootable: Option<bool>) -> String {
+    match bootable {
+        None => String::new(),
+        Some(true) => format!(
+            " — converted {converted} partition(s) 4Kn→512e; ESP converted, should be bootable"
+        ),
+        Some(false) => format!(
+            " — converted {converted} partition(s) 4Kn→512e; ESP not converted, will not boot"
+        ),
+    }
 }
 
 #[cfg(test)]

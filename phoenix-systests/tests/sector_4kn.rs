@@ -205,6 +205,7 @@ fn ntfs_4kn_backup_restore_roundtrip() {
         backup_path: backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore to 4Kn");
@@ -259,6 +260,7 @@ fn ntfs_4kn_clone_same_size_and_expanded() {
         target_disk_index: target.disk_index(),
         plan: ClonePlan::identity(&src),
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("same-size clone between 4Kn disks");
@@ -284,6 +286,7 @@ fn ntfs_4kn_clone_same_size_and_expanded() {
         target_disk_index: bigger.disk_index(),
         plan: ClonePlan::expand_to_fill(&src, &big),
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("expand-to-fill clone between 4Kn disks");
@@ -402,6 +405,7 @@ fn ntfs_4kn_clone_shrinks_into_a_smaller_slot() {
             table_mode: CloneTableMode::ReinitMatchSource,
         },
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("shrinking clone between 4Kn disks");

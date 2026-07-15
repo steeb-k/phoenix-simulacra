@@ -105,6 +105,7 @@ fn gpt_identity_preserved_when_source_absent() {
         backup_path: backup_path.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");

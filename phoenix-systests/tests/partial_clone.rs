@@ -210,6 +210,7 @@ fn partial_clone_replaces_one_slot_and_preserves_sibling() {
         target_disk_index: target.disk_index(),
         plan,
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("partial clone");
@@ -371,6 +372,7 @@ fn partial_clone_shrinks_ntfs_into_a_smaller_slot() {
             },
         },
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("partial clone with shrink");
@@ -496,6 +498,7 @@ fn partial_clone_drops_an_unpreserved_live_partition() {
             },
         },
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("partial clone dropping a live partition");
@@ -626,6 +629,7 @@ fn clone_aborts_before_touching_the_target_when_a_source_cannot_be_frozen() {
         target_disk_index: target.disk_index(),
         plan: ClonePlan::identity(&src_disk),
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     });
 

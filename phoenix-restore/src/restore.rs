@@ -7,6 +7,7 @@ use phoenix_core::container::{PartitionIndexEntry, PhnxReader};
 use phoenix_core::disk::{enumerate_disks, DiskInfo, FilesystemKind};
 use phoenix_core::error::Result;
 use phoenix_core::manifest::fs_kind_from_string;
+use phoenix_core::sector::ConversionReport;
 use phoenix_core::ProgressHandle;
 use tracing::{info, warn};
 
@@ -22,6 +23,14 @@ pub struct RestoreOptions {
     pub backup_path: std::path::PathBuf,
     pub plan: RestorePlan,
     pub verify_on_restore: bool,
+    /// Opt-in to a 4Kn → 512e cross-sector-size conversion. When the backup's
+    /// source disk uses 4096-byte logical sectors and the target uses 512-byte
+    /// sectors, the filesystem boot sectors must be rewritten or the restored
+    /// volumes come up RAW. This is the explicit acknowledgement (equivalent to
+    /// the CLI `--convert-sector-size` flag / the GUI hazard-dialog checkbox)
+    /// that the result is a converted copy, not a byte-identical restore.
+    /// Ignored when the sector sizes already match.
+    pub convert_sector_size: bool,
     pub progress: Option<ProgressHandle>,
 }
 
@@ -39,6 +48,18 @@ pub struct RestoreSummary {
     /// this, and note that Windows may need a reboot or a disk reconnect
     /// before it re-recognizes the volume (see the post-restore rescan).
     pub restored_locked_bitlocker: bool,
+    /// Number of partitions whose boot sector was rewritten 4Kn → 512e.
+    pub partitions_converted: u32,
+    /// `Some(true/false)` when a 4Kn → 512e conversion ran: whether the ESP was
+    /// among the converted set (i.e. the restored disk should be bootable).
+    /// `None` when no conversion occurred.
+    pub conversion_bootable: Option<bool>,
+    /// Human names of the partitions converted 4Kn → 512e (Alert G summary).
+    pub conversion_converted_names: Vec<String>,
+    /// Human names of partitions the conversion left untouched because v1 does
+    /// not convert their filesystem (exFAT / BitLocker ciphertext) — restored
+    /// but unreadable on the 512e target (Alert E).
+    pub conversion_unconverted_names: Vec<String>,
 }
 
 pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
@@ -61,6 +82,22 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // Reject an overlapping or oversized layout before touching the disk.
     // This catches a hand-edited plan.toml as well as any auto-layout bug.
     opts.plan.validate_layout(disk.size_bytes)?;
+
+    // Cross-sector-size pre-flight: compare the backup's source logical sector
+    // size against the target disk's. Returns `Some(report)` for an opted-in
+    // 4Kn → 512e conversion, `None` when sizes match, and errors out for a
+    // missing opt-in (SectorConversionRequired), an unsupported mismatch
+    // (SectorSizeUnsupported), or a converted-partition shrink — all before the
+    // disk is touched, so an aborted pre-flight leaves the target untouched.
+    let conversion = plan_sector_conversion(
+        &reader.manifest,
+        &opts.plan,
+        disk.sector_size,
+        opts.convert_sector_size,
+    )?;
+    if let Some(report) = &conversion {
+        log_conversion_banner(reader.manifest.disk.sector_size, disk.sector_size, report);
+    }
 
     info!(
         "Restoring to disk {} ({}); source style={}, target was {}",
@@ -464,6 +501,29 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                 )?;
             }
         }
+
+        // Cross-sector-size conversion: rewrite the just-landed boot sector to
+        // 512e so the volume mounts instead of coming up RAW. Auto-detects
+        // NTFS/FAT32 from the boot sector (so it catches the ESP, which restores
+        // through the raw path as `Efi`); exFAT / MSR / encrypted return Skipped.
+        // Runs on the same handle that streamed the data, in the same offline
+        // window (before the partition table is planted), so nothing has
+        // re-mounted the volume underneath us. The resize finalizers only touch
+        // the boot sector on *shrink*, which the pre-flight has already refused
+        // for a converted partition, so there is no double-write to reconcile.
+        if conversion.is_some() {
+            let outcome =
+                phoenix_capture::apply_sector_conversion(&mut writer, entry.target_offset_bytes)?;
+            if outcome.converted() {
+                summary.partitions_converted += 1;
+            }
+        }
+    }
+
+    if let Some(report) = &conversion {
+        summary.conversion_bootable = Some(report.bootable);
+        summary.conversion_converted_names = report.converted_names.clone();
+        summary.conversion_unconverted_names = report.unconverted_names.clone();
     }
 
     // PHASE 3 — now that every partition's bytes are on disk, plant
@@ -643,12 +703,114 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     info!(
         partitions_restored = summary.partitions_restored,
         partitions_resized = summary.partitions_resized,
+        partitions_converted = summary.partitions_converted,
         restored_locked_bitlocker = summary.restored_locked_bitlocker,
         elapsed = %phoenix_core::progress::format_elapsed(total_secs),
         throughput = %phoenix_core::progress::format_rate(bytes_done, total_secs),
         "Restore complete"
     );
     Ok(summary)
+}
+
+/// Decide, name, and gate a cross-sector-size conversion for a restore plan.
+/// Pure and side-effect-free so the CLI/GUI can call it to describe the
+/// operation *before* it runs (the GUI passes `opt_in = true` because its
+/// hazard-dialog checkbox is the opt-in gate).
+///
+/// * sizes match → `Ok(None)`, restore verbatim;
+/// * 4Kn → 512e with opt-in → `Ok(Some(report))` (having refused any
+///   converted-partition shrink);
+/// * 4Kn → 512e without opt-in → `Err(SectorConversionRequired)` (Alert A);
+/// * unsupported mismatch (e.g. 512e → 4Kn) → `Err(SectorSizeUnsupported)`
+///   (Alert B).
+pub fn plan_sector_conversion(
+    manifest: &phoenix_core::manifest::BackupManifest,
+    plan: &RestorePlan,
+    target_sector_size: u32,
+    opt_in: bool,
+) -> Result<Option<ConversionReport>> {
+    use phoenix_core::sector::{
+        classify_sector_sizes, is_esp, partition_convert_role, PartitionConvertRole, SectorPlan,
+    };
+
+    let source_ss = manifest.disk.sector_size;
+    match classify_sector_sizes(source_ss, target_sector_size)? {
+        SectorPlan::Identical => Ok(None),
+        SectorPlan::Convert4knTo512e => {
+            if !opt_in {
+                return Err(phoenix_core::error::PhoenixError::SectorConversionRequired {
+                    source_sector: source_ss,
+                    target_sector: target_sector_size,
+                });
+            }
+            let mut report = ConversionReport::default();
+            for entry in &plan.entries {
+                if !entry.restore {
+                    continue;
+                }
+                let Some(src) = entry.source_partition_index else {
+                    continue;
+                };
+                let Some(part) = manifest.partitions.iter().find(|p| p.index == src) else {
+                    continue;
+                };
+                let fs = fs_kind_from_string(&part.fs);
+                let name = format!("[{}] {}", part.index, part.name);
+                match partition_convert_role(fs) {
+                    PartitionConvertRole::Convert => {
+                        // v1 does not combine conversion with a shrink: the NTFS
+                        // relocation / metadata rewrite path isn't sector-size-
+                        // aware. Refuse before touching the disk.
+                        if entry.target_size_bytes < part.original_size {
+                            return Err(
+                                phoenix_core::error::PhoenixError::SectorConversionShrinkUnsupported {
+                                    partition_index: src,
+                                    target_size: entry.target_size_bytes,
+                                    source_size: part.original_size,
+                                },
+                            );
+                        }
+                        if is_esp(fs) {
+                            report.bootable = true;
+                        }
+                        report.converted_names.push(name);
+                    }
+                    PartitionConvertRole::NoFilesystem => {}
+                    PartitionConvertRole::LeftUnconverted => report.unconverted_names.push(name),
+                }
+            }
+            Ok(Some(report))
+        }
+    }
+}
+
+/// Emit the pre-flight warning banner for a conversion (Alerts D/E/F surface
+/// here in the CLI log stream). Called by `run_restore` once the report is in
+/// hand; the GUI builds its hazard dialog from the same report instead.
+fn log_conversion_banner(source_ss: u32, target_ss: u32, report: &ConversionReport) {
+    warn!(
+        source_sector_size = source_ss,
+        target_sector_size = target_ss,
+        convert = report.converted_names.len(),
+        "4Kn -> 512e conversion: filesystem boot sectors will be rewritten. The restored disk is \
+         a CONVERTED COPY, not a byte-identical restore."
+    );
+    for n in &report.converted_names {
+        info!(partition = n.as_str(), "will convert 4Kn -> 512e");
+    }
+    if !report.bootable {
+        warn!(
+            "the EFI System Partition is not among the converted set: the restored disk will hold \
+             its data but will NOT boot"
+        );
+    }
+    for n in &report.unconverted_names {
+        warn!(
+            partition = n.as_str(),
+            "left unconverted (exFAT / encrypted): its bytes restore but the volume will be \
+             unreadable on the 512e target"
+        );
+    }
 }
 
 /// Best-effort: after bring-online, wait briefly for the mount manager to give

@@ -197,6 +197,7 @@ fn run_restore_plan(backup: &Path, plan: RestorePlan) {
         backup_path: backup.to_path_buf(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: Some(progress.handle()),
     })
     .expect("run_restore");

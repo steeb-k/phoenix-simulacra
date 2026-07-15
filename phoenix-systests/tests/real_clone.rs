@@ -188,6 +188,7 @@ fn run(plan: ClonePlan, src: &RealDisk, tgt: &RealDisk, what: &str) {
         // ReadBack: re-read the target's sectors and compare. On real media this
         // is the check that matters — it is what caught the phantom-cluster bug.
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .unwrap_or_else(|e| panic!("{what} failed: {e}"));
@@ -578,6 +579,7 @@ fn real_clone_back_from_hdd_to_flash() {
             table_mode: CloneTableMode::ReinitAs { gpt: false },
         },
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("clone back to the flash drive");

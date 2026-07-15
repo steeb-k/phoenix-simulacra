@@ -17,6 +17,7 @@ use phoenix_core::disk::{
 };
 use phoenix_core::error::{PhoenixError, Result};
 use phoenix_core::relocation::RelocationMap;
+use phoenix_core::sector::ConversionReport;
 use phoenix_core::ProgressHandle;
 
 use phoenix_capture::{
@@ -49,6 +50,13 @@ pub struct CloneOptions {
     pub target_disk_index: u32,
     pub plan: ClonePlan,
     pub verify: CloneVerify,
+    /// Opt-in to a 4Kn → 512e cross-sector-size conversion (source disk uses
+    /// 4096-byte logical sectors, target uses 512-byte). The filesystem boot
+    /// sectors are rewritten so the cloned volumes mount instead of coming up
+    /// RAW — a converted copy, not a byte-identical clone. Equivalent to the CLI
+    /// `--convert-sector-size` flag / the GUI hazard-dialog checkbox. Ignored
+    /// when the sector sizes already match.
+    pub convert_sector_size: bool,
     pub progress: Option<ProgressHandle>,
     // NOTE: there is deliberately no `use_vss`. How a source is frozen is not a
     // user choice — the engine takes the strongest freeze each volume allows (see
@@ -64,6 +72,17 @@ pub struct CloneSummary {
     pub partitions_cloned: u32,
     pub partitions_resized: u32,
     pub bytes_copied: u64,
+    /// Number of partitions whose boot sector was rewritten 4Kn → 512e.
+    pub partitions_converted: u32,
+    /// `Some(true/false)` when a 4Kn → 512e conversion ran: whether the ESP was
+    /// among the converted set (i.e. the cloned disk should be bootable).
+    /// `None` when no conversion occurred.
+    pub conversion_bootable: Option<bool>,
+    /// Human names of partitions converted 4Kn → 512e (Alert G summary).
+    pub conversion_converted_names: Vec<String>,
+    /// Human names of partitions left unconverted because v1 does not convert
+    /// their filesystem (exFAT / BitLocker ciphertext) — Alert E.
+    pub conversion_unconverted_names: Vec<String>,
 }
 
 /// Clone `source_disk_index` onto `target_disk_index` per the plan.
@@ -120,6 +139,16 @@ pub fn run_clone(opts: CloneOptions) -> Result<CloneSummary> {
 
 fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Result<CloneSummary> {
     let mut summary = CloneSummary::default();
+
+    // Cross-sector-size pre-flight, before anything is frozen or the target is
+    // touched: gate/opt-in the 4Kn → 512e conversion, refuse an unsupported
+    // mismatch or a converted-partition shrink, and name what will convert.
+    let conversion =
+        plan_sector_conversion(source, &opts.plan, target.sector_size, opts.convert_sector_size)?;
+    if let Some(report) = &conversion {
+        log_conversion_banner(source.sector_size, target.sector_size, report);
+    }
+    let converting = conversion.is_some();
 
     // Total planned bytes for the progress meter (doubled when reading back).
     let per_pass: u64 = opts
@@ -278,7 +307,12 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
             .find(|p| p.index == entry.source_partition_index)
             .ok_or_else(|| PhoenixError::Disk("source partition vanished".into()))?;
 
-        bytes_done = stream_one_partition(target, part, &entry, &mut prep, opts, bytes_done)?;
+        let converted;
+        (bytes_done, converted) =
+            stream_one_partition(target, part, &entry, &mut prep, opts, bytes_done, converting)?;
+        if converted {
+            summary.partitions_converted += 1;
+        }
 
         summary.partitions_cloned += 1;
         if entry.target_size_bytes != part.size_bytes {
@@ -291,6 +325,12 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
         }
     }
     summary.bytes_copied = per_pass;
+
+    if let Some(report) = &conversion {
+        summary.conversion_bootable = Some(report.bootable);
+        summary.conversion_converted_names = report.converted_names.clone();
+        summary.conversion_unconverted_names = report.unconverted_names.clone();
+    }
 
     // --- Plant the partition table on top of the freshly-written data ---
     flush_disk(&target.path);
@@ -523,6 +563,9 @@ fn prepare_partition(
 
 /// Stream one **already-prepared** partition to the target, applying shrink
 /// relocation and the FS-specific finalization. Returns the running byte total.
+/// Returns `(bytes_done, converted)` where `converted` is true when this
+/// partition's boot sector was rewritten 4Kn → 512e.
+#[allow(clippy::too_many_arguments)]
 fn stream_one_partition(
     target: &DiskInfo,
     part: &PartitionInfo,
@@ -530,7 +573,8 @@ fn stream_one_partition(
     prep: &mut PreparedPartition,
     opts: &CloneOptions,
     mut bytes_done: u64,
-) -> Result<u64> {
+    convert: bool,
+) -> Result<(u64, bool)> {
     // Take the extents (the reader stays borrowed in place — `stream_extents` needs
     // it by &mut, and the rest are Copy).
     let extents = std::mem::take(&mut prep.extents);
@@ -584,13 +628,27 @@ fn stream_one_partition(
         }
         _ => {}
     }
+
+    // Cross-sector-size conversion, on the same handle that streamed the data.
+    // Auto-detects NTFS/FAT32 from the just-landed boot sector (so it catches
+    // the ESP, cloned through the raw `_` arm above as `Efi`); exFAT / MSR /
+    // encrypted return Skipped. The ReadBack verify already ran per-block during
+    // streaming, before this rewrite, so it cannot false-fail on the patched
+    // boot sectors. Same offline window as the writes (table not yet planted).
+    let mut converted = false;
+    if convert {
+        let outcome = phoenix_capture::apply_sector_conversion(&mut writer, entry.target_offset_bytes)?;
+        converted = outcome.converted();
+    }
+
     writer.flush()?;
     info!(
         partition = part.index,
         target_offset = entry.target_offset_bytes,
+        converted,
         "cloned partition"
     );
-    Ok(bytes_done)
+    Ok((bytes_done, converted))
 }
 
 /// Copy every byte of `extents` from source to target in CHUNK_SIZE blocks,
@@ -721,6 +779,97 @@ fn planned_bytes(p: &PartitionInfo) -> u64 {
             .filter(|n| *n > 0)
             .unwrap_or(p.size_bytes),
         CaptureMode::Raw => p.size_bytes,
+    }
+}
+
+/// Decide, name, and gate a cross-sector-size conversion for a clone. Pure and
+/// side-effect-free so the GUI can describe the operation before it runs (it
+/// passes `opt_in = true` because its hazard-dialog checkbox is the opt-in gate).
+/// Mirrors the restore path's `plan_sector_conversion`:
+///
+/// * sizes match → `Ok(None)`;
+/// * 4Kn → 512e with opt-in → `Ok(Some(report))` (refusing any
+///   converted-partition shrink);
+/// * 4Kn → 512e without opt-in → `Err(SectorConversionRequired)` (Alert A);
+/// * unsupported mismatch → `Err(SectorSizeUnsupported)` (Alert B).
+pub fn plan_sector_conversion(
+    source: &DiskInfo,
+    plan: &ClonePlan,
+    target_sector_size: u32,
+    opt_in: bool,
+) -> Result<Option<ConversionReport>> {
+    use phoenix_core::sector::{
+        classify_sector_sizes, is_esp, partition_convert_role, PartitionConvertRole, SectorPlan,
+    };
+
+    match classify_sector_sizes(source.sector_size, target_sector_size)? {
+        SectorPlan::Identical => Ok(None),
+        SectorPlan::Convert4knTo512e => {
+            if !opt_in {
+                return Err(PhoenixError::SectorConversionRequired {
+                    source_sector: source.sector_size,
+                    target_sector: target_sector_size,
+                });
+            }
+            let mut report = ConversionReport::default();
+            for entry in &plan.entries {
+                let Some(part) = source
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == entry.source_partition_index)
+                else {
+                    continue;
+                };
+                let name = format!("[{}] {}", part.index, part.name);
+                match partition_convert_role(part.fs_kind) {
+                    PartitionConvertRole::Convert => {
+                        if entry.target_size_bytes < part.size_bytes {
+                            return Err(PhoenixError::SectorConversionShrinkUnsupported {
+                                partition_index: part.index,
+                                target_size: entry.target_size_bytes,
+                                source_size: part.size_bytes,
+                            });
+                        }
+                        if is_esp(part.fs_kind) {
+                            report.bootable = true;
+                        }
+                        report.converted_names.push(name);
+                    }
+                    PartitionConvertRole::NoFilesystem => {}
+                    PartitionConvertRole::LeftUnconverted => report.unconverted_names.push(name),
+                }
+            }
+            Ok(Some(report))
+        }
+    }
+}
+
+/// Emit the pre-flight conversion banner (Alerts D/E/F). Called by `clone_inner`
+/// once the report is built; the GUI builds its hazard dialog from the same
+/// report instead.
+fn log_conversion_banner(source_ss: u32, target_ss: u32, report: &ConversionReport) {
+    warn!(
+        source_sector_size = source_ss,
+        target_sector_size = target_ss,
+        convert = report.converted_names.len(),
+        "4Kn -> 512e conversion: filesystem boot sectors will be rewritten. The cloned disk is a \
+         CONVERTED COPY, not a byte-identical clone."
+    );
+    for n in &report.converted_names {
+        info!(partition = n.as_str(), "will convert 4Kn -> 512e");
+    }
+    if !report.bootable {
+        warn!(
+            "the EFI System Partition is not among the converted set: the cloned disk will hold \
+             its data but will NOT boot"
+        );
+    }
+    for n in &report.unconverted_names {
+        warn!(
+            partition = n.as_str(),
+            "left unconverted (exFAT / encrypted): its bytes clone but the volume will be \
+             unreadable on the 512e target"
+        );
     }
 }
 

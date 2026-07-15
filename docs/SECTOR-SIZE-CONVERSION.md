@@ -1,5 +1,38 @@
 # Sector-size conversion on restore/clone — build plan
 
+**Status: BUILT + HARDWARE-VALIDATED (2026-07-14).** Engine, CLI, and GUI are
+implemented; unit + integration tests and clippy are green; and the T2 suite
+(`phoenix-systests/tests/sector_convert.rs`, 5 tests) **passed on synthesized
+4Kn/512e VHDX** — NTFS convert+grow, FAT32 convert, the 512e→4Kn refusal, the
+opt-in gate, and per-partition partial restore all mount + verify (88s, one
+staged per-binary run). Converted volumes are `chkdsk`-clean; the FAT32 case
+verified by fixture digest because VSS can't snapshot a small FAT32 volume for
+`chkdsk /scan` (harness fallback, not a conversion issue).
+
+Implementation notes (where it differs from the plan below):
+- The per-partition conversion is a **standalone step in the restore/clone write
+  loop that auto-detects the landed boot sector** (NTFS magic / FAT32 BPB), not a
+  hook on the FS-specific finalizers. Reason: the ESP is classified `Efi` + raw
+  and restores through `restore_raw`, so a kind-driven dispatch would miss
+  exactly the partition whose conversion makes the disk bootable. Lives in
+  `phoenix-capture/src/sector_convert.rs` (`apply_sector_conversion`).
+- Classification + the shared `ConversionReport` live in `phoenix-core/src/
+  sector.rs`; the pre-flight/gate is `plan_sector_conversion` in both
+  `phoenix-restore::restore` and `phoenix-clone` (pure; the GUI reuses it with
+  `opt_in = true` since its ack checkbox is the gate).
+- **v1 scope refinement:** convert composes with **same-size and grow**; a
+  converted-partition **shrink is refused** (`SectorConversionShrinkUnsupported`)
+  because the NTFS relocation/metadata rewrite isn't sector-size-aware. Full-disk
+  restore (which grows NTFS via `expand_ntfs_slack`) is therefore supported.
+- verify-after needs **no special handling**: restore's verify is an in-pipeline
+  chunk-hash check (never re-reads the target), and clone's ReadBack verify runs
+  per-block *before* the boot-sector rewrite — so a converted op cannot
+  false-fail. The mount + `chkdsk` proof lives in the T2 tests.
+
+---
+
+*Original plan follows.*
+
 **Status: proven on hardware, not yet built.** This document is the plan to turn
 the two hardware spikes (2026-07-14) into a shipping, opt-in feature. Read it on
 the dev box before implementing.
