@@ -7,3 +7,5 @@
 # Breadcrumb logs from the staged system-test runner.
 t2-staged.log
 arm64-t2.log
+# Downloaded WinFsp MSI staged for the installer build (fetched by build-installer.ps1).
+/installer/build/
