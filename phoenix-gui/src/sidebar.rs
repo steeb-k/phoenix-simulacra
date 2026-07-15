@@ -344,7 +344,12 @@ fn draw_brand(ui: &mut Ui, palette: &Palette) {
     ui.vertical_centered(|ui| {
         ui.add(
             egui::Image::new(egui::include_image!("../../assets/phoenix-sidebar.png"))
-                .fit_to_exact_size(Vec2::new(LOGO_WIDTH, LOGO_WIDTH * LOGO_ASPECT)),
+                .fit_to_exact_size(Vec2::new(LOGO_WIDTH, LOGO_WIDTH * LOGO_ASPECT))
+                // Multiply-tint the grayscale phoenix with the live accent color:
+                // its shading is preserved (highlights -> lighter accent, shadows
+                // -> darker) and fully transparent pixels stay transparent
+                // (0 * anything = 0). Re-tints when the Windows accent changes.
+                .tint(palette.accent),
         );
         ui.add_space(BRAND_WORDMARK_GAP);
         draw_wordmark(ui, palette);
