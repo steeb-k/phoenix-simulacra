@@ -61,6 +61,14 @@ enum Commands {
         plan: PathBuf,
         #[arg(long, default_value_t = true)]
         verify: bool,
+        /// Opt in to a 4Kn -> 512e sector-size conversion. Required when the
+        /// backup is from a 4096-byte-logical-sector (4Kn) disk and the target
+        /// uses 512-byte sectors: the filesystem boot sectors are rewritten so
+        /// the restored volumes mount instead of coming up RAW. The result is a
+        /// converted copy, not a byte-identical restore. Without this flag such
+        /// a restore is refused; with matching sector sizes it does nothing.
+        #[arg(long, default_value_t = false)]
+        convert_sector_size: bool,
     },
     /// Clone one disk directly onto another (no intermediate file)
     Clone {
@@ -85,6 +93,14 @@ enum Commands {
         /// Skip the interactive "type the target disk number" confirmation
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Opt in to a 4Kn -> 512e sector-size conversion. Required when the
+        /// source disk uses 4096-byte logical sectors and the target uses
+        /// 512-byte sectors: the filesystem boot sectors are rewritten so the
+        /// cloned volumes mount instead of coming up RAW. The result is a
+        /// converted copy, not a byte-identical clone. Without this flag such a
+        /// clone is refused; with matching sector sizes it does nothing.
+        #[arg(long, default_value_t = false)]
+        convert_sector_size: bool,
     },
     /// Mount a backup read-only so its files are browsable in Explorer. Runs
     /// in the foreground; press Enter to unmount.
@@ -164,18 +180,27 @@ fn main() -> anyhow::Result<()> {
             backup,
             plan,
             verify,
+            convert_sector_size,
         } => {
             let plan = RestorePlan::from_toml(&plan)?;
             let summary = run_restore(RestoreOptions {
                 backup_path: backup,
                 plan,
                 verify_on_restore: verify,
+                convert_sector_size,
                 progress: None,
             })?;
             info!(
                 partitions_restored = summary.partitions_restored,
                 partitions_resized = summary.partitions_resized,
+                partitions_converted = summary.partitions_converted,
                 "Restore complete"
+            );
+            print_conversion_summary(
+                summary.partitions_converted,
+                summary.conversion_bootable,
+                &summary.conversion_converted_names,
+                &summary.conversion_unconverted_names,
             );
             if summary.restored_locked_bitlocker {
                 println!(
@@ -193,13 +218,21 @@ fn main() -> anyhow::Result<()> {
             verify,
             no_vss,
             yes,
+            convert_sector_size,
         } => {
             if no_vss {
                 tracing::warn!(
                     "--no-vss is deprecated and ignored: the engine now always takes the                      strongest freeze each volume allows (lock, else VSS shadow, else abort                      for a lettered volume)"
                 );
             }
-            cmd_clone(source_disk, target_disk, expand, verify, yes)?
+            cmd_clone(
+                source_disk,
+                target_disk,
+                expand,
+                verify,
+                yes,
+                convert_sector_size,
+            )?
         }
         Commands::Mount { backup, partitions } => cmd_mount(&backup, partitions.as_deref())?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
@@ -244,6 +277,7 @@ fn cmd_clone(
     expand: bool,
     verify: bool,
     yes: bool,
+    convert_sector_size: bool,
 ) -> anyhow::Result<()> {
     use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
 
@@ -302,14 +336,55 @@ fn cmd_clone(
         } else {
             CloneVerify::None
         },
+        convert_sector_size,
         progress: None,
     })?;
     info!(
         partitions_cloned = summary.partitions_cloned,
         partitions_resized = summary.partitions_resized,
+        partitions_converted = summary.partitions_converted,
         "Clone complete"
     );
+    print_conversion_summary(
+        summary.partitions_converted,
+        summary.conversion_bootable,
+        &summary.conversion_converted_names,
+        &summary.conversion_unconverted_names,
+    );
     Ok(())
+}
+
+/// Post-op summary for a 4Kn -> 512e conversion (Alert G). No-op when no
+/// conversion ran (`bootable` is `None`).
+fn print_conversion_summary(
+    converted: u32,
+    bootable: Option<bool>,
+    converted_names: &[String],
+    unconverted_names: &[String],
+) {
+    let Some(bootable) = bootable else {
+        return;
+    };
+    println!("\nSector-size conversion (4Kn -> 512e): {converted} partition(s) converted.");
+    for n in converted_names {
+        println!("  converted: {n}");
+    }
+    for n in unconverted_names {
+        println!(
+            "  left unconverted (exFAT/encrypted — restored but unreadable on 512e): {n}"
+        );
+    }
+    if bootable {
+        println!(
+            "  The EFI System Partition was converted — the disk should be bootable (firmware \
+             boot is not verified here)."
+        );
+    } else {
+        println!(
+            "  The EFI System Partition was NOT converted — the disk holds its data but will not \
+             boot."
+        );
+    }
 }
 
 fn cmd_list_disks() -> anyhow::Result<()> {
@@ -318,12 +393,21 @@ fn cmd_list_disks() -> anyhow::Result<()> {
         for part in &mut disk.partitions {
             phoenix_core::disk::refine_partition_fs(part);
         }
+        // Flag 4Kn media explicitly — it's the signal that a restore/clone onto
+        // 512e media needs --convert-sector-size (and vice-versa is refused).
+        let sector_note = match disk.sector_size {
+            4096 => " 4Kn",
+            512 => " 512e",
+            _ => "",
+        };
         println!(
-            "Disk {}: {} ({:.2} GB, {})",
+            "Disk {}: {} ({:.2} GB, {}, {}-byte sectors{})",
             disk.index,
             disk.path,
             disk.size_bytes as f64 / 1e9,
-            if disk.is_gpt { "GPT" } else { "MBR" }
+            if disk.is_gpt { "GPT" } else { "MBR" },
+            disk.sector_size,
+            sector_note,
         );
         for p in &disk.partitions {
             let bitlocker = match p.bitlocker {

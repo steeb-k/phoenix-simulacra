@@ -72,6 +72,7 @@ fn ntfs_backup_restore_roundtrip_same_size() {
         backup_path: backup_path.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");

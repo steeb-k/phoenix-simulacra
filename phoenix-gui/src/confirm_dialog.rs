@@ -22,6 +22,16 @@ pub enum ConfirmAction {
     Cancel,
 }
 
+/// An optional acknowledgement checkbox rendered above the buttons. When
+/// present, Confirm stays disabled until `*checked` is true — for actions where
+/// a wrong-disk warning isn't enough and the user must affirm they understand a
+/// specific consequence (e.g. that a sector-size conversion produces a converted
+/// copy, not a byte-identical restore).
+pub struct ConfirmAck<'a> {
+    pub label: &'a str,
+    pub checked: &'a mut bool,
+}
+
 /// Everything the dialog needs to render one frame.
 pub struct ConfirmView<'a> {
     pub title: &'a str,
@@ -42,6 +52,8 @@ pub struct ConfirmView<'a> {
     /// different app's dialog. Left as a flag because a purely informational
     /// confirmation would not want it.
     pub hazard_tape: bool,
+    /// Optional acknowledgement checkbox gating the Confirm button.
+    pub ack: Option<ConfirmAck<'a>>,
 }
 
 const DIALOG_WIDTH: f32 = 460.0;
@@ -69,7 +81,12 @@ fn paint_tape(painter: &egui::Painter, rect: egui::Rect) {
 /// Render the dialog and return the user's action for this frame. Escape maps
 /// to Cancel; there is deliberately no Enter-to-confirm binding, so a
 /// destructive action always needs an explicit click.
-pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> ConfirmAction {
+pub fn show(ctx: &egui::Context, palette: &Palette, view: &mut ConfirmView<'_>) -> ConfirmAction {
+    // Captured up front so the window-layout code below can read it without
+    // clashing with the `body` closure's mutable borrow of `view` (needed for
+    // the acknowledgement checkbox).
+    let hazard_tape = view.hazard_tape;
+
     // Full-screen dim backdrop that swallows clicks aimed at the UI behind it.
     let screen = ctx.screen_rect();
     egui::Area::new(egui::Id::new("confirm_dialog_backdrop"))
@@ -104,7 +121,7 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
             .rounding(egui::Rounding::same(10.0))
     };
 
-    let body = |ui: &mut egui::Ui, action: &mut ConfirmAction| {
+    let mut body = |ui: &mut egui::Ui, action: &mut ConfirmAction| {
         ui.set_width(DIALOG_WIDTH);
 
         ui.label(RichText::new(view.title).font(fonts::bold(18.0)));
@@ -127,6 +144,19 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
                     }
                 });
         }
+
+        // Optional acknowledgement checkbox; Confirm stays disabled until ticked.
+        let ack_satisfied = match view.ack.as_mut() {
+            Some(ack) => {
+                ui.add_space(14.0);
+                ui.checkbox(
+                    ack.checked,
+                    RichText::new(ack.label).color(palette.icon_color),
+                );
+                *ack.checked
+            }
+            None => true,
+        };
 
         ui.add_space(20.0);
         ui.horizontal(|ui| {
@@ -153,10 +183,11 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
             } else {
                 palette.accent
             };
-            let confirm = ui.add_sized(
-                button,
+            let confirm = ui.add_enabled(
+                ack_satisfied,
                 egui::Button::new(RichText::new(view.confirm_label).color(Color32::WHITE))
-                    .fill(confirm_fill),
+                    .fill(confirm_fill)
+                    .min_size(button),
             );
             if confirm.clicked() {
                 *action = ConfirmAction::Confirm;
@@ -173,7 +204,7 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &ConfirmView<'_>) -> C
         .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .frame(frame)
         .show(ctx, |ui| {
-            if view.hazard_tape {
+            if hazard_tape {
                 let width = DIALOG_WIDTH + BODY_MARGIN * 2.0;
                 ui.set_width(width);
                 // The strips and the body frame butt up against each other;

@@ -134,6 +134,7 @@ fn restore_and_verify(backup_path: &std::path::Path, digest: &phoenix_systests::
         backup_path: backup_path.to_path_buf(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");

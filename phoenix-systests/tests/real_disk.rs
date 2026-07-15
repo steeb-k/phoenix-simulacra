@@ -191,6 +191,7 @@ fn multifs_roundtrip(disk: &RealDisk, gpt: bool) {
         backup_path: backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");
@@ -327,6 +328,7 @@ fn real_mbr_restore_shrink() {
         backup_path: backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore (shrink)");
@@ -402,6 +404,7 @@ fn real_mbr_exfat_roundtrip() {
         backup_path: backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");
@@ -518,6 +521,7 @@ fn real_mbr_bitlocker_roundtrip() {
         backup_path: locked_backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore (ciphertext)");
@@ -582,6 +586,7 @@ fn real_mbr_bitlocker_roundtrip() {
         backup_path: unlocked_backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore (plaintext)");
@@ -715,6 +720,7 @@ fn real_vss_backup_roundtrip() {
         backup_path: backup.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");
@@ -782,6 +788,7 @@ fn real_clone_to_vhd() {
         target_disk_index: target.disk_index(),
         plan,
         verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_clone real -> vhd");

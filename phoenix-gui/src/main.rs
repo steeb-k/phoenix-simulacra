@@ -32,7 +32,7 @@ use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
 use phoenix_core::ProgressHandle;
 use phoenix_restore::restore::RestoreOptions;
 
-use crate::confirm_dialog::{ConfirmAction, ConfirmView};
+use crate::confirm_dialog::{ConfirmAck, ConfirmAction, ConfirmView};
 use crate::job::{spawn_backup, spawn_clone, spawn_restore, spawn_verify, BackgroundJob, JobKind};
 use crate::sidebar::Page;
 use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView, Verdict};
@@ -205,6 +205,11 @@ struct PendingClone {
     message: String,
     details: Vec<String>,
     subject: JobSubject,
+    /// True when a 4Kn → 512e sector-size conversion is pending: the dialog
+    /// becomes the conversion hazard dialog (extra copy + an acknowledgement
+    /// checkbox gating Confirm). `ack` holds that checkbox's state.
+    convert: bool,
+    ack: bool,
 }
 
 /// A validated, ready-to-run restore parked while its confirmation dialog
@@ -213,6 +218,9 @@ struct PendingRestore {
     opts: RestoreOptions,
     details: Vec<String>,
     subject: JobSubject,
+    /// See [`PendingClone::convert`].
+    convert: bool,
+    ack: bool,
 }
 
 /// The two ends of the running job, named the way a person would name them
@@ -244,6 +252,36 @@ impl JobSubject {
 }
 
 /// The `Disk number / Size / Model` lines both confirmation dialogs show.
+/// The acknowledgement the user must tick before a sector-size conversion can
+/// proceed — the one thing the wrong-disk warning can't cover: the result is a
+/// converted copy, not a byte-identical restore/clone.
+const CONVERSION_ACK_LABEL: &str =
+    "I understand this rewrites filesystem metadata, and the result is a converted copy — \
+     not an identical one.";
+
+/// Detail lines describing a pending 4Kn → 512e conversion, appended to the
+/// hazard dialog's details under the standard wrong-disk block (Alerts D/E).
+fn conversion_detail_lines(report: &phoenix_core::sector::ConversionReport) -> Vec<String> {
+    let mut lines = vec!["— Sector-size conversion (4Kn → 512e) —".to_string()];
+    for n in &report.converted_names {
+        lines.push(format!("convert: {n}"));
+    }
+    if report.bootable {
+        lines.push(
+            "The EFI System Partition will be converted — the disk should be bootable.".to_string(),
+        );
+    } else {
+        lines.push(
+            "The ESP is NOT being converted — the disk will hold its data but will not boot."
+                .to_string(),
+        );
+    }
+    for n in &report.unconverted_names {
+        lines.push(format!("left unconverted (unreadable on 512e): {n}"));
+    }
+    lines
+}
+
 fn disk_confirm_details(disk: &DiskInfo) -> Vec<String> {
     vec![
         format!("Disk number:   {}", disk.index),
@@ -1345,7 +1383,7 @@ impl PhoenixApp {
             } else {
                 format!("{count} backup files with these names already exist. Overwrite them?")
             };
-            let view = ConfirmView {
+            let mut view = ConfirmView {
                 title: "Backup file already exists",
                 message: &message,
                 details: &pending.existing,
@@ -1353,8 +1391,9 @@ impl PhoenixApp {
                 cancel_label: "Cancel",
                 confirm_danger: true,
                 hazard_tape: true,
+                ack: None,
             };
-            confirm_dialog::show(ctx, &self.palette, &view)
+            confirm_dialog::show(ctx, &self.palette, &mut view)
         };
 
         match action {
@@ -1376,21 +1415,42 @@ impl PhoenixApp {
     /// the first byte is written. Confirm launches the worker; Cancel drops
     /// the parked plan and leaves the page untouched.
     fn show_clone_confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending_clone.as_ref() else {
+        // Taken out so the acknowledgement checkbox can borrow `pending.ack`
+        // mutably while the rest of the view borrows other fields; re-parked on
+        // ConfirmAction::None (dialog still up).
+        let Some(mut pending) = self.pending_clone.take() else {
             return;
         };
-        let view = ConfirmView {
-            title: "Confirm clone target",
-            message: &pending.message,
-            details: &pending.details,
-            confirm_label: "Clone disk",
-            cancel_label: "Cancel",
-            confirm_danger: true,
-            hazard_tape: true,
+        let convert = pending.convert;
+        let title = if convert {
+            "Convert 4Kn → 512e and clone"
+        } else {
+            "Confirm clone target"
         };
-        match confirm_dialog::show(ctx, &self.palette, &view) {
+        let confirm_label = if convert {
+            "Convert and clone"
+        } else {
+            "Clone disk"
+        };
+        let action = {
+            let ack = convert.then_some(ConfirmAck {
+                label: CONVERSION_ACK_LABEL,
+                checked: &mut pending.ack,
+            });
+            let mut view = ConfirmView {
+                title,
+                message: &pending.message,
+                details: &pending.details,
+                confirm_label,
+                cancel_label: "Cancel",
+                confirm_danger: true,
+                hazard_tape: true,
+                ack,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+        match action {
             ConfirmAction::Confirm => {
-                let pending = self.pending_clone.take().expect("dialog was open");
                 self.completed = None;
                 self.status = format!(
                     "Cloning disk {} → disk {}…",
@@ -1400,31 +1460,55 @@ impl PhoenixApp {
                 self.job = Some(spawn_clone(pending.opts));
             }
             ConfirmAction::Cancel => {
-                self.pending_clone = None;
                 self.status = "Clone cancelled — no changes were made".into();
             }
-            ConfirmAction::None => {}
+            ConfirmAction::None => self.pending_clone = Some(pending),
         }
     }
 
     /// The restore counterpart of [`show_clone_confirm_dialog`].
     fn show_restore_confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending_restore.as_ref() else {
+        let Some(mut pending) = self.pending_restore.take() else {
             return;
         };
-        let view = ConfirmView {
-            title: "Confirm restore target",
-            message: "This will PERMANENTLY OVERWRITE the planned partitions on the target \
-                      disk with the backup's contents. Verify this is the right disk:",
-            details: &pending.details,
-            confirm_label: "Run restore",
-            cancel_label: "Cancel",
-            confirm_danger: true,
-            hazard_tape: true,
+        let convert = pending.convert;
+        let title = if convert {
+            "Convert 4Kn → 512e and restore"
+        } else {
+            "Confirm restore target"
         };
-        match confirm_dialog::show(ctx, &self.palette, &view) {
+        let message = if convert {
+            "This backup is from a 4096-byte-sector (4Kn) disk; the target uses 512-byte sectors \
+             (512e). To make it usable, the filesystem boot sectors will be rewritten. The result \
+             is a CONVERTED COPY, not a byte-identical restore. Verify this is the right disk:"
+        } else {
+            "This will PERMANENTLY OVERWRITE the planned partitions on the target disk with the \
+             backup's contents. Verify this is the right disk:"
+        };
+        let confirm_label = if convert {
+            "Convert and restore"
+        } else {
+            "Run restore"
+        };
+        let action = {
+            let ack = convert.then_some(ConfirmAck {
+                label: CONVERSION_ACK_LABEL,
+                checked: &mut pending.ack,
+            });
+            let mut view = ConfirmView {
+                title,
+                message,
+                details: &pending.details,
+                confirm_label,
+                cancel_label: "Cancel",
+                confirm_danger: true,
+                hazard_tape: true,
+                ack,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+        match action {
             ConfirmAction::Confirm => {
-                let pending = self.pending_restore.take().expect("dialog was open");
                 // Surfaces while `run_restore` does its pre-flight work
                 // (opening the .phnx, validating, enumerating disks) before
                 // the worker's first `set_phase` takes over the status text.
@@ -1434,10 +1518,9 @@ impl PhoenixApp {
                 self.job = Some(spawn_restore(pending.opts));
             }
             ConfirmAction::Cancel => {
-                self.pending_restore = None;
                 self.status = "Restore cancelled — no changes were made".into();
             }
-            ConfirmAction::None => {}
+            ConfirmAction::None => self.pending_restore = Some(pending),
         }
     }
 
@@ -1470,7 +1553,7 @@ impl PhoenixApp {
             },
             if details.len() == 1 { "its" } else { "their" },
         );
-        let view = ConfirmView {
+        let mut view = ConfirmView {
             title: "Backups are still mounted",
             message: &message,
             details: &details,
@@ -1478,8 +1561,9 @@ impl PhoenixApp {
             cancel_label: "Keep Open",
             confirm_danger: false,
             hazard_tape: true,
+            ack: None,
         };
-        match confirm_dialog::show(ctx, &self.palette, &view) {
+        match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
                 self.pending_close = false;
                 self.unmount_all();
@@ -1500,7 +1584,7 @@ impl PhoenixApp {
             "Size:          931.5 GB".to_string(),
             "Model:         WDC WD10EZEX-08WN4A0".to_string(),
         ];
-        let view = ConfirmView {
+        let mut view = ConfirmView {
             title: "Confirm restore target",
             message: "This will PERMANENTLY OVERWRITE the planned partitions on the target \
                       disk with the backup's contents. Verify this is the right disk:",
@@ -1509,8 +1593,9 @@ impl PhoenixApp {
             cancel_label: "Cancel",
             confirm_danger: true,
             hazard_tape: true,
+            ack: None,
         };
-        if confirm_dialog::show(ctx, &self.palette, &view) != ConfirmAction::None {
+        if confirm_dialog::show(ctx, &self.palette, &mut view) != ConfirmAction::None {
             self.demo_confirm = false;
         }
     }
@@ -2105,6 +2190,13 @@ impl PhoenixApp {
             return;
         };
         let plan = layout.to_restore_plan(target);
+        // Cross-sector-size pre-flight, computed here so the confirm dialog can
+        // describe (and, for a conversion, gate on an acknowledgement of) what
+        // will happen. `opt_in = true` because the hazard-dialog checkbox — not
+        // a flag — is the opt-in gate here; an unsupported mismatch or a
+        // converted-partition shrink still errors and blocks the job.
+        let mut convert = false;
+        let mut convert_lines: Vec<String> = Vec::new();
         if let Ok(mut reader) = PhnxReader::open(&backup_path) {
             if let Err(e) = plan.validate_against_backup(&reader.manifest) {
                 self.status = format!("Plan invalid: {e}");
@@ -2113,6 +2205,22 @@ impl PhoenixApp {
             if let Err(e) = plan.validate_extents_fit(&mut reader) {
                 self.status = format!("Plan invalid: {e}");
                 return;
+            }
+            match phoenix_restore::restore::plan_sector_conversion(
+                &reader.manifest,
+                &plan,
+                target.sector_size,
+                true,
+            ) {
+                Ok(None) => {}
+                Ok(Some(report)) => {
+                    convert = true;
+                    convert_lines = conversion_detail_lines(&report);
+                }
+                Err(e) => {
+                    self.status = format!("Cannot restore onto this disk: {e}");
+                    return;
+                }
             }
         }
         // Park the validated restore behind the same final confirm-the-target
@@ -2123,6 +2231,8 @@ impl PhoenixApp {
             target: self.disk_label(target.index),
             image_path: Some(backup_path.clone()),
         };
+        let mut details = disk_confirm_details(target);
+        details.extend(convert_lines);
         self.pending_restore = Some(PendingRestore {
             subject,
             opts: RestoreOptions {
@@ -2131,9 +2241,12 @@ impl PhoenixApp {
                 // Read-back verification is CLI-only; the image's chunk hashes
                 // were already checked while decompressing.
                 verify_on_restore: false,
+                convert_sector_size: convert,
                 progress: Some(ProgressHandle::new()),
             },
-            details: disk_confirm_details(target),
+            details,
+            convert,
+            ack: false,
         });
     }
 
@@ -2330,10 +2443,26 @@ impl PhoenixApp {
             self.status = format!("Cannot clone: {e}");
             return;
         }
+        // Cross-sector-size pre-flight (see start_restore for the opt_in = true
+        // rationale). An unsupported mismatch or a converted-partition shrink
+        // blocks the clone here rather than failing mid-write.
+        let mut convert = false;
+        let mut convert_lines: Vec<String> = Vec::new();
+        match phoenix_clone::plan_sector_conversion(&source, &plan, target.sector_size, true) {
+            Ok(None) => {}
+            Ok(Some(report)) => {
+                convert = true;
+                convert_lines = conversion_detail_lines(&report);
+            }
+            Err(e) => {
+                self.status = format!("Cannot clone onto this disk: {e}");
+                return;
+            }
+        }
         // Nothing on the page has touched a disk yet — park the validated
         // plan behind a final confirm-the-target dialog before the worker
         // gets to write.
-        let message = if layout.full_disk {
+        let mut message = if layout.full_disk {
             format!(
                 "This will PERMANENTLY ERASE everything on the target disk and replace it \
                  with the contents of disk {src}. Verify this is the right disk:"
@@ -2345,6 +2474,14 @@ impl PhoenixApp {
                  this is the right disk:"
             )
         };
+        if convert {
+            message.push_str(
+                "\n\nThis clone also converts 4Kn → 512e: the filesystem boot sectors are \
+                 rewritten, so the result is a CONVERTED COPY, not a byte-identical clone.",
+            );
+        }
+        let mut details = disk_confirm_details(&target);
+        details.extend(convert_lines);
         self.pending_clone = Some(PendingClone {
             subject: JobSubject {
                 source: self.disk_label(src),
@@ -2357,10 +2494,13 @@ impl PhoenixApp {
                 target_disk_index: tgt,
                 plan,
                 verify: phoenix_clone::CloneVerify::None,
+                convert_sector_size: convert,
                 progress: None,
             },
             message,
-            details: disk_confirm_details(&target),
+            details,
+            convert,
+            ack: false,
         });
     }
 
@@ -2701,7 +2841,7 @@ impl PhoenixApp {
             ),
             describe_job(rec),
         ];
-        let view = ConfirmView {
+        let mut view = ConfirmView {
             title: "Remove from history",
             message: "Remove this entry from the job history? This forgets the entry only — \
                       the backup file itself is not touched.",
@@ -2712,8 +2852,9 @@ impl PhoenixApp {
             // Taped: the entry is gone for good once removed, and it is the
             // only record that the backup it names was ever made.
             hazard_tape: true,
+            ack: None,
         };
-        match confirm_dialog::show(ctx, &self.palette, &view) {
+        match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
                 self.pending_history_delete = None;
                 if self.history.remove(index) && !self.demo_history {

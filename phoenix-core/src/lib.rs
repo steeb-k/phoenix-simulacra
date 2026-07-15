@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod pipeline;
 pub mod progress;
 pub mod relocation;
+pub mod sector;
 
 pub use container::{Footer, Header, PartitionIndexEntry, PhnxReader, PhnxWriter, CHUNK_SIZE};
 pub use disk::{enumerate_disks, CaptureMode, DiskInfo, FilesystemKind, PartitionInfo};

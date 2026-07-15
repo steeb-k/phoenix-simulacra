@@ -89,6 +89,7 @@ fn roundtrip_fs(fs: TestFs, size_mb: u64, seed: u64) {
         backup_path: backup_path.clone(),
         plan,
         verify_on_restore: true,
+        convert_sector_size: false,
         progress: None,
     })
     .expect("run_restore");
