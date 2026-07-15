@@ -29,9 +29,16 @@ fn embed_windows_resources() {
         .to_str()
         .expect("phoenix-appicon.ico path must be valid UTF-8");
 
+    // Present as "Phoenix Simulacra CLI" rather than the crate name
+    // "phoenix-cli". See phoenix-gui/build.rs for the full rationale.
     winres::WindowsResource::new()
         .set_manifest_file(manifest_str)
         .set_icon(icon_str)
+        .set("FileDescription", "Phoenix Simulacra CLI")
+        .set("ProductName", "Phoenix Simulacra")
+        .set("InternalName", "simulacra-cli")
+        .set("OriginalFilename", "simulacra-cli.exe")
+        .set("LegalCopyright", "© 2026 Steve Kzenjak")
         .compile()
         .expect("failed to embed Windows application resources");
 }
