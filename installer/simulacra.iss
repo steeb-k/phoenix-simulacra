@@ -57,6 +57,12 @@ UsePreviousTasks=yes
 WizardStyle=modern dynamic
 WizardImageFile=..\assets\wizardImage.png
 WizardSmallImageFile=..\assets\phoenix-appicon-128px.png
+; Under WizardStyle=... dynamic, a dark Windows theme uses the *DynamicDark image
+; slots; if unset, Setup falls back to its built-in dark image and ignores the
+; light WizardImageFile above. The wizard art is transparent RGBA, so it adapts
+; to either theme background -- point the dark slots at the same files.
+WizardImageFileDynamicDark=..\assets\wizardImage.png
+WizardSmallImageFileDynamicDark=..\assets\phoenix-appicon-128px.png
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
