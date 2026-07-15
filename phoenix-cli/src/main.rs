@@ -11,7 +11,11 @@ use phoenix_restore::restore::{run_restore, verify_backup, RestoreOptions};
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "simulacra")]
+// The shipped CLI binary is `simulacra-cli.exe` (the bundle renames the cargo
+// `simulacra` bin so the GUI can own the plain `simulacra.exe` name). Pin the
+// help/usage program name to the shipped name so `--help` matches what users
+// actually type.
+#[command(name = "simulacra-cli")]
 #[command(about = "Phoenix Simulacra — Backup and Restore")]
 struct Cli {
     #[command(subcommand)]

@@ -490,7 +490,7 @@ work is the machinery behind it.
   the latest release, compare its tag against `CARGO_PKG_VERSION` — which the
   running binary already knows via `version::BUILD_INFO`, alongside its git hash
   and build timestamp.
-- **Small prerequisite:** `simulacra.exe --version` currently **errors**
+- **Small prerequisite:** `simulacra-cli.exe --version` currently **errors**
   (`unexpected argument '--version'`) — the CLI is subcommand-only, and the version
   is merely logged in the provenance banner. An updater needs a machine-readable
   way to ask a binary what it is; wire up `--version` (and consider a
