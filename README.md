@@ -55,7 +55,7 @@ Binaries embed a `requireAdministrator` manifest (UAC on launch). Paths depend o
 
 | Target | CLI | GUI |
 |--------|-----|-----|
-| Host default | `target/release/simulacra.exe` | `target/release/simulacra-gui.exe` |
+| Host default | `target/release/simulacra-cli.exe` | `target/release/simulacra.exe` |
 | `x86_64-pc-windows-msvc` | `target/x86_64-pc-windows-msvc/release/...` | same |
 | `aarch64-pc-windows-msvc` | `target/aarch64-pc-windows-msvc/release/...` | same |
 
@@ -73,8 +73,8 @@ The release script assembles a single shippable bundle in `dist/simulacra/` hold
 
 ## CLI Usage
 
-The CLI ships as `simulacra-cli` (the `-cli` binary in the bundle; a dev
-`cargo build` produces it as `simulacra.exe`).
+The CLI binary is `simulacra-cli` and the GUI is the plain `simulacra` — the
+same names in a dev build and in the bundle.
 
 ```bash
 # List disks (UAC prompt appears automatically when launching the exe)

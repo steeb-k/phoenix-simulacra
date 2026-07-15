@@ -6,7 +6,7 @@
 use phoenix_core::build_info::BuildInfo;
 
 pub const BUILD_INFO: BuildInfo = BuildInfo {
-    binary_name: "simulacra",
+    binary_name: "simulacra-cli",
     version: env!("CARGO_PKG_VERSION"),
     git_hash: match option_env!("PHOENIX_BUILD_GIT_HASH") {
         Some(v) => v,

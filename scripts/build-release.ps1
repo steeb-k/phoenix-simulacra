@@ -65,14 +65,15 @@ New-Item -ItemType Directory -Force -Path $bundle | Out-Null
 $x64Rel = Join-Path "target" (Join-Path $x64 "release")
 $armRel = Join-Path "target" (Join-Path $arm "release")
 
-# source path -> bundled name. The cargo bin names (simulacra = CLI,
-# simulacra-gui = GUI) are remapped to the shipped scheme here.
+# source path -> bundled name. Cargo bin names match the shipped x64 names
+# (simulacra = GUI, simulacra-cli = CLI), so the x64 copies are straight; the
+# ARM64 copies just gain the -arm suffix that lets both arches share one folder.
 $layout = @(
     @{ Src = (Join-Path $x64Rel "simulacra-launcher.exe"); Dst = "simulacra-launcher.exe" }
-    @{ Src = (Join-Path $x64Rel "simulacra-gui.exe");      Dst = "simulacra.exe" }
-    @{ Src = (Join-Path $x64Rel "simulacra.exe");          Dst = "simulacra-cli.exe" }
-    @{ Src = (Join-Path $armRel "simulacra-gui.exe");      Dst = "simulacra-arm.exe" }
-    @{ Src = (Join-Path $armRel "simulacra.exe");          Dst = "simulacra-cli-arm.exe" }
+    @{ Src = (Join-Path $x64Rel "simulacra.exe");          Dst = "simulacra.exe" }
+    @{ Src = (Join-Path $x64Rel "simulacra-cli.exe");      Dst = "simulacra-cli.exe" }
+    @{ Src = (Join-Path $armRel "simulacra.exe");          Dst = "simulacra-arm.exe" }
+    @{ Src = (Join-Path $armRel "simulacra-cli.exe");      Dst = "simulacra-cli-arm.exe" }
 )
 
 foreach ($item in $layout) {

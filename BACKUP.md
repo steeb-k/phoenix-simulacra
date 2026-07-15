@@ -193,7 +193,7 @@ simulacra-cli verify backup.phnx --quick  # Metadata + manifest hash only
 
 ## GUI reference
 
-Launch the GUI (Administrator / UAC): `simulacra-launcher.exe` in a shipped bundle, or `simulacra-gui.exe` from a dev build.
+Launch the GUI (Administrator / UAC): `simulacra-launcher.exe` in a shipped bundle, or `simulacra.exe` from a dev build.
 
 **Backup tab:**
 
