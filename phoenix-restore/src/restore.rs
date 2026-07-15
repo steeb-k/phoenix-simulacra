@@ -738,10 +738,12 @@ pub fn plan_sector_conversion(
         SectorPlan::Identical => Ok(None),
         SectorPlan::Convert4knTo512e => {
             if !opt_in {
-                return Err(phoenix_core::error::PhoenixError::SectorConversionRequired {
-                    source_sector: source_ss,
-                    target_sector: target_sector_size,
-                });
+                return Err(
+                    phoenix_core::error::PhoenixError::SectorConversionRequired {
+                        source_sector: source_ss,
+                        target_sector: target_sector_size,
+                    },
+                );
             }
             let mut report = ConversionReport::default();
             for entry in &plan.entries {

@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-restore"
-description = "Carbon Phoenix restore planner and partition writer"
+description = "Phoenix Simulacra restore planner and partition writer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 //! Persisted application data: job history and user settings.
 //!
-//! Both live under `%LOCALAPPDATA%\CarbonPhoenix` as JSON. Reads never panic on
+//! Both live under `%LOCALAPPDATA%\PhoenixSimulacra` as JSON. Reads never panic on
 //! a corrupt or missing file: settings fall back to defaults, and a corrupt
 //! history file is renamed aside and a fresh one started, so a damaged file can
 //! never take down the app.
@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// `%LOCALAPPDATA%\CarbonPhoenix` (created on demand). Falls back to the temp
+/// `%LOCALAPPDATA%\PhoenixSimulacra` (created on demand). Falls back to the temp
 /// dir if `LOCALAPPDATA` is unset (e.g. some service contexts).
 pub fn appdata_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("CarbonPhoenix");
+    let dir = base.join("PhoenixSimulacra");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

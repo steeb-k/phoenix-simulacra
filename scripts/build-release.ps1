@@ -1,4 +1,4 @@
-# Build Carbon Phoenix for all tier-1 Windows targets (x64 + ARM64).
+# Build Phoenix Simulacra for all tier-1 Windows targets (x64 + ARM64).
 # Requires: Rust stable, Visual Studio Build Tools with Desktop C++ and both
 # x64 and ARM64 MSVC toolchains (see docs/WINDOWS-ARM64.md), plus LLVM/libclang
 # (for the winfsp bindgen step) and WinFsp installed (for its SDK). The shipped
@@ -42,12 +42,12 @@ foreach ($t in $targets) {
     $outDir = Join-Path "dist" $t
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     $src = Join-Path "target" (Join-Path $t "release")
-    Copy-Item (Join-Path $src "carbon-phoenix.exe") $outDir -Force
-    Copy-Item (Join-Path $src "carbon-phoenix-gui.exe") $outDir -Force
+    Copy-Item (Join-Path $src "simulacra.exe") $outDir -Force
+    Copy-Item (Join-Path $src "simulacra-gui.exe") $outDir -Force
 }
 
 Write-Host "Done. Artifacts:"
 foreach ($t in $targets) {
-    Write-Host "  dist\$t\carbon-phoenix.exe"
-    Write-Host "  dist\$t\carbon-phoenix-gui.exe"
+    Write-Host "  dist\$t\simulacra.exe"
+    Write-Host "  dist\$t\simulacra-gui.exe"
 }

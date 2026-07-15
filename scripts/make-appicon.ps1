@@ -12,12 +12,12 @@
     ICO directory (width/height are single bytes) and are skipped.
 
 .EXAMPLE
-    pwsh scripts/make-appicon.ps1 -Stem carbon-phoenix-appicon2
+    pwsh scripts/make-appicon.ps1 -Stem phoenix-appicon
 #>
 [CmdletBinding()]
 param(
     # Basename of the asset family: <stem>-<N>px.png in, <stem>.ico out.
-    [string] $Stem = 'carbon-phoenix-appicon2',
+    [string] $Stem = 'phoenix-appicon',
 
     # Icon sizes to embed. 48 is what the shell uses for "medium icons".
     [int[]] $Sizes = @(16, 32, 48, 64, 80, 96, 128, 256),

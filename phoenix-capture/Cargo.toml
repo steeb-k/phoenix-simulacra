@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-capture"
-description = "Carbon Phoenix partition capture engines"
+description = "Phoenix Simulacra partition capture engines"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

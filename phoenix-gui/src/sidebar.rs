@@ -76,11 +76,23 @@ const BOTTOM_ITEMS: &[NavItem] = &[
 
 const SIDEBAR_WIDTH: f32 = 220.0;
 const ROW_HEIGHT: f32 = 40.0;
-const LOGO_SIZE: f32 = 192.0; // display size; source is 256×256 carbon-phoenix-sidebar.png
+/// Display width of the sidebar phoenix image. Source `phoenix-sidebar.png` is
+/// 1024×976, so the height follows via [`LOGO_ASPECT`] rather than forcing a
+/// square (which would squash the art).
+const LOGO_WIDTH: f32 = 192.0;
+/// height / width of `phoenix-sidebar.png` (1024×976).
+const LOGO_ASPECT: f32 = 976.0 / 1024.0;
+/// Gap between the phoenix image and the "Simulacra" wordmark below it.
+const BRAND_WORDMARK_GAP: f32 = 6.0;
+/// Approximate rendered height of the fitted "Simulacra" wordmark. Used only
+/// to size the OS window's minimum height (see [`min_content_height`]); the
+/// brand panel itself sizes to the real glyph height, so this only needs to be
+/// close.
+const WORDMARK_HEIGHT_EST: f32 = 48.0;
 const SIDEBAR_H_PAD: f32 = 12.0;
 const BRAND_TOP_PAD: f32 = 18.0;
 const BRAND_BOTTOM_PAD: f32 = 18.0;
-/// Trailing space inside `draw_brand` between the image and the panel edge.
+/// Trailing space inside `draw_brand` between the wordmark and the panel edge.
 const BRAND_IMAGE_TRAILER: f32 = 6.0;
 const BOTTOM_NAV_TOP_PAD: f32 = 8.0;
 const BOTTOM_NAV_BOTTOM_PAD: f32 = 18.0;
@@ -99,7 +111,12 @@ const MIN_VISIBLE_TOP_ITEMS: f32 = 1.5;
 /// can't collapse below "logo + 1.5-item scroll hint + History/About + theme
 /// pill".
 pub fn min_content_height() -> f32 {
-    let brand = BRAND_TOP_PAD + LOGO_SIZE + BRAND_IMAGE_TRAILER + BRAND_BOTTOM_PAD;
+    let brand = BRAND_TOP_PAD
+        + LOGO_WIDTH * LOGO_ASPECT
+        + BRAND_WORDMARK_GAP
+        + WORDMARK_HEIGHT_EST
+        + BRAND_IMAGE_TRAILER
+        + BRAND_BOTTOM_PAD;
     let bottom = BOTTOM_NAV_TOP_PAD
         + (BOTTOM_ITEMS.len() as f32) * ROW_HEIGHT
         + THEME_PILL_TOP_PAD
@@ -175,7 +192,7 @@ pub fn show(
                         bottom: BRAND_BOTTOM_PAD,
                     }))
                     .show_inside(ui, |ui| {
-                        draw_brand(ui);
+                        draw_brand(ui, palette);
                     })
                     .response
                     .rect;
@@ -323,16 +340,46 @@ fn theme_pill(ui: &mut Ui, theme: &mut ThemeChoice, palette: &Palette) -> bool {
     changed
 }
 
-fn draw_brand(ui: &mut Ui) {
+fn draw_brand(ui: &mut Ui, palette: &Palette) {
     ui.vertical_centered(|ui| {
         ui.add(
-            egui::Image::new(egui::include_image!(
-                "../../assets/carbon-phoenix-sidebar.png"
-            ))
-            .fit_to_exact_size(Vec2::splat(LOGO_SIZE)),
+            egui::Image::new(egui::include_image!("../../assets/phoenix-sidebar.png"))
+                .fit_to_exact_size(Vec2::new(LOGO_WIDTH, LOGO_WIDTH * LOGO_ASPECT)),
         );
+        ui.add_space(BRAND_WORDMARK_GAP);
+        draw_wordmark(ui, palette);
         ui.add_space(BRAND_IMAGE_TRAILER);
     });
+}
+
+/// Paint the "Simulacra" wordmark in Inter ExtraBold, scaled so the word spans
+/// the full sidebar content width.
+fn draw_wordmark(ui: &mut Ui, palette: &Palette) {
+    const WORD: &str = "Simulacra";
+    let target_w = ui.available_width();
+
+    // epaint lays text out by summing per-glyph advances (no kerning/GPOS), so
+    // the advance sum at a reference size gives an exact scale factor to hit
+    // the target width — no iterative fitting needed.
+    const REF_SIZE: f32 = 100.0;
+    let ref_font = fonts::extrabold(REF_SIZE);
+    let ref_w: f32 = ui.fonts(|f| WORD.chars().map(|c| f.glyph_width(&ref_font, c)).sum());
+    let size = if ref_w > 0.0 {
+        REF_SIZE * target_w / ref_w
+    } else {
+        REF_SIZE
+    };
+
+    let font = fonts::extrabold(size);
+    let row_h = ui.fonts(|f| f.row_height(&font));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(target_w, row_h), Sense::hover());
+    ui.painter().text(
+        rect.center_top(),
+        Align2::CENTER_TOP,
+        WORD,
+        font,
+        palette.icon_color,
+    );
 }
 
 fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -> Response {

@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-core"
-description = "Carbon Phoenix core: .phnx format, manifest, hashing, disk enumeration"
+description = "Phoenix Simulacra core: .phnx format, manifest, hashing, disk enumeration"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

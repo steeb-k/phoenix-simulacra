@@ -1,4 +1,4 @@
-//! Direct disk-to-disk cloning for Carbon Phoenix.
+//! Direct disk-to-disk cloning for Phoenix Simulacra.
 //!
 //! Unlike backup+restore, cloning streams each source partition's used blocks
 //! straight to the target disk with no intermediate `.phnx` file and no
@@ -143,8 +143,12 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     // Cross-sector-size pre-flight, before anything is frozen or the target is
     // touched: gate/opt-in the 4Kn → 512e conversion, refuse an unsupported
     // mismatch or a converted-partition shrink, and name what will convert.
-    let conversion =
-        plan_sector_conversion(source, &opts.plan, target.sector_size, opts.convert_sector_size)?;
+    let conversion = plan_sector_conversion(
+        source,
+        &opts.plan,
+        target.sector_size,
+        opts.convert_sector_size,
+    )?;
     if let Some(report) = &conversion {
         log_conversion_banner(source.sector_size, target.sector_size, report);
     }
@@ -308,8 +312,9 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
             .ok_or_else(|| PhoenixError::Disk("source partition vanished".into()))?;
 
         let converted;
-        (bytes_done, converted) =
-            stream_one_partition(target, part, &entry, &mut prep, opts, bytes_done, converting)?;
+        (bytes_done, converted) = stream_one_partition(
+            target, part, &entry, &mut prep, opts, bytes_done, converting,
+        )?;
         if converted {
             summary.partitions_converted += 1;
         }
@@ -637,7 +642,8 @@ fn stream_one_partition(
     // boot sectors. Same offline window as the writes (table not yet planted).
     let mut converted = false;
     if convert {
-        let outcome = phoenix_capture::apply_sector_conversion(&mut writer, entry.target_offset_bytes)?;
+        let outcome =
+            phoenix_capture::apply_sector_conversion(&mut writer, entry.target_offset_bytes)?;
         converted = outcome.converted();
     }
 

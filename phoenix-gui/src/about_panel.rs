@@ -49,7 +49,7 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, version: &str) -> bool {
             ui.horizontal_top(|ui| {
                 ui.add(
                     egui::Image::new(egui::include_image!(
-                        "../../assets/carbon-phoenix-appicon2-256px.png"
+                        "../../assets/phoenix-appicon-256px.png"
                     ))
                     .fit_to_exact_size(Vec2::splat(ICON_SIZE)),
                 );

@@ -24,7 +24,8 @@ use phoenix_restore::plan::{build_partial_plan, default_plan_from_backup};
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
     chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
-    wait_for_letter, wait_for_letter_at_offset, wait_for_restored_letter, PartSpec, TestFs, TestVhd,
+    wait_for_letter, wait_for_letter_at_offset, wait_for_restored_letter, PartSpec, TestFs,
+    TestVhd,
 };
 
 /// Capture a 4Kn NTFS volume and restore it, converted, onto a larger 512e disk.
@@ -129,7 +130,10 @@ fn convert_4kn_fat32_to_512e() {
             label: "CVTFAT".into(),
         }])
         .expect("init 4Kn FAT32 source");
-    assert!(wait_for_letter('X', 15_000), "4Kn FAT32 source never mounted");
+    assert!(
+        wait_for_letter('X', 15_000),
+        "4Kn FAT32 source never mounted"
+    );
     let digest = fill_fixture('X', 0x4096_FA32).expect("fill fixture");
 
     let disks = enumerate_disks().expect("enumerate disks");

@@ -194,7 +194,7 @@ impl FileSystemContext for VhdFs {
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
         out.total_size = self.total_len;
         out.free_size = 0; // read-only, fully used
-        out.set_volume_label("Carbon Phoenix");
+        out.set_volume_label("Phoenix Simulacra");
         Ok(())
     }
 

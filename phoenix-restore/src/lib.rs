@@ -1,4 +1,4 @@
-//! Carbon Phoenix restore planner and execution.
+//! Phoenix Simulacra restore planner and execution.
 
 pub mod grow;
 pub mod layout_edit;

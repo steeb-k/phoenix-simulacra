@@ -1,12 +1,12 @@
 # Windows platform support (x64 and ARM64)
 
-Carbon Phoenix targets **x86_64** and **ARM64** Windows from one source tree: the
+Phoenix Simulacra targets **x86_64** and **ARM64** Windows from one source tree: the
 same CLI flags, GUI, capture modes, VSS behavior, and `.phnx` format. There are
 no `#[cfg(target_arch)]` branches in application logic.
 
 **Status (2026-07-14): the engine RUNS on ARM64 — backup and mount, end to end.**
 On a Snapdragon 7c Gen 2 / Windows 10 Home box whose internal UFS disk is **true
-4Kn**, Carbon Phoenix imaged the live system disk and mounted the result:
+4Kn**, Phoenix Simulacra imaged the live system disk and mounted the result:
 
 | Proven on ARM64 hardware | Evidence |
 |---|---|
@@ -35,7 +35,7 @@ is.) Treat the checklist at the bottom as the plan for what remains.
 | Rule | Reality |
 |------|---------|
 | One codebase | ✅ No `#[cfg(target_arch)]` in application logic. The only OS gate is `#[cfg(windows)]` / `target_os = "windows"` (GUI fonts, titlebar, theme). |
-| Same binaries per arch | ✅ `carbon-phoenix.exe` + `carbon-phoenix-gui.exe` per target; native PE, not x64 emulation. |
+| Same binaries per arch | ✅ `simulacra.exe` + `simulacra-gui.exe` per target; native PE, not x64 emulation. |
 | Same GUI stack | ✅ `eframe = { default-features = false, features = ["wgpu"] }` (phoenix-gui/Cargo.toml) — **wgpu (DX12) on both, glow on neither**. It *was* glow, until glow turned out not to start on ARM64 at all. See "The OpenGL problem". |
 | Same Win32 APIs | ✅ Disk IOCTLs, volume locking, and the admin manifest are arch-neutral. |
 | Same VSS mechanism | ✅ …but **not** `vssadmin`. See below. |
@@ -44,7 +44,7 @@ is.) Treat the checklist at the bottom as the plan for what remains.
 
 If an x64 and an ARM64 build of the same commit behave differently, that is a bug
 unless the difference comes from the OS or the hardware (disk geometry, sector
-size), not from Carbon Phoenix.
+size), not from Phoenix Simulacra.
 
 ### VSS is PowerShell + `Win32_ShadowCopy`, not `vssadmin`
 
@@ -142,7 +142,7 @@ Three notes for whoever touches this next:
 
 **Verified 2026-07-14: the wgpu/DX12 GUI renders on BOTH arches**, ARM64 included —
 observed on real Windows 11 ARM hardware, not inferred. That is the first time any
-Carbon Phoenix binary has drawn a pixel on ARM64. It says nothing yet about the
+Phoenix Simulacra binary has drawn a pixel on ARM64. It says nothing yet about the
 *engine* on ARM64: see the test plan below, all of which is still unrun.
 
 ## The WinFsp problem (read this before building on ARM64)
@@ -202,7 +202,7 @@ WinFsp MSI, both ARM64 builds.
 ```powershell
 .\scripts\build-release.ps1
 ```
-Produces `dist/<target>/carbon-phoenix.exe` and `carbon-phoenix-gui.exe` for both
+Produces `dist/<target>/simulacra.exe` and `simulacra-gui.exe` for both
 targets.
 
 ✅ **Verified working, x64 host → both targets (2026-07-13.)** All four binaries
@@ -336,13 +336,13 @@ both arches; use the crate list above.
 Nothing here writes to a disk.
 
 ```powershell
-.\target\release\carbon-phoenix.exe list-disks
+.\target\release\simulacra.exe list-disks
 ```
 Confirm the UFS drive enumerates, and that its **sector size, bus type, and model**
 are reported correctly — this is the first real exercise of `get_sector_size` and
 the drive-type/USB-bridge naming on ARM64.
 
-Then launch the GUI and confirm it renders: `.\target\release\carbon-phoenix-gui.exe`
+Then launch the GUI and confirm it renders: `.\target\release\simulacra-gui.exe`
 (UAC prompt expected). This is the first-ever run of **glow/OpenGL on ARM64** — the
 plausible failure is the GL context, not our code. Check the sidebar, the disk
 cards, the theme toggle, and the sticky action bar.
@@ -383,7 +383,7 @@ startup on a slow machine, that is a real (and fixable) ARM-relevant finding.
 The first-ever run of `winfsp-a64.dll`.
 
 ```powershell
-.\target\release\carbon-phoenix.exe mount <backup.phnx> --partitions 2
+.\target\release\simulacra.exe mount <backup.phnx> --partitions 2
 ```
 Confirm: the drive letter appears, files read back correctly, **disk usage does not
 grow** (the whole point of the zero-space mount), and the letter disappears on
