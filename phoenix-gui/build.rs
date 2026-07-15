@@ -32,9 +32,18 @@ fn embed_windows_resources() {
         .to_str()
         .expect("phoenix-appicon.ico path must be valid UTF-8");
 
+    // Version-info strings. Without these, winres derives them from the crate
+    // name ("phoenix-gui"), which is what Task Manager's Name column and the UAC
+    // elevation prompt display. Set them to the product name so the user sees
+    // "Phoenix Simulacra", not the crate.
     winres::WindowsResource::new()
         .set_manifest_file(manifest_str)
         .set_icon(icon_str)
+        .set("FileDescription", "Phoenix Simulacra")
+        .set("ProductName", "Phoenix Simulacra")
+        .set("InternalName", "simulacra")
+        .set("OriginalFilename", "simulacra.exe")
+        .set("LegalCopyright", "© 2026 Steve Kzenjak")
         .compile()
         .expect("failed to embed Windows application resources");
 }
