@@ -398,6 +398,24 @@ fn ensure_winfsp() -> Result<()> {
     }
 }
 
+/// Whether WinFsp is present and usable for mounting. Returns true when the
+/// user-mode DLL initializes: `winfsp_init` (the `system` feature) loads
+/// winfsp-<arch>.dll from the registry-recorded InstallDir, so success means
+/// WinFsp is installed and its runtime is reachable — the prerequisite for a
+/// mount to attach. A missing or broken install fails here, which is the case
+/// the GUI gate exists to catch (portable runs, locked-down machines).
+///
+/// The kernel driver is registered under a per-install, timestamped service
+/// name (e.g. `WinFsp+20260708T041027Z`), so there is no fixed service to
+/// probe for "driver loaded"; the DLL init is the reliable signal, and any
+/// remaining driver-load failure surfaces as a clear error at mount time.
+///
+/// Cheap to call repeatedly: init runs at most once (guarded by `Once`) and
+/// the cached outcome is returned thereafter.
+pub fn is_available() -> bool {
+    ensure_winfsp().is_ok()
+}
+
 /// Build a permissive self-relative security descriptor granting World read
 /// (`O:BA G:BA D:P(A;;FA;;;WD)`), returned as raw bytes. Empty on failure.
 fn build_security_descriptor() -> Vec<u8> {

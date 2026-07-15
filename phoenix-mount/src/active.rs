@@ -61,4 +61,19 @@ impl ActiveMount {
     pub const fn space_efficient() -> bool {
         cfg!(feature = "winfsp")
     }
+
+    /// Whether mounting can actually run right now. The `winfsp` build needs
+    /// the WinFsp runtime present (see [`winfsp_mount::is_available`]); the
+    /// materialize-to-temp-VHD fallback build needs nothing external, so it is
+    /// always available. The GUI uses this to gate its Mount page.
+    pub fn runtime_available() -> bool {
+        #[cfg(feature = "winfsp")]
+        {
+            crate::winfsp_mount::is_available()
+        }
+        #[cfg(not(feature = "winfsp"))]
+        {
+            true
+        }
+    }
 }
