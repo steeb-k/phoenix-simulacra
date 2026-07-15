@@ -35,7 +35,7 @@ is.) Treat the checklist at the bottom as the plan for what remains.
 | Rule | Reality |
 |------|---------|
 | One codebase | ✅ No `#[cfg(target_arch)]` in application logic. The only OS gate is `#[cfg(windows)]` / `target_os = "windows"` (GUI fonts, titlebar, theme). |
-| Same binaries per arch | ✅ `simulacra.exe` + `simulacra-gui.exe` per target; native PE, not x64 emulation. |
+| Same binaries per arch | ✅ `simulacra.exe` (GUI) + `simulacra-cli.exe` (CLI) per target; native PE, not x64 emulation. |
 | Same GUI stack | ✅ `eframe = { default-features = false, features = ["wgpu"] }` (phoenix-gui/Cargo.toml) — **wgpu (DX12) on both, glow on neither**. It *was* glow, until glow turned out not to start on ARM64 at all. See "The OpenGL problem". |
 | Same Win32 APIs | ✅ Disk IOCTLs, volume locking, and the admin manifest are arch-neutral. |
 | Same VSS mechanism | ✅ …but **not** `vssadmin`. See below. |
@@ -338,13 +338,13 @@ both arches; use the crate list above.
 Nothing here writes to a disk.
 
 ```powershell
-.\target\release\simulacra.exe list-disks
+.\target\release\simulacra-cli.exe list-disks
 ```
 Confirm the UFS drive enumerates, and that its **sector size, bus type, and model**
 are reported correctly — this is the first real exercise of `get_sector_size` and
 the drive-type/USB-bridge naming on ARM64.
 
-Then launch the GUI and confirm it renders: `.\target\release\simulacra-gui.exe`
+Then launch the GUI and confirm it renders: `.\target\release\simulacra.exe`
 (UAC prompt expected). This is the first-ever run of **glow/OpenGL on ARM64** — the
 plausible failure is the GL context, not our code. Check the sidebar, the disk
 cards, the theme toggle, and the sticky action bar.
@@ -385,7 +385,7 @@ startup on a slow machine, that is a real (and fixable) ARM-relevant finding.
 The first-ever run of `winfsp-a64.dll`.
 
 ```powershell
-.\target\release\simulacra.exe mount <backup.phnx> --partitions 2
+.\target\release\simulacra-cli.exe mount <backup.phnx> --partitions 2
 ```
 Confirm: the drive letter appears, files read back correctly, **disk usage does not
 grow** (the whole point of the zero-space mount), and the letter disappears on

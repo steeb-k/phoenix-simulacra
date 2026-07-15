@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "simulacra"
+name = "simulacra-cli"
 path = "src/main.rs"
 
 [dependencies]

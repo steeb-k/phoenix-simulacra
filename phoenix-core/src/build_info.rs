@@ -30,8 +30,9 @@ use tracing::info;
 /// as `"unknown"` rather than left empty so the banner stays scannable.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildInfo {
-    /// Display name of the binary (e.g. `"simulacra-gui"`). Lets the
-    /// banner tell GUI and CLI sessions apart in a multiplexed log.
+    /// Display name of the binary (e.g. `"simulacra"` for the GUI,
+    /// `"simulacra-cli"` for the CLI). Lets the banner tell GUI and CLI
+    /// sessions apart in a multiplexed log.
     pub binary_name: &'static str,
     /// Crate version from `CARGO_PKG_VERSION` (the value of
     /// `version` in the binary crate's `Cargo.toml`).
