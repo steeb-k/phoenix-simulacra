@@ -385,6 +385,12 @@ struct PhoenixApp {
     /// synthesized source disk always renders as disk 0).
     mount_selection: HashSet<(u32, u32)>,
     mounts: Vec<phoenix_mount::ActiveMount>,
+    /// Whether WinFsp is installed and reachable, so mounting can actually run.
+    /// Probed once at startup (the underlying init caches its outcome anyway).
+    /// When false the Mount page shows an install-WinFsp notice instead of the
+    /// picker, and its action bar is withheld. `--demo-no-winfsp` forces this
+    /// false so the notice can be eyeballed on a machine that has WinFsp.
+    mount_available: bool,
     /// `--demo-mounts`: canned table rows that stand in for real mounts, so the
     /// Active-mounts table and the close-with-mounts dialog can be eyeballed
     /// without an elevated session and a `.phnx` to attach. Empty in normal
@@ -486,6 +492,8 @@ impl PhoenixApp {
             mount_source: None,
             mount_selection: HashSet::new(),
             mounts: Vec::new(),
+            mount_available: !force_no_winfsp_from_args()
+                && phoenix_mount::ActiveMount::runtime_available(),
             demo_mounts: demo_mount_rows_from_args(),
             pending_close: false,
             settings,
@@ -1107,6 +1115,12 @@ impl PhoenixApp {
                 }
             }
             Page::Mount => {
+                // No WinFsp, no mounting — the page shows an install notice in
+                // place of the picker, so there is nothing to act on: withhold
+                // the bar entirely rather than leave a permanently-dead Start.
+                if !self.mount_available {
+                    return None;
+                }
                 let already_mounted = self.selected_backup_already_mounted();
                 StartAction {
                     label: "Mount (Read-Only)",
@@ -2525,6 +2539,14 @@ impl PhoenixApp {
     }
 
     fn ui_mount(&mut self, ui: &mut egui::Ui) {
+        // Without WinFsp there is nothing to mount onto — the whole page is a
+        // dead end. Replace the picker/table with a centered notice telling the
+        // user why and where to get WinFsp, instead of offering controls that
+        // could only ever fail.
+        if !self.mount_available {
+            self.ui_mount_unavailable(ui);
+            return;
+        }
         // Same shell as every other page: the content scrolls vertically as a
         // unit (the Active-mounts table included) under the sticky
         // "Mount (Read-Only)" action bar.
@@ -2586,6 +2608,75 @@ impl PhoenixApp {
             ui.label(egui::RichText::new("Active mounts").font(fonts::bold(16.0)));
             ui.add_space(6.0);
             self.ui_active_mounts(ui);
+        });
+    }
+
+    /// Shown in place of the whole Mount page when WinFsp is unavailable: a
+    /// notice centered both axes explaining that mounting needs WinFsp, with a
+    /// link to install it. No scroll shell, header, or action bar — there is
+    /// nothing to do here until WinFsp is present.
+    fn ui_mount_unavailable(&self, ui: &mut egui::Ui) {
+        // Estimated height of the notice block, used to place it vertically:
+        // a top spacer of half the leftover height centers it in the pane.
+        // (egui lays out top-down, so exact centering would need a size pass;
+        // the block is fixed content, so a constant estimate reads as centered
+        // across window sizes and clamps cleanly when the pane is short.)
+        const NOTICE_HEIGHT: f32 = 210.0;
+        const NOTICE_WIDTH: f32 = 460.0;
+
+        let leftover = (ui.available_height() - NOTICE_HEIGHT).max(0.0);
+        ui.add_space(leftover * 0.5);
+        ui.vertical_centered(|ui| {
+            // Cap the column so the paragraph wraps to a readable measure and
+            // stays centered rather than stretching the full pane width.
+            ui.set_max_width(NOTICE_WIDTH);
+            ui.label(
+                egui::RichText::new(egui_phosphor::regular::HARD_DRIVES)
+                    .font(fonts::icon(48.0))
+                    .color(self.palette.subtle_text),
+            );
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new("WinFsp is required to mount backups")
+                    .font(fonts::bold(18.0)),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Mounting exposes a backup as a browsable read-only drive using WinFsp, \
+                     which isn't installed on this machine (or its driver isn't loaded). \
+                     Install WinFsp and restart Simulacra to mount backups.",
+                )
+                .font(fonts::regular(14.0))
+                .color(self.palette.subtle_text),
+            );
+            ui.add_space(16.0);
+            // Icon + label as one clickable, link-colored widget: a single
+            // RichText can't mix the phosphor (icon) and Inter Bold (text)
+            // families, so hand-build the layout job. Both sections take the
+            // hyperlink color so it still reads as a link.
+            let mut link = egui::text::LayoutJob::default();
+            link.append(
+                egui_phosphor::regular::LINK,
+                0.0,
+                egui::TextFormat {
+                    font_id: fonts::icon(16.0),
+                    color: self.palette.accent,
+                    valign: egui::Align::Center,
+                    ..Default::default()
+                },
+            );
+            link.append(
+                "  Get WinFsp — winfsp.dev",
+                0.0,
+                egui::TextFormat {
+                    font_id: fonts::bold(14.0),
+                    color: self.palette.accent,
+                    valign: egui::Align::Center,
+                    ..Default::default()
+                },
+            );
+            ui.hyperlink_to(link, "https://winfsp.dev");
         });
     }
 
@@ -3071,6 +3162,13 @@ fn demo_backup_name_from_args() -> String {
         true => "demo-backup".into(),
         false => String::new(),
     }
+}
+
+/// Debug/verification aid: `--demo-no-winfsp` forces the Mount page's
+/// "WinFsp required" gate on, so its centered install notice can be eyeballed
+/// on a machine where WinFsp is actually installed.
+fn force_no_winfsp_from_args() -> bool {
+    std::env::args().skip(1).any(|a| a == "--demo-no-winfsp")
 }
 
 /// Debug/verification aid: `--page clone` (etc.) opens the app on that page
