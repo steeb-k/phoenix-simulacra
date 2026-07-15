@@ -5,16 +5,30 @@
 #   2. Read the app version from the workspace Cargo.toml.
 #   3. Ensure installer/build/winfsp.msi exists and matches the pinned SHA-256
 #      (downloads it from winfsp.dev's GitHub release on first run / mismatch).
+#   3b. Code-sign the bundle exes (before ISCC embeds them) with Azure Trusted
+#      Signing -- automatic when scripts/artifact-signing-metadata.json exists;
+#      pass -NoSign to skip (dev builds). See scripts/sign-artifacts.ps1.
 #   4. Compile installer/simulacra.iss with Inno Setup (ISCC), version 6.6.0+.
+#   5. Code-sign the installer itself.
 #
 # Output: dist/Simulacra-Setup-<ver>.exe
 #
 # Prereqs: everything build-release.ps1 needs, plus Inno Setup 6.6.0+
 # (winget install JRSoftware.InnoSetup). 6.6.0 is required for the installer's
-# native dark mode (WizardStyle=... dynamic) and PNG wizard image.
+# native dark mode (WizardStyle=... dynamic) and PNG wizard image. Signing also
+# needs the Windows SDK signtool, the Trusted Signing client tools
+# (winget install Microsoft.Azure.TrustedSigningClientTools), and an Azure login.
+param(
+    [switch]$NoSign
+)
 $ErrorActionPreference = "Stop"
 $repo = Join-Path $PSScriptRoot ".."
 Set-Location $repo
+
+# Sign when the metadata file is present unless the caller opted out.
+$signMeta = Join-Path $PSScriptRoot "artifact-signing-metadata.json"
+$doSign = (-not $NoSign) -and (Test-Path $signMeta)
+$signScript = Join-Path $PSScriptRoot "sign-artifacts.ps1"
 
 # --- Pinned WinFsp MSI (2.1 ABI, matching winfsp-sys 0.12.1+winfsp-2.1) --------
 $WinFspUrl    = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
@@ -53,6 +67,16 @@ if (Test-Msi) {
         throw "WinFsp MSI SHA-256 mismatch!`n  expected $WinFspSha256`n  got      $got"
     }
     Write-Host "== WinFsp MSI downloaded and verified."
+}
+
+# --- 3b. Sign the bundle exes (before ISCC embeds them) -----------------------
+$bundleExes = Get-ChildItem (Join-Path $repo "dist\simulacra") -Filter *.exe | Select-Object -ExpandProperty FullName
+if ($doSign) {
+    & $signScript @bundleExes
+    if ($LASTEXITCODE -ne 0) { throw "signing the bundle exes failed ($LASTEXITCODE)" }
+} else {
+    $why = if ($NoSign) { "-NoSign" } else { "no artifact-signing-metadata.json" }
+    Write-Host "== Skipping code signing ($why). Artifacts will be UNSIGNED." -ForegroundColor Yellow
 }
 
 # --- 4. Locate Inno Setup 6.6.0+ ----------------------------------------------
@@ -95,9 +119,15 @@ Write-Host "== Compiling installer ..." -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 
 $out = Join-Path $repo "dist\Simulacra-Setup-$version.exe"
-Write-Host ""
-if (Test-Path $out) {
-    Write-Host "Done. Installer: $out" -ForegroundColor Green
-} else {
-    Write-Host "ISCC reported success but expected output not found: $out" -ForegroundColor Yellow
+if (-not (Test-Path $out)) {
+    throw "ISCC reported success but expected output not found: $out"
 }
+
+# --- 6. Sign the installer -----------------------------------------------------
+if ($doSign) {
+    & $signScript $out
+    if ($LASTEXITCODE -ne 0) { throw "signing the installer failed ($LASTEXITCODE)" }
+}
+
+Write-Host ""
+Write-Host "Done. Installer: $out $(if ($doSign) { '(signed)' } else { '(UNSIGNED)' })" -ForegroundColor Green

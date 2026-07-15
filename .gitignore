@@ -9,3 +9,6 @@ t2-staged.log
 arm64-t2.log
 # Downloaded WinFsp MSI staged for the installer build (fetched by build-installer.ps1).
 /installer/build/
+# Azure Trusted Signing metadata (account + certificate-profile identifiers).
+# Kept local so it isn't published to the public repo; provide it per build box.
+/scripts/artifact-signing-metadata.json
