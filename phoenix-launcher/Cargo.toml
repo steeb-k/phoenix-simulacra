@@ -1,0 +1,27 @@
+[package]
+name = "phoenix-launcher"
+description = "Phoenix Simulacra launcher (arch-selecting GUI shim)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "simulacra-launcher"
+path = "src/main.rs"
+
+# The launcher is ALWAYS shipped as an x86_64 binary. Windows 11 on ARM64 runs
+# x64 processes under emulation, so one x64 launcher runs everywhere; a native
+# ARM64 build could not run on x64 hardware, defeating the "single exe" goal.
+# It then detects the *native* machine at run time and spawns the matching GUI.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winres.workspace = true

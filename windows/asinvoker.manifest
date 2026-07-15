@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <!-- The launcher runs as the invoking user (no shield, no UAC on start).
+             It elevates the GUI on demand via ShellExecute's "runas" verb, so
+             the single UAC prompt is attributed to the GUI, not this shim.
+             An explicit asInvoker level also disables the legacy installer-
+             detection heuristic that would otherwise auto-elevate an unmanifested
+             exe by name. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
