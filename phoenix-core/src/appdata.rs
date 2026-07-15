@@ -29,6 +29,18 @@ fn settings_path() -> PathBuf {
     appdata_dir().join("settings.json")
 }
 
+fn update_state_path() -> PathBuf {
+    appdata_dir().join("update.json")
+}
+
+/// `%LOCALAPPDATA%\PhoenixSimulacra\updates` (created on demand) — where the
+/// self-updater stages a downloaded installer while it verifies it.
+pub fn updates_dir() -> PathBuf {
+    let dir = appdata_dir().join("updates");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Seconds since the Unix epoch, right now. Timestamps are stored as plain
 /// integers so the on-disk format doesn't depend on a datetime crate version.
 pub fn now_unix() -> i64 {
@@ -280,6 +292,52 @@ impl Settings {
     }
 }
 
+/// Self-updater state, persisted separately from user [`Settings`] because the
+/// app writes it (last-check throttle, staged installer) rather than the user.
+///
+/// Every field has a serde default, so a missing or partial file loads cleanly.
+/// A `staged_installer` path is recorded *only* after the download has passed
+/// both SHA-256 and Authenticode verification — on close the app trusts it and
+/// runs it silently, so nothing unverified may ever land here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UpdateState {
+    /// Unix seconds of the last completed update check. Drives the once-a-day
+    /// throttle on the silent startup check.
+    pub last_check_unix: i64,
+    /// Version string (bare `x.y.z`) of the staged installer, if any.
+    pub staged_version: Option<String>,
+    /// Absolute path to the verified staged installer to run on exit, if any.
+    pub staged_installer: Option<String>,
+}
+
+impl UpdateState {
+    /// Load update state, falling back to defaults on a missing or unreadable
+    /// file (same forgiving contract as [`Settings::load`]).
+    pub fn load() -> Self {
+        Self::load_from(&update_state_path())
+    }
+
+    fn load_from(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<UpdateState>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        save_atomic(&update_state_path(), self)
+    }
+
+    /// Forget any staged installer (keeps `last_check_unix`). Called once the
+    /// installer has been handed off on exit, or when a staged update is found
+    /// to be stale (already installed).
+    pub fn clear_staged(&mut self) {
+        self.staged_version = None;
+        self.staged_installer = None;
+    }
+}
+
 /// Serialize `value` as pretty JSON to a temp file next to `path`, then rename
 /// it into place so a crash mid-write can't leave a half-written file.
 fn save_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
@@ -394,5 +452,30 @@ mod tests {
         let s: Settings = serde_json::from_slice(json).unwrap();
         assert_eq!(s.theme, ThemeChoice::Dark);
         assert!(s.default_verify_quick); // defaulted
+    }
+
+    #[test]
+    fn update_state_defaults_on_missing_file() {
+        let u = UpdateState::load_from(Path::new("does-not-exist.json"));
+        assert_eq!(u, UpdateState::default());
+        assert_eq!(u.last_check_unix, 0);
+        assert!(u.staged_installer.is_none());
+    }
+
+    #[test]
+    fn update_state_roundtrips_and_clears() {
+        let mut u = UpdateState {
+            last_check_unix: 1_700_000_000,
+            staged_version: Some("0.2.0".into()),
+            staged_installer: Some(r"C:\path\Simulacra-Setup-0.2.0.exe".into()),
+        };
+        let json = serde_json::to_vec(&u).unwrap();
+        let back: UpdateState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, u);
+        // Clearing the staged fields leaves the throttle timestamp intact.
+        u.clear_staged();
+        assert_eq!(u.last_check_unix, 1_700_000_000);
+        assert!(u.staged_version.is_none());
+        assert!(u.staged_installer.is_none());
     }
 }

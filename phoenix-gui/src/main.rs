@@ -23,6 +23,7 @@ mod status_modal;
 mod stripes;
 mod theme;
 mod titlebar;
+mod updater;
 mod util;
 mod version;
 
@@ -414,6 +415,15 @@ struct PhoenixApp {
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
+    /// Self-updater state (last-check throttle + a verified staged installer),
+    /// persisted separately from `settings` because the app writes it.
+    update_state: phoenix_core::appdata::UpdateState,
+    /// An in-flight update check (manual or the throttled auto one). `None` when
+    /// no check is running.
+    update_check: Option<updater::UpdateCheck>,
+    /// Set once a verified installer is staged: the persistent "will install on
+    /// close" line shown in the status bar. `None` until then.
+    update_banner: Option<String>,
     /// `--demo-history`: the history is a canned set of rows for styling work,
     /// and must never be written back over the real one.
     demo_history: bool,
@@ -475,6 +485,7 @@ impl PhoenixApp {
             .default_backup_dir
             .clone()
             .unwrap_or_else(default_backup_folder);
+        let update_state = phoenix_core::appdata::UpdateState::load();
         let mut app = Self {
             disks: Vec::new(),
             selections: HashSet::new(),
@@ -510,6 +521,9 @@ impl PhoenixApp {
             pending_close: false,
             settings,
             history,
+            update_state,
+            update_check: None,
+            update_banner: None,
             demo_history: is_demo_history,
             pending_history_delete: None,
             job_started: None,
@@ -525,7 +539,97 @@ impl PhoenixApp {
             refresh_overlay_until: demo_refresh_overlay_from_args(),
         };
         app.refresh_disks();
+        app.init_updates();
         app
+    }
+
+    /// Startup update housekeeping: drop an already-applied staged installer and
+    /// sweep partial downloads; re-arm the "install on close" banner if a
+    /// verified installer survived from a previous session; and kick off a
+    /// silent check.
+    ///
+    /// The check runs on every launch (no throttle): this is a manually-launched
+    /// tool, not a daemon, so one background check per start is cheap and — the
+    /// reason it's unconditional — a per-day throttle made the update silently
+    /// skip a launch where a new release had just dropped. The status-bar banner
+    /// is the only signal the user needs; the update applies silently on close.
+    fn init_updates(&mut self) {
+        let running = version::BUILD_INFO.version;
+        updater::cleanup_stale(&mut self.update_state, running);
+
+        // A verified installer left staged from last session (e.g. the user
+        // never closed the app) still applies on the next close.
+        if let (Some(ver), Some(_path)) = (
+            self.update_state.staged_version.clone(),
+            self.update_state.staged_installer.clone(),
+        ) {
+            self.update_banner = Some(format!("Update {ver} will install when you close the app."));
+        }
+
+        // Nothing to do if an update from last session is already staged.
+        if self.update_banner.is_none() {
+            self.update_state.last_check_unix = phoenix_core::appdata::now_unix();
+            let _ = self.update_state.save();
+            self.update_check = Some(updater::UpdateCheck::spawn(
+                updater::CheckMode::SilentAuto,
+                running.to_string(),
+            ));
+        }
+    }
+
+    /// Advance an in-flight update check and act on its events. Manual checks
+    /// narrate via `self.status`; auto checks stay silent unless an update is
+    /// actually staged. Called once per frame from `update()`.
+    fn poll_updater(&mut self, ctx: &egui::Context) {
+        let Some(check) = self.update_check.as_mut() else {
+            return;
+        };
+        let manual = check.mode() == updater::CheckMode::Manual;
+        let Some(ev) = check.poll() else {
+            return;
+        };
+        match ev {
+            updater::UpdateEvent::Progress { downloaded, total } => {
+                if total > 0 {
+                    let pct = (downloaded.saturating_mul(100) / total).min(100);
+                    self.status = format!("Downloading update… {pct}%");
+                } else {
+                    self.status = "Downloading update…".into();
+                }
+                ctx.request_repaint();
+            }
+            updater::UpdateEvent::UpToDate => {
+                if manual {
+                    self.status = "You're on the latest version.".into();
+                }
+                self.update_check = None;
+            }
+            updater::UpdateEvent::Ready(staged) => {
+                self.update_state.staged_version = Some(staged.version.clone());
+                self.update_state.staged_installer =
+                    Some(staged.installer.display().to_string());
+                let _ = self.update_state.save();
+                let banner =
+                    format!("Update {} will install when you close the app.", staged.version);
+                self.update_banner = Some(banner.clone());
+                self.status = banner;
+                self.update_check = None;
+                ctx.request_repaint();
+            }
+            updater::UpdateEvent::NoNetwork => {
+                if manual {
+                    self.status =
+                        "Couldn't reach the update server — check your connection.".into();
+                }
+                self.update_check = None;
+            }
+            updater::UpdateEvent::Failed(msg) => {
+                if manual {
+                    self.status = format!("Update check failed: {msg}");
+                }
+                self.update_check = None;
+            }
+        }
     }
 
     fn refresh_disks(&mut self) {
@@ -1168,6 +1272,7 @@ impl eframe::App for PhoenixApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job(ctx);
+        self.poll_updater(ctx);
         self.maybe_refresh_theme(ctx);
         // Runs the refresh a click armed LAST frame — that frame already
         // painted the dim/spinner overlay, so it stays on screen while the
@@ -1236,7 +1341,24 @@ impl eframe::App for PhoenixApp {
             )
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!modal_open, |ui| {
-                    ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&self.status).color(self.palette.subtle_text),
+                        );
+                        // A staged update announces itself on the right, kept
+                        // separate from the transient `status` line so it stays
+                        // visible until the app is closed (and the update runs).
+                        if let Some(banner) = &self.update_banner {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(banner).color(self.palette.accent),
+                                    );
+                                },
+                            );
+                        }
+                    });
                 });
             });
 
@@ -1335,6 +1457,7 @@ impl eframe::App for PhoenixApp {
     /// `on_exit` also runs on OS session-end).
     fn on_exit(&mut self) {
         self.unmount_all();
+        self.apply_staged_update_on_exit();
     }
 }
 
@@ -2992,9 +3115,43 @@ impl PhoenixApp {
     fn ui_about(&mut self, ui: &mut egui::Ui) {
         page_scroll_shell(ui, "about_page", |ui| {
             if about_panel::show(ui, &self.palette, version::BUILD_INFO.version) {
-                self.status = "Update checks aren't wired up yet.".into();
+                self.start_update_check();
             }
         });
+    }
+
+    /// On close, run any verified staged installer silently and detached, then
+    /// forget it. Only a fully verified file is ever recorded, and startup
+    /// `cleanup_stale` already dropped any already-applied one — so a recorded
+    /// path here is a genuine pending upgrade. Best-effort: if the launch fails
+    /// there's nothing to surface at exit, and the file stays for next time.
+    fn apply_staged_update_on_exit(&mut self) {
+        let Some(path) = self.update_state.staged_installer.clone() else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            self.update_state.clear_staged();
+            let _ = self.update_state.save();
+            return;
+        }
+        if updater::launch_installer(&path).is_ok() {
+            self.update_state.clear_staged();
+            let _ = self.update_state.save();
+        }
+    }
+
+    /// Kick off a manual "Check for updates" run (ignored if one is already in
+    /// flight, so repeated clicks don't stack worker threads).
+    fn start_update_check(&mut self) {
+        if self.update_check.is_some() {
+            return;
+        }
+        self.status = "Checking for updates…".into();
+        self.update_check = Some(updater::UpdateCheck::spawn(
+            updater::CheckMode::Manual,
+            version::BUILD_INFO.version.to_string(),
+        ));
     }
 }
 
