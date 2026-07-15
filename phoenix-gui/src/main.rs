@@ -18,6 +18,7 @@ mod mount_table;
 mod restore_layout;
 mod restore_panel;
 mod sidebar;
+mod single_instance;
 mod status_modal;
 mod stripes;
 mod theme;
@@ -110,6 +111,17 @@ fn main() -> eframe::Result<()> {
         attach_debug_console();
     }
     let _log_guard = init_logging(debug);
+
+    // Single instance: a second launch focuses the running window and exits.
+    // Multi-drive backups/mounts all run from one window, so a second is never
+    // wanted. Hold the guard for the whole run (released on process exit).
+    let _instance: single_instance::Guard = match single_instance::acquire() {
+        Some(guard) => guard,
+        None => {
+            tracing::info!("another instance is already running; focused it and exiting");
+            return Ok(());
+        }
+    };
 
     let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
     let options = eframe::NativeOptions {
