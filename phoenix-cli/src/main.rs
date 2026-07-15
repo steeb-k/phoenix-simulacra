@@ -11,8 +11,8 @@ use phoenix_restore::restore::{run_restore, verify_backup, RestoreOptions};
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "carbon-phoenix")]
-#[command(about = "Carbon Phoenix — Backup and Restore")]
+#[command(name = "simulacra")]
+#[command(about = "Phoenix Simulacra — Backup and Restore")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -241,7 +241,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Result<()> {
-    let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
+    let scratch = std::env::temp_dir().join("PhoenixSimulacra").join("mounts");
     if phoenix_mount::ActiveMount::space_efficient() {
         println!("Mounting {} (read-only, on-demand)…", backup.display());
     } else {
@@ -370,9 +370,7 @@ fn print_conversion_summary(
         println!("  converted: {n}");
     }
     for n in unconverted_names {
-        println!(
-            "  left unconverted (exFAT/encrypted — restored but unreadable on 512e): {n}"
-        );
+        println!("  left unconverted (exFAT/encrypted — restored but unreadable on 512e): {n}");
     }
     if bootable {
         println!(

@@ -265,7 +265,7 @@ impl Vhdx {
         // --- File Type Identifier -------------------------------------------
         out[0..8].copy_from_slice(b"vhdxfile");
         // Creator, UTF-16LE, 512 bytes. Purely informational.
-        for (i, c) in "carbon-phoenix".encode_utf16().enumerate() {
+        for (i, c) in "simulacra".encode_utf16().enumerate() {
             let at = 8 + i * 2;
             out[at..at + 2].copy_from_slice(&c.to_le_bytes());
         }

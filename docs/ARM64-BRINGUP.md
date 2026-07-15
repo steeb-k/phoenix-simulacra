@@ -2,7 +2,7 @@
 
 **Read this on the ARM64 machine. It is written to be executed, not skimmed.**
 
-This document was written when Carbon Phoenix had never been *run* on ARM64. That
+This document was written when Phoenix Simulacra had never been *run* on ARM64. That
 is no longer true, and the phases below now carry their results inline.
 
 > ### Where it stands (2026-07-14)
@@ -291,7 +291,7 @@ There is **no `--version` flag**. The proof is the startup banner, which every
 run emits at INFO by default:
 
 ```powershell
-.\target\release\carbon-phoenix.exe list-disks
+.\target\release\simulacra.exe list-disks
 ```
 
 The `phoenix_build` banner must report:
@@ -344,7 +344,7 @@ machine — if so, say so; that is useful.
 ## Phase 4 — Read-only smoke (nothing is written)
 
 ```powershell
-.\target\release\carbon-phoenix.exe list-disks
+.\target\release\simulacra.exe list-disks
 ```
 
 Confirm the internal drive enumerates and that its **sector size, bus type, and
@@ -389,7 +389,7 @@ Everything downstream trusts that number.
 ### The GUI — the renderer already bit us once
 
 ```powershell
-.\target\release\carbon-phoenix-gui.exe          # UAC prompt expected: it requires admin
+.\target\release\simulacra-gui.exe          # UAC prompt expected: it requires admin
 ```
 
 > **This phase has already produced TWO findings (2026-07-14), and it is the most
@@ -511,7 +511,7 @@ Notes:
   in-flight buffers cap around 128 MiB at the default `min(cores, 8)`).
 - **`bitlocker.rs` needs a Pro/Enterprise SKU — the *test* does, the *product*
   does not.** The test calls `Enable-BitLocker` to *create* an encrypted fixture
-  volume to back up, and that cmdlet is Pro+. Carbon Phoenix's BitLocker
+  volume to back up, and that cmdlet is Pro+. Phoenix Simulacra's BitLocker
   *handling* — detecting `-FVE-FS-`, choosing plaintext-vs-ciphertext capture —
   is pure sector inspection and is not gated on any SKU. **This machine is Home,
   so the test cannot run here.** Report it as `skipped-and-why`, not as a
@@ -610,7 +610,7 @@ this machine, **skip it**: the only fixed disk is the one you are booting from.
 **Mount** (the zero-space WinFsp path — the whole point of the feature):
 
 ```powershell
-.\target\release\carbon-phoenix.exe mount <backup.phnx> --partitions 2
+.\target\release\simulacra.exe mount <backup.phnx> --partitions 2
 ```
 
 Confirm: the drive letter appears, files read back correctly, **free disk space

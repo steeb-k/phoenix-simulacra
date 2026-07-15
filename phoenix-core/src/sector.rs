@@ -113,14 +113,23 @@ mod tests {
 
     #[test]
     fn identical_and_unknown_never_convert_or_refuse() {
-        assert_eq!(classify_sector_sizes(512, 512).unwrap(), SectorPlan::Identical);
+        assert_eq!(
+            classify_sector_sizes(512, 512).unwrap(),
+            SectorPlan::Identical
+        );
         assert_eq!(
             classify_sector_sizes(4096, 4096).unwrap(),
             SectorPlan::Identical
         );
         // Zero (pre-sector-size backups) is treated as legacy 512e — no refusal.
-        assert_eq!(classify_sector_sizes(0, 512).unwrap(), SectorPlan::Identical);
-        assert_eq!(classify_sector_sizes(4096, 0).unwrap(), SectorPlan::Identical);
+        assert_eq!(
+            classify_sector_sizes(0, 512).unwrap(),
+            SectorPlan::Identical
+        );
+        assert_eq!(
+            classify_sector_sizes(4096, 0).unwrap(),
+            SectorPlan::Identical
+        );
     }
 
     #[test]

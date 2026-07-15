@@ -1,4 +1,4 @@
-//! Carbon Phoenix core library: `.phnx` format, manifest, hashing, disk enumeration.
+//! Phoenix Simulacra core library: `.phnx` format, manifest, hashing, disk enumeration.
 
 pub mod appdata;
 pub mod build_info;

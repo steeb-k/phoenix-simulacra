@@ -1,13 +1,13 @@
 [package]
 name = "phoenix-cli"
-description = "Carbon Phoenix CLI"
+description = "Phoenix Simulacra CLI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "carbon-phoenix"
+name = "simulacra"
 path = "src/main.rs"
 
 [dependencies]

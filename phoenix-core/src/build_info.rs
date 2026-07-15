@@ -30,7 +30,7 @@ use tracing::info;
 /// as `"unknown"` rather than left empty so the banner stays scannable.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildInfo {
-    /// Display name of the binary (e.g. `"carbon-phoenix-gui"`). Lets the
+    /// Display name of the binary (e.g. `"simulacra-gui"`). Lets the
     /// banner tell GUI and CLI sessions apart in a multiplexed log.
     pub binary_name: &'static str,
     /// Crate version from `CARGO_PKG_VERSION` (the value of
@@ -92,7 +92,7 @@ pub fn log_startup_banner(info: &BuildInfo) {
         .unwrap_or_else(|e| format!("<current_dir failed: {e}>"));
     let host = hostname();
 
-    info!(target: "phoenix_build", "================ Carbon Phoenix session start ================");
+    info!(target: "phoenix_build", "================ Phoenix Simulacra session start ================");
     info!(
         target: "phoenix_build",
         binary = info.binary_name,

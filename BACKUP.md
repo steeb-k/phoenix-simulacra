@@ -1,6 +1,6 @@
-# Carbon Phoenix — Backup Guide
+# Phoenix Simulacra — Backup Guide
 
-This document explains how backups work in Carbon Phoenix, what options you have, and how to choose settings for different scenarios.
+This document explains how backups work in Phoenix Simulacra, what options you have, and how to choose settings for different scenarios.
 
 For the on-disk file layout, see [docs/phnx-format.md](docs/phnx-format.md). For restore, see the main [README.md](README.md#cli-usage) restore section.
 
@@ -8,7 +8,7 @@ For the on-disk file layout, see [docs/phnx-format.md](docs/phnx-format.md). For
 
 ## What a backup is (and is not)
 
-Carbon Phoenix does **not** create a monolithic sector-by-sector image of an entire physical disk (unlike many tools in “dd” or Clonezilla full-disk mode).
+Phoenix Simulacra does **not** create a monolithic sector-by-sector image of an entire physical disk (unlike many tools in “dd” or Clonezilla full-disk mode).
 
 Instead, each backup is a single **`.phnx`** file that contains:
 
@@ -56,7 +56,7 @@ Each partition is backed up using one of two capture strategies.
 - **Free space inside the partition is skipped** — the backup file stays much smaller than the partition size.
 - Empty space is **not** preserved; restore targets a partition that you size explicitly in a restore plan.
 
-This is the default for Windows data volumes and is the main reason Carbon Phoenix avoids “full imaging” bloat.
+This is the default for Windows data volumes and is the main reason Phoenix Simulacra avoids “full imaging” bloat.
 
 ### Raw sector capture (`raw`)
 
@@ -125,7 +125,7 @@ BitLocker volumes must be **unlocked** (decrypted at the volume layer) for a nor
    - Hash uncompressed chunk with **BLAKE3**; record in manifest.
 5. **Finalize** — Write partition index table, JSON manifest, footer with manifest hash.
 
-Integrity is recorded **during** backup; use `carbon-phoenix verify` afterward for a full re-read check.
+Integrity is recorded **during** backup; use `simulacra verify` afterward for a full re-read check.
 
 ---
 
@@ -139,7 +139,7 @@ Integrity is recorded **during** backup; use `carbon-phoenix verify` afterward f
 After backup, inspect contents:
 
 ```bash
-carbon-phoenix list backup.phnx
+simulacra list backup.phnx
 ```
 
 Look at `used_bytes` vs `original_size` per partition to see how much logical data was captured versus partition capacity.
@@ -151,7 +151,7 @@ Look at `used_bytes` vs `original_size` per partition to see how much logical da
 ### List disks and partitions
 
 ```bash
-carbon-phoenix list-disks
+simulacra list-disks
 ```
 
 Shows disk index, path, GPT/MBR, and each partition’s index, name, size, detected filesystem, and capture mode.
@@ -159,7 +159,7 @@ Shows disk index, path, GPT/MBR, and each partition’s index, name, size, detec
 ### Create a backup
 
 ```bash
-carbon-phoenix backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --output <PATH.phnx> [--no-verify]
+simulacra backup --disk <DISK_INDEX> --partitions <INDEX>[,<INDEX>...] --output <PATH.phnx> [--no-verify]
 ```
 
 | Option | Required | Description |
@@ -175,25 +175,25 @@ Locking vs. VSS is not an option — the engine locks the volume when it can and
 
 ```bash
 # Data drive (idle → captured under an exclusive volume lock)
-carbon-phoenix backup --disk 1 --partitions 2 --output D:\Backups\data.phnx
+simulacra backup --disk 1 --partitions 2 --output D:\Backups\data.phnx
 
 # System disk: EFI + MSR + Windows partition (indices from list-disks).
 # The running C: can't be locked, so it's captured through a VSS shadow.
-carbon-phoenix backup --disk 0 --partitions 1,2,3 --output C:\Backups\system.phnx
+simulacra backup --disk 0 --partitions 1,2,3 --output C:\Backups\system.phnx
 ```
 
 ### Verify after backup
 
 ```bash
-carbon-phoenix verify backup.phnx          # Full: re-hash every chunk
-carbon-phoenix verify backup.phnx --quick  # Metadata + manifest hash only
+simulacra verify backup.phnx          # Full: re-hash every chunk
+simulacra verify backup.phnx --quick  # Metadata + manifest hash only
 ```
 
 ---
 
 ## GUI reference
 
-Launch `carbon-phoenix-gui.exe` (Administrator / UAC).
+Launch `simulacra-gui.exe` (Administrator / UAC).
 
 **Backup tab:**
 
@@ -298,10 +298,10 @@ Useful fields for auditing a backup:
 ## Related commands
 
 ```bash
-carbon-phoenix list-disks
-carbon-phoenix backup --disk 0 --partitions 1,2,3 -o backup.phnx
-carbon-phoenix list backup.phnx
-carbon-phoenix verify backup.phnx
+simulacra list-disks
+simulacra backup --disk 0 --partitions 1,2,3 -o backup.phnx
+simulacra list backup.phnx
+simulacra verify backup.phnx
 ```
 
 Restore workflow: `plan` → edit TOML → `restore` (documented in [README.md](README.md)).

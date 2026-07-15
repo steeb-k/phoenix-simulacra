@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-vss"
-description = "Carbon Phoenix VSS snapshot integration for live Windows backups"
+description = "Phoenix Simulacra VSS snapshot integration for live Windows backups"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

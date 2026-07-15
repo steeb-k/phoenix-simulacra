@@ -74,9 +74,8 @@ const START_BUTTON_HEIGHT: f32 = 52.0;
 /// to look right at 16x16/32x32/256x256 against the taskbar/title bar,
 /// while the in-app icons are vector glyphs tinted by the active theme.
 fn app_icon() -> egui::IconData {
-    let bytes = include_bytes!("../../assets/carbon-phoenix-appicon2-256px.png");
-    let image =
-        image::load_from_memory(bytes).expect("failed to decode carbon-phoenix-appicon2-256px.png");
+    let bytes = include_bytes!("../../assets/phoenix-appicon-256px.png");
+    let image = image::load_from_memory(bytes).expect("failed to decode phoenix-appicon-256px.png");
     let image = image.into_rgba8();
     let (width, height) = image.dimensions();
     egui::IconData {
@@ -115,14 +114,14 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Carbon Phoenix",
+        "Phoenix Simulacra",
         options,
         Box::new(|cc| Ok(Box::new(PhoenixApp::new(cc)))),
     )
 }
 
 /// Sets up tracing to BOTH stderr (for users who launch from a terminal) and
-/// a rolling log file in `%LOCALAPPDATA%\CarbonPhoenix\logs\` so users who
+/// a rolling log file in `%LOCALAPPDATA%\PhoenixSimulacra\logs\` so users who
 /// double-click the .exe can still hand us a log when something goes wrong.
 ///
 /// The default filter is deliberately *verbose* — `info` for every Phoenix
@@ -146,10 +145,10 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = std::env::var("LOCALAPPDATA")
         .map(|p| {
             std::path::PathBuf::from(p)
-                .join("CarbonPhoenix")
+                .join("PhoenixSimulacra")
                 .join("logs")
         })
-        .unwrap_or_else(|_| std::env::temp_dir().join("CarbonPhoenix").join("logs"));
+        .unwrap_or_else(|_| std::env::temp_dir().join("PhoenixSimulacra").join("logs"));
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
@@ -157,7 +156,7 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     let (file_layer, guard) = match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
-            let appender = tracing_appender::rolling::daily(&log_dir, "carbon-phoenix.log");
+            let appender = tracing_appender::rolling::daily(&log_dir, "simulacra.log");
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let layer = tracing_subscriber::fmt::layer()
                 .with_writer(writer)
@@ -1544,7 +1543,7 @@ impl PhoenixApp {
 
         let details = self.mount_summaries();
         let message = format!(
-            "Closing Carbon Phoenix unmounts {} and removes {} drive letters. \
+            "Closing Phoenix Simulacra unmounts {} and removes {} drive letters. \
              Any open files or Explorer windows on those drives will be disconnected.",
             if details.len() == 1 {
                 "the mounted backup".to_string()
@@ -2734,7 +2733,7 @@ impl PhoenixApp {
             return;
         }
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
-        let scratch = std::env::temp_dir().join("CarbonPhoenix").join("mounts");
+        let scratch = std::env::temp_dir().join("PhoenixSimulacra").join("mounts");
         let selected: Vec<u32> = self.mount_selection.iter().map(|&(_, part)| part).collect();
         self.status = if phoenix_mount::ActiveMount::space_efficient() {
             "Mounting read-only (on-demand)…".into()
@@ -2963,7 +2962,7 @@ fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
             letters: vec!['I', 'J'],
         },
         mount_table::MountRow {
-            folder: r"\\nas\archive\carbon-phoenix\weekly\workstation\2026\july".into(),
+            folder: r"\\nas\archive\simulacra\weekly\workstation\2026\july".into(),
             name: "workstation-2026-07-12.phnx".into(),
             size: 512_110_190_592,
             letters: vec!['K'],
@@ -2997,7 +2996,7 @@ fn demo_history_from_args() -> Option<phoenix_core::appdata::History> {
             now - 3 * DAY,
             18,
         )
-        .with_source(r"\\nas\archive\carbon-phoenix\weekly\workstation-2026-07-06.phnx")
+        .with_source(r"\\nas\archive\simulacra\weekly\workstation-2026-07-06.phnx")
         .with_target("SanDisk Extreme USB (Disk 3)")
         .with_bytes(0, 512_110_190_592),
         JobRecord::new(K::Backup, O::Cancelled, now - DAY, 340)
@@ -3134,7 +3133,7 @@ fn pick_backup_save_folder(current: &str) -> Option<PathBuf> {
 
 fn pick_backup_open_path(current: &str) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new()
-        .add_filter("Carbon Phoenix backup", &["phnx"])
+        .add_filter("Phoenix Simulacra backup", &["phnx"])
         .set_title("Open backup");
 
     let path = Path::new(current);

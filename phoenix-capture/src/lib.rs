@@ -1,4 +1,4 @@
-//! Partition capture engines for Carbon Phoenix.
+//! Partition capture engines for Phoenix Simulacra.
 
 pub mod backup;
 pub mod fat;
@@ -12,5 +12,5 @@ pub use backup::{plan_capture, run_backup};
 pub use fat::finalize_fat_partition;
 pub use ntfs::finalize_ntfs_partition;
 pub use raw::PartitionWriter;
-pub use sector_convert::{apply_sector_conversion, ConvertOutcome};
 pub use reader::{BlockSource, MemoryBlockSource, PartitionReader};
+pub use sector_convert::{apply_sector_conversion, ConvertOutcome};

@@ -1,6 +1,6 @@
-# Carbon Phoenix — Testing Guide
+# Phoenix Simulacra — Testing Guide
 
-Carbon Phoenix is a disk backup tool where a silent bug can mean **data loss**,
+Phoenix Simulacra is a disk backup tool where a silent bug can mean **data loss**,
 so testing is tiered and deliberately paranoid. Integrity is verified at three
 levels: the backup file's internal consistency, the backup's fidelity to the
 source, and the full source → backup → restore/clone round-trip byte-for-byte.

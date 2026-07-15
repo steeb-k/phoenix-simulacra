@@ -120,12 +120,14 @@ fn conversion_ratio(old_bps: u16) -> Result<Option<u64>> {
 }
 
 fn hidden_sectors(target_offset_bytes: u64) -> Result<u32> {
-    (target_offset_bytes / TARGET_SECTOR).try_into().map_err(|_| {
-        PhoenixError::Other(format!(
-            "partition offset {target_offset_bytes} in 512-byte sectors exceeds the 32-bit \
+    (target_offset_bytes / TARGET_SECTOR)
+        .try_into()
+        .map_err(|_| {
+            PhoenixError::Other(format!(
+                "partition offset {target_offset_bytes} in 512-byte sectors exceeds the 32-bit \
              HiddenSectors field"
-        ))
-    })
+            ))
+        })
 }
 
 /// NTFS BPB field offsets (all within the first 512 bytes of the VBR).
@@ -141,7 +143,10 @@ fn convert_ntfs(
     boot: &mut [u8],
     target_offset_bytes: u64,
 ) -> Result<ConvertOutcome> {
-    let old_bps = u16::from_le_bytes([boot[ntfs_off::BYTES_PER_SECTOR], boot[ntfs_off::BYTES_PER_SECTOR + 1]]);
+    let old_bps = u16::from_le_bytes([
+        boot[ntfs_off::BYTES_PER_SECTOR],
+        boot[ntfs_off::BYTES_PER_SECTOR + 1],
+    ]);
     let Some(ratio) = conversion_ratio(old_bps)? else {
         return Ok(ConvertOutcome::Skipped);
     };
@@ -222,7 +227,10 @@ fn is_fat32(boot: &[u8]) -> bool {
     if boot.len() < 512 || boot[510] != 0x55 || boot[511] != 0xAA {
         return false;
     }
-    let root_ent = u16::from_le_bytes([boot[fat_off::ROOT_ENTRY_COUNT], boot[fat_off::ROOT_ENTRY_COUNT + 1]]);
+    let root_ent = u16::from_le_bytes([
+        boot[fat_off::ROOT_ENTRY_COUNT],
+        boot[fat_off::ROOT_ENTRY_COUNT + 1],
+    ]);
     let fatsz16 = u16::from_le_bytes([boot[fat_off::FAT_SIZE_16], boot[fat_off::FAT_SIZE_16 + 1]]);
     let fatsz32 = u32::from_le_bytes(
         boot[fat_off::FAT_SIZE_32..fat_off::FAT_SIZE_32 + 4]
@@ -237,7 +245,10 @@ fn convert_fat32(
     boot: &mut [u8],
     target_offset_bytes: u64,
 ) -> Result<ConvertOutcome> {
-    let old_bps = u16::from_le_bytes([boot[fat_off::BYTES_PER_SECTOR], boot[fat_off::BYTES_PER_SECTOR + 1]]);
+    let old_bps = u16::from_le_bytes([
+        boot[fat_off::BYTES_PER_SECTOR],
+        boot[fat_off::BYTES_PER_SECTOR + 1],
+    ]);
     let Some(ratio) = conversion_ratio(old_bps)? else {
         return Ok(ConvertOutcome::Skipped);
     };
@@ -251,14 +262,32 @@ fn convert_fat32(
     let new_spc = scale(old_spc, ratio, 255, "FAT32 SectorsPerCluster")?;
 
     let read_u16 = |off: usize| u16::from_le_bytes([boot[off], boot[off + 1]]) as u64;
-    let read_u32 = |off: usize| {
-        u32::from_le_bytes(boot[off..off + 4].try_into().unwrap()) as u64
-    };
+    let read_u32 = |off: usize| u32::from_le_bytes(boot[off..off + 4].try_into().unwrap()) as u64;
 
-    let new_reserved = scale(read_u16(fat_off::RESERVED_SECTORS), ratio, u16::MAX as u64, "FAT32 ReservedSectors")?;
-    let new_totsec32 = scale(read_u32(fat_off::TOTAL_SECTORS_32), ratio, u32::MAX as u64, "FAT32 TotSec32")?;
-    let new_fatsz32 = scale(read_u32(fat_off::FAT_SIZE_32), ratio, u32::MAX as u64, "FAT32 FATSz32")?;
-    let new_fsinfo = scale(read_u16(fat_off::FS_INFO_SECTOR), ratio, u16::MAX as u64, "FAT32 FSInfo sector")?;
+    let new_reserved = scale(
+        read_u16(fat_off::RESERVED_SECTORS),
+        ratio,
+        u16::MAX as u64,
+        "FAT32 ReservedSectors",
+    )?;
+    let new_totsec32 = scale(
+        read_u32(fat_off::TOTAL_SECTORS_32),
+        ratio,
+        u32::MAX as u64,
+        "FAT32 TotSec32",
+    )?;
+    let new_fatsz32 = scale(
+        read_u32(fat_off::FAT_SIZE_32),
+        ratio,
+        u32::MAX as u64,
+        "FAT32 FATSz32",
+    )?;
+    let new_fsinfo = scale(
+        read_u16(fat_off::FS_INFO_SECTOR),
+        ratio,
+        u16::MAX as u64,
+        "FAT32 FSInfo sector",
+    )?;
     let old_bkboot = read_u16(fat_off::BK_BOOT_SECTOR);
     let new_bkboot = scale(old_bkboot, ratio, u16::MAX as u64, "FAT32 BkBootSec")?;
     let new_hidden = hidden_sectors(target_offset_bytes)?;
@@ -326,10 +355,12 @@ mod tests {
     fn build_ntfs_4kn_boot(partition_bytes: u64) -> Vec<u8> {
         let mut b = vec![0u8; 512];
         b[3..7].copy_from_slice(b"NTFS");
-        b[ntfs_off::BYTES_PER_SECTOR..ntfs_off::BYTES_PER_SECTOR + 2].copy_from_slice(&4096u16.to_le_bytes());
+        b[ntfs_off::BYTES_PER_SECTOR..ntfs_off::BYTES_PER_SECTOR + 2]
+            .copy_from_slice(&4096u16.to_le_bytes());
         b[ntfs_off::SECTORS_PER_CLUSTER] = 1; // 4 KiB clusters on 4Kn
         let total = partition_bytes / 4096 - 1;
-        b[ntfs_off::TOTAL_SECTORS..ntfs_off::TOTAL_SECTORS + 8].copy_from_slice(&total.to_le_bytes());
+        b[ntfs_off::TOTAL_SECTORS..ntfs_off::TOTAL_SECTORS + 8]
+            .copy_from_slice(&total.to_le_bytes());
         b[510] = 0x55;
         b[511] = 0xAA;
         b
@@ -338,15 +369,21 @@ mod tests {
     fn build_fat32_4kn_boot() -> Vec<u8> {
         let mut b = vec![0u8; 512];
         b[3..11].copy_from_slice(b"MSDOS5.0");
-        b[fat_off::BYTES_PER_SECTOR..fat_off::BYTES_PER_SECTOR + 2].copy_from_slice(&4096u16.to_le_bytes());
+        b[fat_off::BYTES_PER_SECTOR..fat_off::BYTES_PER_SECTOR + 2]
+            .copy_from_slice(&4096u16.to_le_bytes());
         b[fat_off::SECTORS_PER_CLUSTER] = 1;
-        b[fat_off::RESERVED_SECTORS..fat_off::RESERVED_SECTORS + 2].copy_from_slice(&4u16.to_le_bytes());
-        b[fat_off::ROOT_ENTRY_COUNT..fat_off::ROOT_ENTRY_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
+        b[fat_off::RESERVED_SECTORS..fat_off::RESERVED_SECTORS + 2]
+            .copy_from_slice(&4u16.to_le_bytes());
+        b[fat_off::ROOT_ENTRY_COUNT..fat_off::ROOT_ENTRY_COUNT + 2]
+            .copy_from_slice(&0u16.to_le_bytes());
         b[fat_off::FAT_SIZE_16..fat_off::FAT_SIZE_16 + 2].copy_from_slice(&0u16.to_le_bytes());
-        b[fat_off::TOTAL_SECTORS_32..fat_off::TOTAL_SECTORS_32 + 4].copy_from_slice(&65536u32.to_le_bytes());
+        b[fat_off::TOTAL_SECTORS_32..fat_off::TOTAL_SECTORS_32 + 4]
+            .copy_from_slice(&65536u32.to_le_bytes());
         b[fat_off::FAT_SIZE_32..fat_off::FAT_SIZE_32 + 4].copy_from_slice(&256u32.to_le_bytes());
-        b[fat_off::FS_INFO_SECTOR..fat_off::FS_INFO_SECTOR + 2].copy_from_slice(&1u16.to_le_bytes());
-        b[fat_off::BK_BOOT_SECTOR..fat_off::BK_BOOT_SECTOR + 2].copy_from_slice(&6u16.to_le_bytes());
+        b[fat_off::FS_INFO_SECTOR..fat_off::FS_INFO_SECTOR + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        b[fat_off::BK_BOOT_SECTOR..fat_off::BK_BOOT_SECTOR + 2]
+            .copy_from_slice(&6u16.to_le_bytes());
         b[510] = 0x55;
         b[511] = 0xAA;
         b
@@ -357,7 +394,8 @@ mod tests {
         assert!(is_fat32(&build_fat32_4kn_boot()));
         // A FAT16 boot (RootEntCnt != 0, FATSz16 != 0) is not FAT32.
         let mut b = build_fat32_4kn_boot();
-        b[fat_off::ROOT_ENTRY_COUNT..fat_off::ROOT_ENTRY_COUNT + 2].copy_from_slice(&512u16.to_le_bytes());
+        b[fat_off::ROOT_ENTRY_COUNT..fat_off::ROOT_ENTRY_COUNT + 2]
+            .copy_from_slice(&512u16.to_le_bytes());
         b[fat_off::FAT_SIZE_16..fat_off::FAT_SIZE_16 + 2].copy_from_slice(&20u16.to_le_bytes());
         assert!(!is_fat32(&b));
     }
@@ -419,9 +457,7 @@ mod tests {
         part.writer.write_at(0, &boot).unwrap();
         // Also lay a copy at the source backup location so we can prove it's
         // overwritten with the patched VBR.
-        part.writer
-            .write_at(old_total * 4096, &boot)
-            .unwrap();
+        part.writer.write_at(old_total * 4096, &boot).unwrap();
 
         let outcome = apply_sector_conversion(&mut part.writer, 1024 * 1024).unwrap();
         assert_eq!(outcome, ConvertOutcome::ConvertedNtfs);

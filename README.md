@@ -1,4 +1,4 @@
-# Carbon Phoenix — Backup and Restore
+# Phoenix Simulacra — Backup and Restore
 
 Windows disk backup tool written in Rust. Creates single-file `.phnx` backups with partition metadata, used-block capture for NTFS/FAT/exFAT, and raw capture for EFI/MSR partitions.
 
@@ -55,7 +55,7 @@ Binaries embed a `requireAdministrator` manifest (UAC on launch). Paths depend o
 
 | Target | CLI | GUI |
 |--------|-----|-----|
-| Host default | `target/release/carbon-phoenix.exe` | `target/release/carbon-phoenix-gui.exe` |
+| Host default | `target/release/simulacra.exe` | `target/release/simulacra-gui.exe` |
 | `x86_64-pc-windows-msvc` | `target/x86_64-pc-windows-msvc/release/...` | same |
 | `aarch64-pc-windows-msvc` | `target/aarch64-pc-windows-msvc/release/...` | same |
 
@@ -65,24 +65,24 @@ Packaged copies from the release script: `dist/<target>/`.
 
 ```bash
 # List disks (UAC prompt appears automatically when launching the exe)
-carbon-phoenix list-disks
+simulacra list-disks
 
 # Backup partitions 1,2,3 on disk 0. Idle volumes are captured under an exclusive
 # lock; volumes in use (the live C: among them) are captured through a VSS shadow —
 # there is nothing to choose.
-carbon-phoenix backup --disk 0 --partitions 1,2,3 --output backup.phnx
+simulacra backup --disk 0 --partitions 1,2,3 --output backup.phnx
 
 # Inspect backup
-carbon-phoenix list backup.phnx
+simulacra list backup.phnx
 
 # Verify
-carbon-phoenix verify backup.phnx
-carbon-phoenix verify backup.phnx --quick
+simulacra verify backup.phnx
+simulacra verify backup.phnx --quick
 
 # Restore
-carbon-phoenix plan backup.phnx --disk 1 --output plan.toml
+simulacra plan backup.phnx --disk 1 --output plan.toml
 # Edit plan.toml (partition sizes/offsets)
-carbon-phoenix restore backup.phnx --plan plan.toml
+simulacra restore backup.phnx --plan plan.toml
 ```
 
 ## Documentation

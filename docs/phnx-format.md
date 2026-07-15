@@ -1,4 +1,4 @@
-# Carbon Phoenix `.phnx` Backup Format (v2)
+# Phoenix Simulacra `.phnx` Backup Format (v2)
 
 Single-file container for disk/partition backups. All multi-byte integers are **little-endian**.
 

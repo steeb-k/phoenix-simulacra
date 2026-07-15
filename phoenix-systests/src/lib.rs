@@ -1,4 +1,4 @@
-//! System-test harness for Carbon Phoenix (Tier 2).
+//! System-test harness for Phoenix Simulacra (Tier 2).
 //!
 //! These helpers drive **real** Windows virtual disks (VHDX attached via
 //! `diskpart`, which surface as ordinary `\\.\PhysicalDriveN` devices) so the

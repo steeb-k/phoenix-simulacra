@@ -4,6 +4,7 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyl
 
 const REGULAR: &str = "inter-regular";
 const BOLD: &str = "inter-bold";
+const EXTRABOLD: &str = "inter-extrabold";
 const PHOSPHOR: &str = "phosphor";
 const PHOSPHOR_FILL: &str = "phosphor-fill";
 const PHOSPHOR_BOLD: &str = "phosphor-bold";
@@ -27,6 +28,10 @@ pub fn install(ctx: &egui::Context) {
         BOLD.into(),
         FontData::from_static(include_bytes!("../../assets/Inter-Bold.ttf")),
     );
+    fonts.font_data.insert(
+        EXTRABOLD.into(),
+        FontData::from_static(include_bytes!("../../assets/Inter-ExtraBold.ttf")),
+    );
 
     fonts
         .families
@@ -40,6 +45,14 @@ pub fn install(ctx: &egui::Context) {
     fonts.families.insert(
         FontFamily::Name(BOLD.into()),
         vec![BOLD.into(), REGULAR.into()],
+    );
+
+    // Inter ExtraBold (weight 800) — used by the sidebar "Simulacra" wordmark.
+    // A separate family so `fonts::extrabold()` can name it directly; falls
+    // back to Regular for any glyph the ExtraBold face lacks.
+    fonts.families.insert(
+        FontFamily::Name(EXTRABOLD.into()),
+        vec![EXTRABOLD.into(), REGULAR.into()],
     );
 
     // The caption buttons (minimize/maximize/close) render the exact glyphs
@@ -138,6 +151,12 @@ pub fn bold(size: f32) -> FontId {
 
 pub fn regular(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
+}
+
+/// Inter ExtraBold (weight 800). Heavier than [`bold`]; used for the sidebar
+/// wordmark.
+pub fn extrabold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(EXTRABOLD.into()))
 }
 
 pub fn icon(size: f32) -> FontId {
