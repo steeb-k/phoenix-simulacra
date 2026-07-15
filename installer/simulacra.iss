@@ -45,10 +45,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; WinFsp MSI install + Program Files both need elevation.
 PrivilegesRequired=admin
-; Let an in-place update close a running instance (needs the app-side named
-; mutex "PhoenixSimulacra"; harmless if absent).
-CloseApplications=yes
-AppMutex=PhoenixSimulacra
+; Updates are applied while the app is CLOSED (IDE/browser style: the updater
+; stages the new setup and runs it silently after the user exits), so the
+; installer never force-closes a running instance -- a backup in progress is
+; never interrupted.
+CloseApplications=no
 ; Silent updates keep the user's earlier task choices (desktop icon, WinFsp).
 UsePreviousTasks=yes
 ; Native theming (Inno 6.6.0+): modern layout, follows the Windows light/dark
