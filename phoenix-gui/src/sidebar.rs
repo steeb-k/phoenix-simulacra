@@ -265,7 +265,7 @@ fn theme_pill(ui: &mut Ui, theme: &mut ThemeChoice, palette: &Palette) -> bool {
     );
     let painter = ui.painter_at(rect);
     let radius = rect.height() / 2.0;
-    painter.rect_filled(rect, Rounding::same(radius), palette.sidebar_hover_bg);
+    painter.rect_filled(rect, Rounding::same(radius), palette.segment_track_bg);
 
     let seg_width = rect.width() / CHOICES.len() as f32;
     let seg_rect = |i: f32| {
