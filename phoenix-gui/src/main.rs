@@ -857,6 +857,14 @@ struct PhoenixApp {
     /// dialog was accepted, or a portable `ViewportCommand::Close` arrived. The
     /// winit loop checks it after each paint and calls `event_loop.exit()`.
     should_exit: bool,
+    /// Set by the status bar's "Restart to update" link: the exit that follows
+    /// should wait for the staged installer and relaunch the app, rather than
+    /// leaving it closed the way a plain close does.
+    restart_after_update: bool,
+    /// Running from the portable ZIP rather than an installed copy
+    /// ([`updater::is_portable`]). Read once at startup: the marker sits beside
+    /// the exe and can't change under a running process.
+    portable: bool,
 }
 
 impl PhoenixApp {
@@ -937,6 +945,8 @@ impl PhoenixApp {
             pending_refresh: None,
             refresh_overlay_until: demo_refresh_overlay_from_args(),
             should_exit: false,
+            restart_after_update: false,
+            portable: updater::is_portable(),
         };
         app.refresh_disks();
         app.init_updates();
@@ -953,7 +963,15 @@ impl PhoenixApp {
     /// reason it's unconditional — a per-day throttle made the update silently
     /// skip a launch where a new release had just dropped. The status-bar banner
     /// is the only signal the user needs; the update applies silently on close.
+    ///
+    /// None of it happens in a portable build: no check, no staging, no banner.
+    /// See [`updater::is_portable`] — the About page's manual check is the only
+    /// update surface those get, and it downloads nothing.
     fn init_updates(&mut self) {
+        if self.portable {
+            tracing::info!("portable build — automatic updates disabled");
+            return;
+        }
         let running = version::BUILD_INFO.version;
         updater::cleanup_stale(&mut self.update_state, running);
 
@@ -973,6 +991,7 @@ impl PhoenixApp {
             self.update_check = Some(updater::UpdateCheck::spawn(
                 updater::CheckMode::SilentAuto,
                 running.to_string(),
+                updater::Depth::Stage,
             ));
         }
     }
@@ -1002,6 +1021,17 @@ impl PhoenixApp {
                 if manual {
                     self.status = "You're on the latest version.".into();
                 }
+                self.update_check = None;
+            }
+            // Portable builds only, and only ever from the About page's button:
+            // say what's out there and where to get it, then stop. Nothing was
+            // downloaded and nothing will be, so this leaves no banner behind —
+            // there is no "Restart to update" to offer.
+            updater::UpdateEvent::Available { version } => {
+                self.status = format!(
+                    "Update {version} is available — download it from {}",
+                    about_panel::HOME_URL
+                );
                 self.update_check = None;
             }
             updater::UpdateEvent::Ready(staged) => {
@@ -1738,18 +1768,22 @@ impl PhoenixApp {
                         ui.label(
                             egui::RichText::new(&self.status).color(self.palette.subtle_text),
                         );
-                        // A staged update announces itself on the right, kept
-                        // separate from the transient `status` line so it stays
-                        // visible until the app is closed (and the update runs).
-                        if let Some(banner) = &self.update_banner {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(banner).color(self.palette.accent),
-                                    );
-                                },
-                            );
+                        // A staged update offers itself on the right as the one
+                        // action the banner implies: close, install, come back
+                        // on the new version. The left status line already
+                        // carries the "installs when you close" wording, so this
+                        // is a bare link rather than the same sentence twice.
+                        if self.update_banner.is_some() {
+                            let clicked = ui
+                                .with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| ui.link("Restart to update").clicked(),
+                                )
+                                .inner;
+                            if clicked {
+                                self.restart_after_update = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                         }
                     });
                 });
@@ -3519,6 +3553,13 @@ impl PhoenixApp {
     /// path here is a genuine pending upgrade. Best-effort: if the launch fails
     /// there's nothing to surface at exit, and the file stays for next time.
     fn apply_staged_update_on_exit(&mut self) {
+        // A portable build stages nothing, so there is normally nothing here —
+        // but an installed copy on the same machine shares this state file, and
+        // running *its* pending installer off the back of a portable close is
+        // exactly the surprise the portable build exists to avoid.
+        if self.portable {
+            return;
+        }
         let Some(path) = self.update_state.staged_installer.clone() else {
             return;
         };
@@ -3528,14 +3569,20 @@ impl PhoenixApp {
             let _ = self.update_state.save();
             return;
         }
-        if updater::launch_installer(&path).is_ok() {
+        let launched = if self.restart_after_update {
+            updater::launch_installer_and_restart(&path, &relaunch_target()).is_ok()
+        } else {
+            updater::launch_installer(&path).is_ok()
+        };
+        if launched {
             self.update_state.clear_staged();
             let _ = self.update_state.save();
         }
     }
 
     /// Kick off a manual "Check for updates" run (ignored if one is already in
-    /// flight, so repeated clicks don't stack worker threads).
+    /// flight, so repeated clicks don't stack worker threads). A portable build
+    /// only ever reports what it finds — see [`updater::is_portable`].
     fn start_update_check(&mut self) {
         if self.update_check.is_some() {
             return;
@@ -3544,6 +3591,11 @@ impl PhoenixApp {
         self.update_check = Some(updater::UpdateCheck::spawn(
             updater::CheckMode::Manual,
             version::BUILD_INFO.version.to_string(),
+            if self.portable {
+                updater::Depth::Report
+            } else {
+                updater::Depth::Stage
+            },
         ));
     }
 }
@@ -3723,6 +3775,20 @@ fn demo_backup_name_from_args() -> String {
     match std::env::args().skip(1).any(|a| a == "--demo-armed") {
         true => "demo-backup".into(),
         false => String::new(),
+    }
+}
+
+/// What "Restart to update" comes back as. The installed bundle is dual-arch,
+/// so the launcher — not this exe — is the entry point that picks the right
+/// build for the machine; falling back to our own path covers a dev or portable
+/// run, where there may be no launcher beside us.
+fn relaunch_target() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("simulacra.exe"));
+    let launcher = exe.with_file_name("simulacra-launcher.exe");
+    if launcher.is_file() {
+        launcher
+    } else {
+        exe
     }
 }
 

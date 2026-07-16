@@ -8,6 +8,7 @@
 # as a side effect. A full release carries four assets:
 #   - Simulacra-Setup-<ver>.exe        the installer (what auto-update fetches)
 #   - Simulacra-Bundle-<ver>.zip       portable bundle: the 5 exes + WinFsp MSI
+#                                      + portable.marker (disables auto-update)
 #   - a .sha256 sidecar for each of the two above
 #
 # -ZipOnly publishes ONLY the ZIP + its sidecar: no installer, nothing signed.
@@ -17,8 +18,10 @@
 # `Simulacra-Setup-*.exe` asset in /releases/latest and reports "release has no
 # installer asset" without one — a silent auto-check swallows that (installed
 # users simply never update), but a manual "Check for updates" surfaces the
-# error. Pair with -PreRelease to keep such a release out of /releases/latest
-# entirely, leaving the in-app updater pointed at the last full release.
+# error. (Portable users are unaffected: their check stops at the version and
+# never looks for the asset.) Pair with -PreRelease to keep such a release out
+# of /releases/latest entirely, leaving the in-app updater pointed at the last
+# full release.
 #
 # The app queries /releases/latest, which ignores drafts and pre-releases, so a
 # real update must be a FULL release. Use -Draft to stage one for review first.
@@ -92,6 +95,23 @@ if (Test-Path $stageRoot) { Remove-Item -Recurse -Force $stageRoot }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 $exes | Copy-Item -Destination $stage
 Copy-Item $msi -Destination $stage
+# The ZIP and the installer ship the SAME exes, so this marker is the only thing
+# that tells a running app it's the portable copy (phoenix-gui/src/updater.rs,
+# `is_portable`). Without it the bundle would auto-download and silently run the
+# installer on close -- which would install a SECOND, installed copy into Program
+# Files and leave the extracted folder untouched, in the one environment (WinPE,
+# off a USB stick) least able to afford the download. Keep the name in step with
+# `PORTABLE_MARKER`; deleting it from an extracted bundle re-arms auto-update.
+Set-Content -Path (Join-Path $stage "portable.marker") -Encoding ASCII -Value @(
+    "This file marks the folder beside it as a PORTABLE Phoenix Simulacra bundle."
+    ""
+    "While it is here, the app never checks for, downloads, or installs updates on"
+    "its own -- the About page's 'Check for updates' button reports new versions but"
+    "downloads nothing. Pick new versions up from https://kznjk.com/."
+    ""
+    "Deleting this file turns automatic updates back on, which will install a"
+    "separate, non-portable copy into Program Files."
+)
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
 Remove-Item -Recurse -Force $stageRoot
