@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
+use egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
 
 const REGULAR: &str = "inter-regular";
 const BOLD: &str = "inter-bold";

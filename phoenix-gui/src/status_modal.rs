@@ -12,7 +12,7 @@
 //! foreground `Area` backdrop plus a centered `Window`. This is structured so
 //! it can be swapped for `egui::Modal` if/when we upgrade egui.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, Order, RichText};
 
 use crate::fonts;

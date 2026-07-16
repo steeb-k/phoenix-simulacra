@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use eframe::egui;
+use egui;
 use egui::Ui;
 
 use phoenix_core::disk::DiskInfo;

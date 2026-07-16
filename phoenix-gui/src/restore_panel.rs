@@ -7,7 +7,7 @@
 //! only structural difference is the source — a `.phnx` file picked with the
 //! Browse row above, not a disk chosen from a dropdown.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, CursorIcon, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use phoenix_core::disk::{DiskInfo, PartitionInfo};

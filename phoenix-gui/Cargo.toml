@@ -17,21 +17,18 @@ phoenix-vss.workspace = true
 phoenix-restore.workspace = true
 phoenix-clone.workspace = true
 phoenix-mount.workspace = true
-# `wgpu`, not `glow`. Windows on ARM ships no desktop OpenGL driver: opengl32
-# falls back to Microsoft's GDI software rasterizer, which is OpenGL 1.1, and
-# egui_glow needs 2.0+ — so the glow build died at startup on ARM64 hardware
-# (2026-07-14). wgpu targets DX12 here, which every Win11 ARM and x64 box has.
-# Both arches use the same backend on purpose; see docs/WINDOWS-ARM64.md.
-eframe = { version = "0.29", default-features = false, features = ["wgpu"] }
-# DX12 must be asked for BY NAME. In wgpu 22 `dx12` is an opt-in feature, while
-# Vulkan and GLES switch themselves on by target cfg — and eframe enables only
-# `metal` + `webgpu`, which on Windows amounts to nothing. The resulting build
-# offered Vulkan and GLES and no DX12: fine on x64 (Vulkan works), fatal on
-# Snapdragon, where the Vulkan ICD exposes no usable surface extensions and GLES
-# falls back to the same 1.1 software GL. It crashed with "no suitable adapter"
-# (2026-07-14). Depending on wgpu directly unifies the feature into eframe's copy.
-wgpu = { version = "22", default-features = false, features = ["dx12", "wgsl"] }
+# CPU-rendered egui: winit + softbuffer + a hand-written rasterizer (see the
+# Renderer in main.rs and tex_mgr.rs), NOT eframe/wgpu. Every GPU backend fails
+# in Windows PE / GPU-less recovery VMs — wgpu's DX12 path can't build egui's
+# shader pipeline there (shader translation error 0x8007007E) and its GL path
+# finds only Microsoft's 1.1 software GL ("no suitable adapter") — and PE is
+# exactly where a bare-metal restore tool has to run. Software rasterizing is
+# heavier per frame but runs anywhere; the UI is static 2D so idle CPU stays 0%.
+# Same approach as the Diskoria app, which is verified in this PE. (2026-07-15)
 egui = "0.29"
+egui-winit = { version = "0.29", default-features = false, features = ["clipboard", "links"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
 anyhow.workspace = true
 chrono.workspace = true
 tracing.workspace = true

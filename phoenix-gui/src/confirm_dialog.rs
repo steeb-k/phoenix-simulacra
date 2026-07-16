@@ -7,7 +7,7 @@
 //! Like the status modal, this is hand-rolled from a foreground `Area` backdrop
 //! plus a centered `Window` because egui 0.29 has no `egui::Modal`.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, Order, RichText};
 
 use crate::fonts;
