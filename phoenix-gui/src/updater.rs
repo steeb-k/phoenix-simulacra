@@ -45,6 +45,36 @@ pub enum CheckMode {
     SilentAuto,
 }
 
+/// The file the portable ZIP ships beside the exes to say what it is. The ZIP
+/// and the installer carry the *same* binaries, so this is the only thing that
+/// can tell them apart at runtime.
+const PORTABLE_MARKER: &str = "portable.marker";
+
+/// Is this the portable bundle rather than an installed copy?
+///
+/// A portable build must never update itself: its installer would install a
+/// *second*, installed copy into Program Files and leave the extracted folder
+/// the user is running from untouched — and the environment it exists for
+/// (Windows PE, off a USB stick) is the worst place to spend a download and an
+/// install on that. So the check never runs on its own here, nothing is ever
+/// staged, and nothing is ever applied on close; the About page's manual check
+/// still reports what's out there ([`Depth::Report`]).
+pub fn is_portable() -> bool {
+    std::env::current_exe()
+        .map(|exe| exe.with_file_name(PORTABLE_MARKER).is_file())
+        .unwrap_or(false)
+}
+
+/// How far a check goes once it finds a newer release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// Download, verify, and stage the installer to apply on close.
+    Stage,
+    /// Say a new version exists and stop — download nothing. Portable builds
+    /// only ([`is_portable`]).
+    Report,
+}
+
 /// A verified installer waiting to be applied on exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedUpdate {
@@ -59,6 +89,9 @@ pub enum UpdateEvent {
     Progress { downloaded: u64, total: u64 },
     /// Already on the latest version — nothing to do.
     UpToDate,
+    /// A newer release exists and was deliberately not downloaded — the
+    /// terminal event of a [`Depth::Report`] check.
+    Available { version: String },
     /// A newer installer was downloaded and fully verified.
     Ready(StagedUpdate),
     /// Couldn't reach the update server (offline / DNS / timeout). Silent for
@@ -83,11 +116,11 @@ pub struct UpdateCheck {
 
 impl UpdateCheck {
     /// Spawn the worker for a fresh check against `local_version` (the running
-    /// GUI's `CARGO_PKG_VERSION`).
-    pub fn spawn(mode: CheckMode, local_version: String) -> Self {
+    /// GUI's `CARGO_PKG_VERSION`), going as far as `depth`.
+    pub fn spawn(mode: CheckMode, local_version: String, depth: Depth) -> Self {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let outcome = run_check(&local_version, &tx);
+            let outcome = run_check(&local_version, depth, &tx);
             // The terminal event is always sent last; progress events (if any)
             // were streamed by `run_check` as the download ran.
             let _ = tx.send(outcome);
@@ -217,7 +250,7 @@ fn agent() -> ureq::Agent {
 
 // --- The worker chain ---------------------------------------------------------
 
-fn run_check(local_version: &str, tx: &mpsc::Sender<UpdateEvent>) -> UpdateEvent {
+fn run_check(local_version: &str, depth: Depth, tx: &mpsc::Sender<UpdateEvent>) -> UpdateEvent {
     let agent = agent();
 
     let release = match fetch_latest(&agent) {
@@ -232,6 +265,14 @@ fn run_check(local_version: &str, tx: &mpsc::Sender<UpdateEvent>) -> UpdateEvent
     }
     let version = normalize_version(&release.tag_name);
     info!(target: "phoenix_gui::updater", %version, "newer release available");
+
+    // A portable build stops here, before a byte of installer is fetched. It
+    // deliberately doesn't care whether the release ships an installer asset:
+    // it isn't going to run one, and the user is being pointed at the download
+    // page (which carries the ZIP too).
+    if depth == Depth::Report {
+        return UpdateEvent::Available { version };
+    }
 
     // Locate the installer asset and its checksum sibling.
     let installer = match release.assets.iter().find(|a| {
@@ -469,6 +510,48 @@ pub fn launch_installer(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(windows))]
 pub fn launch_installer(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Same silent install as [`launch_installer`], but relaunch `app` once the
+/// installer has finished — the "Restart to update" link's exit path.
+///
+/// `cmd.exe` does the waiting because nothing of ours can: this process is on
+/// its way out, and a helper spawned from our own install directory would be
+/// the very file the installer needs to replace. `DETACHED_PROCESS` leaves it
+/// with no console, so the install runs with nothing on screen. The relaunched
+/// app inherits this process's elevated token, so the user is not asked to
+/// consent a second time.
+///
+/// The chain is `&`, not `&&`: the user asked for the app back, so a failed or
+/// refused install still returns them to the version they were running, which
+/// comes up still holding its staged update and still saying so in the banner.
+#[cfg(windows)]
+pub fn launch_installer_and_restart(installer: &Path, app: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    // `cmd /c` does not parse its command line the way the C runtime does, so
+    // it is handed over verbatim with `raw_arg` rather than through Rust's
+    // arg escaping. The outer quote pair is the one cmd strips off (the `&`
+    // puts it on that branch of its documented rule), leaving the two quoted
+    // paths intact. `start ""` (empty title) hands the app off so cmd exits
+    // instead of lingering as its parent.
+    let line = format!(
+        r#"/c ""{}" /VERYSILENT /NORESTART /SUPPRESSMSGBOXES & start "" "{}"""#,
+        installer.display(),
+        app.display()
+    );
+    info!(target: "phoenix_gui::updater", installer = %installer.display(), app = %app.display(), "applying update with restart");
+    std::process::Command::new("cmd.exe")
+        .raw_arg(line)
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(windows))]
+pub fn launch_installer_and_restart(_installer: &Path, _app: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

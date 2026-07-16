@@ -12,8 +12,10 @@ use egui::{Color32, Vec2};
 use crate::theme::{self, Palette};
 use crate::{fonts, icon_label, page_header, ACTION_BUTTON_HEIGHT};
 
-/// Where to send people who want to see what else this author makes.
-const HOME_URL: &str = "https://kznjk.com/";
+/// Where to send people who want to see what else this author makes — and where
+/// a portable build points them to pick up a new version by hand, since it never
+/// downloads one itself (see [`crate::updater::is_portable`]).
+pub const HOME_URL: &str = "https://kznjk.com/";
 const KOFI_URL: &str = "https://ko-fi.com/kznjk";
 const COPYRIGHT: &str = "© 2026 Steve Kzenjak";
 
