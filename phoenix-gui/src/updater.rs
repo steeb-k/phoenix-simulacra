@@ -2,7 +2,7 @@
 //! download and verify it in the background, and hand it to the on-close hook
 //! to run silently.
 //!
-//! The feed is the GitHub Releases API of `steeb-k/phoenix-simulcra-binaries`
+//! The feed is the GitHub Releases API of `steeb-k/phoenix-simulacra-binaries`
 //! (the code repo is private; only the built installers are published there).
 //! A release ships `Simulacra-Setup-<ver>.exe` and a matching `.sha256`. Before
 //! anything is staged we require BOTH: the SHA-256 must match the published
@@ -26,10 +26,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-/// The public binaries repo's "latest release" endpoint. The owner/repo — note
-/// the deliberate `simulcra` spelling — are load-bearing; keep them exact.
+/// The public binaries repo's "latest release" endpoint. The owner/repo are
+/// load-bearing; keep them exact.
 const LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/steeb-k/phoenix-simulcra-binaries/releases/latest";
+    "https://api.github.com/repos/steeb-k/phoenix-simulacra-binaries/releases/latest";
 
 /// GitHub rejects API requests without a `User-Agent`. Identify ourselves with
 /// the running version so the request log is legible.

@@ -2,7 +2,7 @@
 #
 # This is the counterpart to build-installer.ps1: build first (which produces a
 # signed dist/Simulacra-Setup-<ver>.exe), then run this to tag and upload it —
-# plus a .sha256 sidecar — to steeb-k/phoenix-simulcra-binaries, which is where
+# plus a .sha256 sidecar — to steeb-k/phoenix-simulacra-binaries, which is where
 # the app's "Check for updates" flow looks. Kept separate from the build so a
 # build never publishes as a side effect.
 #
@@ -26,7 +26,7 @@ $repo = Join-Path $PSScriptRoot ".."
 Set-Location $repo
 
 # Where the built binaries live (public; separate from this private code repo).
-$Target = "steeb-k/phoenix-simulcra-binaries"
+$Target = "steeb-k/phoenix-simulacra-binaries"
 
 # --- 1. App version from Cargo.toml (same read as build-installer.ps1) ---------
 $cargo = Get-Content (Join-Path $repo "Cargo.toml") -Raw
