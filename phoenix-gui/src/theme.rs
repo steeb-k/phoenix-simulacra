@@ -23,6 +23,11 @@ pub struct Palette {
     /// Subtle fill for disk-map cards and segment wells on the main content
     /// pane (distinct from sidebar hover tints).
     pub content_card_bg: Color32,
+    /// Track fill for the sidebar's segmented theme pill. Deliberately a much
+    /// stronger wash than `sidebar_hover_bg`: the pill's unselected segments
+    /// have to read as part of one control against `sidebar_bg`, so the well
+    /// needs to be visible at rest rather than only under the pointer.
+    pub segment_track_bg: Color32,
     /// 1px outline between the central panel and the sidebar/status-bar L.
     /// `sidebar_bg` vs `panel_fill` alone is too low-contrast to read as an
     /// edge, especially in light mode.
@@ -75,6 +80,7 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
             icon_color: Color32::from_rgb(0x30, 0x30, 0x30),
             input_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
             content_card_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+            segment_track_bg: Color32::from_black_alpha(36),
             panel_border: Color32::from_rgb(0xC8, 0xC8, 0xC8),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
             danger: Color32::from_rgb(0xC6, 0x28, 0x28),
@@ -90,6 +96,7 @@ fn palette_for(accent: Color32, light_mode: bool) -> Palette {
             icon_color: Color32::from_rgb(0xE6, 0xE6, 0xE6),
             input_bg: Color32::from_rgb(0x3C, 0x3C, 0x3C),
             content_card_bg: Color32::from_rgb(0x33, 0x33, 0x33),
+            segment_track_bg: Color32::from_white_alpha(40),
             panel_border: Color32::from_rgb(0x4A, 0x4A, 0x4A),
             success: Color32::from_rgb(0x2E, 0x7D, 0x32),
             danger: Color32::from_rgb(0xC6, 0x28, 0x28),
