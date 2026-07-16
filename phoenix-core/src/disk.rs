@@ -1942,6 +1942,23 @@ pub fn guid_to_string(g: &[u8; 16]) -> String {
     format_guid(g)
 }
 
+/// The GPT partition type GUID of the EFI System Partition
+/// (`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`), stored on-disk in the mixed-endian
+/// byte layout `format_guid` decodes.
+pub const EFI_SYSTEM_TYPE_GUID: [u8; 16] = [
+    0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
+];
+
+/// True when `type_guid` identifies an EFI System Partition, regardless of the
+/// filesystem probed on it or whether the OS has (unusually) assigned it a
+/// drive letter. The ESP is small, static, and kept mounted by the firmware/OS
+/// — Windows refuses both `FSCTL_LOCK_VOLUME` and a VSS snapshot on it — so the
+/// capture/clone freeze logic treats it as read-unfrozen rather than aborting,
+/// exactly as it does for an ESP that has no letter.
+pub fn is_efi_system_partition(type_guid: &[u8; 16]) -> bool {
+    type_guid == &EFI_SYSTEM_TYPE_GUID
+}
+
 /// Parse a dashed GUID string back into the on-disk mixed-endian byte layout
 /// `format_guid`/`guid_to_string` produce (data1/2/3 little-endian, data4
 /// verbatim — the same layout `windows-sys`'s `GUID` uses). Returns `None`
@@ -2153,5 +2170,20 @@ mod tests {
         assert_eq!(parse_drive_letter(r"\\?\D:\"), Some('D'));
         assert_eq!(parse_drive_letter("E:"), Some('E'));
         assert_eq!(parse_drive_letter(r"\\.\PhysicalDrive0"), None);
+    }
+
+    #[test]
+    fn efi_system_partition_guid_is_recognized() {
+        // The constant must decode to the canonical ESP type GUID, or the
+        // freeze logic would abort on a lettered ESP again.
+        assert_eq!(
+            guid_to_string(&EFI_SYSTEM_TYPE_GUID),
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+        );
+        assert!(is_efi_system_partition(&EFI_SYSTEM_TYPE_GUID));
+        // Basic data partition GUID must NOT be treated as an ESP.
+        let basic_data =
+            guid_from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").expect("valid guid");
+        assert!(!is_efi_system_partition(&basic_data));
     }
 }

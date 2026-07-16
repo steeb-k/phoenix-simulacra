@@ -156,12 +156,20 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         let mut steps = Vec::with_capacity(partition_count + 3);
         steps.push("Preparing volumes".to_string());
         for (idx, part) in selected.iter().enumerate() {
-            steps.push(format!(
-                "Backing up partition {} of {} — {}",
-                idx + 1,
-                partition_count,
-                part.name
-            ));
+            // Many partitions (the ESP especially) carry no GPT name; append it
+            // only when present so an unnamed partition doesn't render a
+            // dangling separator.
+            let step = if part.name.trim().is_empty() {
+                format!("Backing up partition {} of {}", idx + 1, partition_count)
+            } else {
+                format!(
+                    "Backing up partition {} of {} ({})",
+                    idx + 1,
+                    partition_count,
+                    part.name
+                )
+            };
+            steps.push(step);
         }
         steps.push("Finalizing backup file".to_string());
         if opts.verify_after {
@@ -325,22 +333,34 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                         ) = plan_capture(part, &mut reader)?;
                         is_live = false;
                         frozen = true;
-                    } else if parse_drive_letter(vol).is_some() {
+                    } else if parse_drive_letter(vol).is_some()
+                        && !phoenix_core::disk::is_efi_system_partition(&part.type_guid)
+                    {
                         // Lettered volume we could neither lock nor snapshot:
                         // files are open and the filesystem is actively
                         // mutating. Abort before any bytes are streamed
                         // (`prepared` drops, releasing earlier locks) rather
                         // than write a torn image. The lock error names the
                         // drive and is the actionable one to surface.
+                        //
+                        // The ESP is exempt: Windows (or an OEM tool) sometimes
+                        // assigns it a drive letter, but it is still the small,
+                        // static boot partition Windows keeps mounted and
+                        // refuses to lock — freezing it is impossible and
+                        // pointless, so it takes the read-unfrozen path below
+                        // just as an unlettered ESP does. Without this exemption
+                        // a lettered ESP aborted the whole backup with
+                        // "Failed to freeze \\.\X: ... (last Win32 error: 5)".
                         return Err(lock_err);
                     } else {
                         // Un-lettered volumes (ESP/Recovery via their
-                        // \\?\Volume{GUID} device): Windows can refuse the lock
-                        // outright (observed: ERROR_ACCESS_DENIED on the ESP)
-                        // and VSS can refuse to snapshot them too, and there is
-                        // no user-closeable "open file" to remedy either.
-                        // Capture unfrozen; verify-after checks the image's
-                        // integrity instead of re-reading the mutable source.
+                        // \\?\Volume{GUID} device) and the ESP even when
+                        // lettered: Windows can refuse the lock outright
+                        // (observed: ERROR_ACCESS_DENIED on the ESP) and VSS can
+                        // refuse to snapshot them too, and there is no
+                        // user-closeable "open file" to remedy either. Capture
+                        // unfrozen; verify-after checks the image's integrity
+                        // instead of re-reading the mutable source.
                         warn!(
                             volume = vol.as_str(),
                             error = %lock_err,
