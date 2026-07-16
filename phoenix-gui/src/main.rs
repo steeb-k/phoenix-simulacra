@@ -198,6 +198,10 @@ struct Renderer {
     egui_state: egui_winit::State,
     app: PhoenixApp,
     tex_mgr: tex_mgr::TextureManager,
+    /// The window is created hidden and shown by `paint` the moment the first
+    /// frame has been presented, so it never appears as an unpainted white
+    /// rectangle while `PhoenixApp::new`'s disk enumeration runs.
+    revealed: bool,
 }
 
 impl Renderer {
@@ -212,6 +216,11 @@ impl Renderer {
             // native frame behavior (drag, edge resize, snap, system menu) —
             // see `titlebar::install`.
             .with_decorations(false)
+            // Born hidden, revealed by `paint` once there is a frame to show.
+            // `PhoenixApp::new` below enumerates every physical disk before the
+            // first paint can run, and a window that is already on screen spends
+            // that whole enumeration white. See `Renderer::revealed`.
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(1100.0, 720.0))
             .with_min_inner_size(LogicalSize::new(MIN_WINDOW_WIDTH as f64, min_height as f64));
         if let Some(icon) = app_icon() {
@@ -261,6 +270,7 @@ impl Renderer {
             egui_state,
             app,
             tex_mgr: tex_mgr::TextureManager::new(),
+            revealed: false,
         }
     }
 
@@ -452,7 +462,14 @@ impl Renderer {
         {
             if let Ok(mut buf) = self.surface.buffer_mut() {
                 buf.copy_from_slice(&pixels);
-                let _ = buf.present();
+                let presented = buf.present().is_ok();
+                // Reveal on the first frame that actually reached the surface,
+                // never merely because we tried to draw one — a window shown
+                // ahead of its content is the white flash this avoids.
+                if presented && !self.revealed {
+                    self.window.set_visible(true);
+                    self.revealed = true;
+                }
             }
         }
         // Continuous repaints are driven by the egui repaint callback ->
@@ -474,8 +491,23 @@ struct App {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.renderer.is_none() {
-            let renderer = Renderer::new(event_loop, self.proxy.clone());
-            renderer.window.request_redraw();
+            let mut renderer = Renderer::new(event_loop, self.proxy.clone());
+            // Paint the first frame here and now rather than asking for a
+            // redraw: the window is still hidden, a hidden window gets no
+            // WM_PAINT, and nothing else would drive a paint — `about_to_wait`
+            // only paints once egui's repaint callback has armed a deadline,
+            // which cannot happen until egui has run a frame. Waiting for
+            // RedrawRequested would leave the app hung and unshown. This paint
+            // is also what reveals the window.
+            renderer.paint();
+            // Fail open. If that paint could not present, `revealed` is still
+            // false and nothing later would show the window — the app would be
+            // running and unreachable. Falling back to the old behaviour costs
+            // at worst the flash this change removes.
+            if !renderer.revealed {
+                renderer.window.set_visible(true);
+                renderer.revealed = true;
+            }
             self.renderer = Some(renderer);
         }
     }
