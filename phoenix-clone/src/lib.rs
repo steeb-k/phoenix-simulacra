@@ -531,20 +531,28 @@ fn prepare_partition(
                         fs_kind,
                         _bitmap_hash,
                     ) = plan_capture(part, &mut reader)?;
-                } else if phoenix_core::disk::parse_drive_letter(vol).is_some() {
+                } else if phoenix_core::disk::parse_drive_letter(vol).is_some()
+                    && !phoenix_core::disk::is_efi_system_partition(&part.type_guid)
+                {
                     // A lettered volume we could neither lock nor snapshot: files are
                     // open and the filesystem is actively mutating. Abort now, before
                     // the target is touched, rather than clone a torn filesystem the
                     // user would trust.
+                    //
+                    // The ESP is exempt even when it carries a drive letter (some
+                    // OEM/Windows configs assign one): it is still the static boot
+                    // partition Windows keeps mounted and refuses to lock, so it takes
+                    // the read-unfrozen path below rather than aborting the clone.
                     return Err(lock_err);
                 } else {
                     // Un-lettered volumes (ESP/Recovery, reached via their
-                    // \\?\Volume{GUID} device). Windows keeps the ESP mounted itself
-                    // and refuses the lock (observed: ERROR_ACCESS_DENIED), and VSS
-                    // will not snapshot FAT32 — and there is no open file the user
-                    // could close to change either answer. These partitions are small,
-                    // static, and not being written during a clone, so read them
-                    // unfrozen rather than refuse to clone a boot disk at all.
+                    // \\?\Volume{GUID} device) and the ESP even when lettered. Windows
+                    // keeps the ESP mounted itself and refuses the lock (observed:
+                    // ERROR_ACCESS_DENIED), and VSS will not snapshot FAT32 — and there
+                    // is no open file the user could close to change either answer.
+                    // These partitions are small, static, and not being written during
+                    // a clone, so read them unfrozen rather than refuse to clone a boot
+                    // disk at all.
                     warn!(
                         volume = vol.as_str(),
                         error = %lock_err,

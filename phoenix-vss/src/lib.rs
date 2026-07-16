@@ -20,6 +20,16 @@ use phoenix_core::error::Result;
 // introducing dead `#[allow]` attributes scattered through the file.
 #[cfg(not(windows))]
 use phoenix_core::error::PhoenixError;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// `CREATE_NO_WINDOW` (from `winbase.h`). The GUI is a `/SUBSYSTEM:WINDOWS`
+/// process with no console of its own, so every `powershell` / `vssadmin` child
+/// we spawn to drive VSS would otherwise pop a visible console window — one per
+/// snapshot create and one per teardown, flashing on screen during a backup.
+/// This flag runs them fully hidden.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// A scope-bound set of VSS shadow copies. Snapshots created via
 /// [`VssSession::snapshot_volume`] are tracked by ShadowID and torn down on
@@ -119,6 +129,7 @@ pub fn delete_all_snapshots() -> Result<()> {
     use std::process::Command;
     let _ = Command::new("vssadmin")
         .args(["delete", "shadows", "/all", "/quiet"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     Ok(())
 }
@@ -188,6 +199,7 @@ fn create_snapshot(volume_path: &str) -> Option<(String, String)> {
             "-Command",
             &script,
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
         Ok(o) => o,
@@ -280,6 +292,7 @@ fn delete_snapshot_by_id(shadow_id: &str) {
             "-Command",
             &script,
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match result {
         Ok(o) if !o.status.success() => {
