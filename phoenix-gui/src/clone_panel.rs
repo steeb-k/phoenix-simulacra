@@ -10,7 +10,7 @@
 //! to a partial clone of just what gets dropped, with the same
 //! move/resize/delete editing as a partial restore.
 
-use eframe::egui;
+use egui;
 use egui::{CursorIcon, Ui};
 
 use phoenix_core::disk::DiskInfo;

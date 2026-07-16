@@ -27,7 +27,7 @@
 //! so it stays an ordinary egui widget (hover, tooltip, click) inside an
 //! otherwise non-client corner.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, Context, FontId, Rect, Rounding, Sense, Ui, ViewportCommand};
 
 use crate::fonts;
@@ -79,7 +79,11 @@ pub fn show(ctx: &Context, palette: &Palette, brand_rect: Rect, refresh_enabled:
 fn draw(ui: &mut Ui, palette: &Palette, brand_rect: Rect, refresh_enabled: bool) -> bool {
     let screen = ui.ctx().screen_rect();
     let focused = ui.input(|i| i.viewport().focused.unwrap_or(true));
-    let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+    // egui's viewport().maximized is unreliable for an undecorated window, so on
+    // Windows read the OS truth (IsZoomed) directly; fall back to egui's value
+    // off-Windows or before the subclass is installed.
+    let maximized =
+        nc::is_zoomed().unwrap_or_else(|| ui.input(|i| i.viewport().maximized.unwrap_or(false)));
     let bottom = screen.top() + CAPTION_BAND_HEIGHT;
 
     // Contrasted strip behind the three caption buttons — a step off the
@@ -337,10 +341,10 @@ pub use nc::install;
 /// Non-client integration: wndproc subclass + DWM shadow/corners.
 #[cfg(target_os = "windows")]
 mod nc {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock};
 
-    use eframe::egui::{Context, Rect};
+    use egui::{Context, Rect};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::{
         DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -369,6 +373,10 @@ mod nc {
     /// (0 = none). Written by the wndproc, read by the egui painter.
     static HOVER: AtomicU32 = AtomicU32::new(0);
     static PRESSED: AtomicU32 = AtomicU32::new(0);
+    /// The subclassed window handle, stashed so `is_zoomed` can ask the OS for
+    /// the real maximized state — egui's viewport().maximized is unreliable for
+    /// an undecorated window.
+    static HWND_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
     /// Caption geometry in *physical client pixels*. Republished by egui
     /// every frame so window resizes and DPI changes are always current.
@@ -399,6 +407,7 @@ mod nc {
     /// behavior (see module docs on [`super`]).
     pub fn install(hwnd: isize, ctx: Context) {
         let _ = CONTEXT.set(ctx);
+        HWND_HANDLE.store(hwnd, Ordering::Relaxed);
         let hwnd = hwnd as HWND;
         unsafe {
             // A 1px frame extension is the canonical trick to make DWM draw
@@ -436,6 +445,17 @@ mod nc {
         }
         geo.refresh = rect_px(refresh);
         geo.brand = rect_px(brand);
+    }
+
+    /// The OS maximized state (`IsZoomed`) for the subclassed window, or `None`
+    /// before `install`. Preferred over egui's viewport().maximized, which is
+    /// unreliable for a borderless window.
+    pub(super) fn is_zoomed() -> Option<bool> {
+        let hwnd = HWND_HANDLE.load(Ordering::Relaxed);
+        if hwnd == 0 {
+            return None;
+        }
+        Some(unsafe { IsZoomed(hwnd as HWND) != 0 })
     }
 
     pub(super) fn hovered() -> Option<Caption> {
@@ -678,7 +698,7 @@ mod nc {
 /// `interact`s above provide the behavior there).
 #[cfg(not(target_os = "windows"))]
 mod nc {
-    use eframe::egui::{Context, Rect};
+    use egui::{Context, Rect};
 
     use super::Caption;
 
@@ -689,6 +709,10 @@ mod nc {
     }
 
     pub(super) fn pressed() -> Option<Caption> {
+        None
+    }
+
+    pub(super) fn is_zoomed() -> Option<bool> {
         None
     }
 }

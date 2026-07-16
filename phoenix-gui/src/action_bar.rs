@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use eframe::egui;
+use egui;
 use egui::{Color32, Mesh, Pos2, Rect, Rounding, Sense, Shape, Stroke};
 
 use crate::stripes;

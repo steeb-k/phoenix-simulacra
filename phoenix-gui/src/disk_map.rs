@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use phoenix_core::disk::{BitlockerState, DiskInfo, FilesystemKind, PartitionInfo};

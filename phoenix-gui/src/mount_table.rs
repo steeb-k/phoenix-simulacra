@@ -16,7 +16,7 @@
 //! layout cursor. Every control is an `interact` + painter call at an
 //! explicit rect, so the card owns its geometry outright.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use crate::disk_map::{blend, with_alpha};

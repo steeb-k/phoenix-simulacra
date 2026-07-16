@@ -6,7 +6,7 @@
 //! sidebar pill, the backup folder remembers itself, and verify-after-backup
 //! is not negotiable. What's left is provenance.
 
-use eframe::egui;
+use egui;
 use egui::{Color32, Vec2};
 
 use crate::theme::{self, Palette};

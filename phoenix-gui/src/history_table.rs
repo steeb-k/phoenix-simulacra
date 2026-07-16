@@ -16,7 +16,7 @@
 //! record type — the page flattens [`phoenix_core::appdata::JobRecord`]s into
 //! [`HistoryRow`]s and maps a click back to the record it came from.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, Color32, CursorIcon, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use crate::disk_map::with_alpha;

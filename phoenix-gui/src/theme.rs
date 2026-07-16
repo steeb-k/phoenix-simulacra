@@ -1,4 +1,4 @@
-use eframe::egui;
+use egui;
 use egui::{Color32, Response, Rounding, Stroke, Ui, Visuals};
 use phoenix_core::appdata::ThemeChoice;
 

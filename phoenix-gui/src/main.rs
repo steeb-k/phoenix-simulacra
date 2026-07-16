@@ -21,6 +21,7 @@ mod sidebar;
 mod single_instance;
 mod status_modal;
 mod stripes;
+mod tex_mgr;
 mod theme;
 mod titlebar;
 mod updater;
@@ -28,12 +29,18 @@ mod util;
 mod version;
 
 use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui;
 use egui::{Align2, Sense, Vec2};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::Window;
+
 use phoenix_capture::backup::BackupOptions;
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
@@ -81,16 +88,11 @@ const START_BUTTON_HEIGHT: f32 = 52.0;
 /// `egui_phosphor`) — the OS-level icon is a full-color raster that needs
 /// to look right at 16x16/32x32/256x256 against the taskbar/title bar,
 /// while the in-app icons are vector glyphs tinted by the active theme.
-fn app_icon() -> egui::IconData {
+fn app_icon() -> Option<winit::window::Icon> {
     let bytes = include_bytes!("../../assets/phoenix-appicon-256px.png");
-    let image = image::load_from_memory(bytes).expect("failed to decode phoenix-appicon-256px.png");
-    let image = image.into_rgba8();
+    let image = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = image.dimensions();
-    egui::IconData {
-        rgba: image.into_raw(),
-        width,
-        height,
-    }
+    winit::window::Icon::from_rgba(image.into_raw(), width, height).ok()
 }
 
 /// Approximate height of the bottom status bar (`Margin::symmetric(16.0,
@@ -101,7 +103,7 @@ fn app_icon() -> egui::IconData {
 const STATUS_BAR_HEIGHT_ESTIMATE: f32 = 40.0;
 const MIN_WINDOW_WIDTH: f32 = 640.0;
 
-fn main() -> eframe::Result<()> {
+fn main() {
     // `--debug` re-enables the console this GUI-subsystem build normally
     // suppresses. Attach it BEFORE logging init so the stderr layer binds to a
     // live console handle (Rust resolves the std handles lazily per write, and
@@ -120,32 +122,428 @@ fn main() -> eframe::Result<()> {
         Some(guard) => guard,
         None => {
             tracing::info!("another instance is already running; focused it and exiting");
-            return Ok(());
+            return;
         }
     };
 
-    let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
-    let options = eframe::NativeOptions {
-        // DX12 (via wgpu), not OpenGL. Windows on ARM has no desktop GL driver
-        // above the 1.1 software fallback, so a glow build cannot start there
-        // at all. Same backend on both arches — see phoenix-gui/Cargo.toml.
-        renderer: eframe::Renderer::Wgpu,
-        // Chromeless: no OS titlebar. `titlebar::show` floats a Win11-style
-        // control box over the top-right corner and, on Windows, a wndproc
-        // subclass restores all native frame behavior (drag, edge resize,
-        // snap, system menu) — see `titlebar::install`.
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([MIN_WINDOW_WIDTH, min_height])
-            .with_icon(Arc::new(app_icon())),
-        ..Default::default()
+    // CPU-rendered egui on winit + softbuffer, not eframe/wgpu — the GPU
+    // backends can't start in Windows PE (see phoenix-gui/Cargo.toml). The
+    // window itself is built lazily in `resumed` (see `Renderer::new`).
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("failed to build event loop");
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+
+    let mut app = App {
+        renderer: None,
+        proxy,
+        next_repaint: None,
+        exited: false,
     };
-    eframe::run_native(
-        "Phoenix Simulacra",
-        options,
-        Box::new(|cc| Ok(Box::new(PhoenixApp::new(cc)))),
-    )
+    if let Err(e) = event_loop.run_app(&mut app) {
+        tracing::error!("event loop error: {e}");
+    }
+}
+
+// ── CPU-rendered winit shell ─────────────────────────────────────────────────
+//
+// Phoenix runs on winit + softbuffer + a hand-written egui rasterizer instead of
+// eframe/wgpu, because every GPU backend fails to start in Windows PE / GPU-less
+// recovery VMs — and PE is exactly where a bare-metal restore happens. See
+// phoenix-gui/Cargo.toml for the full rationale. This is a single, chromeless
+// top-level window; titlebar.rs re-adds the native frame behavior on top.
+
+/// ASAP repaint requests (`after == 0`) are clamped to one frame so a
+/// continuously-animating view (a running job's progress bar, the armed
+/// action-bar mosaic) settles into a steady ~60 fps tick instead of spinning
+/// the CPU — which matters more for a software rasterizer than a GPU one.
+const REPAINT_FRAME_CAP: Duration = Duration::from_millis(16);
+
+/// egui asked for a (possibly delayed) repaint — from a worker thread or an
+/// animation. Forwarded from egui's repaint callback into the winit loop, where
+/// it becomes the next wake deadline; `request_repaint` alone only sets an egui
+/// flag and cannot wake a loop sleeping in `ControlFlow::Wait`.
+enum UserEvent {
+    Repaint { after: Duration },
+}
+
+/// Pack an opaque pixel the way softbuffer expects it on Windows: `0x00RRGGBB`
+/// (the presenter ignores the top byte).
+#[inline]
+fn to_bgra(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) << 16 | (g as u32) << 8 | (b as u32)
+}
+
+/// Everything one window owns: the OS window, its software framebuffer, the egui
+/// context + winit input bridge, the app state, and the CPU texture cache the
+/// rasterizer samples.
+struct Renderer {
+    window: Arc<Window>,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    app: PhoenixApp,
+    tex_mgr: tex_mgr::TextureManager,
+}
+
+impl Renderer {
+    fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let min_height = sidebar::min_content_height() + STATUS_BAR_HEIGHT_ESTIMATE;
+        let mut attrs = Window::default_attributes()
+            // Title is load-bearing: single_instance::focus_existing finds the
+            // running window by this exact string (FindWindowW).
+            .with_title("Phoenix Simulacra")
+            // Chromeless: no OS titlebar. `titlebar::show` floats a Win11-style
+            // control pill and, on Windows, a wndproc subclass restores all
+            // native frame behavior (drag, edge resize, snap, system menu) —
+            // see `titlebar::install`.
+            .with_decorations(false)
+            .with_inner_size(LogicalSize::new(1100.0, 720.0))
+            .with_min_inner_size(LogicalSize::new(MIN_WINDOW_WIDTH as f64, min_height as f64));
+        if let Some(icon) = app_icon() {
+            attrs = attrs.with_window_icon(Some(icon));
+        }
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+
+        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
+        let surface =
+            softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+
+        let egui_ctx = egui::Context::default();
+        // Bridge egui repaint requests into the winit loop.
+        {
+            let proxy = proxy.clone();
+            egui_ctx.set_request_repaint_callback(move |info| {
+                let _ = proxy.send_event(UserEvent::Repaint { after: info.delay });
+            });
+        }
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        );
+
+        // The HWND the titlebar subclass hooks (0 / unused off-Windows).
+        #[cfg(windows)]
+        let hwnd: isize = {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match window.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+                _ => 0,
+            }
+        };
+        #[cfg(not(windows))]
+        let hwnd: isize = 0;
+
+        let app = PhoenixApp::new(&egui_ctx, hwnd);
+
+        Renderer {
+            window,
+            surface,
+            egui_ctx,
+            egui_state,
+            app,
+            tex_mgr: tex_mgr::TextureManager::new(),
+        }
+    }
+
+    /// Run one egui frame and rasterize it into the softbuffer surface on the
+    /// CPU: tessellate the UI into triangle meshes, walk each with barycentric
+    /// interpolation while sampling the font/texture atlas, blend per-pixel,
+    /// then present. No GPU is touched anywhere in here.
+    fn paint(&mut self) {
+        let size = self.window.inner_size();
+        let (w, h) = (size.width, size.height);
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            self.app.draw(ctx);
+        });
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        // Window commands egui emitted this frame. On Windows, minimize/maximize/
+        // close/drag run natively through the titlebar wndproc, so the one seen
+        // here in practice is `Close` (from the close-confirm dialog); the rest
+        // are the portable off-Windows fallback.
+        if let Some(vo) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
+            for cmd in &vo.commands {
+                match cmd {
+                    egui::ViewportCommand::StartDrag => {
+                        let _ = self.window.drag_window();
+                        // The OS move-loop eats the button release, leaving
+                        // egui's pointer stuck "down"; synthesize the release so
+                        // the next drag can start.
+                        let pos = self
+                            .egui_ctx
+                            .input(|i| i.pointer.latest_pos())
+                            .unwrap_or(egui::Pos2::ZERO);
+                        self.egui_state.egui_input_mut().events.push(
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        );
+                    }
+                    egui::ViewportCommand::Minimized(v) => self.window.set_minimized(*v),
+                    egui::ViewportCommand::Maximized(v) => self.window.set_maximized(*v),
+                    egui::ViewportCommand::Close => self.app.should_exit = true,
+                    _ => {}
+                }
+            }
+        }
+
+        self.tex_mgr.update(&full_output.textures_delta);
+
+        let ppp = full_output.pixels_per_point;
+        let clipped = self.egui_ctx.tessellate(full_output.shapes, ppp);
+
+        // Clear to the sidebar color (eframe's old `clear_color`): the central
+        // panel's rounded bottom-left corner exposes it, and it must read as
+        // part of the sidebar/status-bar L.
+        let bg = self.app.palette.sidebar_bg;
+        let bg32 = to_bgra(bg.r(), bg.g(), bg.b());
+        let mut pixels: Vec<u32> = vec![bg32; (w * h) as usize];
+
+        for prim in &clipped {
+            let clip = prim.clip_rect;
+            let clip_x0 = (clip.min.x * ppp).floor() as i32;
+            let clip_y0 = (clip.min.y * ppp).floor() as i32;
+            let clip_x1 = (clip.max.x * ppp).ceil() as i32;
+            let clip_y1 = (clip.max.y * ppp).ceil() as i32;
+
+            let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
+                continue;
+            };
+            let verts = &mesh.vertices;
+            let indices = &mesh.indices;
+            let is_font_tex = mesh.texture_id == egui::TextureId::default();
+
+            for tri in 0..indices.len() / 3 {
+                let i0 = indices[tri * 3] as usize;
+                let i1 = indices[tri * 3 + 1] as usize;
+                let i2 = indices[tri * 3 + 2] as usize;
+                if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() {
+                    continue;
+                }
+                let v0 = &verts[i0];
+                let v1 = &verts[i1];
+                let v2 = &verts[i2];
+
+                let p0 = (v0.pos.x * ppp, v0.pos.y * ppp);
+                let p1 = (v1.pos.x * ppp, v1.pos.y * ppp);
+                let p2 = (v2.pos.x * ppp, v2.pos.y * ppp);
+
+                let min_x = p0.0.min(p1.0).min(p2.0).floor() as i32;
+                let min_y = p0.1.min(p1.1).min(p2.1).floor() as i32;
+                let max_x = p0.0.max(p1.0).max(p2.0).ceil() as i32;
+                let max_y = p0.1.max(p1.1).max(p2.1).ceil() as i32;
+
+                let x0 = min_x.max(clip_x0).max(0);
+                let y0 = min_y.max(clip_y0).max(0);
+                let x1 = max_x.min(clip_x1).min(w as i32 - 1);
+                let y1 = max_y.min(clip_y1).min(h as i32 - 1);
+
+                let denom = (p1.1 - p2.1) * (p0.0 - p2.0) + (p2.0 - p1.0) * (p0.1 - p2.1);
+                if denom.abs() < 0.001 {
+                    continue;
+                }
+
+                for py in y0..=y1 {
+                    for px in x0..=x1 {
+                        let fx = px as f32 + 0.5;
+                        let fy = py as f32 + 0.5;
+
+                        let w0 =
+                            ((p1.1 - p2.1) * (fx - p2.0) + (p2.0 - p1.0) * (fy - p2.1)) / denom;
+                        let w1 =
+                            ((p2.1 - p0.1) * (fx - p2.0) + (p0.0 - p2.0) * (fy - p2.1)) / denom;
+                        let w2 = 1.0 - w0 - w1;
+                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                            continue;
+                        }
+
+                        let uv_x = v0.uv.x * w0 + v1.uv.x * w1 + v2.uv.x * w2;
+                        let uv_y = v0.uv.y * w0 + v1.uv.y * w1 + v2.uv.y * w2;
+
+                        let vr = v0.color.r() as f32 * w0
+                            + v1.color.r() as f32 * w1
+                            + v2.color.r() as f32 * w2;
+                        let vg = v0.color.g() as f32 * w0
+                            + v1.color.g() as f32 * w1
+                            + v2.color.g() as f32 * w2;
+                        let vb = v0.color.b() as f32 * w0
+                            + v1.color.b() as f32 * w1
+                            + v2.color.b() as f32 * w2;
+                        let va = v0.color.a() as f32 * w0
+                            + v1.color.a() as f32 * w1
+                            + v2.color.a() as f32 * w2;
+
+                        let (r, g, b, final_a) = if is_font_tex {
+                            let cov = self.tex_mgr.sample_alpha_f(uv_x, uv_y);
+                            (vr, vg, vb, va / 255.0 * cov)
+                        } else {
+                            let [tr, tg, tb, ta] =
+                                self.tex_mgr.sample_rgba(mesh.texture_id, uv_x, uv_y);
+                            (tr * vr, tg * vg, tb * vb, ta * va / 255.0)
+                        };
+                        if final_a < 1.0 / 255.0 {
+                            continue;
+                        }
+
+                        let idx = (py as u32 * w + px as u32) as usize;
+                        let dst = pixels[idx];
+                        let dr = ((dst >> 16) & 0xFF) as f32;
+                        let dg = ((dst >> 8) & 0xFF) as f32;
+                        let db = (dst & 0xFF) as f32;
+
+                        // Gamma-correct blend (gamma ≈ 2.0): linearise, blend,
+                        // re-encode. Approximate vs true sRGB ~2.2 but cheap.
+                        let inv = 1.0 - final_a;
+                        let r_lin = (r / 255.0) * (r / 255.0);
+                        let g_lin = (g / 255.0) * (g / 255.0);
+                        let b_lin = (b / 255.0) * (b / 255.0);
+                        let dr_lin = (dr / 255.0) * (dr / 255.0);
+                        let dg_lin = (dg / 255.0) * (dg / 255.0);
+                        let db_lin = (db / 255.0) * (db / 255.0);
+                        let out_r = ((r_lin * final_a + dr_lin * inv).sqrt() * 255.0 + 0.5) as u8;
+                        let out_g = ((g_lin * final_a + dg_lin * inv).sqrt() * 255.0 + 0.5) as u8;
+                        let out_b = ((b_lin * final_a + db_lin * inv).sqrt() * 255.0 + 0.5) as u8;
+
+                        pixels[idx] = to_bgra(out_r, out_g, out_b);
+                    }
+                }
+            }
+        }
+
+        if self
+            .surface
+            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+            .is_ok()
+        {
+            if let Ok(mut buf) = self.surface.buffer_mut() {
+                buf.copy_from_slice(&pixels);
+                let _ = buf.present();
+            }
+        }
+        // Continuous repaints are driven by the egui repaint callback ->
+        // UserEvent::Repaint -> the timer-paced paint in `about_to_wait`, so we
+        // deliberately do NOT request_redraw here (that would spin the CPU).
+    }
+}
+
+/// The winit application: one window plus the loop's wake bookkeeping.
+struct App {
+    renderer: Option<Renderer>,
+    proxy: EventLoopProxy<UserEvent>,
+    /// Earliest pending repaint deadline; folded into `about_to_wait`'s WaitUntil.
+    next_repaint: Option<Instant>,
+    /// `on_exit` (unmount + apply staged update) must run exactly once.
+    exited: bool,
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.renderer.is_none() {
+            let renderer = Renderer::new(event_loop, self.proxy.clone());
+            renderer.window.request_redraw();
+            self.renderer = Some(renderer);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        let mut exit = false;
+        if let Some(r) = self.renderer.as_mut() {
+            let resp = r.egui_state.on_window_event(&r.window, &event);
+            if resp.repaint {
+                r.window.request_redraw();
+            }
+            match event {
+                WindowEvent::CloseRequested => {
+                    // Backups can't outlive the process (their drive letters and
+                    // virtual disks are owned by it), so a close with mounts up
+                    // is held for the "these will be unmounted" dialog
+                    // (pending_close counts as a modal, so the page goes inert);
+                    // otherwise the close goes straight through.
+                    if r.app.anything_mounted() && !r.app.pending_close {
+                        r.app.pending_close = true;
+                        r.window.request_redraw();
+                    } else {
+                        r.app.should_exit = true;
+                    }
+                }
+                WindowEvent::RedrawRequested => r.paint(),
+                WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+                    r.window.request_redraw();
+                }
+                _ => {}
+            }
+            exit = r.app.should_exit;
+        }
+        if exit {
+            event_loop.exit();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Repaint { after } => {
+                let delay = if after.is_zero() { REPAINT_FRAME_CAP } else { after };
+                let deadline = Instant::now() + delay;
+                self.next_repaint =
+                    Some(self.next_repaint.map_or(deadline, |d| d.min(deadline)));
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Service a due repaint by painting directly (not request_redraw), so
+        // the loop keeps returning to the OS message pump between frames.
+        let due = matches!(self.next_repaint, Some(d) if Instant::now() >= d);
+        let mut exit = false;
+        if let Some(r) = self.renderer.as_mut() {
+            if due {
+                self.next_repaint = None;
+                r.paint();
+            }
+            exit = r.app.should_exit;
+        }
+        if exit {
+            event_loop.exit();
+            return;
+        }
+        // Sticky control flow: reset to Wait when nothing is pending, else an
+        // elapsed WaitUntil spins the loop until the next OS event.
+        match self.next_repaint {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Runs on every loop exit (close dialog, titlebar X, OS session-end):
+        // the last chance to tear mounts down and apply a staged update.
+        if !self.exited {
+            self.exited = true;
+            if let Some(r) = self.renderer.as_mut() {
+                r.app.on_exit();
+            }
+        }
+    }
 }
 
 /// Sets up tracing to a rolling log file in `%LOCALAPPDATA%\PhoenixSimulacra\
@@ -455,29 +853,30 @@ struct PhoenixApp {
     /// Keeps the dim/spinner overlay up until this deadline (click time +
     /// [`REFRESH_OVERLAY_MIN`]), even when the refresh itself is instant.
     refresh_overlay_until: Option<Instant>,
+    /// Set when the app should exit after the current frame — the close-confirm
+    /// dialog was accepted, or a portable `ViewportCommand::Close` arrived. The
+    /// winit loop checks it after each paint and calls `event_loop.exit()`.
+    should_exit: bool,
 }
 
 impl PhoenixApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-        fonts::install(&cc.egui_ctx);
+    fn new(egui_ctx: &egui::Context, hwnd: isize) -> Self {
+        egui_extras::install_image_loaders(egui_ctx);
+        fonts::install(egui_ctx);
 
         // Hook the native window for the chromeless titlebar: DWM shadow +
         // rounded corners, and the WM_NCHITTEST subclass that makes drag,
         // edge-resize, Aero Snap, and the Snap Layouts flyout behave exactly
-        // like a decorated window.
+        // like a decorated window. `hwnd` comes from `Renderer::new`.
         #[cfg(target_os = "windows")]
-        {
-            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(handle) = cc.window_handle() {
-                if let RawWindowHandle::Win32(h) = handle.as_raw() {
-                    titlebar::install(h.hwnd.get(), cc.egui_ctx.clone());
-                }
-            }
+        if hwnd != 0 {
+            titlebar::install(hwnd, egui_ctx.clone());
         }
+        #[cfg(not(target_os = "windows"))]
+        let _ = hwnd;
 
         let settings = phoenix_core::appdata::Settings::load();
-        let palette = theme::refresh(&cc.egui_ctx, settings.theme);
+        let palette = theme::refresh(egui_ctx, settings.theme);
         let demo_history = demo_history_from_args();
         let is_demo_history = demo_history.is_some();
         let history = demo_history.unwrap_or_else(phoenix_core::appdata::History::load);
@@ -537,6 +936,7 @@ impl PhoenixApp {
             last_theme_refresh: Instant::now(),
             pending_refresh: None,
             refresh_overlay_until: demo_refresh_overlay_from_args(),
+            should_exit: false,
         };
         app.refresh_disks();
         app.init_updates();
@@ -1262,15 +1662,13 @@ impl PhoenixApp {
     }
 }
 
-impl eframe::App for PhoenixApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Sidebar color, not panel_fill: the central panel's rounded
-        // bottom-left corner exposes the clear color, and it must read as
-        // part of the sidebar/status-bar L.
-        self.palette.sidebar_bg.to_normalized_gamma_f32()
-    }
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl PhoenixApp {
+    /// One egui frame: poll workers, refresh theme, then lay out the sidebar,
+    /// titlebar, sticky action bar, central page, and the modals over the top.
+    /// Called by `Renderer::paint` inside `egui_ctx.run`. (The old eframe
+    /// `clear_color` — sidebar_bg for the rounded-corner cutout — is now the
+    /// background fill in `Renderer::paint`.)
+    fn draw(&mut self, ctx: &egui::Context) {
         self.poll_job(ctx);
         self.poll_updater(ctx);
         self.maybe_refresh_theme(ctx);
@@ -1284,14 +1682,9 @@ impl eframe::App for PhoenixApp {
             self.poll_restore_backup_load();
         }
 
-        // A close request (titlebar X, Alt+F4, taskbar) while backups are
-        // mounted is held back: the mounts have to come down with the app, and
-        // the user gets told so before it happens. `pending_close` counts as a
-        // modal below, so the page behind the dialog goes inert.
-        if ctx.input(|i| i.viewport().close_requested()) && self.anything_mounted() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending_close = true;
-        }
+        // The close-with-mounts guard lives in the winit loop's CloseRequested
+        // handler now (it sets `pending_close`, which counts as a modal below so
+        // the page behind the dialog goes inert) — nothing to do here per frame.
 
         let focus_regained = ctx.input(|i| {
             i.events

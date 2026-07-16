@@ -3,7 +3,7 @@
 //! `[info card | partition map]` row, or a hint field while nothing is
 //! picked), and the popup lists every disk as a full row.
 
-use eframe::egui;
+use egui;
 use egui::{Align2, CursorIcon, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use phoenix_core::disk::DiskInfo;

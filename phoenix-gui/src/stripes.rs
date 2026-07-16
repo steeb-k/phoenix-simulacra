@@ -13,7 +13,7 @@
 //! comes out square-cornered. Callers that need a rounded silhouette get it
 //! back from [`patch_rounded_corners`].
 
-use eframe::egui;
+use egui;
 use egui::{Color32, Mesh, Rect, Rounding, Shape, Stroke};
 
 /// Lay 45° bars of `stripe` across `rect`, over whatever the caller has
