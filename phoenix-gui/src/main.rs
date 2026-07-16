@@ -168,6 +168,19 @@ enum UserEvent {
     Repaint { after: Duration },
 }
 
+/// Slack on the rasterizer's inside-triangle test, as a fraction of a
+/// triangle's own size (the test runs on normalised barycentric weights).
+///
+/// egui antialiases by tessellating a solid core plus a 1px feathered ring
+/// that share an edge, so on any shape edge landing on a whole pixel
+/// coordinate — every panel, every button — that shared edge falls exactly
+/// down the middle of a row of pixel centres. Exact arithmetic would put
+/// those centres on both triangles; f32 puts them a few 1e-8 outside *both*,
+/// and the pixel is dropped, letting the background dot through the fill.
+/// Real geometry misses by ~1e-1, so anything in between separates float
+/// noise from a genuine miss with orders of magnitude to spare.
+const EDGE_EPS: f32 = 1e-5;
+
 /// Pack an opaque pixel the way softbuffer expects it on Windows: `0x00RRGGBB`
 /// (the presenter ignores the top byte).
 #[inline]
@@ -368,7 +381,7 @@ impl Renderer {
                         let w1 =
                             ((p2.1 - p0.1) * (fx - p2.0) + (p0.0 - p2.0) * (fy - p2.1)) / denom;
                         let w2 = 1.0 - w0 - w1;
-                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        if w0 < -EDGE_EPS || w1 < -EDGE_EPS || w2 < -EDGE_EPS {
                             continue;
                         }
 
@@ -396,6 +409,13 @@ impl Renderer {
                                 self.tex_mgr.sample_rgba(mesh.texture_id, uv_x, uv_y);
                             (tr * vr, tg * vg, tb * vb, ta * va / 255.0)
                         };
+                        // A pixel admitted by EDGE_EPS sits marginally outside the
+                        // triangle, so its interpolated alpha can land a hair
+                        // outside [0, 1]. Left alone, a negative `inv` below can
+                        // push the blend under zero, and `sqrt` of that is NaN —
+                        // which casts to 0 and paints the black speck this whole
+                        // epsilon exists to remove.
+                        let final_a = final_a.clamp(0.0, 1.0);
                         if final_a < 1.0 / 255.0 {
                             continue;
                         }
