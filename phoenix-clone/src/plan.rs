@@ -61,15 +61,18 @@ impl ClonePlan {
         }
     }
 
-    /// Like [`identity`](Self::identity) but grows the last NTFS partition to
-    /// fill the extra space on a larger target (the common "clone to a bigger
-    /// disk" case). Partitions after it (recovery, etc.) are shifted to the
-    /// tail so the data partition can expand without overlapping them.
+    /// Like [`identity`](Self::identity) but grows the largest NTFS partition
+    /// to fill the extra space on a larger target (the common "clone to a
+    /// bigger disk" case). The largest NTFS volume is almost always the
+    /// Windows/data partition — picking by start offset instead would grow
+    /// the (NTFS) recovery partition that Windows places after C:. Partitions
+    /// after it (recovery, etc.) are shifted to the tail so the data
+    /// partition can expand without overlapping them.
     pub fn expand_to_fill(source: &DiskInfo, target: &DiskInfo) -> Self {
         let mut plan = Self::identity(source);
         let align = 1024 * 1024u64;
 
-        // Find the latest-starting NTFS partition to grow.
+        // Find the largest NTFS partition to grow (start offset breaks ties).
         let ntfs_idx = plan
             .entries
             .iter()
@@ -82,7 +85,7 @@ impl ClonePlan {
                     .map(|p| p.fs_kind == FilesystemKind::Ntfs)
                     .unwrap_or(false)
             })
-            .max_by_key(|(_, e)| e.target_offset_bytes)
+            .max_by_key(|(_, e)| (e.target_size_bytes, e.target_offset_bytes))
             .map(|(i, _)| i);
 
         let Some(primary) = ntfs_idx else {
@@ -297,6 +300,41 @@ mod tests {
             .expect("expanded plan should validate");
         // It actually grew (target size > source size).
         assert!(plan.entries[0].target_size_bytes > 255 * MIB);
+    }
+
+    #[test]
+    fn expand_grows_largest_ntfs_not_last() {
+        // Windows-style layout on a 512 MiB source: EFI (FAT, 1..51 MiB),
+        // C: (NTFS, 51..451 MiB), WinRE (NTFS, 451..501 MiB). The recovery
+        // partition is NTFS and starts last — the grow must still pick C:
+        // (largest) and push WinRE to the tail with its size intact.
+        let mut efi = ntfs_part(0, MIB, 50 * MIB, 10 * MIB);
+        efi.fs_kind = FilesystemKind::Fat;
+        let c_drive = ntfs_part(1, 51 * MIB, 400 * MIB, 100 * MIB);
+        let winre = ntfs_part(2, 451 * MIB, 50 * MIB, 30 * MIB);
+        let src = disk(0, 512 * MIB, vec![efi, c_drive, winre]);
+        let tgt = disk(1, 2048 * MIB, vec![]);
+
+        let plan = ClonePlan::expand_to_fill(&src, &tgt);
+        plan.validate(&src, &tgt).expect("plan should validate");
+
+        let entry = |idx: u32| {
+            plan.entries
+                .iter()
+                .find(|e| e.source_partition_index == idx)
+                .unwrap()
+        };
+        // C: grew; WinRE kept its size and moved past C:'s new end.
+        assert!(entry(1).target_size_bytes > 400 * MIB, "C: did not grow");
+        assert_eq!(entry(2).target_size_bytes, 50 * MIB);
+        assert!(
+            entry(2).target_offset_bytes
+                >= entry(1).target_offset_bytes + entry(1).target_size_bytes,
+            "WinRE was not pushed past the grown C:"
+        );
+        // EFI stays put.
+        assert_eq!(entry(0).target_offset_bytes, MIB);
+        assert_eq!(entry(0).target_size_bytes, 50 * MIB);
     }
 
     #[test]
