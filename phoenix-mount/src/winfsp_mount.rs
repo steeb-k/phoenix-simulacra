@@ -235,6 +235,64 @@ impl FileSystemContext for VhdFs {
     }
 }
 
+/// Where WinFsp put the one-file volume that serves the synthesized image.
+///
+/// A directory under the scratch dir is the default: it keeps this plumbing
+/// out of Explorer, so the only drives the user sees are the backup's own
+/// partitions (assigned in [`crate::letters`] from the *attached* disk — a
+/// separate layer that this choice does not affect).
+enum MountLocation {
+    /// The hidden scratch directory. WinFsp turns it into a junction.
+    Dir(PathBuf),
+    /// A spare drive letter, used when the host volume can't hold a junction.
+    Drive(char),
+}
+
+impl MountLocation {
+    /// Directory the image file lives in, whichever form the mount took.
+    fn image_dir(&self) -> PathBuf {
+        match self {
+            Self::Dir(p) => p.clone(),
+            Self::Drive(c) => PathBuf::from(format!("{c}:\\")),
+        }
+    }
+}
+
+/// Mount `host`'s volume, preferring `mount_dir` and falling back to a drive
+/// letter.
+///
+/// WinFsp implements a directory mount point as a reparse point on that
+/// directory, so a volume whose filesystem has no reparse support rejects it
+/// with `STATUS_NOT_IMPLEMENTED` — which is exactly what the WinPE RAM disk
+/// (`X:`) does, and PE is where a restore tool has to work. A drive letter
+/// needs no reparse point, so spend one rather than fail the mount; the cost
+/// is that this internal volume becomes briefly visible.
+fn mount_host(
+    host: &mut FileSystemHost<VhdFs, FineGuard>,
+    mount_dir: PathBuf,
+) -> Result<MountLocation> {
+    let dir_err = match host.mount(&mount_dir) {
+        Ok(()) => return Ok(MountLocation::Dir(mount_dir)),
+        Err(e) => e,
+    };
+
+    let Some(letter) = crate::letters::free_letters().next() else {
+        return Err(PhoenixError::Other(format!(
+            "WinFsp mount at {mount_dir:?} failed: {dir_err}, and no drive letter was free to fall back to"
+        )));
+    };
+    tracing::warn!(
+        "WinFsp could not mount at {mount_dir:?} ({dir_err}); falling back to drive {letter}: \
+         (the volume holding this directory likely has no reparse-point support)"
+    );
+    host.mount(format!("{letter}:")).map_err(|drive_err| {
+        PhoenixError::Other(format!(
+            "WinFsp mount failed at {mount_dir:?} ({dir_err}) and at {letter}: ({drive_err})"
+        ))
+    })?;
+    Ok(MountLocation::Drive(letter))
+}
+
 /// A live WinFsp-backed mount: the filesystem host plus the attached virtual
 /// disk. Dropping detaches the disk, stops the filesystem, and cleans up.
 pub struct WinFspMount {
@@ -242,7 +300,7 @@ pub struct WinFspMount {
     // handle on backup.vhd) before `host` tears down the filesystem.
     attached: Option<AttachedDisk>,
     host: FileSystemHost<VhdFs, FineGuard>,
-    mount_dir: PathBuf,
+    mount_point: MountLocation,
     /// `backup.vhd` or `backup.vhdx`, per the container the backup needed.
     image_name: &'static str,
     pub backup_path: PathBuf,
@@ -300,13 +358,11 @@ impl WinFspMount {
         // one isn't in the way.
         let _ = std::fs::remove_dir_all(&mount_dir);
 
-        host.mount(&mount_dir).map_err(|e| {
-            PhoenixError::Other(format!("WinFsp mount at {mount_dir:?} failed: {e}"))
-        })?;
+        let mount_point = mount_host(&mut host, mount_dir)?;
         host.start()
             .map_err(|e| PhoenixError::Other(format!("WinFsp start failed: {e}")))?;
 
-        let vhd_path = mount_dir.join(image_name);
+        let vhd_path = mount_point.image_dir().join(image_name);
         let attached = AttachedDisk::attach_readonly_opts(
             vhd_path
                 .to_str()
@@ -330,7 +386,7 @@ impl WinFspMount {
         Ok(Self {
             attached: Some(attached),
             host,
-            mount_dir,
+            mount_point,
             image_name,
             backup_path: backup.to_path_buf(),
             disk_size,
@@ -342,7 +398,7 @@ impl WinFspMount {
     /// Path to the synthesized image inside the WinFsp mount (the file the
     /// virtual disk is attached from). Useful for diagnostics/tests.
     pub fn vhd_path(&self) -> PathBuf {
-        self.mount_dir.join(self.image_name)
+        self.mount_point.image_dir().join(self.image_name)
     }
 
     /// `N` in `\\.\PhysicalDriveN` for the attached synthetic disk.
@@ -367,7 +423,11 @@ impl Drop for WinFspMount {
         // …then stop and unmount the filesystem.
         self.host.stop();
         self.host.unmount();
-        let _ = std::fs::remove_dir_all(&self.mount_dir);
+        // Only the directory form leaves anything on disk to clean up; the
+        // drive-letter form is gone with `unmount`.
+        if let MountLocation::Dir(dir) = &self.mount_point {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 

@@ -203,16 +203,20 @@ fn volume_disk_extent(guid_path: &[u16]) -> Option<(u32, u64)> {
     Some((ext.DiskNumber, ext.StartingOffset as u64))
 }
 
+/// Drive letters not currently in use, D: onward (A: and B: are floppy slots
+/// and C: is conventionally the system drive, so we never hand them out). The
+/// set is sampled once, when the iterator is built.
+pub(crate) fn free_letters() -> impl Iterator<Item = char> {
+    let in_use = unsafe { GetLogicalDrives() };
+    (3..26u32)
+        .filter(move |i| in_use & (1 << i) == 0)
+        .map(|i| (b'A' + i as u8) as char)
+}
+
 /// Assign the first free drive letter (D: onward) to `guid_path`
 /// (`\\?\Volume{GUID}\`, NUL-terminated). Requires Administrator.
 fn assign_free_letter(guid_path: &[u16]) -> Result<char> {
-    let in_use = unsafe { GetLogicalDrives() };
-    for i in 3..26u32 {
-        // start at D:
-        if in_use & (1 << i) != 0 {
-            continue;
-        }
-        let letter = (b'A' + i as u8) as char;
+    for letter in free_letters() {
         let mount_point: Vec<u16> = format!("{letter}:\\").encode_utf16().chain([0]).collect();
         if unsafe { SetVolumeMountPointW(mount_point.as_ptr(), guid_path.as_ptr()) } != 0 {
             return Ok(letter);
