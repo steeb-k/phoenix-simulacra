@@ -1,0 +1,6 @@
+# Statically link the MSVC C runtime into every binary (x64 and the ARM64
+# cross-builds alike). Without this, a clean Windows install with no VC++
+# redistributable fails at launch with "vcruntime140.dll is missing" — we
+# ship no redist and must not require one.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
