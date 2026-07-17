@@ -500,9 +500,9 @@ pub fn build_full_disk_plan(
     }
 }
 
-/// Grow NTFS partition(s) into free space at the end of the disk. Partitions that
-/// sat after NTFS in the backup layout (e.g. Windows RE) are moved to the tail
-/// so NTFS can expand without overlapping them.
+/// Grow the main NTFS partition into free space at the end of the disk.
+/// Partitions that sat after it in the backup layout (e.g. Windows RE) are
+/// moved to the tail, sizes kept, so it can expand without overlapping them.
 fn expand_ntfs_slack(
     entries: &mut [RestorePlanEntry],
     reader: &PhnxReader,
@@ -519,7 +519,14 @@ fn expand_ntfs_slack(
         .map(|e| (e.target_offset_bytes, e.target_size_bytes))
         .collect();
 
-    expand_ntfs_slack_inner(entries, reader, target_disk_size, align);
+    let is_ntfs = |e: &RestorePlanEntry| {
+        reader
+            .index
+            .iter()
+            .find(|i| i.index == e.source_partition_index.unwrap_or(u32::MAX))
+            .is_some_and(|i| i.fs_kind == FilesystemKind::Ntfs)
+    };
+    expand_ntfs_slack_inner(entries, &is_ntfs, target_disk_size, align);
 
     if let Some(problem) = layout_problem(entries, target_disk_size) {
         tracing::warn!(
@@ -535,44 +542,35 @@ fn expand_ntfs_slack(
 
 fn expand_ntfs_slack_inner(
     entries: &mut [RestorePlanEntry],
-    reader: &PhnxReader,
+    is_ntfs: &dyn Fn(&RestorePlanEntry) -> bool,
     target_disk_size: u64,
     align: u64,
 ) {
-    let ntfs_indices: Vec<usize> = entries
+    // The LARGEST restorable NTFS is treated as the main data partition to
+    // expand (start offset breaks ties). On a stock Windows disk the recovery
+    // partition is NTFS too and starts *after* C:, so picking by start offset
+    // would grow WinRE instead of the Windows partition.
+    let primary_ntfs = match entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| {
-            e.restore
-                && reader
-                    .index
-                    .iter()
-                    .find(|i| i.index == e.source_partition_index.unwrap_or(u32::MAX))
-                    .is_some_and(|i| i.fs_kind == FilesystemKind::Ntfs)
-        })
+        .filter(|(_, e)| e.restore && is_ntfs(e))
+        .max_by_key(|(_, e)| (e.target_size_bytes, e.target_offset_bytes))
         .map(|(i, _)| i)
-        .collect();
-
-    if ntfs_indices.is_empty() {
-        return;
-    }
-
-    // Latest-starting NTFS is treated as the main data partition to expand.
-    let primary_ntfs = *ntfs_indices
-        .iter()
-        .max_by_key(|&&i| entries[i].target_offset_bytes)
-        .unwrap();
+    {
+        Some(i) => i,
+        None => return,
+    };
     let ntfs_start = entries[primary_ntfs].target_offset_bytes;
     let ntfs_orig_end = ntfs_start.saturating_add(entries[primary_ntfs].target_size_bytes);
 
-    // Tail = every other partition at/after the original NTFS end (RE, etc.).
+    // Tail = every other partition at/after the primary's original end (RE,
+    // etc. — NTFS or not). They keep their sizes and are packed against the
+    // end of the disk so the primary can grow into the gap.
     let mut tail: Vec<usize> = entries
         .iter()
         .enumerate()
         .filter(|(i, e)| {
-            *i != primary_ntfs
-                && !ntfs_indices.contains(i)
-                && e.target_offset_bytes >= ntfs_orig_end.saturating_sub(align)
+            *i != primary_ntfs && e.target_offset_bytes >= ntfs_orig_end.saturating_sub(align)
         })
         .map(|(i, _)| i)
         .collect();
@@ -596,8 +594,8 @@ fn expand_ntfs_slack_inner(
         cursor = entries[i].target_offset_bytes;
     }
 
-    // Main NTFS fills the gap from its start to the first tail partition (or the
-    // usable disk end).
+    // The primary fills the gap from its start to the first tail partition (or
+    // the usable disk end).
     let ntfs_end = if let Some(&first_tail) = tail.first() {
         entries[first_tail].target_offset_bytes
     } else {
@@ -607,45 +605,6 @@ fn expand_ntfs_slack_inner(
     if ntfs_end > ntfs_start {
         entries[primary_ntfs].target_size_bytes =
             align_down(ntfs_end.saturating_sub(ntfs_start), align);
-    }
-
-    // Additional NTFS volumes (rare) share any space after the tail pack.
-    let extra_ntfs: Vec<usize> = ntfs_indices
-        .iter()
-        .copied()
-        .filter(|&i| i != primary_ntfs)
-        .collect();
-    if extra_ntfs.is_empty() {
-        return;
-    }
-    let layout_end = entries
-        .iter()
-        .map(|e| e.target_offset_bytes.saturating_add(e.target_size_bytes))
-        .max()
-        .unwrap_or(0);
-    let trailing = target_disk_size.saturating_sub(layout_end);
-    if trailing < align {
-        return;
-    }
-    let total_extra_orig: u64 = extra_ntfs
-        .iter()
-        .map(|&i| entries[i].target_size_bytes)
-        .sum();
-    let mut remaining = trailing;
-    for (pos, &idx) in extra_ntfs.iter().enumerate() {
-        // Split `trailing` in proportion to each partition's original size, or
-        // evenly when every one of them is zero-sized. `extra_ntfs` is non-empty
-        // (guarded above), so the even-split divisor is safe.
-        let share = if pos + 1 == extra_ntfs.len() {
-            remaining
-        } else {
-            (trailing * entries[idx].target_size_bytes)
-                .checked_div(total_extra_orig)
-                .unwrap_or(trailing / extra_ntfs.len() as u64)
-        };
-        remaining = remaining.saturating_sub(share);
-        entries[idx].target_size_bytes =
-            align_up(entries[idx].target_size_bytes.saturating_add(share), align);
     }
 }
 
@@ -700,6 +659,37 @@ mod tests {
             target_offset_bytes: offset,
             target_size_bytes: size,
         }
+    }
+
+    #[test]
+    fn expand_grows_largest_ntfs_not_last() {
+        const MIB: u64 = 1024 * 1024;
+        // Windows-style layout: EFI (FAT, idx 0), MSR (idx 1), C: (NTFS,
+        // idx 2, largest), WinRE (NTFS, idx 3, small, after C:). Expanding
+        // onto a bigger disk must grow C:, not the later-starting WinRE, and
+        // push WinRE to the tail with its size intact.
+        let mut entries = vec![
+            entry(0, MIB, 100 * MIB),
+            entry(1, 101 * MIB, 16 * MIB),
+            entry(2, 117 * MIB, 300 * MIB),
+            entry(3, 417 * MIB, 50 * MIB),
+        ];
+        let is_ntfs = |e: &RestorePlanEntry| matches!(e.source_partition_index, Some(2 | 3));
+        let disk = 2048 * MIB;
+        expand_ntfs_slack_inner(&mut entries, &is_ntfs, disk, MIB);
+
+        assert!(layout_problem(&entries, disk).is_none());
+        // C: grew; WinRE kept its size and now sits past C:'s new end.
+        assert!(entries[2].target_size_bytes > 300 * MIB, "C: did not grow");
+        assert_eq!(entries[3].target_size_bytes, 50 * MIB);
+        assert!(
+            entries[3].target_offset_bytes
+                >= entries[2].target_offset_bytes + entries[2].target_size_bytes,
+            "WinRE was not pushed past the grown C:"
+        );
+        // EFI and MSR stay put.
+        assert_eq!(entries[0].target_offset_bytes, MIB);
+        assert_eq!(entries[1].target_offset_bytes, 101 * MIB);
     }
 
     #[test]

@@ -81,7 +81,7 @@ enum Commands {
         /// Target physical disk index — WILL BE ERASED
         #[arg(long)]
         target_disk: u32,
-        /// Grow the last NTFS partition to fill a larger target
+        /// Grow the largest NTFS partition to fill a larger target
         #[arg(long, default_value_t = false)]
         expand: bool,
         /// Read every written block back off the target and compare to source
