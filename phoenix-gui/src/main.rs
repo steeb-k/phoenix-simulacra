@@ -15,6 +15,7 @@ mod fonts;
 mod history_table;
 mod job;
 mod mount_table;
+mod raster;
 mod restore_layout;
 mod restore_panel;
 mod sidebar;
@@ -168,26 +169,6 @@ enum UserEvent {
     Repaint { after: Duration },
 }
 
-/// Slack on the rasterizer's inside-triangle test, as a fraction of a
-/// triangle's own size (the test runs on normalised barycentric weights).
-///
-/// egui antialiases by tessellating a solid core plus a 1px feathered ring
-/// that share an edge, so on any shape edge landing on a whole pixel
-/// coordinate — every panel, every button — that shared edge falls exactly
-/// down the middle of a row of pixel centres. Exact arithmetic would put
-/// those centres on both triangles; f32 puts them a few 1e-8 outside *both*,
-/// and the pixel is dropped, letting the background dot through the fill.
-/// Real geometry misses by ~1e-1, so anything in between separates float
-/// noise from a genuine miss with orders of magnitude to spare.
-const EDGE_EPS: f32 = 1e-5;
-
-/// Pack an opaque pixel the way softbuffer expects it on Windows: `0x00RRGGBB`
-/// (the presenter ignores the top byte).
-#[inline]
-fn to_bgra(r: u8, g: u8, b: u8) -> u32 {
-    (r as u32) << 16 | (g as u32) << 8 | (b as u32)
-}
-
 /// Everything one window owns: the OS window, its software framebuffer, the egui
 /// context + winit input bridge, the app state, and the CPU texture cache the
 /// rasterizer samples.
@@ -198,6 +179,13 @@ struct Renderer {
     egui_state: egui_winit::State,
     app: PhoenixApp,
     tex_mgr: tex_mgr::TextureManager,
+    /// Reused frame buffer — reallocating ~3 MB per frame is measurable at
+    /// 60 fps, keeping it is free.
+    pixels: Vec<u32>,
+    /// When the most recent `paint` began. Continuous-repaint pacing anchors
+    /// the next frame's deadline here instead of "now" so rasterization time
+    /// doesn't stretch the frame interval (see `App::user_event`).
+    last_paint_start: Instant,
     /// The window is created hidden and shown by `paint` the moment the first
     /// frame has been presented, so it never appears as an unpainted white
     /// rectangle while `PhoenixApp::new`'s disk enumeration runs.
@@ -270,6 +258,8 @@ impl Renderer {
             egui_state,
             app,
             tex_mgr: tex_mgr::TextureManager::new(),
+            pixels: Vec::new(),
+            last_paint_start: Instant::now(),
             revealed: false,
         }
     }
@@ -279,6 +269,7 @@ impl Renderer {
     /// interpolation while sampling the font/texture atlas, blend per-pixel,
     /// then present. No GPU is touched anywhere in here.
     fn paint(&mut self) {
+        self.last_paint_start = Instant::now();
         let size = self.window.inner_size();
         let (w, h) = (size.width, size.height);
         if w == 0 || h == 0 {
@@ -334,126 +325,9 @@ impl Renderer {
         // panel's rounded bottom-left corner exposes it, and it must read as
         // part of the sidebar/status-bar L.
         let bg = self.app.palette.sidebar_bg;
-        let bg32 = to_bgra(bg.r(), bg.g(), bg.b());
-        let mut pixels: Vec<u32> = vec![bg32; (w * h) as usize];
-
-        for prim in &clipped {
-            let clip = prim.clip_rect;
-            let clip_x0 = (clip.min.x * ppp).floor() as i32;
-            let clip_y0 = (clip.min.y * ppp).floor() as i32;
-            let clip_x1 = (clip.max.x * ppp).ceil() as i32;
-            let clip_y1 = (clip.max.y * ppp).ceil() as i32;
-
-            let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
-                continue;
-            };
-            let verts = &mesh.vertices;
-            let indices = &mesh.indices;
-            let is_font_tex = mesh.texture_id == egui::TextureId::default();
-
-            for tri in 0..indices.len() / 3 {
-                let i0 = indices[tri * 3] as usize;
-                let i1 = indices[tri * 3 + 1] as usize;
-                let i2 = indices[tri * 3 + 2] as usize;
-                if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() {
-                    continue;
-                }
-                let v0 = &verts[i0];
-                let v1 = &verts[i1];
-                let v2 = &verts[i2];
-
-                let p0 = (v0.pos.x * ppp, v0.pos.y * ppp);
-                let p1 = (v1.pos.x * ppp, v1.pos.y * ppp);
-                let p2 = (v2.pos.x * ppp, v2.pos.y * ppp);
-
-                let min_x = p0.0.min(p1.0).min(p2.0).floor() as i32;
-                let min_y = p0.1.min(p1.1).min(p2.1).floor() as i32;
-                let max_x = p0.0.max(p1.0).max(p2.0).ceil() as i32;
-                let max_y = p0.1.max(p1.1).max(p2.1).ceil() as i32;
-
-                let x0 = min_x.max(clip_x0).max(0);
-                let y0 = min_y.max(clip_y0).max(0);
-                let x1 = max_x.min(clip_x1).min(w as i32 - 1);
-                let y1 = max_y.min(clip_y1).min(h as i32 - 1);
-
-                let denom = (p1.1 - p2.1) * (p0.0 - p2.0) + (p2.0 - p1.0) * (p0.1 - p2.1);
-                if denom.abs() < 0.001 {
-                    continue;
-                }
-
-                for py in y0..=y1 {
-                    for px in x0..=x1 {
-                        let fx = px as f32 + 0.5;
-                        let fy = py as f32 + 0.5;
-
-                        let w0 =
-                            ((p1.1 - p2.1) * (fx - p2.0) + (p2.0 - p1.0) * (fy - p2.1)) / denom;
-                        let w1 =
-                            ((p2.1 - p0.1) * (fx - p2.0) + (p0.0 - p2.0) * (fy - p2.1)) / denom;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < -EDGE_EPS || w1 < -EDGE_EPS || w2 < -EDGE_EPS {
-                            continue;
-                        }
-
-                        let uv_x = v0.uv.x * w0 + v1.uv.x * w1 + v2.uv.x * w2;
-                        let uv_y = v0.uv.y * w0 + v1.uv.y * w1 + v2.uv.y * w2;
-
-                        let vr = v0.color.r() as f32 * w0
-                            + v1.color.r() as f32 * w1
-                            + v2.color.r() as f32 * w2;
-                        let vg = v0.color.g() as f32 * w0
-                            + v1.color.g() as f32 * w1
-                            + v2.color.g() as f32 * w2;
-                        let vb = v0.color.b() as f32 * w0
-                            + v1.color.b() as f32 * w1
-                            + v2.color.b() as f32 * w2;
-                        let va = v0.color.a() as f32 * w0
-                            + v1.color.a() as f32 * w1
-                            + v2.color.a() as f32 * w2;
-
-                        let (r, g, b, final_a) = if is_font_tex {
-                            let cov = self.tex_mgr.sample_alpha_f(uv_x, uv_y);
-                            (vr, vg, vb, va / 255.0 * cov)
-                        } else {
-                            let [tr, tg, tb, ta] =
-                                self.tex_mgr.sample_rgba(mesh.texture_id, uv_x, uv_y);
-                            (tr * vr, tg * vg, tb * vb, ta * va / 255.0)
-                        };
-                        // A pixel admitted by EDGE_EPS sits marginally outside the
-                        // triangle, so its interpolated alpha can land a hair
-                        // outside [0, 1]. Left alone, a negative `inv` below can
-                        // push the blend under zero, and `sqrt` of that is NaN —
-                        // which casts to 0 and paints the black speck this whole
-                        // epsilon exists to remove.
-                        let final_a = final_a.clamp(0.0, 1.0);
-                        if final_a < 1.0 / 255.0 {
-                            continue;
-                        }
-
-                        let idx = (py as u32 * w + px as u32) as usize;
-                        let dst = pixels[idx];
-                        let dr = ((dst >> 16) & 0xFF) as f32;
-                        let dg = ((dst >> 8) & 0xFF) as f32;
-                        let db = (dst & 0xFF) as f32;
-
-                        // Gamma-correct blend (gamma ≈ 2.0): linearise, blend,
-                        // re-encode. Approximate vs true sRGB ~2.2 but cheap.
-                        let inv = 1.0 - final_a;
-                        let r_lin = (r / 255.0) * (r / 255.0);
-                        let g_lin = (g / 255.0) * (g / 255.0);
-                        let b_lin = (b / 255.0) * (b / 255.0);
-                        let dr_lin = (dr / 255.0) * (dr / 255.0);
-                        let dg_lin = (dg / 255.0) * (dg / 255.0);
-                        let db_lin = (db / 255.0) * (db / 255.0);
-                        let out_r = ((r_lin * final_a + dr_lin * inv).sqrt() * 255.0 + 0.5) as u8;
-                        let out_g = ((g_lin * final_a + dg_lin * inv).sqrt() * 255.0 + 0.5) as u8;
-                        let out_b = ((b_lin * final_a + db_lin * inv).sqrt() * 255.0 + 0.5) as u8;
-
-                        pixels[idx] = to_bgra(out_r, out_g, out_b);
-                    }
-                }
-            }
-        }
+        let bg32 = raster::to_bgra(bg.r(), bg.g(), bg.b());
+        self.pixels.resize((w * h) as usize, 0);
+        raster::rasterize(&clipped, &self.tex_mgr, w, h, ppp, bg32, &mut self.pixels);
 
         if self
             .surface
@@ -461,7 +335,7 @@ impl Renderer {
             .is_ok()
         {
             if let Ok(mut buf) = self.surface.buffer_mut() {
-                buf.copy_from_slice(&pixels);
+                buf.copy_from_slice(&self.pixels);
                 let presented = buf.present().is_ok();
                 // Reveal on the first frame that actually reached the surface,
                 // never merely because we tried to draw one — a window shown
@@ -554,8 +428,20 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Repaint { after } => {
-                let delay = if after.is_zero() { REPAINT_FRAME_CAP } else { after };
-                let deadline = Instant::now() + delay;
+                let now = Instant::now();
+                let deadline = if after.is_zero() {
+                    // Continuous animation: anchor the ~60 fps tick to the
+                    // START of the frame that asked for it, not to now —
+                    // otherwise rasterization time adds to the interval and
+                    // a 10 ms frame yields 26 ms ticks, not 16 ms ones.
+                    let anchor = self
+                        .renderer
+                        .as_ref()
+                        .map_or(now, |r| r.last_paint_start);
+                    (anchor + REPAINT_FRAME_CAP).max(now)
+                } else {
+                    now + after
+                };
                 self.next_repaint =
                     Some(self.next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
@@ -905,6 +791,11 @@ struct PhoenixApp {
     /// Keeps the dim/spinner overlay up until this deadline (click time +
     /// [`REFRESH_OVERLAY_MIN`]), even when the refresh itself is instant.
     refresh_overlay_until: Option<Instant>,
+    /// A backup/restore/clone just finished: re-enumerate disks at the start
+    /// of the NEXT frame (so the completion modal paints first), keeping the
+    /// drive dropdowns in step with what the job changed on disk. Unlike a
+    /// titlebar Refresh this resets no page state and shows no overlay.
+    pending_disk_reload: bool,
     /// Set when the app should exit after the current frame — the close-confirm
     /// dialog was accepted, or a portable `ViewportCommand::Close` arrived. The
     /// winit loop checks it after each paint and calls `event_loop.exit()`.
@@ -996,6 +887,7 @@ impl PhoenixApp {
             last_theme_refresh: Instant::now(),
             pending_refresh: None,
             refresh_overlay_until: demo_refresh_overlay_from_args(),
+            pending_disk_reload: false,
             should_exit: false,
             restart_after_update: false,
             portable: updater::is_portable(),
@@ -1115,6 +1007,16 @@ impl PhoenixApp {
     }
 
     fn refresh_disks(&mut self) {
+        self.status = match self.reload_disks() {
+            Ok(n) => format!("Found {n} disk(s)"),
+            Err(e) => format!("Disk enumeration failed: {e}"),
+        };
+    }
+
+    /// Re-enumerate physical disks and prune stale selections without
+    /// touching the status line — the post-job reload must not stomp the
+    /// "Backup completed" message the job just wrote there.
+    fn reload_disks(&mut self) -> std::result::Result<usize, String> {
         match enumerate_disks() {
             Ok(mut disks) => {
                 for d in &mut disks {
@@ -1124,9 +1026,9 @@ impl PhoenixApp {
                 }
                 self.disks = disks;
                 self.prune_stale_selections();
-                self.status = format!("Found {} disk(s)", self.disks.len());
+                Ok(self.disks.len())
             }
-            Err(e) => self.status = format!("Disk enumeration failed: {e}"),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -1529,6 +1431,15 @@ impl PhoenixApp {
                 self.finish_modal(job_kind, &final_snap, outcome, job_verified, None);
             }
         }
+
+        // The finished job may have rewritten a partition table or written a
+        // new image file — reload the disk list so the drive dropdowns don't
+        // show the pre-job world. A verify changes nothing on disk, and a
+        // mid-queue backup completion (self.job re-armed above) waits for the
+        // whole queue to drain.
+        if self.job.is_none() && job_kind != JobKind::Verify {
+            self.pending_disk_reload = true;
+        }
     }
 
     /// Park the just-finished job's final step list in `self.completed` so the
@@ -1768,6 +1679,15 @@ impl PhoenixApp {
         // painted the dim/spinner overlay, so it stays on screen while the
         // enumeration below blocks.
         self.run_pending_refresh();
+        // A job finished last frame: the completion modal is already on
+        // screen, so a blocking enumeration here is invisible. Status stays
+        // whatever the job set it to; failure just leaves the old list.
+        if self.pending_disk_reload {
+            self.pending_disk_reload = false;
+            if let Err(e) = self.reload_disks() {
+                tracing::warn!("post-job disk reload failed: {e}");
+            }
+        }
         // Both pages that name a `.phnx` want it parsed: the Restore page to
         // seed its layout editor, the Verify page to preview the contents.
         if matches!(self.page, Page::Restore | Page::Verify) {
@@ -2995,7 +2915,7 @@ impl PhoenixApp {
                 && ui
                     .checkbox(
                         &mut self.clone_expand,
-                        "Expand the last NTFS partition to fill a larger target",
+                        "Expand the largest NTFS partition to fill a larger target",
                     )
                     .changed()
             {
