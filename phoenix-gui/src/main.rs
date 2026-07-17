@@ -1654,16 +1654,26 @@ impl PhoenixApp {
     /// state the page forms edit, so the bar stays in step with them.
     fn current_page_action(&self, busy: bool) -> Option<StartAction<'static>> {
         let action = match self.page {
-            Page::Backup => StartAction {
-                label: "Start Backup",
-                icon: Some(egui_phosphor::fill::PLAY),
-                enabled: !busy && !self.backup_name.trim().is_empty(),
-                disabled_hint: Some(if busy {
-                    "A backup is already running"
-                } else {
-                    "Enter a backup name first"
-                }),
-            },
+            Page::Backup => {
+                // Mirror `start_backup`'s own guards exactly — it takes the
+                // name through `sanitize_backup_name` (so a bare ".phnx"
+                // sanitizes to nothing) and refuses an empty selection. Gating
+                // on anything looser enables a button that then declines the
+                // click with a status message, which reads as a broken button.
+                let name_ready = !sanitize_backup_name(&self.backup_name).is_empty();
+                StartAction {
+                    label: "Start Backup",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy && name_ready && !self.selections.is_empty(),
+                    disabled_hint: Some(if busy {
+                        "A backup is already running"
+                    } else if !name_ready {
+                        "Enter a backup name first"
+                    } else {
+                        "Select at least one partition to back up"
+                    }),
+                }
+            }
             Page::Restore => {
                 let plan_ready = self
                     .restore_layout
