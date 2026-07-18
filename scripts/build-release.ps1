@@ -12,7 +12,7 @@
 # so one binary covers both machines (see phoenix-launcher/src/main.rs).
 #
 # Requires: Rust stable, Visual Studio Build Tools with Desktop C++ and both the
-# x64 and ARM64 MSVC toolchains (see docs/WINDOWS-ARM64.md), plus LLVM/libclang
+# x64 and ARM64 MSVC toolchains (see docs/BUILDING.md), plus LLVM/libclang
 # (for the winfsp bindgen step) and WinFsp installed (for its SDK). The shipped
 # GUI/CLI binaries delay-load winfsp-<arch>.dll and locate it via the registry at
 # run time; the app installer must bundle+install WinFsp (https://winfsp.dev).

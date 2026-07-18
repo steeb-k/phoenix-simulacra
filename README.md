@@ -1,118 +1,58 @@
-# Phoenix Simulacra — Backup and Restore
+# Phoenix Simulacra
 
-Windows disk backup tool written in Rust. Creates single-file `.phnx` backups with partition metadata, used-block capture for NTFS/FAT/exFAT, and raw capture for EFI/MSR partitions.
+A disk backup, restore, and cloning tool for Windows, written in Rust.
 
-**Platforms:** Tier-1 support for **Windows x64** and **Windows ARM64** with identical behavior; ship the native binary for each architecture. See [docs/WINDOWS-ARM64.md](docs/WINDOWS-ARM64.md).
+Phoenix Simulacra images the partitions you pick into a single compressed `.phnx` file, restores them with resizing, clones disk-to-disk (running system disk included), and lets you browse a backup's files in Explorer without extracting anything. It runs on Windows x64 and ARM64, with the same features on both.
 
 ## Features
 
-- GPT/MBR disk enumeration
-- Selective partition backup and restore
-- Used-block imaging (smaller than full disk images)
-- Restore with partition resizing (NTFS grow + shrink-with-relocation, FAT/exFAT grow)
-- **Disk-to-disk cloning** (`clone`), including live system disks via VSS, with resize
-- **Read-only mounting** (`mount`) — browse a backup's files in Explorer with **zero
-  extra disk space**: a WinFsp filesystem serves a synthesized `backup.vhd` on demand
-  straight from the compressed `.phnx`, and Windows attaches it read-only
-- Bulletproof verification: format v2 checksums every metadata structure (footer CRC,
-  total-length/truncation check, index-table hash, per-entry CRC); `verify --quick`
-  runs a structural + sampled check, `verify` hashes every chunk
-- **Verify-after-backup (default on):** immediately re-reads the source and confirms
-  every chunk matches — proving the image faithfully captured the disk, not just that
-  the file is internally consistent (opt out with `backup --no-verify`)
-- Verify-on-restore (default) and optional read-back verification on clone
-- **Automatic source freeze — no switch to get wrong:** every backup takes an exclusive
-  volume lock when it can, falls back to a VSS shadow when the volume is in use (the
-  running Windows volume always is), and refuses to capture a lettered volume it can
-  freeze neither way
-- CLI and egui GUI (WinPE-friendly, no WebView2)
+- **Backs up only what's used.** NTFS, FAT, and exFAT partitions are captured used-blocks-only, so images stay close to the size of your data, not the size of the disk.
+- **Backs up live systems.** Idle volumes are captured under an exclusive lock; busy ones (like the running `C:`) automatically go through a VSS snapshot. There's no switch to get wrong — the engine picks the strongest freeze the volume allows, and refuses to capture anything it can't freeze.
+- **Verifies its own work.** Every chunk is BLAKE3-hashed, and by default a backup finishes by re-reading the source and confirming the image matches it — proving the backup is faithful, not just internally consistent.
+- **Restores with resizing.** Grow or shrink partitions during restore, with a drag-and-drop layout editor in the GUI and an editable plan file in the CLI.
+- **Clones disk-to-disk.** Full or partial, with resizing, straight from a live system.
+- **Mounts backups in place.** Browse a `.phnx` in Explorer with drive letters and essentially zero extra disk space, read-only or with a writable copy-on-write overlay. (Requires [WinFsp](https://winfsp.dev); the installer sets it up.)
+- **Repairs boot files.** A built-in Boot Repair tool (`bcdboot`/`bootsect`, UEFI and BIOS), and clone/restore can fix up the target's boot files automatically so a restored disk actually boots.
+- **Handles BitLocker.** Unlocked volumes back up as normal plaintext images; locked volumes are captured as raw ciphertext (clearly flagged) and restore still locked.
+- **Handles 4Kn disks.** Native 4096-byte-sector support end to end, plus opt-in 4Kn→512e conversion when restoring or cloning to a 512-byte-sector disk.
+- **Works in WinPE.** The GUI renders on the CPU — no GPU, WebView2, or OpenGL needed — so it runs in recovery environments.
 
-> **Mounting requires WinFsp** — the `winfsp` build feature is **on by default**
-> for the GUI and CLI, so dev and release builds behave the same. It adds no
-> meaningful disk footprint — reads are served on demand from the compressed
-> `.phnx`, and you pick which partition(s) get drive letters. Install WinFsp
-> from [winfsp.dev](https://winfsp.dev) (release builds bundle it). Building
-> with `--no-default-features` drops the feature; mount then falls back to
-> materializing a full-size temp VHD — a dev-only stopgap.
+## Download
 
-## Build
+Grab the installer (`Simulacra-Setup-<version>.exe`) or the portable ZIP from the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases). One download covers both x64 and ARM64 — a launcher picks the right binary for your machine. The installer also sets up WinFsp so mounting works out of the box, and the app can update itself from the same releases feed.
 
-Requires Rust 1.70+, Windows, and Visual Studio Build Tools (**Desktop development with C++**, including **x64** and **ARM64** MSVC when building both targets). The default `winfsp` feature additionally needs LLVM/libclang (set `LIBCLANG_PATH` if LLVM isn't at `C:\Program Files\LLVM`) and WinFsp installed for its SDK headers.
+To build from source instead, see [docs/BUILDING.md](docs/BUILDING.md).
 
-**Release builds (x64 + ARM64):**
+## Quick start (CLI)
+
+The GUI (`simulacra.exe`) covers everything below with the same engine. Both request Administrator via UAC on launch.
 
 ```powershell
-.\scripts\build-release.ps1
+simulacra-cli list-disks                                              # see what's attached
+simulacra-cli backup --disk 0 --partitions 1,2,3 -o backup.phnx       # back up (freeze is automatic)
+simulacra-cli verify backup.phnx                                      # re-hash every chunk
+simulacra-cli mount backup.phnx                                       # browse it in Explorer
+simulacra-cli plan backup.phnx --disk 1 -o plan.toml                  # draft a restore layout
+simulacra-cli restore backup.phnx --plan plan.toml                    # restore it
 ```
 
-**Single-target dev build** (host default):
-
-```bash
-cargo build --release
-```
-
-Binaries embed a `requireAdministrator` manifest (UAC on launch). Paths depend on target:
-
-| Target | CLI | GUI |
-|--------|-----|-----|
-| Host default | `target/release/simulacra-cli.exe` | `target/release/simulacra.exe` |
-| `x86_64-pc-windows-msvc` | `target/x86_64-pc-windows-msvc/release/...` | same |
-| `aarch64-pc-windows-msvc` | `target/aarch64-pc-windows-msvc/release/...` | same |
-
-The release script assembles a single shippable bundle in `dist/simulacra/` holding both architectures plus an arch-selecting launcher:
-
-| File | Arch | What |
-|------|------|------|
-| `simulacra-launcher.exe` | x64* | Picks and launches the right GUI for the machine |
-| `simulacra.exe` | x64 | GUI |
-| `simulacra-cli.exe` | x64 | CLI |
-| `simulacra-arm.exe` | ARM64 | GUI |
-| `simulacra-cli-arm.exe` | ARM64 | CLI |
-
-\* The launcher ships as x64 only — Windows-on-ARM64 runs it under emulation, so one binary detects the native machine (`IsWow64Process2`) and launches `simulacra.exe` or `simulacra-arm.exe` accordingly. It is the normal entry point; the per-arch exes can also be run directly.
-
-## CLI Usage
-
-The CLI binary is `simulacra-cli` and the GUI is the plain `simulacra` — the
-same names in a dev build and in the bundle.
-
-```bash
-# List disks (UAC prompt appears automatically when launching the exe)
-simulacra-cli list-disks
-
-# Backup partitions 1,2,3 on disk 0. Idle volumes are captured under an exclusive
-# lock; volumes in use (the live C: among them) are captured through a VSS shadow —
-# there is nothing to choose.
-simulacra-cli backup --disk 0 --partitions 1,2,3 --output backup.phnx
-
-# Inspect backup
-simulacra-cli list backup.phnx
-
-# Verify
-simulacra-cli verify backup.phnx
-simulacra-cli verify backup.phnx --quick
-
-# Restore
-simulacra-cli plan backup.phnx --disk 1 --output plan.toml
-# Edit plan.toml (partition sizes/offsets)
-simulacra-cli restore backup.phnx --plan plan.toml
-```
+For capture modes, freeze behavior, and the full CLI/GUI reference, see the [backup guide](docs/BACKUP.md).
 
 ## Documentation
 
-- [docs/TESTING.md](docs/TESTING.md) — **test tiers (unit / VHD / real-disk), how to run them, integrity guarantees**
-- [docs/ROADMAP.md](docs/ROADMAP.md) — **remaining work, known caveats, and out-of-scope items**
-- [BACKUP.md](BACKUP.md) — Backup process, capture modes, VSS, and options
-- [docs/WINDOWS-ARM64.md](docs/WINDOWS-ARM64.md) — x64 / ARM64 parity and build matrix
-- [docs/ARM64-BRINGUP.md](docs/ARM64-BRINGUP.md) — runbook for bringing the app up on an ARM64 machine
-- [docs/phnx-format.md](docs/phnx-format.md) — `.phnx` file format specification
-- [scripts/live-smoke-checklist.md](scripts/live-smoke-checklist.md) — manual pre-release live-system checklist
+- [docs/BACKUP.md](docs/BACKUP.md) — user guide: how backups work, capture modes, CLI and GUI reference
+- [docs/BUILDING.md](docs/BUILDING.md) — building from source, release bundles, the installer
+- [docs/phnx-format.md](docs/phnx-format.md) — the `.phnx` file format specification
+- [docs/TESTING.md](docs/TESTING.md) — the test tiers (unit / virtual disk / real disk) and how to run them
+- [docs/ARM64.md](docs/ARM64.md) — Windows on ARM: parity contract, platform notes, validation status
+- [docs/ROADMAP.md](docs/ROADMAP.md) — what's planned, known caveats, what's out of scope
 
 ## Requirements
 
-- Administrator privileges (requested automatically via embedded manifest)
-- BitLocker volumes must be unlocked
-- Restore to different hardware may require Windows Startup Repair / `bcdedit`
+- Windows 10/11, x64 or ARM64 (32-bit is out of scope)
+- Administrator privileges (requested automatically)
+- [WinFsp](https://winfsp.dev) for mounting backups — bundled with the installer
+- Restoring to different hardware may need Windows Startup Repair; the built-in Boot Repair covers the common cases
 
 ## License
 
