@@ -883,6 +883,191 @@ pub fn create_vhdx_with_sector_size(
     Ok(())
 }
 
+/// Create a differencing VHDX `child` whose parent is `parent`, via
+/// `CreateVirtualDisk` (virtdisk.dll). Leaving MaximumSize / SectorSize zero
+/// makes the child inherit them from the parent — the declaration of "I am a
+/// copy-on-write diff of that disk". Nothing is preallocated; the child starts a
+/// few MiB and grows only with writes.
+///
+/// The parent may be an ordinary file or one served by a user-mode filesystem
+/// (WinFsp): Windows reads it through the same file API either way.
+pub fn create_differencing_vhdx(child: &Path, parent: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::Vhd::{
+        CreateVirtualDisk, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
+        CREATE_VIRTUAL_DISK_VERSION_2, VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE,
+        VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+    };
+
+    const VENDOR_MICROSOFT: GUID = GUID {
+        data1: 0xec98_4aec,
+        data2: 0xa0f9,
+        data3: 0x47e9,
+        data4: [0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b],
+    };
+
+    let child_w: Vec<u16> = child.as_os_str().encode_wide().chain(Some(0)).collect();
+    let parent_w: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+    let storage = VIRTUAL_STORAGE_TYPE {
+        DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        VendorId: VENDOR_MICROSOFT,
+    };
+
+    // SAFETY: a zeroed Version2 means "dynamic, provider defaults"; we then set
+    // only the parent, which is what turns it into a differencing disk. Every
+    // field of Version2 is a pointer/int/GUID/POD for which all-zero is valid.
+    let mut params: CREATE_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
+    params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+    params.Anonymous.Version2.ParentPath = parent_w.as_ptr();
+    params.Anonymous.Version2.ParentVirtualStorageType = storage;
+
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: pointers outlive the call; both wide paths are NUL-terminated; the
+    // optional security-descriptor / overlapped pointers are null.
+    let err = unsafe {
+        CreateVirtualDisk(
+            &storage,
+            child_w.as_ptr(),
+            VIRTUAL_DISK_ACCESS_NONE,
+            std::ptr::null_mut(),
+            CREATE_VIRTUAL_DISK_FLAG_NONE,
+            0,
+            &params,
+            std::ptr::null(),
+            &mut handle,
+        )
+    };
+    if err != 0 {
+        bail!(
+            "CreateVirtualDisk (differencing) failed for {} over parent {} (Win32 error {err}, \
+             0x{err:08X})",
+            child.display(),
+            parent.display()
+        );
+    }
+    if !handle.is_null() {
+        unsafe { CloseHandle(handle) };
+    }
+    Ok(())
+}
+
+/// A read-WRITE attach of a virtual disk (e.g. a differencing child). Dropping
+/// detaches it — no `PERMANENT_LIFETIME` is requested, so closing the handle is
+/// the detach, mirroring `phoenix_mount::attach`.
+pub struct AttachedRw {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl AttachedRw {
+    /// Open `vhdx_path` read-write and attach it, letting the mount manager
+    /// assign drive letters to its volumes. `RWDepth = 1` opens only the top of
+    /// a differencing chain (the child) writable and any parent(s) read-only —
+    /// exactly the copy-on-write guarantee.
+    pub fn attach(vhdx_path: &Path) -> Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows_sys::core::GUID;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::Vhd::{
+            AttachVirtualDisk, OpenVirtualDisk, ATTACH_VIRTUAL_DISK_FLAG_NONE,
+            ATTACH_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
+            VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE,
+            VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        };
+
+        const VENDOR_MICROSOFT: GUID = GUID {
+            data1: 0xec98_4aec,
+            data2: 0xa0f9,
+            data3: 0x47e9,
+            data4: [0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b],
+        };
+
+        let w: Vec<u16> = vhdx_path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let storage = VIRTUAL_STORAGE_TYPE {
+            DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            VendorId: VENDOR_MICROSOFT,
+        };
+
+        let mut handle: HANDLE = INVALID_HANDLE_VALUE;
+        let mut open: OPEN_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
+        open.Version = 1; // OPEN_VIRTUAL_DISK_VERSION_1
+        open.Anonymous.Version1.RWDepth = 1;
+        let rc = unsafe {
+            OpenVirtualDisk(
+                &storage,
+                w.as_ptr(),
+                VIRTUAL_DISK_ACCESS_ATTACH_RW | VIRTUAL_DISK_ACCESS_GET_INFO,
+                OPEN_VIRTUAL_DISK_FLAG_NONE,
+                &open,
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            bail!(
+                "OpenVirtualDisk (RW) failed for {} (Win32 error {rc}, 0x{rc:08X})",
+                vhdx_path.display()
+            );
+        }
+
+        // Read-WRITE attach (no READ_ONLY flag), auto drive letters (no
+        // NO_DRIVE_LETTER flag).
+        let attach = ATTACH_VIRTUAL_DISK_PARAMETERS {
+            Version: 1, // ATTACH_VIRTUAL_DISK_VERSION_1
+            Anonymous: unsafe { std::mem::zeroed() },
+        };
+        let rc = unsafe {
+            AttachVirtualDisk(
+                handle,
+                std::ptr::null_mut(),
+                ATTACH_VIRTUAL_DISK_FLAG_NONE,
+                0,
+                &attach,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            unsafe { CloseHandle(handle) };
+            bail!(
+                "AttachVirtualDisk (RW) failed for {} (Win32 error {rc}, 0x{rc:08X}); \
+                 mounting requires Administrator",
+                vhdx_path.display()
+            );
+        }
+        Ok(Self { handle })
+    }
+
+    /// `N` in `\\.\PhysicalDriveN` for the attached disk, for diagnostics.
+    pub fn physical_drive_number(&self) -> Option<u32> {
+        use windows_sys::Win32::Storage::Vhd::GetVirtualDiskPhysicalPath;
+        let mut buf = [0u16; 256];
+        let mut size_bytes = (buf.len() * 2) as u32;
+        let rc =
+            unsafe { GetVirtualDiskPhysicalPath(self.handle, &mut size_bytes, buf.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+}
+
+impl Drop for AttachedRw {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
 /// Clean up any leaked VHDs from a previous crashed run: detach every attached
 /// disk whose location points into our scratch dir, then delete the files.
 /// Safe to call at the start of a test run.

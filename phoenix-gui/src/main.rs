@@ -748,6 +748,11 @@ struct PhoenixApp {
     /// A window close was intercepted because backups are still mounted: the
     /// "these will be unmounted" dialog is up, waiting for the user.
     pending_close: bool,
+    /// A mount awaiting the "enable temporary write access" hazard dialog. Holds
+    /// the Active-mounts table index (real rows first, then demo rows).
+    pending_enable_write: Option<usize>,
+    /// Acknowledgement-checkbox state for the enable-write dialog.
+    enable_write_ack: bool,
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
@@ -869,6 +874,8 @@ impl PhoenixApp {
                 && phoenix_mount::ActiveMount::runtime_available(),
             demo_mounts: demo_mount_rows_from_args(),
             pending_close: false,
+            pending_enable_write: None,
+            enable_write_ack: false,
             settings,
             history,
             update_state,
@@ -893,6 +900,16 @@ impl PhoenixApp {
             portable: updater::is_portable(),
         };
         app.refresh_disks();
+        // Reclaim any mount artifacts a previous crashed run left in the scratch
+        // dir (stale WinFsp junctions, orphaned writable-overlay children).
+        phoenix_mount::cleanup_leaked_mounts(&phoenix_mount::mount_scratch_dir());
+        // `--demo-enable-write`: pop the write-access hazard dialog on a demo
+        // mount at startup, so its styling can be eyeballed without an elevated
+        // session and a real mount. Needs `--demo-mounts` for a row to target.
+        if demo_enable_write_from_args() && !app.demo_mounts.is_empty() {
+            app.page = Page::Mount;
+            app.pending_enable_write = Some(0);
+        }
         app.init_updates();
         app
     }
@@ -1126,6 +1143,7 @@ impl PhoenixApp {
             || self.pending_restore.is_some()
             || self.pending_history_delete.is_some()
             || self.pending_close
+            || self.pending_enable_write.is_some()
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -1856,6 +1874,7 @@ impl PhoenixApp {
         self.show_demo_confirm_dialog(ctx);
         self.show_demo_progress_modal(ctx);
         self.show_close_dialog(ctx);
+        self.show_enable_write_dialog(ctx);
         self.show_refresh_overlay(ctx);
     }
 
@@ -2175,6 +2194,159 @@ impl PhoenixApp {
         };
         if confirm_dialog::show(ctx, &self.palette, &mut view) != ConfirmAction::None {
             self.demo_confirm = false;
+        }
+    }
+
+    /// Cheap eligibility check before offering write access, so the common
+    /// refusal (a locked BitLocker partition, whose image is raw ciphertext)
+    /// happens WITHOUT first tearing down the read-only mount. Returns the
+    /// message to show on refusal.
+    fn enable_write_precheck(&self, index: usize) -> std::result::Result<(), String> {
+        let mount = &self.mounts[index];
+        let selected: Vec<u32> = mount.volumes().iter().map(|v| v.partition_index).collect();
+        let reader = phoenix_core::container::PhnxReader::open(mount.backup_path())
+            .map_err(|e| format!("Couldn't read the backup to check BitLocker state: {e}"))?;
+        for pm in &reader.manifest.partitions {
+            if selected.contains(&pm.index) && pm.bitlocker.as_deref() == Some("locked") {
+                return Err(format!(
+                    "Write access is unavailable: partition {} is a locked BitLocker volume, so \
+                     its captured data is raw ciphertext.",
+                    pm.index
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The hazard-taped confirmation for enabling temporary write access. Makes
+    /// unmistakable that changes go to a scratch layer and are discarded, and
+    /// gates the action behind an acknowledgement checkbox.
+    fn show_enable_write_dialog(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_enable_write else {
+            return;
+        };
+        // Resolve the target's name + letters for the details block (real mount
+        // first, then demo rows). If it vanished, drop the dialog.
+        let real = self.mounts.len();
+        let (name, letters): (String, Vec<char>) = if index < real {
+            let m = &self.mounts[index];
+            (
+                m.backup_path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "backup".into()),
+                m.volumes().iter().filter_map(|v| v.drive_letter).collect(),
+            )
+        } else if let Some(row) = self.demo_mounts.get(index - real) {
+            (row.name.clone(), row.letters.clone())
+        } else {
+            self.pending_enable_write = None;
+            return;
+        };
+        let letters_str = if letters.is_empty() {
+            "(no drive letters)".to_string()
+        } else {
+            letters
+                .iter()
+                .map(|l| format!("{l}:"))
+                .collect::<Vec<_>>()
+                .join("   ")
+        };
+        let details = vec![format!("Backup:  {name}"), format!("Drives:  {letters_str}")];
+
+        let mut ack_checked = self.enable_write_ack;
+        let mut view = ConfirmView {
+            title: "Enable temporary write access?",
+            message: "This re-mounts the backup read/write using a copy-on-write overlay. You can \
+                      create, edit and delete files on the drive — but every change is written to \
+                      a temporary scratch layer, NEVER to the backup. All changes are DISCARDED \
+                      when you unmount or close the app, and the backup image is never modified.",
+            details: &details,
+            confirm_label: "Enable Write Access",
+            cancel_label: "Cancel",
+            confirm_danger: true,
+            hazard_tape: true,
+            ack: Some(ConfirmAck {
+                label: "I understand my changes are temporary and will be discarded on unmount",
+                checked: &mut ack_checked,
+            }),
+        };
+        let result = confirm_dialog::show(ctx, &self.palette, &mut view);
+        self.enable_write_ack = ack_checked;
+        match result {
+            ConfirmAction::Confirm => {
+                self.pending_enable_write = None;
+                self.enable_write_ack = false;
+                self.perform_enable_write(index);
+            }
+            ConfirmAction::Cancel => {
+                self.pending_enable_write = None;
+                self.enable_write_ack = false;
+            }
+            ConfirmAction::None => {}
+        }
+    }
+
+    /// Convert a read-only mount into a writable copy-on-write overlay in place.
+    /// The read-only mount must be ejected first — its parent is attached with
+    /// the same GPT identity the writable child carries, and Windows will not
+    /// bring two such disks online at once — so on failure we put the read-only
+    /// mount back rather than leave the drive gone.
+    fn perform_enable_write(&mut self, index: usize) {
+        let real = self.mounts.len();
+        if index >= real {
+            // Demo row: just flip its state so the flow can be previewed.
+            if let Some(row) = self.demo_mounts.get_mut(index - real) {
+                row.writable = true;
+            }
+            self.status = "Write access enabled (demo row)".into();
+            return;
+        }
+
+        // Capture everything we need before ejecting the read-only mount.
+        let backup = self.mounts[index].backup_path().to_path_buf();
+        let vols = self.mounts[index].volumes().to_vec();
+        let selection: Vec<u32> = vols.iter().map(|v| v.partition_index).collect();
+        let preferred: Vec<(u32, char)> = vols
+            .iter()
+            .filter_map(|v| v.drive_letter.map(|l| (v.partition_index, l)))
+            .collect();
+        let scratch = phoenix_mount::mount_scratch_dir();
+        let name = backup
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Eject the read-only mount (frees its letters, detaches its disk).
+        drop(self.mounts.remove(index));
+
+        match phoenix_mount::ActiveMount::open_writable_selected(
+            &backup, &scratch, &selection, &preferred,
+        ) {
+            Ok(m) => {
+                let letters = describe_mounted_volumes(&m);
+                self.mounts.insert(index, m);
+                self.status = format!(
+                    "Write access enabled for {name} — {letters}. Changes are temporary and \
+                     discarded on unmount."
+                );
+            }
+            Err(e) => {
+                // Best-effort: restore the read-only mount so the drive returns.
+                match phoenix_mount::ActiveMount::open_selected(&backup, &scratch, Some(&selection))
+                {
+                    Ok(m) => {
+                        self.mounts.insert(index, m);
+                        self.status = format!("Couldn't enable write access: {e} — kept read-only.");
+                    }
+                    Err(e2) => {
+                        self.status = format!(
+                            "Couldn't enable write access ({e}); re-mounting read-only also failed \
+                             ({e2}). The backup is now unmounted."
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3244,6 +3416,7 @@ impl PhoenixApp {
                     .unwrap_or_else(|| "backup".into()),
                 size: m.disk_size(),
                 letters: m.volumes().iter().filter_map(|v| v.drive_letter).collect(),
+                writable: m.is_writable(),
             })
             .collect();
         // The demo rows sit after the real ones, so `Unmount(i)` still indexes
@@ -3282,6 +3455,22 @@ impl PhoenixApp {
             }
             mount_table::MountAction::Unmount(i) => {
                 self.demo_mounts.remove(i - real_rows);
+            }
+            // A real mount: refuse locked BitLocker up front, otherwise raise the
+            // hazard "changes are temporary" dialog before converting it.
+            mount_table::MountAction::EnableWrite(i) if i < real_rows => {
+                match self.enable_write_precheck(i) {
+                    Ok(()) => {
+                        self.pending_enable_write = Some(i);
+                        self.enable_write_ack = false;
+                    }
+                    Err(msg) => self.status = msg,
+                }
+            }
+            // A demo row: no precheck, just preview the dialog + writable state.
+            mount_table::MountAction::EnableWrite(i) => {
+                self.pending_enable_write = Some(i);
+                self.enable_write_ack = false;
             }
             mount_table::MountAction::None => {}
         }
@@ -3389,7 +3578,7 @@ impl PhoenixApp {
             return;
         }
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
-        let scratch = std::env::temp_dir().join("PhoenixSimulacra").join("mounts");
+        let scratch = phoenix_mount::mount_scratch_dir();
         let selected: Vec<u32> = self.mount_selection.iter().map(|&(_, part)| part).collect();
         self.status = if phoenix_mount::ActiveMount::space_efficient() {
             "Mounting read-only (on-demand)…".into()
@@ -3682,6 +3871,12 @@ fn demo_refresh_overlay_from_args() -> Option<Instant> {
 /// multi-letter layout, its buttons, and the close-with-mounts dialog can all be
 /// eyeballed without an elevated session and a real `.phnx` to attach. The rows
 /// are inert: Explore reports instead of opening Explorer.
+/// `--demo-enable-write`: open the write-access hazard dialog at startup on a
+/// demo mount, a styling aid for the dialog (pairs with `--demo-mounts`).
+fn demo_enable_write_from_args() -> bool {
+    std::env::args().skip(1).any(|a| a == "--demo-enable-write")
+}
+
 fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
     if !std::env::args().skip(1).any(|a| a == "--demo-mounts") {
         return Vec::new();
@@ -3692,12 +3887,14 @@ fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
             name: "fdBU.phnx".into(),
             size: 30_800_000_000,
             letters: vec!['I', 'J'],
+            writable: false,
         },
         mount_table::MountRow {
             folder: r"\\nas\archive\simulacra\weekly\workstation\2026\july".into(),
             name: "workstation-2026-07-12.phnx".into(),
             size: 512_110_190_592,
             letters: vec!['K'],
+            writable: true,
         },
     ]
 }
