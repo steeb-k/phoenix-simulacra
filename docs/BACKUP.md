@@ -2,7 +2,7 @@
 
 This document explains how backups work in Phoenix Simulacra, what options you have, and how to choose settings for different scenarios.
 
-For the on-disk file layout, see [docs/phnx-format.md](docs/phnx-format.md). For restore, see the main [README.md](README.md#cli-usage) restore section.
+For the on-disk file layout, see [phnx-format.md](phnx-format.md). For restore, see the [README](../README.md#quick-start-cli) quick start.
 
 ---
 
@@ -259,12 +259,12 @@ If you see this, the backup is still **not** imaging unselected partitions or ot
 | Topic | Requirement |
 |-------|-------------|
 | Privileges | Administrator (embedded in executables). |
-| OS | Windows **x64** or **ARM64** for backup (same features on both); WinPE supported for offline capture — use the PE that matches WinPE architecture ([docs/WINDOWS-ARM64.md](docs/WINDOWS-ARM64.md)). |
-| BitLocker | Volume must be unlocked; backup reads decrypted content. |
-| Encryption | Backups are **not** encrypted in v1; protect the `.phnx` file like sensitive data. |
-| Incremental | Full backup only in v1; file format reserves fields for future incrementals. |
-| Network | Write `.phnx` to local or mapped path; no built-in cloud upload in v1. |
-| macOS / Linux | Not supported as backup sources in v1. |
+| OS | Windows **x64** or **ARM64** for backup (same features on both); WinPE supported for offline capture — use the PE that matches the machine's architecture ([ARM64.md](ARM64.md)). |
+| BitLocker | An **unlocked** volume backs up as a normal plaintext image; a **locked** volume is captured as raw ciphertext (see above). |
+| Encryption | Backups are **not** encrypted; protect the `.phnx` file like sensitive data. |
+| Incremental | Full backup only; the file format reserves fields for future incrementals. |
+| Network | Write `.phnx` to a local or mapped path; no built-in cloud upload. |
+| macOS / Linux | Not supported as backup sources. |
 
 ---
 
@@ -304,4 +304,4 @@ simulacra-cli list backup.phnx
 simulacra-cli verify backup.phnx
 ```
 
-Restore workflow: `plan` → edit TOML → `restore` (documented in [README.md](README.md)).
+Restore workflow: `plan` → edit TOML → `restore` (documented in the [README](../README.md)).

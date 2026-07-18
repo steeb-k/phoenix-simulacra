@@ -53,15 +53,11 @@ or a spare disk you can afford to overwrite.
 
 ## 6. 4Kn / USB media (if available)
 
-> ⚠️ **4Kn is currently BROKEN, not merely untested** (audited 2026-07-13). Capture
-> fails on the first read with `ERROR_INVALID_PARAMETER` (Win32 87) — the FS parsers
-> issue hardcoded 512-byte reads on a raw handle. Don't run this expecting a pass;
-> see ROADMAP.md → "P1 — 4Kn media support". It reproduces on a 4Kn VHDX, so it does
-> not need 4Kn hardware to fix (TESTING.md → "Tier 2-4Kn").
->
-> Check which you actually have first — 512e (4096 physical / **512 logical**) is the
-> common case and works fine:
+> 4Kn is fully supported (backup, restore, clone, mount — see TESTING.md →
+> "Tier 2-4Kn"), so any failure here is a finding, not a known limitation.
+> Check what you actually have first — 512e (4096 physical / **512 logical**) is
+> the common case:
 > `Get-Disk | Select-Object Number, LogicalSectorSize, PhysicalSectorSize`
 
-- [ ] Back up and restore a partition on a true 4Kn (`LogicalSectorSize = 4096`) disk — **expected to fail until P1 lands**.
+- [ ] Back up and restore a partition on a true 4Kn (`LogicalSectorSize = 4096`) disk.
 - [ ] Repeat on a USB-attached disk.

@@ -1,5 +1,6 @@
 /target/
 /dist/
+.claude/
 **/*.phnx
 *.swp
 .idea/
