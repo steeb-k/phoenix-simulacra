@@ -39,6 +39,10 @@ pub struct MountRow {
     /// gave no letter to (Microsoft Reserved, an unreadable filesystem, …)
     /// simply don't appear — the table is a list of what you can browse.
     pub letters: Vec<char>,
+    /// Whether this mount has temporary write access enabled (a copy-on-write
+    /// overlay). Shown as a warning chip; read-only mounts show an
+    /// "Enable Write" button instead.
+    pub writable: bool,
 }
 
 /// What the user clicked this frame.
@@ -49,6 +53,8 @@ pub enum MountAction {
     Explore(char),
     /// Unmount the backup at this index in the table's slice.
     Unmount(usize),
+    /// Enable temporary (copy-on-write) write access on the backup at this index.
+    EnableWrite(usize),
 }
 
 const HEADER_H: f32 = 22.0;
@@ -68,6 +74,8 @@ const UNMOUNT_W: f32 = 112.0;
 const NAME_MIN_W: f32 = 130.0;
 const BTN_H: f32 = 30.0;
 const BTN_ROUNDING: f32 = 6.0;
+/// Vertical gap between the stacked Unmount and write-access controls.
+const BTN_GAP: f32 = 8.0;
 /// Leading between the dimmed folder line and the backup's name below it.
 const FOLDER_GAP: f32 = 1.0;
 
@@ -186,7 +194,11 @@ fn card(
     // A mount whose selection exposed no letter at all still gets a row, so it
     // can be seen — and unmounted.
     let sub_rows = row.letters.len().max(1);
-    let height = sub_rows as f32 * SUB_ROW_H + CARD_PAD_Y * 2.0;
+    // The right column stacks the Unmount button over the write-access control,
+    // so the card must be tall enough for both even on a single-letter mount.
+    let action_stack_bottom = CARD_PAD_Y + SUB_ROW_H * 0.5 + BTN_H * 0.5 + BTN_GAP + BTN_H;
+    let height =
+        (sub_rows as f32 * SUB_ROW_H + CARD_PAD_Y * 2.0).max(action_stack_bottom + CARD_PAD_Y);
 
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     ui.painter()
@@ -303,7 +315,55 @@ fn card(
         action = Some(MountAction::Unmount(index));
     }
 
+    // Directly below Unmount: enable temporary write access, or — once enabled —
+    // a static "Writable" indicator. Warning-tinted, because a writable mount is
+    // a scratch layer whose changes are discarded on unmount.
+    let write_rect = Rect::from_min_size(
+        egui::pos2(cols.unmount_x, unmount.bottom() + BTN_GAP),
+        Vec2::new(UNMOUNT_W, BTN_H),
+    );
+    if row.writable {
+        writable_chip(ui, write_rect, index, palette);
+    } else if table_button(
+        ui,
+        write_rect,
+        ui.id().with(("mount_enable_write", index)),
+        egui_phosphor::regular::PENCIL_SIMPLE,
+        "Enable Write",
+        palette.warning,
+        palette,
+    ) {
+        action = Some(MountAction::EnableWrite(index));
+    }
+
     action
+}
+
+/// Static, non-interactive indicator shown in place of the Enable-Write button
+/// once a mount already has temporary write access: a warning-tinted chip. The
+/// hazard colour signals "this is the write-enabled, changes-are-temporary
+/// state".
+fn writable_chip(ui: &mut Ui, rect: Rect, index: usize, palette: &Palette) {
+    let fill = blend(palette.content_card_bg, palette.warning, 0.28);
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(BTN_ROUNDING), fill);
+    painter.rect_stroke(
+        rect,
+        Rounding::same(BTN_ROUNDING),
+        Stroke::new(1.0, palette.warning),
+    );
+    let job = icon_label(
+        egui_phosphor::regular::WARNING,
+        fonts::icon(15.0),
+        "Writable",
+        fonts::regular(13.0),
+        palette.icon_color,
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let pos = rect.center() - galley.size() * 0.5;
+    ui.painter().galley(pos, galley, palette.icon_color);
+    ui.interact(rect, ui.id().with(("writable_chip", index)), Sense::hover())
+        .on_hover_text("Temporary write access is on. Changes go to a scratch layer and are discarded on unmount.");
 }
 
 /// A card-local button: a raised chip against the card fill that tints toward

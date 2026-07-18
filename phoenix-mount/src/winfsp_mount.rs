@@ -431,6 +431,224 @@ impl Drop for WinFspMount {
     }
 }
 
+/// A WinFsp filesystem serving the synthesized image **without** attaching it as
+/// a virtual disk — the building block for a writable overlay.
+///
+/// [`WinFspMount`] serves the image *and* attaches it read-only, so the backup's
+/// own volumes surface with drive letters. A writable overlay instead needs the
+/// served image to be only the read-only *parent* of a differencing disk, with
+/// just the (writable) child attached: attaching the parent too would put a
+/// second disk online carrying the same GPT/partition GUIDs as the child, a
+/// duplicate Windows keeps offline. So this type brings up the filesystem and
+/// hands back the served path, and attaches nothing.
+///
+/// Dropping stops the filesystem and removes the mount directory.
+pub struct WinFspServe {
+    host: FileSystemHost<VhdFs, FineGuard>,
+    mount_point: MountLocation,
+    /// `backup.vhd` or `backup.vhdx`, per the container the backup needed.
+    image_name: &'static str,
+    pub disk_size: u64,
+    /// Partition layout on the synthesized disk, for letter assignment on a
+    /// differencing child attached over this parent.
+    spans: Vec<crate::chunkstore::PartitionSpan>,
+}
+
+impl WinFspServe {
+    /// Bring up the WinFsp filesystem serving `backup`'s synthesized image in
+    /// `scratch_dir`, without attaching a virtual disk. The returned
+    /// [`WinFspServe::image_path`] is the file a differencing disk can name as
+    /// its parent.
+    ///
+    /// `force_vhdx` wraps even a 512e backup in VHDX — required when the served
+    /// image is to be a differencing parent, since a fixed VHD cannot be one.
+    pub fn serve(backup: &Path, scratch_dir: &Path, force_vhdx: bool) -> Result<Self> {
+        ensure_winfsp()?;
+        let reader = PhnxReader::open(backup)?;
+        let backup_id = reader.header.backup_id;
+        let vhd = if force_vhdx {
+            SyntheticVhd::build_vhdx(reader)?
+        } else {
+            SyntheticVhd::build(reader)?
+        };
+        let disk_size = vhd.disk_size();
+        let image_name = vhd.image_name();
+        let spans = vhd.spans().to_vec();
+        let fs = VhdFs::new(vhd)?;
+
+        // Identical volume params to WinFspMount: the served file is the same
+        // read-only synthesized image; only the attach step differs.
+        let mut params = VolumeParams::new();
+        params
+            .sector_size(512)
+            .sectors_per_allocation_unit(1)
+            .file_info_timeout(1000)
+            .case_preserved_names(true)
+            .unicode_on_disk(true)
+            .persistent_acls(true)
+            .read_only_volume(true)
+            .filesystem_name("phoenix-mount");
+
+        let mut host = FileSystemHost::<VhdFs, FineGuard>::new(params, fs)
+            .map_err(|e| PhoenixError::Other(format!("WinFsp host create failed: {e}")))?;
+
+        std::fs::create_dir_all(scratch_dir)?;
+        let mount_dir = scratch_dir.join(format!("serve-{}", backup_id.simple()));
+        let _ = std::fs::remove_dir_all(&mount_dir);
+
+        let mount_point = mount_host(&mut host, mount_dir)?;
+        host.start()
+            .map_err(|e| PhoenixError::Other(format!("WinFsp start failed: {e}")))?;
+
+        Ok(Self {
+            host,
+            mount_point,
+            image_name,
+            disk_size,
+            spans,
+        })
+    }
+
+    /// Path to the served image file — the differencing parent.
+    pub fn image_path(&self) -> PathBuf {
+        self.mount_point.image_dir().join(self.image_name)
+    }
+
+    /// Partition layout on the synthesized disk (for letter assignment).
+    pub fn spans(&self) -> &[crate::chunkstore::PartitionSpan] {
+        &self.spans
+    }
+}
+
+impl Drop for WinFspServe {
+    fn drop(&mut self) {
+        self.host.stop();
+        self.host.unmount();
+        if let MountLocation::Dir(dir) = &self.mount_point {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// A **writable overlay** mount: the backup's synthesized image is served
+/// read-only through WinFsp as a differencing *parent*, and a differencing
+/// *child* (`.avhdx`) on the scratch disk is attached **read-write**. Windows
+/// does the copy-on-write — every write lands in the child, the backup is never
+/// touched — so the mount is writable while the `.phnx` stays immutable and
+/// still verifies, and the footprint grows only with writes.
+///
+/// The child is **ephemeral**: it is deleted on drop (and swept by
+/// [`crate::cleanup_leaked_mounts`] after a crash), so changes are discarded on
+/// unmount. That is the guarantee the UI's hazard warning states.
+pub struct WinFspWritableMount {
+    // Drop order is load-bearing: the RW child must detach (releasing its open
+    // handle on the served parent) BEFORE the parent filesystem is torn down.
+    attached: Option<AttachedDisk>,
+    serve: Option<WinFspServe>,
+    /// The differencing child file, deleted on drop.
+    child_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub disk_size: u64,
+    pub volumes: Vec<crate::letters::MountedVolume>,
+    assigned_letters: Vec<char>,
+}
+
+impl WinFspWritableMount {
+    /// Mount `backup` WRITABLE with a copy-on-write overlay. `selection` holds
+    /// the backup partition indices to expose; `preferred_letters` maps a
+    /// partition index to the drive letter it should get if that letter is free
+    /// (used to preserve letters when converting a read-only mount in place) —
+    /// anything unmatched falls back to first-free.
+    pub fn mount_selected(
+        backup: &Path,
+        scratch_dir: &Path,
+        selection: &[u32],
+        preferred_letters: &[(u32, char)],
+    ) -> Result<Self> {
+        ensure_winfsp()?;
+
+        // Refuse locked BitLocker partitions: their image is raw ciphertext, so
+        // writing through the overlay would corrupt the volume's own crypto.
+        let reader = PhnxReader::open(backup)?;
+        let backup_id = reader.header.backup_id;
+        for pm in &reader.manifest.partitions {
+            if selection.contains(&pm.index) && pm.bitlocker.as_deref() == Some("locked") {
+                return Err(PhoenixError::Other(format!(
+                    "partition {} is a locked BitLocker volume, so write access is unavailable — \
+                     its captured data is raw ciphertext. Unlock BitLocker before backing up to \
+                     mount it writable.",
+                    pm.index
+                )));
+            }
+        }
+        drop(reader);
+
+        // Serve the backup as a read-only differencing PARENT (forced VHDX, since
+        // a fixed VHD cannot be a differencing parent).
+        let serve = WinFspServe::serve(backup, scratch_dir, true)?;
+        let parent_path = serve.image_path();
+        let disk_size = serve.disk_size;
+        let spans = serve.spans().to_vec();
+
+        // Create the ephemeral differencing CHILD on the scratch disk. Keyed by
+        // backup_id like the serve-/mount- junctions, so crash cleanup can find
+        // all of a mount's artifacts together.
+        let child_path = scratch_dir.join(format!("child-{}.avhdx", backup_id.simple()));
+        let _ = std::fs::remove_file(&child_path);
+        let parent_str = parent_path
+            .to_str()
+            .ok_or_else(|| PhoenixError::Other("non-UTF-8 served parent path".into()))?;
+        let child_str = child_path
+            .to_str()
+            .ok_or_else(|| PhoenixError::Other("non-UTF-8 child path".into()))?;
+        crate::attach::create_differencing_vhdx(child_str, parent_str)?;
+
+        // Attach the child READ-WRITE with no drive letters, then expose only the
+        // selected partitions (reusing prior letters where possible). On any
+        // failure past this point, delete the orphaned child.
+        let attached = AttachedDisk::attach_readwrite_opts(child_str, false).inspect_err(|_| {
+            let _ = std::fs::remove_file(&child_path);
+        })?;
+        let disk = match attached.physical_drive_number() {
+            Ok(d) => d,
+            Err(e) => {
+                drop(attached);
+                let _ = std::fs::remove_file(&child_path);
+                return Err(e);
+            }
+        };
+        let (volumes, assigned_letters) = crate::letters::expose_selected_with_letters(
+            disk,
+            &spans,
+            selection,
+            preferred_letters,
+        )?;
+
+        Ok(Self {
+            attached: Some(attached),
+            serve: Some(serve),
+            child_path,
+            backup_path: backup.to_path_buf(),
+            disk_size,
+            volumes,
+            assigned_letters,
+        })
+    }
+}
+
+impl Drop for WinFspWritableMount {
+    fn drop(&mut self) {
+        // Remove assigned letters while the volumes still exist…
+        crate::letters::remove_letters(&self.assigned_letters);
+        // …detach the RW child (releases its handle on the served parent)…
+        self.attached.take();
+        // …tear down the parent filesystem…
+        self.serve.take();
+        // …then delete the ephemeral diff so writes never persist.
+        let _ = std::fs::remove_file(&self.child_path);
+    }
+}
+
 /// Initialize WinFsp once per process. `winfsp_init` loads winfsp-<arch>.dll
 /// from the WinFsp install directory (via the registry) so the delay-loaded
 /// symbols resolve; it must run before any other WinFsp call. The token it

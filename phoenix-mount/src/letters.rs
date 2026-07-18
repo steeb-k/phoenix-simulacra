@@ -52,6 +52,20 @@ pub fn expose_selected(
     spans: &[PartitionSpan],
     selected: &[u32],
 ) -> Result<(Vec<MountedVolume>, Vec<char>)> {
+    expose_selected_with_letters(disk_number, spans, selected, &[])
+}
+
+/// Like [`expose_selected`], but each `(partition_index, letter)` in
+/// `preferred` requests that specific drive letter for that partition when it
+/// is free — used to preserve a read-only mount's letters when converting it to
+/// a writable overlay in place. Unmatched partitions (or a preferred letter
+/// that is taken) fall back to the first free letter.
+pub fn expose_selected_with_letters(
+    disk_number: u32,
+    spans: &[PartitionSpan],
+    selected: &[u32],
+    preferred: &[(u32, char)],
+) -> Result<(Vec<MountedVolume>, Vec<char>)> {
     let volumes = wait_for_volumes(disk_number);
     let mut out = Vec::new();
     let mut letters = Vec::new();
@@ -59,9 +73,13 @@ pub fn expose_selected(
         if !selected.contains(&span.partition_index) {
             continue;
         }
+        let want = preferred
+            .iter()
+            .find(|(p, _)| *p == span.partition_index)
+            .map(|(_, l)| *l);
         let vol = volumes.iter().find(|v| v.start_offset == span.disk_offset);
         let letter = match vol {
-            Some(v) => match assign_free_letter(&v.guid_path) {
+            Some(v) => match assign_letter_preferring(&v.guid_path, want) {
                 Ok(l) => Some(l),
                 Err(e) => {
                     tracing::warn!(
@@ -211,6 +229,26 @@ pub(crate) fn free_letters() -> impl Iterator<Item = char> {
     (3..26u32)
         .filter(move |i| in_use & (1 << i) == 0)
         .map(|i| (b'A' + i as u8) as char)
+}
+
+/// Assign `preferred` to `guid_path` if it is currently free; otherwise (or if
+/// no preference was given) assign the first free letter. Lets a writable
+/// remount keep the read-only mount's letters when nothing else has claimed
+/// them in the meantime, without ever failing just because a letter moved.
+fn assign_letter_preferring(guid_path: &[u16], preferred: Option<char>) -> Result<char> {
+    if let Some(letter) = preferred {
+        let up = letter.to_ascii_uppercase();
+        let idx = (up as u8).wrapping_sub(b'A') as u32;
+        let in_use = unsafe { GetLogicalDrives() };
+        if idx < 26 && in_use & (1 << idx) == 0 {
+            let mount_point: Vec<u16> = format!("{up}:\\").encode_utf16().chain([0]).collect();
+            if unsafe { SetVolumeMountPointW(mount_point.as_ptr(), guid_path.as_ptr()) } != 0 {
+                return Ok(up);
+            }
+            // Raced or refused — fall through to first-free.
+        }
+    }
+    assign_free_letter(guid_path)
 }
 
 /// Assign the first free drive letter (D: onward) to `guid_path`

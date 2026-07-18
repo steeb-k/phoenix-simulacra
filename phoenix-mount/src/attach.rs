@@ -11,10 +11,12 @@ use phoenix_core::error::{PhoenixError, Result};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::Vhd::{
-    AttachVirtualDisk, GetVirtualDiskPhysicalPath, OpenVirtualDisk,
+    AttachVirtualDisk, CreateVirtualDisk, GetVirtualDiskPhysicalPath, OpenVirtualDisk,
     ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
-    ATTACH_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
-    VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE,
+    ATTACH_VIRTUAL_DISK_PARAMETERS, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
+    CREATE_VIRTUAL_DISK_VERSION_2, OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
+    VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO,
+    VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
 };
 
 // VIRTUAL_STORAGE_TYPE_DEVICE_UNKNOWN = 0 — let the API detect VHD vs VHDX
@@ -111,6 +113,74 @@ impl AttachedDisk {
         Ok(Self { handle })
     }
 
+    /// Open `vhd_path` and attach it **read-write** — the writable overlay's
+    /// differencing child. `RWDepth = 1` opens only the top of the chain (the
+    /// child) writable and any parent(s) read-only, which is the copy-on-write
+    /// guarantee: the parent (our synthesized backup image) is never written.
+    /// With `auto_drive_letters: false` the disk attaches with NO drive letters,
+    /// so the caller assigns them selectively (see [`crate::letters`]).
+    pub fn attach_readwrite_opts(vhd_path: &str, auto_drive_letters: bool) -> Result<Self> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(vhd_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let storage_type = VIRTUAL_STORAGE_TYPE {
+            DeviceId: STORAGE_TYPE_DEVICE_UNKNOWN,
+            VendorId: vendor_unknown(),
+        };
+
+        let mut handle: HANDLE = INVALID_HANDLE_VALUE;
+        let mut open_params: OPEN_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
+        open_params.Version = 1; // OPEN_VIRTUAL_DISK_VERSION_1
+        open_params.Anonymous.Version1.RWDepth = RW_DEPTH_DEFAULT;
+        let rc = unsafe {
+            OpenVirtualDisk(
+                &storage_type,
+                wide.as_ptr(),
+                VIRTUAL_DISK_ACCESS_ATTACH_RW | VIRTUAL_DISK_ACCESS_GET_INFO,
+                OPEN_VIRTUAL_DISK_FLAG_NONE,
+                &open_params,
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(PhoenixError::Disk(format!(
+                "OpenVirtualDisk (read-write) failed for {vhd_path} (Win32 error {})",
+                describe_vhd_error(rc)
+            )));
+        }
+
+        let attach_params = ATTACH_VIRTUAL_DISK_PARAMETERS {
+            Version: 1, // ATTACH_VIRTUAL_DISK_VERSION_1
+            Anonymous: unsafe { std::mem::zeroed() },
+        };
+        // No READ_ONLY flag: this attach is writable.
+        let mut flags: i32 = 0; // ATTACH_VIRTUAL_DISK_FLAG_NONE
+        if !auto_drive_letters {
+            flags |= ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER;
+        }
+        let rc = unsafe {
+            AttachVirtualDisk(
+                handle,
+                std::ptr::null_mut(),
+                flags,
+                0,
+                &attach_params,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            unsafe { CloseHandle(handle) };
+            return Err(PhoenixError::Disk(format!(
+                "AttachVirtualDisk (read-write) failed for {vhd_path} (Win32 error {}). Mounting \
+                 requires Administrator.",
+                describe_vhd_error(rc)
+            )));
+        }
+        Ok(Self { handle })
+    }
+
     /// Physical drive number (`N` in `\\.\PhysicalDriveN`) of the attached
     /// disk, for correlating its volumes via disk-extent queries.
     pub fn physical_drive_number(&self) -> Result<u32> {
@@ -153,4 +223,75 @@ fn vendor_unknown() -> GUID {
         data3: 0,
         data4: [0; 8],
     }
+}
+
+/// VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT — {ec984aec-a0f9-47e9-901f-71415a66345b}.
+/// Differencing-disk creation names the parent's storage type explicitly.
+fn vendor_microsoft() -> GUID {
+    GUID {
+        data1: 0xec98_4aec,
+        data2: 0xa0f9,
+        data3: 0x47e9,
+        data4: [0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b],
+    }
+}
+
+/// Create a differencing VHDX `child` whose parent is `parent`, via
+/// `CreateVirtualDisk`. The child inherits size and sector geometry from the
+/// parent (we leave those fields zero) and starts a few MiB, growing only with
+/// writes — the ephemeral scratch layer of a writable overlay.
+///
+/// `parent` may be an ordinary file or one served by a user-mode filesystem
+/// (WinFsp): Windows reads it through the same file API either way, so the
+/// footprint-free on-demand parent works as a differencing parent unchanged.
+pub fn create_differencing_vhdx(child: &str, parent: &str) -> Result<()> {
+    let child_w: Vec<u16> = std::ffi::OsStr::new(child)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let parent_w: Vec<u16> = std::ffi::OsStr::new(parent)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let storage_type = VIRTUAL_STORAGE_TYPE {
+        DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        VendorId: vendor_microsoft(),
+    };
+
+    // SAFETY: a zeroed Version2 is "dynamic, provider defaults"; we then set only
+    // the parent, which is what makes it a differencing disk. Every Version2
+    // field is a pointer/int/GUID/POD for which all-zero is valid.
+    let mut params: CREATE_VIRTUAL_DISK_PARAMETERS = unsafe { std::mem::zeroed() };
+    params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+    params.Anonymous.Version2.ParentPath = parent_w.as_ptr();
+    params.Anonymous.Version2.ParentVirtualStorageType = storage_type;
+
+    let mut handle: HANDLE = std::ptr::null_mut();
+    // SAFETY: pointers outlive the call; both wide paths are NUL-terminated; the
+    // optional security-descriptor / overlapped pointers are null.
+    let rc = unsafe {
+        CreateVirtualDisk(
+            &storage_type,
+            child_w.as_ptr(),
+            VIRTUAL_DISK_ACCESS_NONE,
+            std::ptr::null_mut(),
+            CREATE_VIRTUAL_DISK_FLAG_NONE,
+            0,
+            &params,
+            std::ptr::null(),
+            &mut handle,
+        )
+    };
+    if rc != 0 {
+        return Err(PhoenixError::Disk(format!(
+            "CreateVirtualDisk (differencing) failed for {child} over parent {parent} \
+             (Win32 error {})",
+            describe_vhd_error(rc)
+        )));
+    }
+    if !handle.is_null() {
+        unsafe { CloseHandle(handle) };
+    }
+    Ok(())
 }

@@ -44,4 +44,37 @@ pub use letters::MountedVolume;
 pub use session::MountSession;
 pub use synthetic::SyntheticVhd;
 #[cfg(all(windows, feature = "winfsp"))]
-pub use winfsp_mount::WinFspMount;
+pub use winfsp_mount::{WinFspMount, WinFspServe, WinFspWritableMount};
+
+/// The scratch directory mounts use for transient state — WinFsp mount-point
+/// junctions and the writable overlay's differencing children. Callers pass
+/// this into the mount entry points; [`cleanup_leaked_mounts`] sweeps it at
+/// startup. Factored here so the CLI and GUI agree on one location.
+pub fn mount_scratch_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("PhoenixSimulacra").join("mounts")
+}
+
+/// Reclaim mount artifacts left behind by a previous **crashed** run.
+///
+/// A clean unmount removes everything via `Drop`. A crash cannot: what remains
+/// under the scratch dir is stale WinFsp junctions (`mount-*` / `serve-*`) and
+/// orphaned writable-overlay children (`child-*.avhdx`). The attached virtual
+/// disks are already gone — we never request `PERMANENT_LIFETIME`, so Windows
+/// auto-detaches them when the owning process dies — so reclaiming is just
+/// deleting the leftover files and junctions. Best-effort and quiet; call once
+/// at startup, before any new mount.
+pub fn cleanup_leaked_mounts(scratch_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(scratch_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir && (name.starts_with("mount-") || name.starts_with("serve-")) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else if !is_dir && name.starts_with("child-") && name.ends_with(".avhdx") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}

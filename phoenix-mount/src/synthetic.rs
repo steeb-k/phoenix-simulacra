@@ -57,7 +57,23 @@ pub struct SyntheticVhd {
 impl SyntheticVhd {
     /// Build the synthesized disk from an opened backup. Consumes the reader
     /// (the chunk store owns it for on-demand reads).
+    ///
+    /// A 512e backup is wrapped in a fixed VHD; a 4Kn backup requires VHDX. Use
+    /// [`SyntheticVhd::build_vhdx`] when the caller specifically needs a VHDX
+    /// container regardless of sector size (e.g. a writable-overlay parent — a
+    /// fixed VHD cannot be a differencing parent).
     pub fn build(reader: PhnxReader) -> Result<Self> {
+        Self::build_inner(reader, false)
+    }
+
+    /// Like [`SyntheticVhd::build`], but always wraps the image in VHDX even for
+    /// a 512e backup. Required for the writable overlay: only a VHDX can be named
+    /// as the parent of a Windows differencing disk.
+    pub fn build_vhdx(reader: PhnxReader) -> Result<Self> {
+        Self::build_inner(reader, true)
+    }
+
+    fn build_inner(reader: PhnxReader, force_vhdx: bool) -> Result<Self> {
         // The synthesized disk must advertise the SOURCE disk's sector size. A
         // volume captured from a 4Kn disk records `BytesPerSector = 4096` in its
         // own boot sector, and NTFS refuses to mount when the filesystem's sector
@@ -82,8 +98,10 @@ impl SyntheticVhd {
 
         // A fixed VHD cannot say what its sector size is — 512 is the format, not
         // a field — so 4Kn must go through VHDX. VHDX also has no 2040 GiB ceiling,
-        // which is the other thing that used to make a mount simply refuse.
-        let container = if sector_size == 512 {
+        // which is the other thing that used to make a mount simply refuse. And a
+        // fixed VHD cannot be a differencing parent, so `force_vhdx` routes a 512e
+        // backup through VHDX too when the caller needs a writable-overlay parent.
+        let container = if sector_size == 512 && !force_vhdx {
             if disk_size > VHD_MAX_BYTES {
                 return Err(PhoenixError::Other(format!(
                     "backup describes a {disk_size}-byte disk, larger than the \
@@ -104,7 +122,21 @@ impl SyntheticVhd {
 
         // Synthesize the GPT + footer from the layout while we still hold the
         // reader's index.
-        let disk_guid = *reader.header.backup_id.as_bytes();
+        //
+        // A writable overlay gets a DISTINCT GPT identity (disk GUID + the
+        // partition unique GUIDs derived from it). Otherwise it would carry the
+        // same backup_id-derived GPT GUID as a read-only mount of the same
+        // backup — and the GUI enables write by ejecting the read-only mount and
+        // immediately attaching this one, so the two same-GUID disks briefly
+        // coexist while the old one detaches. Windows keeps the newcomer offline
+        // in that window, and its volume never surfaces (no drive letter). A
+        // different identity sidesteps the collision entirely; the mounted data
+        // is unaffected (the NTFS volume's own id lives in its boot sector).
+        let disk_guid = if force_vhdx {
+            writable_overlay_guid(reader.header.backup_id.as_bytes())
+        } else {
+            *reader.header.backup_id.as_bytes()
+        };
         let parts: Vec<GptPart> = spans
             .iter()
             .map(|s| {
@@ -308,6 +340,19 @@ fn align_up(v: u64, a: u64) -> u64 {
     } else {
         v.div_ceil(a) * a
     }
+}
+
+/// A distinct 16-byte disk GUID for a writable overlay, derived from the
+/// backup id so it is stable per backup yet never equal to the read-only mount's
+/// GUID (which is the backup id itself). Keeps a just-ejected read-only disk and
+/// this one from colliding while the old one finishes detaching.
+fn writable_overlay_guid(backup_id: &[u8; 16]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(backup_id);
+    hasher.update(b"phoenix-writable-overlay");
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[0..16]);
+    out
 }
 
 /// Deterministic 16-byte GUID from the disk GUID + partition index (for the

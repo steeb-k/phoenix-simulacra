@@ -11,9 +11,18 @@ use std::path::Path;
 
 use phoenix_core::error::Result;
 
+/// The live WinFsp mount behind an [`ActiveMount`]: read-only, or a writable
+/// copy-on-write overlay. Both expose the same `disk_size` / `volumes` /
+/// `backup_path` surface.
+#[cfg(feature = "winfsp")]
+enum WinfspInner {
+    ReadOnly(crate::winfsp_mount::WinFspMount),
+    Writable(crate::winfsp_mount::WinFspWritableMount),
+}
+
 pub struct ActiveMount {
     #[cfg(feature = "winfsp")]
-    inner: crate::winfsp_mount::WinFspMount,
+    inner: WinfspInner,
     #[cfg(not(feature = "winfsp"))]
     inner: crate::session::MountSession,
 }
@@ -34,27 +43,109 @@ impl ActiveMount {
         selection: Option<&[u32]>,
     ) -> Result<Self> {
         #[cfg(feature = "winfsp")]
-        let inner =
-            crate::winfsp_mount::WinFspMount::mount_selected(backup, scratch_dir, selection)?;
+        let inner = WinfspInner::ReadOnly(crate::winfsp_mount::WinFspMount::mount_selected(
+            backup, scratch_dir, selection,
+        )?);
         #[cfg(not(feature = "winfsp"))]
         let inner = crate::session::MountSession::mount_selected(backup, scratch_dir, selection)?;
         Ok(Self { inner })
     }
 
+    /// Mount `backup` **writable** with a copy-on-write overlay: the backup is
+    /// served read-only as a differencing parent and all writes land in an
+    /// ephemeral child, so the `.phnx` is never touched and changes are
+    /// discarded on unmount. `selection` holds the partition indices to expose;
+    /// `preferred_letters` maps a partition index to the drive letter it should
+    /// keep if free (to preserve letters when converting a read-only mount).
+    ///
+    /// Only the `winfsp` build supports this — the materialize fallback cannot
+    /// do a zero-footprint writable overlay.
+    #[cfg(feature = "winfsp")]
+    pub fn open_writable_selected(
+        backup: &Path,
+        scratch_dir: &Path,
+        selection: &[u32],
+        preferred_letters: &[(u32, char)],
+    ) -> Result<Self> {
+        let inner = crate::winfsp_mount::WinFspWritableMount::mount_selected(
+            backup,
+            scratch_dir,
+            selection,
+            preferred_letters,
+        )?;
+        Ok(Self {
+            inner: WinfspInner::Writable(inner),
+        })
+    }
+
+    #[cfg(not(feature = "winfsp"))]
+    pub fn open_writable_selected(
+        _backup: &Path,
+        _scratch_dir: &Path,
+        _selection: &[u32],
+        _preferred_letters: &[(u32, char)],
+    ) -> Result<Self> {
+        Err(phoenix_core::error::PhoenixError::Other(
+            "writable mounts require the WinFsp build".into(),
+        ))
+    }
+
     /// Size of the mounted virtual disk in bytes.
     pub fn disk_size(&self) -> u64 {
-        self.inner.disk_size
+        #[cfg(feature = "winfsp")]
+        {
+            match &self.inner {
+                WinfspInner::ReadOnly(m) => m.disk_size,
+                WinfspInner::Writable(m) => m.disk_size,
+            }
+        }
+        #[cfg(not(feature = "winfsp"))]
+        {
+            self.inner.disk_size
+        }
     }
 
     /// Per-partition exposure of a selection mount (empty for `None` mounts:
     /// letters were assigned by Windows, not tracked here).
     pub fn volumes(&self) -> &[crate::letters::MountedVolume] {
-        &self.inner.volumes
+        #[cfg(feature = "winfsp")]
+        {
+            match &self.inner {
+                WinfspInner::ReadOnly(m) => &m.volumes,
+                WinfspInner::Writable(m) => &m.volumes,
+            }
+        }
+        #[cfg(not(feature = "winfsp"))]
+        {
+            &self.inner.volumes
+        }
     }
 
     /// Path of the backup that is mounted.
     pub fn backup_path(&self) -> &Path {
-        &self.inner.backup_path
+        #[cfg(feature = "winfsp")]
+        {
+            match &self.inner {
+                WinfspInner::ReadOnly(m) => &m.backup_path,
+                WinfspInner::Writable(m) => &m.backup_path,
+            }
+        }
+        #[cfg(not(feature = "winfsp"))]
+        {
+            &self.inner.backup_path
+        }
+    }
+
+    /// Whether this mount is a writable copy-on-write overlay (vs read-only).
+    pub fn is_writable(&self) -> bool {
+        #[cfg(feature = "winfsp")]
+        {
+            matches!(self.inner, WinfspInner::Writable(_))
+        }
+        #[cfg(not(feature = "winfsp"))]
+        {
+            false
+        }
     }
 
     /// Whether this build mounts with no meaningful extra disk footprint.

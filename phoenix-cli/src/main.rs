@@ -244,7 +244,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Result<()> {
-    let scratch = std::env::temp_dir().join("PhoenixSimulacra").join("mounts");
+    let scratch = phoenix_mount::mount_scratch_dir();
+    // Reclaim anything a previous crashed run left behind before mounting anew.
+    phoenix_mount::cleanup_leaked_mounts(&scratch);
     if phoenix_mount::ActiveMount::space_efficient() {
         println!("Mounting {} (read-only, on-demand)…", backup.display());
     } else {
