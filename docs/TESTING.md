@@ -221,7 +221,7 @@ Some behavior can't be automated safely on a build machine: backing up and cloni
 ## Integrity guarantees (what the tests protect)
 
 - **`verify` command** — re-hashes every chunk against the per-chunk BLAKE3 manifest, plus format-v2 metadata checksums. `verify --quick` = structure + sample.
-- **verify-after-backup** (default on) — immediately re-reads the **source** (snapshot/lock still held) and confirms every chunk matches. Proves the image faithfully captured the disk. Opt out with `backup --no-verify`.
+- **verify-after-backup** (default on) — the CLI and the test suites immediately re-read the **source** (snapshot/lock still held) and confirm every chunk matches, proving the image faithfully captured the disk; opt out with `backup --no-verify`. The GUI releases the source first and instead decompresses and BLAKE3-checks every chunk of the written image — the same check as a standalone full verify.
 - **verify-on-restore** (default on) — re-hashes chunks before writing them.
 - **Fixture round-trips** (T2/T3) — a known, independently-hashed fixture compared after a full round-trip; validates the *engine's* correctness, which a self-referential `verify` structurally cannot.
 - **Loud failure on short reads** — capture errors rather than silently dropping a used extent that reads 0 bytes.

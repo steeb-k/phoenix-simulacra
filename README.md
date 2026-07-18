@@ -10,7 +10,7 @@ Phoenix Simulacra images the partitions you pick into a single compressed `.phnx
 
 - **Backs up only what's used.** NTFS, FAT, and exFAT partitions are captured used-blocks-only, so images stay close to the size of your data, not the size of the disk.
 - **Backs up live systems.** Idle volumes are captured under an exclusive lock; busy ones (like the running `C:`) automatically go through a VSS snapshot. There's no switch to get wrong — the engine picks the strongest freeze the volume allows, and refuses to capture anything it can't freeze.
-- **Verifies its own work.** Every chunk is BLAKE3-hashed, and by default a backup finishes by re-reading the source and confirming the image matches it — proving the backup is faithful, not just internally consistent.
+- **Verifies its own work.** Every chunk is BLAKE3-hashed, and by default every backup ends with a full verification pass — the CLI re-reads the source and confirms the image matches it; the GUI re-checks every chunk of the written image.
 - **Restores with resizing.** Grow or shrink partitions during restore, with a drag-and-drop layout editor in the GUI and an editable plan file in the CLI.
 - **Clones disk-to-disk.** Full or partial, with resizing, straight from a live system.
 - **Mounts backups in place.** Browse a `.phnx` in Explorer with drive letters and essentially zero extra disk space, read-only or with a writable copy-on-write overlay. (Requires [WinFsp](https://winfsp.dev); the installer sets it up.)
