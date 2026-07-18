@@ -1,5 +1,7 @@
 # Phoenix Simulacra
 
+**[⬇ Download the latest release](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)** — installer and portable ZIP, x64 + ARM64 in one download.
+
 A disk backup, restore, and cloning tool for Windows, written in Rust.
 
 Phoenix Simulacra images the partitions you pick into a single compressed `.phnx` file, restores them with resizing, clones disk-to-disk (running system disk included), and lets you browse a backup's files in Explorer without extracting anything. It runs on Windows x64 and ARM64, with the same features on both.
