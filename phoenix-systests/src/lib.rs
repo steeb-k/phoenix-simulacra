@@ -975,15 +975,28 @@ impl AttachedRw {
     /// a differencing chain (the child) writable and any parent(s) read-only —
     /// exactly the copy-on-write guarantee.
     pub fn attach(vhdx_path: &Path) -> Result<Self> {
+        Self::attach_with_letters(vhdx_path, true)
+    }
+
+    /// As [`AttachedRw::attach`], but with `ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER`:
+    /// the disk attaches read-write but the mount manager assigns no letters.
+    /// The VM write-path spike uses this so the host never surfaces the guest's
+    /// volumes (pair it with [`set_disk_offline`] before touching the raw device).
+    pub fn attach_no_letters(vhdx_path: &Path) -> Result<Self> {
+        Self::attach_with_letters(vhdx_path, false)
+    }
+
+    fn attach_with_letters(vhdx_path: &Path, letters: bool) -> Result<Self> {
         use std::os::windows::ffi::OsStrExt;
 
         use windows_sys::core::GUID;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::Vhd::{
             AttachVirtualDisk, OpenVirtualDisk, ATTACH_VIRTUAL_DISK_FLAG_NONE,
-            ATTACH_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_FLAG_NONE,
-            OPEN_VIRTUAL_DISK_PARAMETERS, VIRTUAL_DISK_ACCESS_ATTACH_RW,
-            VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_PARAMETERS,
+            OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
+            VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE,
+            VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
         };
 
         const VENDOR_MICROSOFT: GUID = GUID {
@@ -1020,8 +1033,12 @@ impl AttachedRw {
             );
         }
 
-        // Read-WRITE attach (no READ_ONLY flag), auto drive letters (no
-        // NO_DRIVE_LETTER flag).
+        // Read-WRITE attach (no READ_ONLY flag); drive letters per `letters`.
+        let flags = if letters {
+            ATTACH_VIRTUAL_DISK_FLAG_NONE
+        } else {
+            ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER
+        };
         let attach = ATTACH_VIRTUAL_DISK_PARAMETERS {
             Version: 1, // ATTACH_VIRTUAL_DISK_VERSION_1
             Anonymous: unsafe { std::mem::zeroed() },
@@ -1030,7 +1047,7 @@ impl AttachedRw {
             AttachVirtualDisk(
                 handle,
                 std::ptr::null_mut(),
-                ATTACH_VIRTUAL_DISK_FLAG_NONE,
+                flags,
                 0,
                 &attach,
                 std::ptr::null_mut(),
@@ -1074,6 +1091,59 @@ impl Drop for AttachedRw {
             unsafe { CloseHandle(self.handle) };
         }
     }
+}
+
+/// Force `\\.\PhysicalDrive{drive_number}` OFFLINE (non-persistent). An offline
+/// disk has no mounted volumes, which both keeps the host's filesystem stack off
+/// the guest's disk and lifts the raw-sector write protection Windows applies
+/// over mounted-volume extents — the state a VM's raw passthrough needs.
+pub fn set_disk_offline(drive_number: u32) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Ioctl::{
+        DISK_ATTRIBUTE_OFFLINE, IOCTL_DISK_SET_DISK_ATTRIBUTES, SET_DISK_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let path = format!(r"\\.\PhysicalDrive{drive_number}");
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+        .open(&path)
+        .with_context(|| format!("open {path} to set it offline"))?;
+
+    // SAFETY: all-zero is valid for this POD struct; we then set the header and
+    // the offline attribute + mask. Persist=0 keeps the change attach-scoped.
+    let mut attrs: SET_DISK_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    attrs.Version = std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32;
+    attrs.Attributes = DISK_ATTRIBUTE_OFFLINE as u64;
+    attrs.AttributesMask = DISK_ATTRIBUTE_OFFLINE as u64;
+
+    let mut returned = 0u32;
+    // SAFETY: the handle is open, the in-buffer outlives the call, out-buffer is
+    // unused for this IOCTL, and `returned` receives the (zero) out length.
+    let ok = unsafe {
+        DeviceIoControl(
+            disk.as_raw_handle() as _,
+            IOCTL_DISK_SET_DISK_ATTRIBUTES,
+            (&attrs as *const SET_DISK_ATTRIBUTES).cast(),
+            std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        bail!(
+            "IOCTL_DISK_SET_DISK_ATTRIBUTES(offline) failed for {path} \
+             (os error {})",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }
 
 /// Clean up any leaked VHDs from a previous crashed run: detach every attached
