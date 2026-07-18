@@ -1,6 +1,6 @@
 # Phoenix Simulacra
 
-**[⬇ Download the latest release](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)** — installer and portable ZIP, x64 + ARM64 in one download.
+**[Download the latest release](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)** — installer and portable ZIP, x64 + ARM64 in one download.
 
 A disk backup, restore, and cloning tool for Windows, written in Rust.
 
