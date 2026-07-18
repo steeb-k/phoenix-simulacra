@@ -1,4 +1,6 @@
-# Publish built artifacts to the PUBLIC binaries repo as a GitHub Release.
+# Publish built artifacts to the PUBLIC binaries repo as a GitHub Release,
+# and mirror a SOURCE release (tag + release notes linking to the binaries
+# page) on the code repo — every full release ships as that pair.
 #
 # This is the counterpart to build-installer.ps1: build first (which produces a
 # signed dist/Simulacra-Setup-<ver>.exe plus dist/simulacra/ and the verified
@@ -174,7 +176,45 @@ if ($exists) {
     if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)" }
 }
 
-# --- 6. Report -----------------------------------------------------------------
+# --- 6. Mirror a source release on the code repo -------------------------------
+# Every full release ships as a PAIR: the binaries release above plus a source
+# release here (annotated tag + GitHub release whose notes link to the binaries
+# page), so the public code repo's releases page tracks the same cycle. Stopgap
+# releases (-ZipOnly / -PreRelease) stay binaries-only; -Draft mirrors as a
+# draft. The tag lands on the current HEAD — publish from the version-bump
+# commit.
+$SourceRepo = "steeb-k/phoenix-simulacra"
+$binariesUrl = "https://github.com/$Target/releases/tag/$tag"
+if ($ZipOnly -or $PreRelease) {
+    Write-Host "== Skipping source release on $SourceRepo (ZipOnly/PreRelease is a stopgap, binaries-only)" -ForegroundColor DarkGray
+} else {
+    & gh release view $tag -R $SourceRepo 1>$null 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "== Source release $tag already exists on $SourceRepo; leaving it as is" -ForegroundColor Yellow
+    } else {
+        & git rev-parse -q --verify "refs/tags/$tag" 1>$null 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            & git tag -a $tag -m "Phoenix Simulacra $version"
+            if ($LASTEXITCODE -ne 0) { throw "git tag $tag failed" }
+        }
+        & git push origin $tag
+        if ($LASTEXITCODE -ne 0) { throw "git push origin $tag failed" }
+        $srcNotes = "Source code for Phoenix Simulacra $version.`n`n" +
+                    "Installer and portable bundle: $binariesUrl"
+        $srcArgs = @(
+            "release", "create", $tag,
+            "-R", $SourceRepo,
+            "--title", "Phoenix Simulacra $version",
+            "--notes", $srcNotes
+        )
+        if ($Draft) { $srcArgs += "--draft" }
+        & gh @srcArgs
+        if ($LASTEXITCODE -ne 0) { throw "gh release create on $SourceRepo failed ($LASTEXITCODE)" }
+        Write-Host "== Published source release $tag on $SourceRepo" -ForegroundColor Green
+    }
+}
+
+# --- 7. Report -----------------------------------------------------------------
 $url = (& gh release view $tag -R $Target --json url -q .url)
 Write-Host ""
 Write-Host "Published $tag$(if ($Draft) { ' (draft)' }): $url" -ForegroundColor Green
