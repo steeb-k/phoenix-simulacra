@@ -49,7 +49,10 @@ use phoenix_core::ProgressHandle;
 use phoenix_restore::restore::RestoreOptions;
 
 use crate::confirm_dialog::{ConfirmAck, ConfirmAction, ConfirmView};
-use crate::job::{spawn_backup, spawn_clone, spawn_restore, spawn_verify, BackgroundJob, JobKind};
+use crate::job::{
+    spawn_backup, spawn_boot_repair, spawn_clone, spawn_restore, spawn_verify, BackgroundJob,
+    JobKind,
+};
 use crate::sidebar::Page;
 use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView, Verdict};
 use crate::theme::Palette;
@@ -592,6 +595,21 @@ struct PendingRestore {
     ack: bool,
 }
 
+/// A boot repair parked while its confirmation dialog is up. The dialog
+/// restates the planned actions; when the target is the disk this machine is
+/// running from, Confirm is additionally gated on an acknowledgement
+/// checkbox (`ack`).
+struct PendingBootRepair {
+    disk_index: u32,
+    partition_index: u32,
+    message: String,
+    details: Vec<String>,
+    subject: JobSubject,
+    /// True when the target is the live system disk.
+    system_disk: bool,
+    ack: bool,
+}
+
 /// The two ends of the running job, named the way a person would name them
 /// ("Samsung SSD 990 PRO (Disk 1)", `D:\Backups\work.phnx`).
 ///
@@ -628,6 +646,13 @@ const CONVERSION_ACK_LABEL: &str =
     "I understand this rewrites filesystem metadata, and the result is a converted copy — \
      not an identical one.";
 
+/// Acknowledgement gating a boot repair aimed at the disk this machine is
+/// currently running from — the one case where "only the selected drive is
+/// modified" still means the live system's own boot files.
+const BOOT_REPAIR_SYSTEM_ACK_LABEL: &str =
+    "I understand this rewrites the boot files of the Windows installation this PC is \
+     currently running.";
+
 /// Detail lines describing a pending 4Kn → 512e conversion, appended to the
 /// hazard dialog's details under the standard wrong-disk block (Alerts D/E).
 fn conversion_detail_lines(report: &phoenix_core::sector::ConversionReport) -> Vec<String> {
@@ -650,6 +675,31 @@ fn conversion_detail_lines(report: &phoenix_core::sector::ConversionReport) -> V
     }
     lines
 }
+
+/// Whether a source layout could produce a bootable Windows disk — drives the
+/// default of the "repair boot files" checkbox on the Clone and Restore
+/// pages. GPT needs an EFI System Partition plus a Windows-capable data
+/// partition; MBR just needs the latter (the repair sets the active flag
+/// itself). A wrong guess is harmless — the checkbox stays editable, and the
+/// repair pass reports "no Windows installation found" rather than failing.
+fn source_looks_bootable(source: &DiskInfo) -> bool {
+    use phoenix_core::disk::FilesystemKind as F;
+    let has_windows_capable = source
+        .partitions
+        .iter()
+        .any(|p| matches!(p.fs_kind, F::Ntfs | F::Bitlocker));
+    let has_esp = source.partitions.iter().any(|p| {
+        p.fs_kind == F::Efi || phoenix_core::disk::is_efi_system_partition(&p.type_guid)
+    });
+    has_windows_capable && (has_esp || !source.is_gpt)
+}
+
+/// Hover text for the "repair boot files" checkbox on both pages.
+const REPAIR_BOOT_HOVER: &str =
+    "After the data is written, detect a Windows installation on the target disk and rebuild \
+     its boot files with Windows' own bcdboot (plus bootsect and the active flag on legacy MBR \
+     disks). Only the target disk is modified — this PC's firmware boot entries are never \
+     touched. Skipped automatically if the target turns out to hold no Windows installation.";
 
 fn disk_confirm_details(disk: &DiskInfo) -> Vec<String> {
     vec![
@@ -713,10 +763,18 @@ struct PhoenixApp {
     /// Restore page's chosen target disk; `None` until the user picks one
     /// (deliberately never auto-selected — same contract as the Clone page).
     target_disk_index: Option<u32>,
+    /// Restore page: run the post-restore boot repair on the target.
+    /// Defaulted when a backup loads (on when its layout looks bootable),
+    /// then user-editable.
+    restore_repair_boot: bool,
     /// Clone page state: chosen source/target disk indices and options.
     clone_source_index: Option<u32>,
     clone_target_index: Option<u32>,
     clone_expand: bool,
+    /// Clone page: run the post-clone boot repair on the target. Defaulted
+    /// per source pick (on when the source carries a bootable Windows
+    /// layout), then user-editable.
+    clone_repair_boot: bool,
     /// The clone plan editor (shared machinery with the Restore page).
     /// `Some` only while both a source and a target disk are picked.
     clone_layout: Option<restore_layout::RestoreLayoutState>,
@@ -753,6 +811,23 @@ struct PhoenixApp {
     pending_enable_write: Option<usize>,
     /// Acknowledgement-checkbox state for the enable-write dialog.
     enable_write_ack: bool,
+    /// Boot Repair page: Windows installations detected on the current disk
+    /// list. `None` means "scan on next page render" — cleared whenever the
+    /// disk list reloads so the page never shows installs from a stale world.
+    bootrepair_installs: Option<Vec<phoenix_restore::bootrepair::WindowsInstall>>,
+    /// The picked installation as `(disk_index, partition_index)`.
+    bootrepair_selected: Option<(u32, u32)>,
+    /// Read-only repair plan preview for the picked installation, keyed by the
+    /// selection it was computed for (recomputed when the pick changes). `Err`
+    /// holds the human reason the install can't be repaired (e.g. GPT disk
+    /// with no ESP).
+    #[allow(clippy::type_complexity)]
+    bootrepair_plan: Option<(
+        (u32, u32),
+        std::result::Result<phoenix_restore::bootrepair::BootRepairPlan, String>,
+    )>,
+    /// Boot repair waiting on its confirmation dialog.
+    pending_boot_repair: Option<PendingBootRepair>,
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
@@ -860,9 +935,11 @@ impl PhoenixApp {
             restore_backup_load_now: false,
             restore_layout: None,
             target_disk_index: None,
+            restore_repair_boot: false,
             clone_source_index: None,
             clone_target_index: None,
             clone_expand: false,
+            clone_repair_boot: false,
             clone_layout: None,
             clone_layout_for: None,
             mount_backup_path: String::new(),
@@ -876,6 +953,10 @@ impl PhoenixApp {
             pending_close: false,
             pending_enable_write: None,
             enable_write_ack: false,
+            bootrepair_installs: None,
+            bootrepair_selected: None,
+            bootrepair_plan: None,
+            pending_boot_repair: None,
             settings,
             history,
             update_state,
@@ -1043,6 +1124,10 @@ impl PhoenixApp {
                 }
                 self.disks = disks;
                 self.prune_stale_selections();
+                // The Boot Repair page's install scan and plan preview were
+                // computed against the old disk list — rescan on next render.
+                self.bootrepair_installs = None;
+                self.bootrepair_plan = None;
                 Ok(self.disks.len())
             }
             Err(e) => Err(e.to_string()),
@@ -1075,6 +1160,11 @@ impl PhoenixApp {
                 self.history = phoenix_core::appdata::History::load()
             }
             Page::History => {}
+            // The install scan is already invalidated by `reload_disks`;
+            // a refresh also drops the pick, page-reset style.
+            Page::BootRepair => {
+                self.bootrepair_selected = None;
+            }
             Page::Verify | Page::Mount | Page::About => {}
         }
     }
@@ -1144,6 +1234,7 @@ impl PhoenixApp {
             || self.pending_history_delete.is_some()
             || self.pending_close
             || self.pending_enable_write.is_some()
+            || self.pending_boot_repair.is_some()
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -1151,6 +1242,7 @@ impl PhoenixApp {
         self.restore_backup_load_after = None;
         self.restore_backup_load_now = false;
         self.restore_layout = None;
+        self.restore_repair_boot = false;
     }
 
     /// Reset the Backup page to its untouched default: nothing selected,
@@ -1182,6 +1274,7 @@ impl PhoenixApp {
         self.clone_source_index = None;
         self.clone_target_index = None;
         self.clone_expand = false;
+        self.clone_repair_boot = false;
         self.clone_layout = None;
         self.clone_layout_for = None;
     }
@@ -1201,9 +1294,11 @@ impl PhoenixApp {
         }
         match PhnxReader::open(path) {
             Ok(reader) => {
-                self.restore_layout = Some(restore_layout::RestoreLayoutState::from_backup(
-                    path_str, &reader,
-                ));
+                let layout = restore_layout::RestoreLayoutState::from_backup(path_str, &reader);
+                // Default the post-restore boot repair to on exactly when the
+                // backup's own layout could produce a bootable Windows disk.
+                self.restore_repair_boot = source_looks_bootable(&layout.source_disk);
+                self.restore_layout = Some(layout);
                 self.restore_loaded_path = path_str.to_string();
                 let n = reader.index.len();
                 self.status = format!("Loaded backup — {n} partition(s)");
@@ -1256,6 +1351,7 @@ impl PhoenixApp {
             JobKind::Restore => JobKindTag::Restore,
             JobKind::Verify => JobKindTag::Verify,
             JobKind::Clone => JobKindTag::Clone,
+            JobKind::BootRepair => JobKindTag::BootRepair,
         };
         let total = self.job_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
         let ended = now_unix();
@@ -1405,6 +1501,14 @@ impl PhoenixApp {
                         job_verified,
                         verify_target,
                     );
+                    // The boot-repair result is multi-line (one line per
+                    // action performed). The modal just captured the full
+                    // text; the one-line status bar keeps only the headline.
+                    if job_kind == JobKind::BootRepair {
+                        if let Some(first) = self.status.lines().next() {
+                            self.status = first.to_string();
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -1481,6 +1585,7 @@ impl PhoenixApp {
                 JobKind::Verify => "Backup verified.".to_string(),
                 JobKind::Restore => "Restore complete.".to_string(),
                 JobKind::Clone => "Clone complete.".to_string(),
+                JobKind::BootRepair => "Boot repair complete.".to_string(),
             },
             // The only thing that raises a Warning is the user cancelling.
             JobOutcome::Warning => format!("{}.", kind.cancelled_message()),
@@ -1677,6 +1782,24 @@ impl PhoenixApp {
                     }),
                 }
             }
+            Page::BootRepair => {
+                let plan_ok = self
+                    .bootrepair_plan
+                    .as_ref()
+                    .is_some_and(|(sel, plan)| Some(*sel) == self.bootrepair_selected && plan.is_ok());
+                StartAction {
+                    label: "Repair Boot",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy && plan_ok,
+                    disabled_hint: Some(if busy {
+                        "A job is already running"
+                    } else if self.bootrepair_selected.is_none() {
+                        "Select a Windows installation first"
+                    } else {
+                        "The selected installation can't be repaired — see the note above"
+                    }),
+                }
+            }
             Page::History | Page::About => return None,
         };
         Some(action)
@@ -1805,6 +1928,7 @@ impl PhoenixApp {
                     Page::Verify => self.start_verify(),
                     Page::Clone => self.start_clone(),
                     Page::Mount => self.start_mount(),
+                    Page::BootRepair => self.start_boot_repair(),
                     _ => {}
                 }
             }
@@ -1838,6 +1962,7 @@ impl PhoenixApp {
                     Page::Restore => self.ui_restore(ui, busy),
                     Page::Verify => self.ui_verify(ui, busy),
                     Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
+                    Page::BootRepair => disabled_when(ui, busy, |ui| self.ui_bootrepair(ui)),
                     Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
                     Page::About => disabled_when(ui, busy, |ui| self.ui_about(ui)),
                 });
@@ -1870,6 +1995,7 @@ impl PhoenixApp {
         self.show_overwrite_dialog(ctx);
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
+        self.show_boot_repair_confirm_dialog(ctx);
         self.show_history_delete_dialog(ctx);
         self.show_demo_confirm_dialog(ctx);
         self.show_demo_progress_modal(ctx);
@@ -2118,6 +2244,47 @@ impl PhoenixApp {
                 self.status = "Restore cancelled — no changes were made".into();
             }
             ConfirmAction::None => self.pending_restore = Some(pending),
+        }
+    }
+
+    /// The boot-repair counterpart of [`show_clone_confirm_dialog`]. When the
+    /// target is the disk the running system booted from, Confirm is
+    /// additionally gated on an acknowledgement checkbox.
+    fn show_boot_repair_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.pending_boot_repair.take() else {
+            return;
+        };
+        let action = {
+            let ack = pending.system_disk.then_some(ConfirmAck {
+                label: BOOT_REPAIR_SYSTEM_ACK_LABEL,
+                checked: &mut pending.ack,
+            });
+            let mut view = ConfirmView {
+                title: "Confirm boot repair",
+                message: &pending.message,
+                details: &pending.details,
+                confirm_label: "Repair boot",
+                cancel_label: "Cancel",
+                confirm_danger: true,
+                hazard_tape: true,
+                ack,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+        match action {
+            ConfirmAction::Confirm => {
+                self.completed = None;
+                self.status = format!("Repairing boot files on disk {}…", pending.disk_index);
+                self.job_subject = pending.subject;
+                self.job = Some(spawn_boot_repair(
+                    pending.disk_index,
+                    pending.partition_index,
+                ));
+            }
+            ConfirmAction::Cancel => {
+                self.status = "Boot repair cancelled — no changes were made".into();
+            }
+            ConfirmAction::None => self.pending_boot_repair = Some(pending),
         }
     }
 
@@ -2426,6 +2593,7 @@ fn job_action_label(kind: phoenix_core::appdata::JobKindTag) -> &'static str {
         K::Restore => "Restore",
         K::Verify => "Verify",
         K::Clone => "Clone",
+        K::BootRepair => "Boot repair",
     }
 }
 
@@ -2442,6 +2610,7 @@ fn describe_job(rec: &phoenix_core::appdata::JobRecord) -> String {
         K::Verify => format!("Fully verified {}{size}", rec.source),
         K::Restore => format!("Restored {} → {}", rec.source, rec.target),
         K::Clone => format!("Cloned {} → {}", rec.source, rec.target),
+        K::BootRepair => format!("Repaired boot files for {} on {}", rec.source, rec.target),
     }
 }
 
@@ -2920,6 +3089,14 @@ impl PhoenixApp {
         if out.target_changed {
             ui.ctx().request_repaint();
         }
+        if self.restore_layout.is_some() {
+            ui.add_space(8.0);
+            ui.checkbox(
+                &mut self.restore_repair_boot,
+                "Repair boot files on the target after restoring",
+            )
+            .on_hover_text(REPAIR_BOOT_HOVER);
+        }
     }
 
     fn start_restore(&mut self) {
@@ -2992,6 +3169,7 @@ impl PhoenixApp {
                 // were already checked while decompressing.
                 verify_on_restore: false,
                 convert_sector_size: convert,
+                repair_boot: self.restore_repair_boot,
                 progress: Some(ProgressHandle::new()),
             },
             details,
@@ -3094,6 +3272,11 @@ impl PhoenixApp {
                 // Re-seed so the target map previews the grown layout.
                 self.reseed_full_disk_clone();
             }
+            ui.checkbox(
+                &mut self.clone_repair_boot,
+                "Repair boot files on the target after cloning",
+            )
+            .on_hover_text(REPAIR_BOOT_HOVER);
             ui.add_space(8.0);
             if let Some(tgt) = self.clone_target_index {
                 let warning = if full_disk {
@@ -3132,6 +3315,22 @@ impl PhoenixApp {
         if self.clone_layout_for != Some((s, t)) || self.clone_layout.is_none() {
             self.clone_layout_for = Some((s, t));
             self.reseed_clone_layout_default();
+            // Default the post-clone boot repair per source pick: on when the
+            // live source actually carries a Windows installation AND the
+            // layout shape can boot (an install with no ESP on GPT would just
+            // make the repair fail).
+            self.clone_repair_boot = self
+                .disks
+                .iter()
+                .find(|d| d.index == s)
+                .map(|src| {
+                    source_looks_bootable(src)
+                        && !phoenix_restore::bootrepair::detect_windows_installs(
+                            std::slice::from_ref(src),
+                        )
+                        .is_empty()
+                })
+                .unwrap_or(false);
         }
     }
 
@@ -3245,6 +3444,7 @@ impl PhoenixApp {
                 plan,
                 verify: phoenix_clone::CloneVerify::None,
                 convert_sector_size: convert,
+                repair_boot: self.clone_repair_boot,
                 progress: None,
             },
             message,
@@ -3570,6 +3770,176 @@ impl PhoenixApp {
         self.mounts
             .iter()
             .any(|m| same_file_path(m.backup_path(), Path::new(chosen)))
+    }
+
+    /// The Boot Repair page: pick a detected Windows installation, preview
+    /// exactly what the repair would do, and hand off to the action bar's
+    /// "Repair Boot" (which parks the job behind a hazard dialog).
+    fn ui_bootrepair(&mut self, ui: &mut egui::Ui) {
+        use phoenix_restore::bootrepair;
+
+        page_scroll_shell(ui, "bootrepair_page", |ui| {
+            page_header(ui, &self.palette, "Boot Repair", "");
+            ui.label(
+                egui::RichText::new(
+                    "Point a drive's boot configuration at a Windows installation on it — for \
+                     a clone that won't start, a restored system disk, or a drive moved from \
+                     another machine. The boot files are rebuilt with Windows' own bcdboot \
+                     (plus bootsect and the active flag on legacy MBR disks). Only the \
+                     selected drive is modified; this PC's firmware boot entries are never \
+                     touched.",
+                )
+                .color(self.palette.subtle_text),
+            );
+            ui.add_space(14.0);
+
+            // Scan lazily — `reload_disks` clears the cache, so a refresh or a
+            // finished job re-detects against the fresh disk list.
+            if self.bootrepair_installs.is_none() {
+                let installs = bootrepair::detect_windows_installs(&self.disks);
+                if let Some(sel) = self.bootrepair_selected {
+                    if !installs
+                        .iter()
+                        .any(|i| (i.disk_index, i.partition_index) == sel)
+                    {
+                        self.bootrepair_selected = None;
+                        self.bootrepair_plan = None;
+                    }
+                }
+                self.bootrepair_installs = Some(installs);
+            }
+            let installs = self.bootrepair_installs.clone().unwrap_or_default();
+
+            if installs.is_empty() {
+                ui.label(
+                    egui::RichText::new("No Windows installations were detected.")
+                        .font(fonts::bold(15.0)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "An installation is recognized by its \\Windows\\System32 tree, so a \
+                         drive whose volumes Windows can't read (unformatted, BitLocker-locked, \
+                         or offline) won't appear here. Attach the drive and press F5 to rescan.",
+                    )
+                    .color(self.palette.subtle_text),
+                );
+            } else {
+                ui.label(egui::RichText::new("Windows installations").font(fonts::bold(16.0)));
+                ui.add_space(6.0);
+                for install in &installs {
+                    let key = (install.disk_index, install.partition_index);
+                    let selected = self.bootrepair_selected == Some(key);
+                    let style = match self.disks.iter().find(|d| d.index == install.disk_index) {
+                        Some(d) if d.is_gpt => "GPT · UEFI boot",
+                        Some(_) => "MBR · legacy BIOS boot",
+                        None => "disk missing",
+                    };
+                    let row = ui.selectable_label(
+                        selected,
+                        egui::RichText::new(format!("{}    ({style})", install.display()))
+                            .font(fonts::regular(14.0)),
+                    );
+                    if row.clicked() {
+                        self.bootrepair_selected = Some(key);
+                    }
+                }
+
+                if let Some(sel) = self.bootrepair_selected {
+                    let stale = self
+                        .bootrepair_plan
+                        .as_ref()
+                        .map(|(key, _)| *key != sel)
+                        .unwrap_or(true);
+                    if stale {
+                        let plan = match (
+                            self.disks.iter().find(|d| d.index == sel.0),
+                            installs
+                                .iter()
+                                .find(|i| (i.disk_index, i.partition_index) == sel),
+                        ) {
+                            (Some(disk), Some(install)) => {
+                                bootrepair::plan_boot_repair(disk, install)
+                                    .map_err(|e| e.to_string())
+                            }
+                            _ => Err("the selected disk is no longer present".to_string()),
+                        };
+                        self.bootrepair_plan = Some((sel, plan));
+                    }
+                    ui.add_space(16.0);
+                    ui.label(egui::RichText::new("What will happen").font(fonts::bold(16.0)));
+                    ui.add_space(6.0);
+                    match &self.bootrepair_plan.as_ref().expect("computed above").1 {
+                        Ok(plan) => {
+                            for action in &plan.actions {
+                                ui.label(
+                                    egui::RichText::new(format!("•  {action}"))
+                                        .color(self.palette.subtle_text),
+                                );
+                            }
+                            if bootrepair::system_disk_index(&self.disks) == Some(sel.0) {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "This is the disk this PC is currently running from — \
+                                         the live system's own boot files will be rewritten.",
+                                    )
+                                    .color(self.palette.warning),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "This installation can't be repaired: {e}"
+                                ))
+                                .color(self.palette.warning),
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Validate the Boot Repair pick and park it behind the confirmation
+    /// dialog. Mirrors `current_page_action`'s gating — a click can only
+    /// arrive with a selected install whose plan preview is `Ok`.
+    fn start_boot_repair(&mut self) {
+        use phoenix_restore::bootrepair;
+
+        let Some(sel) = self.bootrepair_selected else {
+            return;
+        };
+        let plan = match self.bootrepair_plan.as_ref() {
+            Some((key, Ok(plan))) if *key == sel => plan.clone(),
+            _ => return,
+        };
+        let Some(disk) = self.disks.iter().find(|d| d.index == sel.0) else {
+            return;
+        };
+        let mut details = disk_confirm_details(disk);
+        details.push(String::new());
+        details.extend(plan.actions.iter().cloned());
+        let system_disk = bootrepair::system_disk_index(&self.disks) == Some(sel.0);
+        self.pending_boot_repair = Some(PendingBootRepair {
+            disk_index: sel.0,
+            partition_index: sel.1,
+            message: format!(
+                "This will rewrite the boot files on {} so it starts {}. Verify this is the \
+                 right disk:",
+                self.disk_label(sel.0),
+                plan.install.display()
+            ),
+            details,
+            subject: JobSubject {
+                source: plan.install.display(),
+                target: self.disk_label(sel.0),
+                image_path: None,
+            },
+            system_disk,
+            ack: false,
+        });
     }
 
     fn start_mount(&mut self) {
@@ -3990,6 +4360,7 @@ fn start_page_from_args() -> Option<Page> {
                 "restore" => Some(Page::Restore),
                 "verify" => Some(Page::Verify),
                 "mount" => Some(Page::Mount),
+                "bootrepair" | "boot-repair" => Some(Page::BootRepair),
                 "history" => Some(Page::History),
                 "about" => Some(Page::About),
                 _ => None,

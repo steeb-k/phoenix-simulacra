@@ -194,6 +194,7 @@ fn mbr_partial_resize_rewrites_table() {
         plan,
         verify_on_restore: true,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect("run_restore");
@@ -287,6 +288,7 @@ fn mbr_partial_delete_removes_partition() {
         plan,
         verify_on_restore: true,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect("run_restore");
@@ -360,6 +362,7 @@ fn mbr_to_gpt_reinit_partial_restore() {
         plan,
         verify_on_restore: true,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect("run_restore");

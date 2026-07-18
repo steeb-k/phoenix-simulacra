@@ -13,6 +13,7 @@ pub enum Page {
     Restore,
     Verify,
     Mount,
+    BootRepair,
     History,
     About,
 }
@@ -21,9 +22,13 @@ struct NavItem {
     page: Page,
     label: &'static str,
     icon: &'static str,
-    /// Alt+key accelerator. Must match the first letter of `label` — the
-    /// underline hint drawn while Alt is held always sits under that letter.
+    /// Alt+key accelerator.
     key: Key,
+    /// The letter of `label` the accelerator maps to — underlined as the
+    /// hint while Alt is held. Usually the first letter; different only
+    /// when that letter is already claimed by another page (Boot Repair
+    /// vs Backup).
+    accel: char,
 }
 
 const TOP_ITEMS: &[NavItem] = &[
@@ -32,30 +37,42 @@ const TOP_ITEMS: &[NavItem] = &[
         label: "Backup",
         icon: egui_phosphor::regular::FLOPPY_DISK,
         key: Key::B,
+        accel: 'B',
     },
     NavItem {
         page: Page::Clone,
         label: "Clone",
         icon: egui_phosphor::regular::COPY_SIMPLE,
         key: Key::C,
+        accel: 'C',
     },
     NavItem {
         page: Page::Restore,
         label: "Restore",
         icon: egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE,
         key: Key::R,
+        accel: 'R',
     },
     NavItem {
         page: Page::Verify,
         label: "Verify",
         icon: egui_phosphor::regular::SHIELD_CHECK,
         key: Key::V,
+        accel: 'V',
     },
     NavItem {
         page: Page::Mount,
         label: "Mount",
         icon: egui_phosphor::regular::HARD_DRIVES,
         key: Key::M,
+        accel: 'M',
+    },
+    NavItem {
+        page: Page::BootRepair,
+        label: "Boot Repair",
+        icon: egui_phosphor::regular::WRENCH,
+        key: Key::O,
+        accel: 'o',
     },
 ];
 
@@ -65,12 +82,14 @@ const BOTTOM_ITEMS: &[NavItem] = &[
         label: "History",
         icon: egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE,
         key: Key::H,
+        accel: 'H',
     },
     NavItem {
         page: Page::About,
         label: "About",
         icon: egui_phosphor::regular::INFO,
         key: Key::A,
+        accel: 'A',
     },
 ];
 
@@ -456,20 +475,33 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
         text_color,
     );
 
-    // While Alt is held (and navigation is allowed), underline the first
-    // letter as the accelerator hint, Windows-menu style.
+    // While Alt is held (and navigation is allowed), underline the
+    // accelerator letter, Windows-menu style — the first occurrence of
+    // `item.accel` in the label (case-sensitive, so "Boot Repair" with
+    // accel 'o' underlines the o in "Boot", not the one in a hypothetical
+    // leading "O").
     let alt_held = ui.is_enabled() && ui.input(|i| i.modifiers.alt);
     if alt_held {
-        let first = item.label.chars().next().unwrap_or('?');
-        let width = ui.fonts(|f| f.glyph_width(&label_font, first));
-        let y = text_rect.bottom() - 1.0;
-        painter.line_segment(
-            [
-                egui::pos2(text_rect.left(), y),
-                egui::pos2(text_rect.left() + width, y),
-            ],
-            Stroke::new(1.0, text_color),
-        );
+        let mut prefix_width = 0.0;
+        let mut accel_width = None;
+        for c in item.label.chars() {
+            let w = ui.fonts(|f| f.glyph_width(&label_font, c));
+            if c == item.accel {
+                accel_width = Some(w);
+                break;
+            }
+            prefix_width += w;
+        }
+        if let Some(width) = accel_width {
+            let y = text_rect.bottom() - 1.0;
+            painter.line_segment(
+                [
+                    egui::pos2(text_rect.left() + prefix_width, y),
+                    egui::pos2(text_rect.left() + prefix_width + width, y),
+                ],
+                Stroke::new(1.0, text_color),
+            );
+        }
     }
 
     if response.clicked() {

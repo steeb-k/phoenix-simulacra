@@ -94,6 +94,7 @@ fn restore_full_disk_and_verify(
         plan,
         verify_on_restore: true,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect("run_restore");

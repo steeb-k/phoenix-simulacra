@@ -72,6 +72,11 @@ enum Commands {
         /// a restore is refused; with matching sector sizes it does nothing.
         #[arg(long, default_value_t = false)]
         convert_sector_size: bool,
+        /// After the restore, detect a Windows installation on the target disk
+        /// and rebuild its boot environment (bcdboot/bootsect; drive-local,
+        /// never touches this machine's firmware boot entries).
+        #[arg(long, default_value_t = false)]
+        repair_boot: bool,
     },
     /// Clone one disk directly onto another (no intermediate file)
     Clone {
@@ -104,6 +109,32 @@ enum Commands {
         /// clone is refused; with matching sector sizes it does nothing.
         #[arg(long, default_value_t = false)]
         convert_sector_size: bool,
+        /// After the clone, detect a Windows installation on the target disk
+        /// and rebuild its boot environment (bcdboot/bootsect; drive-local,
+        /// never touches this machine's firmware boot entries).
+        #[arg(long, default_value_t = false)]
+        repair_boot: bool,
+    },
+    /// Detect Windows installations and repair a disk's boot environment
+    /// (rebuild BCD/boot files with bcdboot, plus MBR boot code + active
+    /// flag on legacy disks). Drive-local: this machine's firmware (NVRAM)
+    /// boot entries are never modified. Without --disk, lists what was
+    /// detected; without --apply, shows the plan without changing anything.
+    BootRepair {
+        /// Disk index carrying the Windows installation (see the no-argument
+        /// listing or `list-disks`)
+        #[arg(long)]
+        disk: Option<u32>,
+        /// Partition index of the Windows installation — only needed when the
+        /// disk carries more than one
+        #[arg(long)]
+        partition: Option<u32>,
+        /// Perform the repair (default is a dry run that prints the plan)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Mount a backup read-only so its files are browsable in Explorer. Runs
     /// in the foreground; press Enter to unmount.
@@ -184,6 +215,7 @@ fn main() -> anyhow::Result<()> {
             plan,
             verify,
             convert_sector_size,
+            repair_boot,
         } => {
             let plan = RestorePlan::from_toml(&plan)?;
             let summary = run_restore(RestoreOptions {
@@ -191,6 +223,7 @@ fn main() -> anyhow::Result<()> {
                 plan,
                 verify_on_restore: verify,
                 convert_sector_size,
+                repair_boot,
                 progress: None,
             })?;
             info!(
@@ -213,6 +246,9 @@ fn main() -> anyhow::Result<()> {
                      disk and then unlock it."
                 );
             }
+            if let Some(status) = &summary.boot_repair {
+                println!("\n{}", status.describe());
+            }
         }
         Commands::Clone {
             source_disk,
@@ -222,6 +258,7 @@ fn main() -> anyhow::Result<()> {
             no_vss,
             yes,
             convert_sector_size,
+            repair_boot,
         } => {
             if no_vss {
                 tracing::warn!(
@@ -235,8 +272,15 @@ fn main() -> anyhow::Result<()> {
                 verify,
                 yes,
                 convert_sector_size,
+                repair_boot,
             )?
         }
+        Commands::BootRepair {
+            disk,
+            partition,
+            apply,
+            yes,
+        } => cmd_boot_repair(disk, partition, apply, yes)?,
         Commands::Mount { backup, partitions } => cmd_mount(&backup, partitions.as_deref())?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
     }
@@ -276,6 +320,100 @@ fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Re
     Ok(())
 }
 
+fn cmd_boot_repair(
+    disk_index: Option<u32>,
+    partition: Option<u32>,
+    apply: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use phoenix_restore::bootrepair::{
+        detect_windows_installs, execute_boot_repair, plan_boot_repair, system_disk_index,
+    };
+
+    let mut disks = enumerate_disks()?;
+    for d in &mut disks {
+        for p in &mut d.partitions {
+            phoenix_core::disk::refine_partition_fs(p);
+        }
+    }
+    let installs = detect_windows_installs(&disks);
+    if installs.is_empty() {
+        println!("No Windows installations detected on any disk.");
+        return Ok(());
+    }
+
+    let Some(disk_index) = disk_index else {
+        println!("Windows installations detected:");
+        for i in &installs {
+            println!(
+                "  --disk {} --partition {}  ->  {}",
+                i.disk_index,
+                i.partition_index,
+                i.display()
+            );
+        }
+        println!("\nRe-run with --disk (and --partition if listed twice for one disk).");
+        return Ok(());
+    };
+
+    let on_disk: Vec<_> = installs
+        .iter()
+        .filter(|i| i.disk_index == disk_index)
+        .collect();
+    let install = match (on_disk.len(), partition) {
+        (0, _) => anyhow::bail!("no Windows installation detected on disk {disk_index}"),
+        (1, None) => on_disk[0],
+        (_, None) => anyhow::bail!(
+            "disk {disk_index} carries {} Windows installations; pick one with --partition",
+            on_disk.len()
+        ),
+        (_, Some(p)) => on_disk
+            .iter()
+            .find(|i| i.partition_index == p)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no Windows installation on disk {disk_index} partition {p}")
+            })?,
+    };
+
+    let disk = disks
+        .iter()
+        .find(|d| d.index == disk_index)
+        .expect("install came from this disk list");
+    let plan = plan_boot_repair(disk, install)?;
+
+    println!("Boot repair plan for {}:", install.display());
+    for a in &plan.actions {
+        println!("  • {a}");
+    }
+    if system_disk_index(&disks) == Some(disk_index) {
+        println!(
+            "\nWARNING: disk {disk_index} is the disk this machine is currently running from — \
+             this rewrites the live system's boot files."
+        );
+    }
+    if !apply {
+        println!("\nDry run — re-run with --apply to perform the repair.");
+        return Ok(());
+    }
+    if !yes {
+        use std::io::Write;
+        print!("Type the disk number ({disk_index}) to proceed: ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != disk_index.to_string() {
+            anyhow::bail!("confirmation did not match; aborting");
+        }
+    }
+
+    let report = execute_boot_repair(disk, &plan)?;
+    println!("\nBoot repair completed:");
+    for a in &report.actions {
+        println!("  • {a}");
+    }
+    Ok(())
+}
+
 fn cmd_clone(
     source_disk: u32,
     target_disk: u32,
@@ -283,6 +421,7 @@ fn cmd_clone(
     verify: bool,
     yes: bool,
     convert_sector_size: bool,
+    repair_boot: bool,
 ) -> anyhow::Result<()> {
     use phoenix_clone::{run_clone, CloneOptions, ClonePlan, CloneVerify};
 
@@ -342,6 +481,7 @@ fn cmd_clone(
             CloneVerify::None
         },
         convert_sector_size,
+        repair_boot,
         progress: None,
     })?;
     info!(
@@ -356,6 +496,9 @@ fn cmd_clone(
         &summary.conversion_converted_names,
         &summary.conversion_unconverted_names,
     );
+    if let Some(status) = &summary.boot_repair {
+        println!("\n{}", status.describe());
+    }
     Ok(())
 }
 

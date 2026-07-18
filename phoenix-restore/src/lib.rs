@@ -1,5 +1,6 @@
 //! Phoenix Simulacra restore planner and execution.
 
+pub mod bootrepair;
 pub mod grow;
 pub mod layout_edit;
 pub mod partition_table;

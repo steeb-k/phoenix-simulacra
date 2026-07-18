@@ -198,6 +198,7 @@ fn run_restore_plan(backup: &Path, plan: RestorePlan) {
         plan,
         verify_on_restore: true,
         convert_sector_size: false,
+        repair_boot: false,
         progress: Some(progress.handle()),
     })
     .expect("run_restore");
