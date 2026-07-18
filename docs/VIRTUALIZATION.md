@@ -156,9 +156,16 @@ default install locations (`C:\Program Files\qemu`, the MSYS2 locations).
 Validate with `qemu-system-x86_64 --version` and record the version (feature
 gates: WHPX flags changed across versions). If not found, the GUI shows a
 "QEMU required" call-to-action with a link rather than failing cryptically.
-Bundling QEMU in the installer stays an open question — it's ~150–300 MB and
-GPL, fine to redistribute but a big installer jump; revisit after the
-exploration proves value.
+
+**Bundling (decided): ship the QEMU installer in our installer, WinFsp-style.**
+Licensing is fine: QEMU is GPLv2, and bundling its unmodified installer next
+to our app is mere aggregation — it imposes nothing on our license, same as
+the WinFsp MSI we already ship. The GPL obligation we do pick up is
+*corresponding source*: pin the exact installer build we bundle and link (or
+archive) its matching source tarball in the release notes. Practicalities:
+the installer is large (~150–300 MB, a big jump for our installer), so the
+detect-first logic above stays — bundled QEMU installs only when none is
+found — and the runtime path still honors a user-supplied QEMU.
 
 ## Known hard parts (carried over, still true)
 
@@ -201,4 +208,3 @@ exploration proves value.
   (Spike will inform, but the *product* preference matters too.)
 - Session UX: one session per backup, or multiple named sessions per backup?
   (Plan assumes one to start; the layout doesn't preclude more.)
-- Bundle QEMU in the installer eventually, or keep it detect-and-link forever?

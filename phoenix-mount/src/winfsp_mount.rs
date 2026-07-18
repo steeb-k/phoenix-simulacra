@@ -514,6 +514,14 @@ impl WinFspServe {
         self.mount_point.image_dir().join(self.image_name)
     }
 
+    /// Size in bytes of the **synthesized virtual disk** (not the container
+    /// file). This is what an attached child or a VM sees as the disk size —
+    /// partitions plus the synthesized GPT, which can exceed the source
+    /// disk's `size_bytes` from the manifest.
+    pub fn disk_size(&self) -> u64 {
+        self.disk_size
+    }
+
     /// Partition layout on the synthesized disk (for letter assignment).
     pub fn spans(&self) -> &[crate::chunkstore::PartitionSpan] {
         &self.spans
