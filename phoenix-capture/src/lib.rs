@@ -6,6 +6,7 @@ pub mod ntfs;
 pub mod ntfs_meta;
 pub mod raw;
 pub mod reader;
+pub mod refs;
 pub mod sector_convert;
 
 pub use backup::{plan_capture, run_backup};

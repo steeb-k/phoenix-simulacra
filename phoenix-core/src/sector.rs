@@ -62,7 +62,8 @@ pub enum PartitionConvertRole {
     /// No filesystem to convert, and it doesn't block boot (MSR / empty /
     /// unclassified): nothing to do.
     NoFilesystem,
-    /// A data filesystem v1 does not convert — exFAT, BitLocker ciphertext.
+    /// A data filesystem v1 does not convert — exFAT, BitLocker ciphertext,
+    /// ReFS (its superblock carries a checksum we don't recompute).
     /// Its bytes still restore, but the partition is unreadable on the 512e
     /// target and is left as-is (Alert E).
     LeftUnconverted,
@@ -81,7 +82,9 @@ pub fn partition_convert_role(fs: FilesystemKind) -> PartitionConvertRole {
             PartitionConvertRole::Convert
         }
         FilesystemKind::Msr | FilesystemKind::Unknown => PartitionConvertRole::NoFilesystem,
-        FilesystemKind::Exfat | FilesystemKind::Bitlocker => PartitionConvertRole::LeftUnconverted,
+        FilesystemKind::Exfat | FilesystemKind::Bitlocker | FilesystemKind::Refs => {
+            PartitionConvertRole::LeftUnconverted
+        }
     }
 }
 

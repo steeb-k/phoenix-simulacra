@@ -21,6 +21,7 @@ use crate::fat::{capture_exfat, capture_fat, exfat_plan, fat_plan};
 use crate::ntfs::{capture_ntfs, ntfs_plan};
 use crate::raw::{capture_raw, raw_extent_for_partition};
 use crate::reader::{BlockSource, PartitionReader};
+use crate::refs::refs_plan;
 
 pub struct BackupOptions {
     pub disk_index: u32,
@@ -455,6 +456,12 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             (FilesystemKind::Exfat, CaptureMode::UsedBlocks) => {
                 capture_exfat(reader, &mut stream, &prep.extents, prep.bitmap_hash.clone())?
             }
+            (FilesystemKind::Refs, CaptureMode::UsedBlocks) => {
+                // The NTFS streamer is filesystem-agnostic — it only walks the
+                // pre-planned extents — so ReFS shares it. The extents came
+                // from `refs_plan` (FSCTL bitmap read on the unlocked handle).
+                capture_ntfs(reader, &mut stream, &prep.extents, prep.bitmap_hash.clone())?
+            }
             _ => {
                 capture_raw(reader, &mut stream)?;
                 // A partition's used bytes can't exceed its own size. A volume
@@ -873,6 +880,32 @@ pub fn plan_capture(
                     tracing::warn!(
                         error = %e,
                         "exFAT allocation-bitmap plan failed; falling back to full raw capture"
+                    );
+                    Ok((
+                        raw_extent_for_partition(part.size_bytes, 512),
+                        0,
+                        CaptureMode::Raw,
+                        fs,
+                        None,
+                    ))
+                }
+            }
+        }
+        (FilesystemKind::Refs, CaptureMode::UsedBlocks) => {
+            // ReFS: allocation comes from FSCTL_GET_VOLUME_BITMAP (we never
+            // parse ReFS's undocumented allocators). A boot-sector parse
+            // failure — e.g. a future format revision we don't recognize —
+            // falls back to full raw capture rather than risking a partial
+            // backup of a volume we couldn't understand (same policy as
+            // exFAT).
+            match refs_plan(reader) {
+                Ok((extents, bytes_per_cluster, bitmap_hash)) => {
+                    Ok((extents, bytes_per_cluster, mode, fs, bitmap_hash))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ReFS plan failed; falling back to full raw capture"
                     );
                     Ok((
                         raw_extent_for_partition(part.size_bytes, 512),

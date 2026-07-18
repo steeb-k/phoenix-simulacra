@@ -25,8 +25,8 @@ A single one-shot `cargo test -p phoenix-systests` run attaches and detaches eno
 
 ```powershell
 foreach ($b in @('resize_roundtrip','sector_4kn','sector_convert','backup_restore_roundtrip','clone',
-                 'fat_family','gpt_identity','partial_mbr','partial_clone','mount','vss','bitlocker',
-                 'winfsp_mount')) {
+                 'fat_family','refs_family','gpt_identity','partial_mbr','partial_clone','mount','vss',
+                 'bitlocker','winfsp_mount')) {
     cargo test -p phoenix-systests --features winfsp --test $b -- --ignored --test-threads=1
     Start-Sleep -Seconds 5   # VHD detach is asynchronous; let it finish
 }
@@ -79,6 +79,7 @@ These create, attach, format, fill, back up, restore, clone, and mount **real VH
 | `backup_restore_roundtrip.rs` | NTFS backup → restore, same size, fixture + chkdsk |
 | `clone.rs` | disk-to-disk clone, same-size and expand-to-larger |
 | `fat_family.rs` | FAT32 and exFAT round-trips; asserts both capture used-blocks and the backup is materially smaller than the partition |
+| `refs_family.rs` | ReFS round-trips at 4K and 64K clusters (used-block capture via `FSCTL_GET_VOLUME_BITMAP`), restored volume mounts as ReFS with the fixture intact; shrink refused; grow extends via `FSCTL_EXTEND_VOLUME`. ReFS **formatting** is SKU-gated — on editions that can't format ReFS the tests prove the same layout formats as NTFS, print `[refs] SKIP`, and pass as no-ops. No chkdsk leg (chkdsk semantics don't apply to ReFS). |
 | `resize_roundtrip.rs` | NTFS **grow** (`FSCTL_EXTEND_VOLUME`) and **shrink** (relocation + MFT/`$Bitmap`/`$LogFile` rewrite) |
 | `mount.rs` | materialize-to-VHD mount (the dev fallback path) + browse fixture |
 | `bitlocker.rs` | full BitLocker lifecycle (needs Windows Pro+): unlocked volume round-trips as a normal plaintext backup; locked volume backs up as ciphertext, restores locked, and yields the fixture only after `Unlock-BitLocker` |

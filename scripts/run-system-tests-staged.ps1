@@ -32,8 +32,8 @@ param(
     # resize_roundtrip is red, nothing after it means anything.
     [string[]]$Tests = @(
         'resize_roundtrip', 'sector_4kn', 'backup_restore_roundtrip', 'clone',
-        'fat_family', 'gpt_identity', 'partial_mbr', 'partial_clone', 'mount',
-        'vhdx_container', 'vss', 'bitlocker'
+        'fat_family', 'refs_family', 'gpt_identity', 'partial_mbr', 'partial_clone',
+        'mount', 'vhdx_container', 'vss', 'bitlocker'
     ),
     # Adds winfsp_mount. Needs the `winfsp` feature, which needs WinFsp installed
     # AND libclang at BUILD time (winfsp-sys runs bindgen). Without this flag

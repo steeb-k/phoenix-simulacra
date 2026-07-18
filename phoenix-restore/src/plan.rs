@@ -641,6 +641,10 @@ pub fn build_partial_plan(
 }
 
 pub fn partition_allows_resize(fs: FilesystemKind) -> bool {
+    // ReFS is deliberately absent: it has no offline shrink and we refuse to
+    // rewrite its (undocumented) allocators, so the GUI/planner must never
+    // offer to resize it. Grow-on-restore still happens implicitly when the
+    // target slot is larger — see the FSCTL_EXTEND_VOLUME pass in restore.
     matches!(
         fs,
         FilesystemKind::Ntfs | FilesystemKind::Fat | FilesystemKind::Exfat
