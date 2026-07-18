@@ -16,6 +16,7 @@ use crate::{fonts, icon_label, page_header, ACTION_BUTTON_HEIGHT};
 /// a portable build points them to pick up a new version by hand, since it never
 /// downloads one itself (see [`crate::updater::is_portable`]).
 pub const HOME_URL: &str = "https://kznjk.com/";
+const SOURCE_URL: &str = "https://github.com/steeb-k/phoenix-simulacra";
 const KOFI_URL: &str = "https://ko-fi.com/kznjk";
 const COPYRIGHT: &str = "© 2026 Steve Kzenjak";
 
@@ -43,48 +44,50 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, version: &str) -> bool {
         .inner_margin(egui::Margin::same(CARD_PAD))
         .show(ui, |ui| {
             // A Frame sizes itself to its content, so without this the card
-            // would only be as wide as the icon plus the longest line of text.
+            // would only be as wide as its columns.
             // `available_width` here is already inside the inner margin.
             ui.set_width(ui.available_width());
-            let inner = ui.max_rect();
 
+            // Two columns: the facts (version, links, Ko-fi, copyright) take
+            // the slack on the left; the identity column — app icon with the
+            // update button under it — is pinned to the right at the shared
+            // button width so both controls end on the same line.
+            let mut clicked = false;
             ui.horizontal_top(|ui| {
-                ui.add(
-                    egui::Image::new(egui::include_image!(
-                        "../../assets/phoenix-appicon-256px.png"
-                    ))
-                    .fit_to_exact_size(Vec2::splat(ICON_SIZE)),
-                );
+                let left_w = (ui.available_width() - BUTTON_W - ICON_TEXT_GAP).max(0.0);
+                ui.vertical(|ui| {
+                    ui.set_width(left_w);
+                    details(ui, palette, version);
+                });
                 ui.add_space(ICON_TEXT_GAP);
-                ui.vertical(|ui| details(ui, palette, version));
+                ui.vertical(|ui| {
+                    ui.set_width(BUTTON_W);
+                    // Center the icon over the button beneath it.
+                    ui.horizontal(|ui| {
+                        ui.add_space(((BUTTON_W - ICON_SIZE) * 0.5).max(0.0));
+                        ui.add(
+                            egui::Image::new(egui::include_image!(
+                                "../../assets/phoenix-appicon-256px.png"
+                            ))
+                            .fit_to_exact_size(Vec2::splat(ICON_SIZE)),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    let label = icon_label(
+                        egui_phosphor::regular::CLOUD_ARROW_DOWN,
+                        fonts::icon(16.0),
+                        "Check for updates",
+                        fonts::regular(14.0),
+                        ui.visuals().widgets.inactive.fg_stroke.color,
+                    );
+                    clicked = ui
+                        .add_sized([BUTTON_W, ACTION_BUTTON_HEIGHT], egui::Button::new(label))
+                        .clicked();
+                });
             });
-
-            check_for_updates_button(ui, inner)
+            clicked
         })
         .inner
-}
-
-/// The card's top-right corner. Lives *inside* the card rather than beside the
-/// page title — the chromeless window floats its Refresh pill over the top-right
-/// of the pane, and a header-level button there sits under it.
-///
-/// Placed at an explicit rect rather than laid out as a column of the card, so
-/// it floats over the corner without reserving width that the icon and the text
-/// beside it would then have to squeeze into. Nothing in the card's content
-/// reaches that corner, so there is nothing for it to overlap.
-fn check_for_updates_button(ui: &mut egui::Ui, card: egui::Rect) -> bool {
-    let label = icon_label(
-        egui_phosphor::regular::CLOUD_ARROW_DOWN,
-        fonts::icon(16.0),
-        "Check for updates",
-        fonts::regular(14.0),
-        ui.visuals().widgets.inactive.fg_stroke.color,
-    );
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(card.right() - BUTTON_W, card.top()),
-        Vec2::new(BUTTON_W, ACTION_BUTTON_HEIGHT),
-    );
-    ui.put(rect, egui::Button::new(label)).clicked()
 }
 
 /// The card's text column: version, home page, Ko-fi, copyright.
@@ -97,11 +100,12 @@ fn details(ui: &mut egui::Ui, palette: &Palette, version: &str) {
             ui.label(egui::RichText::new(version).font(fonts::regular(14.0)));
             ui.end_row();
 
-            ui.label(egui::RichText::new("URL:").font(fonts::bold(14.0)));
-            ui.hyperlink_to(
-                egui::RichText::new(HOME_URL).font(fonts::bold(14.0)),
-                HOME_URL,
-            );
+            ui.label(egui::RichText::new("Homepage:").font(fonts::bold(14.0)));
+            link_row(ui, HOME_URL);
+            ui.end_row();
+
+            ui.label(egui::RichText::new("Source Code:").font(fonts::bold(14.0)));
+            link_row(ui, SOURCE_URL);
             ui.end_row();
         });
 
@@ -136,6 +140,25 @@ fn details(ui: &mut egui::Ui, palette: &Palette, version: &str) {
             .font(fonts::regular(12.0))
             .color(palette.subtle_text),
     );
+}
+
+/// One link line of the facts grid: an arrow-square-out glyph standing in for
+/// the scheme, then the URL without its `https://` (or a trailing slash) —
+/// the icon already says "this goes somewhere", so the protocol is noise.
+fn link_row(ui: &mut egui::Ui, url: &str) {
+    let display = url
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string();
+    let color = ui.visuals().hyperlink_color;
+    let label = icon_label(
+        egui_phosphor::regular::ARROW_SQUARE_OUT,
+        fonts::icon(14.0),
+        &display,
+        fonts::bold(14.0),
+        color,
+    );
+    ui.hyperlink_to(label, url);
 }
 
 /// The card sits a step *below* the page, not level with it: darkened well off
