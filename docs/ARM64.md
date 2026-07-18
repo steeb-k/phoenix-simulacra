@@ -24,11 +24,11 @@ Proven on real ARM64 hardware (a Snapdragon laptop with a true-4Kn UFS system di
 - **GUI renders**, disks enumerate, and the **live system disk backs up** end to end — all three freeze arms fired correctly (volume lock, VSS escalation on `C:`, unfrozen-with-image-verify on the un-lettered ESP), with used-block NTFS capture off a 4Kn bitmap.
 - **Mount works** through the native `winfsp-a64.sys` driver: drive letters appear, and free space drops by nothing beyond the image itself — the zero-space path, not the fallback.
 - **VSS works on a Home SKU** (one reason the engine uses `Win32_ShadowCopy` rather than the Server-only `vssadmin create shadow`).
-- **T1 unit tests pass natively.**
+- **T1 unit tests pass natively**, and the **full T2 virtual-disk suite passes on ARM64** — backup/restore round-trips, clone, resize, partial restore/clone, mount, VSS, and the 4Kn tier, run staged with no hangs. (The BitLocker binary is the one exception: its fixture needs a Pro+ cmdlet and the reference box is Home.)
 
 Bringing the engine up on ARM64 hardware found three real bugs — UFS firmware LUNs enumerating as disks (and being offered as clone targets), a hardcoded 512-byte boot-sector read that 4Kn devices reject outright, and an unreadable error when the backup destination fell off the USB bus — all since fixed for both arches.
 
-Still unvalidated on ARM64 hardware: **restore, clone, and the T2/T3 destructive test tiers**. BitLocker has no ARM64 *test* coverage (the test fixture needs `Enable-BitLocker`, a Pro+ cmdlet); the product's BitLocker handling is not SKU-gated.
+Still unvalidated on ARM64 hardware: the **destructive real-disk (T3) tiers**, and BitLocker has no ARM64 *test* coverage (the fixture needs `Enable-BitLocker`, a Pro+ cmdlet); the product's BitLocker handling is not SKU-gated.
 
 ## Rendering: why the GUI draws on the CPU
 
