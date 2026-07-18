@@ -60,8 +60,6 @@ use crate::theme::Palette;
 use crate::util::format_bytes;
 
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// Debounce before auto-loading a `.phnx` path typed into the Restore page.
-const RESTORE_BACKUP_LOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Minimum time the click-to-refresh dim/spinner overlay stays up. Disk
 /// enumeration is usually near-instant; holding the overlay for a beat
 /// makes the refresh visibly *happen* instead of flickering.
@@ -756,9 +754,7 @@ struct PhoenixApp {
     restore_backup_path: String,
     /// Path we last successfully loaded (skip redundant opens).
     restore_loaded_path: String,
-    /// When the user edits the backup path, load after this instant.
-    restore_backup_load_after: Option<Instant>,
-    /// Set by Browse to load immediately on the next frame.
+    /// Set by the history dropdown or Browse to load on the next frame.
     restore_backup_load_now: bool,
     restore_layout: Option<restore_layout::RestoreLayoutState>,
     /// Restore page's chosen target disk; `None` until the user picks one
@@ -932,7 +928,6 @@ impl PhoenixApp {
             current_backup_index: 0,
             restore_backup_path: String::new(),
             restore_loaded_path: String::new(),
-            restore_backup_load_after: None,
             restore_backup_load_now: false,
             restore_layout: None,
             target_disk_index: None,
@@ -1240,7 +1235,6 @@ impl PhoenixApp {
 
     fn clear_restore_ui_state(&mut self) {
         self.restore_loaded_path.clear();
-        self.restore_backup_load_after = None;
         self.restore_backup_load_now = false;
         self.restore_layout = None;
         self.restore_repair_boot = false;
@@ -1312,22 +1306,10 @@ impl PhoenixApp {
         }
     }
 
-    fn schedule_restore_backup_load(&mut self) {
-        self.restore_backup_load_after = Some(Instant::now() + RESTORE_BACKUP_LOAD_DEBOUNCE);
-    }
-
     fn poll_restore_backup_load(&mut self) {
         if self.restore_backup_load_now {
             self.restore_backup_load_now = false;
-            self.restore_backup_load_after = None;
             self.try_load_restore_backup();
-            return;
-        }
-        if let Some(deadline) = self.restore_backup_load_after {
-            if Instant::now() >= deadline {
-                self.restore_backup_load_after = None;
-                self.try_load_restore_backup();
-            }
         }
     }
 
@@ -2682,30 +2664,91 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
 /// When `on_path_changed` is `Some`, it is called after the text field
 /// loses focus with a changed value, and immediately after Browse picks a file.
 /// Returns `true` if Browse selected a new file.
+/// Every `.phnx` the job history has ever named — backups created, files
+/// verified or restored from — deduplicated case-insensitively, newest
+/// mention first, and filtered to files that still exist so the dropdown
+/// never offers a dead path. Called from inside the combo's popup closure,
+/// so the `is_file` stats only run while the list is actually open.
+fn history_backup_choices(history: &phoenix_core::appdata::History) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for rec in history.records.iter().rev() {
+        for cand in [&rec.target, &rec.source] {
+            if !cand.to_ascii_lowercase().ends_with(".phnx") {
+                continue;
+            }
+            if seen.insert(cand.to_ascii_lowercase()) && Path::new(cand).is_file() {
+                out.push(cand.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The backup chooser shared by the Restore, Verify, and Mount pages: a
+/// dropdown of every backup the history knows about (full path per row),
+/// with Browse… as the escape hatch for a `.phnx` the history has never
+/// seen. Deliberately not a text field — a picked-or-browsed path is always
+/// well-formed, and typos in hand-typed paths were the only thing the old
+/// free-text box ever contributed. Returns true when a path was chosen
+/// (either way), so the caller can load it immediately.
 fn backup_path_picker(
     ui: &mut egui::Ui,
     label: &str,
     hint: &str,
     path: &mut String,
+    history: &phoenix_core::appdata::History,
     mut on_path_changed: Option<&mut dyn FnMut()>,
 ) -> bool {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).font(fonts::bold(14.0)));
 
         let spacing = ui.spacing().item_spacing.x;
-        let text_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
+        let combo_w = (ui.available_width() - FORM_BUTTON_W - spacing).max(0.0);
+        let mut chosen = false;
 
-        let field_response = ui.add_sized(
-            [text_w, ACTION_BUTTON_HEIGHT],
-            egui::TextEdit::singleline(path)
-                .desired_width(f32::INFINITY)
-                .font(fonts::regular(16.0))
-                .hint_text_font(fonts::regular(16.0))
-                .margin(egui::Margin::symmetric(10.0, 8.0))
-                .hint_text(hint),
-        );
-        if let Some(cb) = on_path_changed.as_deref_mut() {
-            if field_response.lost_focus() && field_response.changed() {
+        // The combo button's height comes from `interact_size`; raise it for
+        // this row so the closed dropdown and the Browse button sit flush.
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = ACTION_BUTTON_HEIGHT;
+            let selected = if path.trim().is_empty() {
+                egui::RichText::new(hint)
+                    .font(fonts::regular(16.0))
+                    .color(ui.visuals().weak_text_color())
+            } else {
+                egui::RichText::new(path.as_str()).font(fonts::regular(16.0))
+            };
+            egui::ComboBox::from_id_salt(("backup_path_combo", label))
+                .width(combo_w)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    let choices = history_backup_choices(history);
+                    if choices.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No backups in the job history yet — use Browse…",
+                            )
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    for choice in choices {
+                        let is_current = choice.eq_ignore_ascii_case(path);
+                        if ui
+                            .selectable_label(
+                                is_current,
+                                egui::RichText::new(&choice).font(fonts::regular(14.0)),
+                            )
+                            .clicked()
+                            && !is_current
+                        {
+                            *path = choice;
+                            chosen = true;
+                        }
+                    }
+                });
+        });
+        if chosen {
+            if let Some(cb) = on_path_changed.as_deref_mut() {
                 cb();
             }
         }
@@ -2717,7 +2760,6 @@ fn backup_path_picker(
             fonts::regular(14.0),
             ui.visuals().widgets.inactive.fg_stroke.color,
         );
-        let mut browsed = false;
         if ui
             .add_sized(
                 [FORM_BUTTON_W, ACTION_BUTTON_HEIGHT],
@@ -2727,13 +2769,13 @@ fn backup_path_picker(
         {
             if let Some(picked) = pick_backup_open_path(path) {
                 *path = picked.display().to_string();
-                browsed = true;
+                chosen = true;
                 if let Some(cb) = on_path_changed {
                     cb();
                 }
             }
         }
-        browsed
+        chosen
     })
     .inner
 }
@@ -3041,28 +3083,23 @@ impl PhoenixApp {
         });
     }
 
-    /// The `.phnx` Browse row plus the (debounced) load of whatever it names
-    /// into `restore_layout`. Shared by the Restore and Verify pages: both
-    /// read the same image, off the same path field, so both get the loaded
-    /// layout — the editor on one, the preview on the other.
+    /// The `.phnx` chooser row plus the load of whatever it names into
+    /// `restore_layout`. Shared by the Restore and Verify pages: both read
+    /// the same image, off the same path field, so both get the loaded
+    /// layout — the editor on one, the preview on the other. A choice (from
+    /// the history dropdown or Browse) loads immediately; there is no typed
+    /// input left to debounce.
     fn ui_backup_file_picker(&mut self, ui: &mut egui::Ui, label: &str) {
-        let path_before = self.restore_backup_path.clone();
-        let mut path_edited = false;
-        let browsed = backup_path_picker(
+        let chosen = backup_path_picker(
             ui,
             label,
-            "Path to .phnx file",
+            "Select or browse for a .phnx backup",
             &mut self.restore_backup_path,
-            Some(&mut || path_edited = true),
+            &self.history,
+            None,
         );
-        if browsed {
+        if chosen {
             self.restore_backup_load_now = true;
-        } else if path_edited && self.restore_backup_path != path_before {
-            if self.restore_backup_path.trim().is_empty() {
-                self.clear_restore_ui_state();
-            } else {
-                self.schedule_restore_backup_load();
-            }
         }
     }
 
@@ -3471,18 +3508,18 @@ impl PhoenixApp {
             page_header(ui, &self.palette, "Mount", "");
 
             let path_before = self.mount_backup_path.clone();
-            let mut path_edited = false;
+            let mut chosen = false;
             ui.add_enabled_ui(self.job.is_none(), |ui| {
-                let browsed = backup_path_picker(
+                chosen = backup_path_picker(
                     ui,
                     "Backup file",
-                    "Path to .phnx file",
+                    "Select or browse for a .phnx backup",
                     &mut self.mount_backup_path,
-                    Some(&mut || path_edited = true),
+                    &self.history,
+                    None,
                 );
-                path_edited |= browsed;
             });
-            let path_changed = path_edited && self.mount_backup_path != path_before;
+            let path_changed = chosen && self.mount_backup_path != path_before;
             if path_changed
                 || (self.mount_source.is_none()
                     && self.mount_loaded_path != self.mount_backup_path.trim())
