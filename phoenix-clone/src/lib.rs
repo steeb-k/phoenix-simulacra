@@ -57,6 +57,12 @@ pub struct CloneOptions {
     /// `--convert-sector-size` flag / the GUI hazard-dialog checkbox. Ignored
     /// when the sector sizes already match.
     pub convert_sector_size: bool,
+    /// After the clone completes and the target is online, detect a Windows
+    /// installation on it and rebuild its boot environment (`bcdboot`/
+    /// `bootsect`, drive-local only — see `phoenix_restore::bootrepair`).
+    /// Best-effort: a repair failure is recorded in the summary, never
+    /// propagated, because the cloned data is already valid.
+    pub repair_boot: bool,
     pub progress: Option<ProgressHandle>,
     // NOTE: there is deliberately no `use_vss`. How a source is frozen is not a
     // user choice — the engine takes the strongest freeze each volume allows (see
@@ -83,6 +89,9 @@ pub struct CloneSummary {
     /// Human names of partitions left unconverted because v1 does not convert
     /// their filesystem (exFAT / BitLocker ciphertext) — Alert E.
     pub conversion_unconverted_names: Vec<String>,
+    /// Outcome of the opt-in post-clone boot repair; `None` when it was not
+    /// requested.
+    pub boot_repair: Option<phoenix_restore::bootrepair::BootRepairStatus>,
 }
 
 /// Clone `source_disk_index` onto `target_disk_index` per the plan.
@@ -416,6 +425,18 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
         if let Err(e) = extend_ntfs_volume(target.index, offset, size) {
             warn!(offset, size, error = %e, "extend_ntfs_volume after clone failed (non-fatal)");
         }
+    }
+
+    // --- Opt-in boot repair: layout stamped, disk online, volumes released
+    // — rebuild the boot environment for a Windows install on the target.
+    // Best-effort by design, see `CloneOptions::repair_boot`.
+    if opts.repair_boot {
+        if let Some(ref p) = opts.progress {
+            p.set_detail("Repairing boot files on the target disk".to_string());
+        }
+        summary.boot_repair = Some(
+            phoenix_restore::bootrepair::repair_target_disk_status(target.index),
+        );
     }
 
     if let Some(ref p) = opts.progress {

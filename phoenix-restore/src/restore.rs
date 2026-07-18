@@ -31,6 +31,12 @@ pub struct RestoreOptions {
     /// that the result is a converted copy, not a byte-identical restore.
     /// Ignored when the sector sizes already match.
     pub convert_sector_size: bool,
+    /// After the restore completes and the disk is online, detect a Windows
+    /// installation on the target and rebuild its boot environment
+    /// (`bcdboot`/`bootsect`, drive-local only — see [`crate::bootrepair`]).
+    /// Best-effort: a repair failure is recorded in the summary, never
+    /// propagated, because the restored data is already valid.
+    pub repair_boot: bool,
     pub progress: Option<ProgressHandle>,
 }
 
@@ -60,6 +66,9 @@ pub struct RestoreSummary {
     /// not convert their filesystem (exFAT / BitLocker ciphertext) — restored
     /// but unreadable on the 512e target (Alert E).
     pub conversion_unconverted_names: Vec<String>,
+    /// Outcome of the opt-in post-restore boot repair; `None` when it was
+    /// not requested.
+    pub boot_repair: Option<crate::bootrepair::BootRepairStatus>,
 }
 
 pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
@@ -694,6 +703,17 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
              unrecognized/decrypted, reboot or reconnect the disk, then unlock it with the \
              original BitLocker key/recovery password"
         );
+    }
+
+    // PHASE 7 — opt-in boot repair: the layout is stamped and the disk is
+    // online, so a Windows install on the target (if any) can have its boot
+    // environment rebuilt. Best-effort by design — see `RestoreOptions::
+    // repair_boot`.
+    if opts.repair_boot {
+        if let Some(ref p) = opts.progress {
+            p.set_detail("Repairing boot files on the target disk".to_string());
+        }
+        summary.boot_repair = Some(crate::bootrepair::repair_target_disk_status(disk.index));
     }
 
     if let Some(ref p) = opts.progress {

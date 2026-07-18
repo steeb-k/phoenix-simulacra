@@ -531,17 +531,31 @@ open-source project. End users then never do a separate install. This is
 packaging/installer work, not engine work. Until it's done, mount requires the
 user to install WinFsp manually.
 
-### P2 — Post-restore BCD fixup for same-machine clones
+### ~~P2 — Post-restore BCD fixup for same-machine clones~~ (DONE 2026-07-17: boot repair)
 Windows regenerates a clone's disk GUID and all partition unique GUIDs when
 it comes online while the source disk is attached (duplicate GPT identities
 are forbidden; observed live in T3B). The clone's BCD then still references
 the ORIGINAL GUIDs — booting it either fails or, with both disks attached,
-silently chain-loads the ORIGINAL Windows volume. A restore option should
-rewrite the clone's BCD device elements to its actual (post-dedup) ESP +
-Windows partition identities — effectively `bcdboot <clone>\Windows /s
-<clone-ESP> /f UEFI`, or in-place BCD device-element editing. Without it,
-"bootable clone" only holds when the clone is created with the source absent
-or moved to a machine where the source never appears.
+silently chain-loads the ORIGINAL Windows volume.
+
+Shipped as `phoenix_restore::bootrepair` plus surfaces on top of it:
+- **Boot Repair page** (GUI sidebar, Alt+O) and `simulacra-cli boot-repair`
+  (`--disk/--partition`, dry-run by default, `--apply` to run): pick a
+  detected Windows installation (probed via `\Windows\System32` +
+  `ntoskrnl.exe` version), preview the plan, repair.
+- **"Repair boot files on the target"** checkbox on the Clone and Restore
+  pages (and `--repair-boot` on the CLI clone/restore commands), default-on
+  when the source layout looks bootable; runs as a best-effort post-pass
+  after `bring_disk_online` — a repair failure is reported in the summary,
+  never fails the clone/restore.
+- Mechanism: GPT → `bcdboot <win> /s <ESP> /f UEFI /nofirmwaresync`; MBR →
+  active-flag set (surgical sector-0 flag write) + `bootsect /nt60 /mbr` +
+  `bcdboot /f BIOS`. Temporary drive letters are assigned/removed for
+  un-lettered volumes (the usual ESP case). Strictly drive-local: NVRAM is
+  never touched, so the repaired drive boots on any machine.
+- Validated end-to-end on scratch VHDs (both GPT/UEFI and MBR/BIOS paths:
+  BCD + bootmgfw.efi / bootmgr landed, active flag set) and detection/planning
+  against real disks. Real-hardware boot-after-repair test still owed.
 
 ### ~~P2 — GUI resize UX revamp (deferred "Phase 7")~~ (LARGELY DONE 2026-07)
 Delivered as the restore layout editor (modeled on Macrium/Backupper):

@@ -28,6 +28,7 @@ fn opts(verify: CloneVerify, progress: Option<ProgressHandle>) -> CloneOptions {
         plan: ClonePlan::default(),
         verify,
         convert_sector_size: false,
+        repair_boot: false,
         progress,
     }
 }

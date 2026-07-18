@@ -60,6 +60,7 @@ fn restore_to(backup_path: &std::path::Path, target: &TestVhd) {
         plan,
         verify_on_restore: true,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect("run_restore");

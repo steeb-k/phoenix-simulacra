@@ -98,6 +98,7 @@ fn convert_4kn_ntfs_to_512e() {
         plan,
         verify_on_restore: true,
         convert_sector_size: true,
+        repair_boot: false,
         progress: None,
     })
     .expect("converted restore 4Kn -> 512e");
@@ -174,6 +175,7 @@ fn convert_4kn_fat32_to_512e() {
         plan,
         verify_on_restore: true,
         convert_sector_size: true,
+        repair_boot: false,
         progress: None,
     })
     .expect("converted FAT32 restore 4Kn -> 512e");
@@ -244,6 +246,7 @@ fn convert_refuses_512e_to_4kn() {
         plan,
         verify_on_restore: false,
         convert_sector_size: true,
+        repair_boot: false,
         progress: None,
     })
     .expect_err("512e -> 4Kn must be refused");
@@ -315,6 +318,7 @@ fn convert_requires_optin() {
         plan: make_plan(),
         verify_on_restore: false,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect_err("4Kn -> 512e without opt-in must be refused");
@@ -329,6 +333,7 @@ fn convert_requires_optin() {
         plan: make_plan(),
         verify_on_restore: false,
         convert_sector_size: true,
+        repair_boot: false,
         progress: None,
     })
     .expect("opted-in restore should succeed");
@@ -439,6 +444,7 @@ fn convert_partial_restore_4kn_ntfs_to_512e() {
         plan,
         verify_on_restore: true,
         convert_sector_size: true,
+        repair_boot: false,
         progress: None,
     })
     .expect("partial converted restore 4Kn -> 512e");

@@ -57,6 +57,7 @@ pub enum JobKindTag {
     Restore,
     Verify,
     Clone,
+    BootRepair,
 }
 
 /// Terminal outcome of a recorded job.

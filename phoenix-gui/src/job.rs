@@ -19,6 +19,7 @@ pub enum JobKind {
     Restore,
     Verify,
     Clone,
+    BootRepair,
 }
 
 impl JobKind {
@@ -28,6 +29,7 @@ impl JobKind {
             JobKind::Restore => "Restore cancelled",
             JobKind::Verify => "Verify cancelled",
             JobKind::Clone => "Clone cancelled",
+            JobKind::BootRepair => "Boot repair cancelled",
         }
     }
 
@@ -39,6 +41,7 @@ impl JobKind {
             JobKind::Restore => "Restoring",
             JobKind::Verify => "Verifying backup",
             JobKind::Clone => "Cloning disk",
+            JobKind::BootRepair => "Repairing boot files",
         }
     }
 
@@ -50,6 +53,7 @@ impl JobKind {
             JobKind::Restore => "Restore",
             JobKind::Verify => "Verify",
             JobKind::Clone => "Clone",
+            JobKind::BootRepair => "Boot repair",
         }
     }
 }
@@ -230,6 +234,10 @@ pub fn spawn_restore(opts: RestoreOptions) -> BackgroundJob {
                 s.partitions_converted,
                 s.conversion_bootable,
             ));
+            if let Some(status) = &s.boot_repair {
+                msg.push_str("\n\n");
+                msg.push_str(&status.describe());
+            }
             msg
         })
         .map_err(|e| e.to_string())
@@ -262,14 +270,62 @@ pub fn spawn_clone(opts: phoenix_clone::CloneOptions) -> BackgroundJob {
             ..opts
         })
         .map(|s| {
-            format!(
+            let mut msg = format!(
                 "Clone complete: {} partition(s) copied, {} resized{}",
                 s.partitions_cloned,
                 s.partitions_resized,
                 conversion_note(s.partitions_converted, s.conversion_bootable),
-            )
+            );
+            if let Some(status) = &s.boot_repair {
+                msg.push_str("\n\n");
+                msg.push_str(&status.describe());
+            }
+            msg
         })
         .map_err(|e| e.to_string())
+    })
+}
+
+/// Repair the boot environment for the Windows installation on
+/// `disk_index`/`partition_index`. Detection and planning run again on the
+/// worker (the page's earlier scan is only a preview) so a disk change
+/// between preview and click is caught rather than acted on blindly.
+pub fn spawn_boot_repair(disk_index: u32, partition_index: u32) -> BackgroundJob {
+    use phoenix_restore::bootrepair;
+
+    let progress = ProgressHandle::new();
+    let progress_worker = progress.clone();
+    make_job(JobKind::BootRepair, progress, move || {
+        progress_worker.set_detail(format!("Repairing boot environment on disk {disk_index}"));
+        let mut disks = phoenix_core::disk::enumerate_disks().map_err(|e| e.to_string())?;
+        for d in &mut disks {
+            for p in &mut d.partitions {
+                phoenix_core::disk::refine_partition_fs(p);
+            }
+        }
+        let disk = disks
+            .iter()
+            .find(|d| d.index == disk_index)
+            .ok_or_else(|| format!("disk {disk_index} not found"))?;
+        let installs = bootrepair::detect_windows_installs(std::slice::from_ref(disk));
+        let install = installs
+            .iter()
+            .find(|i| i.partition_index == partition_index)
+            .ok_or_else(|| {
+                format!(
+                    "no Windows installation found on disk {disk_index}, partition \
+                     {partition_index} — the disk may have changed since the page was refreshed"
+                )
+            })?;
+        let plan = bootrepair::plan_boot_repair(disk, install).map_err(|e| e.to_string())?;
+        let report = bootrepair::execute_boot_repair(disk, &plan).map_err(|e| e.to_string())?;
+        let mut msg = format!("Boot repair completed for {}", install.display());
+        for a in &report.actions {
+            msg.push_str("\n• ");
+            msg.push_str(a);
+        }
+        info!(target: "phoenix_gui::job", disk_index, partition_index, "boot repair completed");
+        Ok(msg)
     })
 }
 

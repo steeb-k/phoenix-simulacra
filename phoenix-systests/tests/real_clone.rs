@@ -189,6 +189,7 @@ fn run(plan: ClonePlan, src: &RealDisk, tgt: &RealDisk, what: &str) {
         // is the check that matters — it is what caught the phantom-cluster bug.
         verify: CloneVerify::ReadBack,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .unwrap_or_else(|e| panic!("{what} failed: {e}"));
@@ -580,6 +581,7 @@ fn real_clone_back_from_hdd_to_flash() {
         },
         verify: CloneVerify::ReadBack,
         convert_sector_size: false,
+        repair_boot: false,
         progress: None,
     })
     .expect("clone back to the flash drive");
