@@ -47,7 +47,7 @@ Each partition is backed up using one of two capture strategies.
 
 ### Used-block capture (`used-blocks`)
 
-**Applies to:** NTFS, FAT, and exFAT data partitions when the filesystem is detected on the volume.
+**Applies to:** NTFS, ReFS, FAT, and exFAT data partitions when the filesystem is detected on the volume.
 
 **Behavior:**
 
@@ -79,6 +79,7 @@ For a typical Windows 11 disk, EFI + MSR are raw (small); `C:` and `D:` are used
 | EFI System | Raw | Tens–hundreds of MB |
 | MSR | Raw | ~16 MB |
 | NTFS (C:, D:, …) | Used-blocks | Close to **used** space, not partition size |
+| ReFS | Used-blocks | Allocated clusters + metadata (ReFS pre-allocates more metadata than NTFS) |
 | FAT / exFAT | Used-blocks | Allocated clusters + metadata |
 | Unknown | Raw | Full partition size |
 
@@ -272,7 +273,7 @@ If you see this, the backup is still **not** imaging unselected partitions or ot
 
 Useful fields for auditing a backup:
 
-- `fs` — `ntfs`, `fat`, `exfat`, `efi`, `msr`, `unknown`
+- `fs` — `ntfs`, `refs`, `fat`, `exfat`, `efi`, `msr`, `bitlocker`, `unknown`
 - `capture_mode` — `raw` or `used-blocks`
 - `original_size` — Partition size at backup time
 - `used_bytes` — Logical bytes captured (good indicator of real workload)

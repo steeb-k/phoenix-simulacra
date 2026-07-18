@@ -92,6 +92,7 @@ pub fn fs_kind_to_string(k: FilesystemKind) -> &'static str {
         FilesystemKind::Efi => "efi",
         FilesystemKind::Msr => "msr",
         FilesystemKind::Bitlocker => "bitlocker",
+        FilesystemKind::Refs => "refs",
     }
 }
 
@@ -129,6 +130,7 @@ pub fn fs_kind_from_string(s: &str) -> FilesystemKind {
         "efi" => FilesystemKind::Efi,
         "msr" => FilesystemKind::Msr,
         "bitlocker" => FilesystemKind::Bitlocker,
+        "refs" => FilesystemKind::Refs,
         _ => FilesystemKind::Unknown,
     }
 }
@@ -173,5 +175,24 @@ mod tests {
             bitlocker_state_from_manifest(Some("suspended")),
             BitlockerState::None
         );
+    }
+
+    #[test]
+    fn fs_kind_string_roundtrip_covers_every_kind() {
+        for kind in [
+            FilesystemKind::Unknown,
+            FilesystemKind::Ntfs,
+            FilesystemKind::Fat,
+            FilesystemKind::Exfat,
+            FilesystemKind::Efi,
+            FilesystemKind::Msr,
+            FilesystemKind::Bitlocker,
+            FilesystemKind::Refs,
+        ] {
+            assert_eq!(kind, fs_kind_from_string(fs_kind_to_string(kind)));
+        }
+        assert_eq!(fs_kind_to_string(FilesystemKind::Refs), "refs");
+        // Old readers see an unknown string, not a crash.
+        assert_eq!(fs_kind_from_string("zfs"), FilesystemKind::Unknown);
     }
 }

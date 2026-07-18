@@ -435,6 +435,7 @@ pub fn describe_filesystem(p: &PartitionInfo) -> String {
         FilesystemKind::Efi => Some("EFI System"),
         FilesystemKind::Msr => Some("Microsoft Reserved"),
         FilesystemKind::Bitlocker => Some("BitLocker"),
+        FilesystemKind::Refs => Some("ReFS"),
         FilesystemKind::Unknown => None,
     };
     if let Some(label) = known {

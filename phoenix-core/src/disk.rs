@@ -49,6 +49,10 @@ pub enum FilesystemKind {
     /// volume in suspended state). The boot sector starts with `-FVE-FS-`.
     /// Treated as raw for backup purposes.
     Bitlocker = 6,
+    /// ReFS (Resilient File System). Used-block capture works through
+    /// `FSCTL_GET_VOLUME_BITMAP` exactly like NTFS; resize is not supported
+    /// (ReFS has no offline shrink and its allocator is undocumented).
+    Refs = 7,
 }
 
 impl FilesystemKind {
@@ -60,6 +64,7 @@ impl FilesystemKind {
             4 => Self::Efi,
             5 => Self::Msr,
             6 => Self::Bitlocker,
+            7 => Self::Refs,
             _ => Self::Unknown,
         }
     }
@@ -1407,6 +1412,7 @@ fn detect_volume_fs_via_get_volume_information(volume_path: &str) -> Option<File
         "NTFS" => Some(FilesystemKind::Ntfs),
         "FAT" | "FAT32" | "FAT16" | "FAT12" => Some(FilesystemKind::Fat),
         "EXFAT" => Some(FilesystemKind::Exfat),
+        "REFS" => Some(FilesystemKind::Refs),
         _ => None,
     }
 }
@@ -1421,6 +1427,7 @@ fn detect_volume_fs_via_get_volume_information(volume_path: &str) -> Option<File
 /// Magic bytes (all within the first 512 bytes):
 /// - `NTFS    ` at offset 3 (8 bytes) -> NTFS
 /// - `EXFAT   ` at offset 3           -> exFAT
+/// - `ReFS\0\0\0\0` at offset 3 + `FSRS` at offset 16 -> ReFS
 /// - `FAT32   ` at offset 82          -> FAT32
 /// - `FAT12   ` / `FAT16   ` at offset 54 -> FAT
 /// - `-FVE-FS-` at offset 3           -> BitLocker (locked or
@@ -1520,6 +1527,13 @@ fn classify_boot_sector(buf: &[u8]) -> Option<FilesystemKind> {
     let oem = &buf[3..11];
     if oem == b"NTFS    " {
         return Some(FilesystemKind::Ntfs);
+    }
+    // ReFS has no BPB: bytes 3..11 hold `ReFS\0\0\0\0` (NUL-padded, not
+    // space-padded like the OEM IDs above) and the FSRS superblock header
+    // magic sits at offset 16. Require both so a stray "ReFS" string in a
+    // garbage sector can't misclassify.
+    if oem == b"ReFS\0\0\0\0" && &buf[16..20] == b"FSRS" {
+        return Some(FilesystemKind::Refs);
     }
     if oem == b"EXFAT   " {
         return Some(FilesystemKind::Exfat);
@@ -1651,9 +1665,9 @@ pub fn classify_partition_on_disk(
 ///
 /// Decision table (`on_disk` = physical view, `part.fs_kind` = volume view):
 ///
-/// | on_disk       | volume view       | result                                   |
-/// |---------------|-------------------|------------------------------------------|
-/// | BitLocker     | NTFS/FAT/exFAT    | `Unlocked` — normal used-block capture   |
+/// | on_disk       | volume view        | result                                   |
+/// |---------------|--------------------|------------------------------------------|
+/// | BitLocker     | NTFS/FAT/exFAT/ReFS| `Unlocked` — normal used-block capture   |
 /// | BitLocker     | anything else     | `Locked` — fs=Bitlocker, raw ciphertext  |
 /// | not BitLocker | Bitlocker         | `Locked` — volume handle reads FVE bytes |
 /// | not BitLocker | anything else     | `None`                                   |
@@ -1665,7 +1679,7 @@ pub fn apply_bitlocker_state(part: &mut PartitionInfo, on_disk: Option<Filesyste
     let disk_is_fve = on_disk == Some(FilesystemKind::Bitlocker);
     let volume_is_plaintext = matches!(
         part.fs_kind,
-        FilesystemKind::Ntfs | FilesystemKind::Fat | FilesystemKind::Exfat
+        FilesystemKind::Ntfs | FilesystemKind::Fat | FilesystemKind::Exfat | FilesystemKind::Refs
     );
     if disk_is_fve && volume_is_plaintext {
         part.bitlocker = BitlockerState::Unlocked;
@@ -2069,9 +2083,42 @@ mod tests {
     }
 
     #[test]
+    fn classify_boot_sector_recognizes_refs() {
+        // ReFS pads its FS name with NULs (not spaces) and carries the FSRS
+        // superblock magic at offset 16.
+        let mut buf = boot_sector_with(b"ReFS\0\0\0\0");
+        buf[16..20].copy_from_slice(b"FSRS");
+        assert_eq!(classify_boot_sector(&buf), Some(FilesystemKind::Refs));
+    }
+
+    #[test]
+    fn classify_boot_sector_refuses_refs_name_without_fsrs_magic() {
+        // The name alone must not classify — a stray "ReFS" string in a
+        // garbage sector is not a ReFS volume.
+        let buf = boot_sector_with(b"ReFS\0\0\0\0");
+        assert_eq!(classify_boot_sector(&buf), None);
+        // Space-padded (NTFS-style) name is equally not ReFS.
+        let mut spaced = boot_sector_with(b"ReFS    ");
+        spaced[16..20].copy_from_slice(b"FSRS");
+        assert_eq!(classify_boot_sector(&spaced), None);
+    }
+
+    #[test]
     fn classify_boot_sector_returns_none_for_garbage() {
         let buf = [0u8; 512];
         assert_eq!(classify_boot_sector(&buf), None);
+    }
+
+    #[test]
+    fn refs_round_trips_through_u8_wire_format() {
+        // Byte 120 of a PartitionIndexEntry is the on-disk fs_kind; make sure
+        // the new discriminant survives and old bytes still map sanely.
+        assert_eq!(
+            FilesystemKind::from_u8(FilesystemKind::Refs as u8),
+            FilesystemKind::Refs
+        );
+        assert_eq!(FilesystemKind::Refs as u8, 7);
+        assert_eq!(FilesystemKind::from_u8(200), FilesystemKind::Unknown);
     }
 
     fn part_with(fs_kind: FilesystemKind, capture_mode: CaptureMode) -> PartitionInfo {

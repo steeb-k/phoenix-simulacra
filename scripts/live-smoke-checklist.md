@@ -51,7 +51,31 @@ or a spare disk you can afford to overwrite.
 - [ ] Unmount (Ctrl-C) and confirm the drive letters disappear cleanly.
 - [ ] With WinFsp NOT installed, confirm the CLI/GUI shows a clear "install WinFsp" message.
 
-## 6. 4Kn / USB media (if available)
+## 6. ReFS on real hardware (if available)
+
+> The automated `refs_family.rs` T2 suite covers VHD-backed ReFS end to end.
+> This section is the real-media leg: a genuine ReFS partition captured from a
+> physical disk and restored to another physical disk. Backing up is
+> **read-only** on the source; only the restore target gets written.
+
+- [ ] Identify the ReFS source partition and a scratch target disk with
+      `Get-Volume` / `Get-Disk` (the target disk will be **wiped**).
+- [ ] Put a few files with known hashes on the ReFS volume.
+- [ ] Back it up: `simulacra-cli backup --disk <src> --partitions <refs part> -o C:\temp\refs.phnx`
+      — confirm the log reports used-block capture (not raw) and `list` shows
+      `fs=refs`, `used_bytes` far below the partition size.
+- [ ] `simulacra-cli verify C:\temp\refs.phnx` passes.
+- [ ] Restore to the scratch disk, same-or-larger size; confirm the restored
+      volume mounts as ReFS (`Get-Volume` → `FileSystem : ReFS`) and the file
+      hashes match.
+- [ ] Restore into a **larger** slot; confirm the volume grew to fill it
+      (FSCTL_EXTEND_VOLUME) and still reads clean.
+- [ ] Attempt a **smaller** restore; confirm it is refused with the ReFS
+      shrink message (this must fail — a success here is a bug).
+- [ ] Mount the backup (`simulacra-cli mount`) and browse the ReFS volume in
+      Explorer; compare a few file hashes.
+
+## 7. 4Kn / USB media (if available)
 
 > 4Kn is fully supported (backup, restore, clone, mount — see TESTING.md →
 > "Tier 2-4Kn"), so any failure here is a finding, not a known limitation.

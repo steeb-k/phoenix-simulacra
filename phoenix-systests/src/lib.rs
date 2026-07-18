@@ -31,6 +31,12 @@ pub enum TestFs {
     /// FAT (chosen by size; use a small partition to land on FAT16, tiny for
     /// FAT12). diskpart's `format fs=fat` picks the width from the size.
     Fat,
+    /// ReFS. Formatting is SKU-gated (Pro for Workstations / Enterprise /
+    /// Server; plain Pro gained it on recent Win11 builds) — tests that
+    /// format ReFS must treat a format failure as a skip, not a regression.
+    /// ReFS only accepts 4K or 64K allocation units and refuses very small
+    /// volumes, so use `init_gpt_with_cluster` and a generously-sized VHD.
+    Refs,
 }
 
 impl TestFs {
@@ -40,6 +46,7 @@ impl TestFs {
             TestFs::Fat32 => "fat32",
             TestFs::Exfat => "exfat",
             TestFs::Fat => "fat",
+            TestFs::Refs => "refs",
         }
     }
 }
@@ -322,6 +329,7 @@ pub fn powershell_layout(disk_index: u32, gpt: bool, parts: &[PartSpec]) -> Resu
             TestFs::Fat32 => "FAT32",
             TestFs::Exfat => "exFAT",
             TestFs::Fat => "FAT",
+            TestFs::Refs => "ReFS",
         };
         // Stale-mapping / live-collision handling for the letter happens in
         // the `ensure_letter_free` preflight above.
@@ -973,9 +981,9 @@ impl AttachedRw {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::Vhd::{
             AttachVirtualDisk, OpenVirtualDisk, ATTACH_VIRTUAL_DISK_FLAG_NONE,
-            ATTACH_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
-            VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE,
-            VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            ATTACH_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_FLAG_NONE,
+            OPEN_VIRTUAL_DISK_PARAMETERS, VIRTUAL_DISK_ACCESS_ATTACH_RW,
+            VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
         };
 
         const VENDOR_MICROSOFT: GUID = GUID {
@@ -1390,6 +1398,17 @@ pub fn partition_boot_oem_tag(disk_index: u32, offset_bytes: u64) -> Result<Stri
         bail!("short read of boot sector at offset {offset_bytes} (got {got} bytes)");
     }
     Ok(String::from_utf8_lossy(&buf[3..11]).to_string())
+}
+
+/// The filesystem name Windows reports for a mounted volume ("NTFS", "ReFS",
+/// "exFAT", …). Proves the OS itself recognizes and mounts a restored volume
+/// as the expected filesystem — a stronger statement than the raw boot-tag
+/// probe, which only shows the bytes landed.
+pub fn volume_filesystem(letter: char) -> Result<String> {
+    let out = powershell(&format!(
+        "(Get-Volume -DriveLetter {letter} -ErrorAction Stop).FileSystem"
+    ))?;
+    Ok(out.trim().to_string())
 }
 
 /// For every partition on a disk, read its boot-sector OEM tag off the

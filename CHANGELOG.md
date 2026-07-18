@@ -2,6 +2,10 @@
 
 Notable changes per release. Releases are published on the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases).
 
+## Unreleased
+
+- **ReFS support**: ReFS volumes are detected (mounted-volume query plus boot-sector `ReFS`/`FSRS` signature), captured used-blocks via `FSCTL_GET_VOLUME_BITMAP`, restored, cloned, and mountable like any other volume. BitLocker-on-ReFS is recognized in both locked and unlocked states. Resize policy: shrink is refused (ReFS has no offline shrink); grow extends the restored volume via `FSCTL_EXTEND_VOLUME`.
+
 ## 0.4.1 — 2026-07-18
 
 - Backup pages gained a backup chooser dropdown fed by the job history.

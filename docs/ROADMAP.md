@@ -25,6 +25,7 @@ What's planned, what's deliberately deferred, and what's out of scope. The engin
 - **Verification after backup is on by default** and adds a full extra read pass. The CLI re-reads the frozen source and confirms the image matches it (`backup --no-verify` opts out); the GUI releases the source immediately and instead runs a full BLAKE3 check of the written image.
 - **BitLocker locked volumes are captured as raw ciphertext**, loudly flagged; restore reproduces the locked volume, which still needs the original key. There is no prompt-to-unlock or re-encrypt-on-restore flow. After restoring ciphertext to *removable* media, Windows may not recognize the locked volume until an unplug/replug or reboot (an OS cache quirk — the on-disk bytes are correct throughout).
 - **Sector-size conversion is 4Kn→512e only, and opt-in.** 512e→4Kn is refused (fine-to-coarse can't be represented), a converted partition can't also be shrunk, and exFAT partitions are left unconverted with a warning. See [SECTOR-SIZE-CONVERSION.md](SECTOR-SIZE-CONVERSION.md).
+- **ReFS is captured used-blocks and restored/cloned/mounted, but never resized.** Shrink is refused (ReFS has no offline shrink and its allocators are undocumented); grow works via `FSCTL_EXTEND_VOLUME`. ReFS partitions are also left unconverted by 4Kn→512e sector conversion, and offline sources (raw/WinPE reads, where `FSCTL_GET_VOLUME_BITMAP` is unavailable) fall back to full-partition capture.
 - **GPT on removable USB media isn't possible** (Windows policy), so removable targets are MBR.
 - **Mount requires WinFsp.** A build without the `winfsp` feature falls back to materializing a full-size temp VHD — a dev-only stopgap that doubles the backup's footprint and is never used in release builds.
 - **Restoring to dissimilar hardware** may still need Windows Startup Repair beyond what the built-in Boot Repair covers.
@@ -34,4 +35,4 @@ What's planned, what's deliberately deferred, and what's out of scope. The engin
 - **Incremental / differential backups** — the v2 format reserves fields for them, but they are not planned near-term.
 - **Resumable (partial) backups** — considered and rejected: a VSS snapshot dies with the process, so resuming a live-source backup would mix two points in time. Interrupted backups restart.
 - **Cloud upload, sync, scheduling** — write the `.phnx` wherever you like; orchestration is not this tool's job.
-- **ReFS** and **32-bit Windows**.
+- **32-bit Windows**.

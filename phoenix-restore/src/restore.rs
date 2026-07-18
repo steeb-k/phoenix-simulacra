@@ -499,6 +499,32 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
                     restore_opts,
                 )?;
             }
+            FilesystemKind::Refs => {
+                // ReFS restores raw (no boot-sector patching, no metadata
+                // rewrite) but must never land in a smaller partition: there
+                // is no offline shrink for ReFS and we don't rewrite its
+                // allocators, so a smaller target would silently truncate
+                // allocated clusters. The planner already refuses ReFS
+                // resize (`partition_allows_resize`); this guard covers
+                // hand-edited plans. Grow is fine — the volume mounts at
+                // source size and PHASE 4 extends it via FSCTL_EXTEND_VOLUME.
+                if entry.target_size_bytes < idx_entry.original_size {
+                    return Err(phoenix_core::error::PhoenixError::Other(format!(
+                        "partition {src_index} is ReFS and cannot be shrunk \
+                         (target {} bytes < source {} bytes); restore it at \
+                         its original size or larger",
+                        entry.target_size_bytes, idx_entry.original_size
+                    )));
+                }
+                bytes_done += restore_raw(
+                    &mut reader,
+                    &idx_entry,
+                    &mut writer,
+                    restore_opts,
+                    None,
+                    entry.target_size_bytes,
+                )?;
+            }
             _ => {
                 bytes_done += restore_raw(
                     &mut reader,
@@ -647,7 +673,14 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             Some(i) => i,
             None => continue,
         };
-        if !matches!(idx_entry.fs_kind, FilesystemKind::Ntfs) {
+        // ReFS joins NTFS here: FSCTL_EXTEND_VOLUME is filesystem-agnostic
+        // (Disk Management's "Extend Volume" uses it for both) and ReFS
+        // supports online extension. The restored ReFS boot sector was left
+        // untouched, so like NTFS it mounts at source size until this runs.
+        if !matches!(
+            idx_entry.fs_kind,
+            FilesystemKind::Ntfs | FilesystemKind::Refs
+        ) {
             continue;
         }
         if entry.target_size_bytes <= idx_entry.original_size {
@@ -657,7 +690,7 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             if let Some(step) = resize_step {
                 p.set_step(step);
             }
-            p.set_detail(format!("Extending NTFS volume for partition {}", src_index));
+            p.set_detail(format!("Extending volume for partition {}", src_index));
         }
         if let Err(e) = extend_ntfs_volume(
             disk.index,
@@ -1092,7 +1125,10 @@ fn build_mbr_layout_entries(
 /// restore rewrites an MBR table.
 fn mbr_type_from_fs(fs: FilesystemKind, size_bytes: u64) -> u8 {
     match fs {
-        FilesystemKind::Ntfs | FilesystemKind::Exfat | FilesystemKind::Bitlocker => 0x07,
+        FilesystemKind::Ntfs
+        | FilesystemKind::Exfat
+        | FilesystemKind::Bitlocker
+        | FilesystemKind::Refs => 0x07,
         FilesystemKind::Fat => {
             if size_bytes < 32 * 1024 * 1024 {
                 0x06
@@ -1185,6 +1221,8 @@ fn mbr_partition_type_for(idx_entry: Option<&PartitionIndexEntry>, size_bytes: u
     match idx.fs_kind {
         FilesystemKind::Ntfs => 0x07,
         FilesystemKind::Exfat => 0x07,
+        // ReFS on MBR is exotic but legal; it lives in an IFS partition.
+        FilesystemKind::Refs => 0x07,
         // A BitLocker data volume lives in an ordinary 0x07 (IFS) MBR
         // partition — the FVE header replaces the filesystem boot sector,
         // not the partition type — so a ciphertext round-trip preserves it.

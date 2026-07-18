@@ -332,9 +332,12 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
         if entry.target_size_bytes != part.size_bytes {
             summary.partitions_resized += 1;
         }
-        // A grown NTFS partition needs FSCTL_EXTEND_VOLUME after the table is
-        // in place and the volume mounts.
-        if part.fs_kind == FilesystemKind::Ntfs && entry.target_size_bytes > part.size_bytes {
+        // A grown NTFS or ReFS partition needs FSCTL_EXTEND_VOLUME after the
+        // table is in place and the volume mounts (the IOCTL is FS-agnostic
+        // and both filesystems support online extension).
+        if matches!(part.fs_kind, FilesystemKind::Ntfs | FilesystemKind::Refs)
+            && entry.target_size_bytes > part.size_bytes
+        {
             grown_ntfs.push((entry.target_offset_bytes, entry.target_size_bytes));
         }
     }
@@ -434,9 +437,9 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
         if let Some(ref p) = opts.progress {
             p.set_detail("Repairing boot files on the target disk".to_string());
         }
-        summary.boot_repair = Some(
-            phoenix_restore::bootrepair::repair_target_disk_status(target.index),
-        );
+        summary.boot_repair = Some(phoenix_restore::bootrepair::repair_target_disk_status(
+            target.index,
+        ));
     }
 
     if let Some(ref p) = opts.progress {
@@ -615,6 +618,19 @@ fn stream_one_partition(
     let bytes_per_cluster = prep.bytes_per_cluster;
     let capture_mode = prep.capture_mode;
     let fs_kind = prep.fs_kind;
+
+    // ReFS cannot be shrunk: no offline shrink exists, we don't rewrite its
+    // allocators, and its backup superblocks live at the end of the volume —
+    // even a shrink whose used extents all fit would clone a volume whose
+    // tail metadata is gone. Refuse outright (the planner never offers ReFS
+    // resize; this guards hand-built plans).
+    if fs_kind == FilesystemKind::Refs && entry.target_size_bytes < part.size_bytes {
+        return Err(PhoenixError::Other(format!(
+            "partition {} is ReFS and cannot be shrunk (target {} bytes < source {} bytes); \
+             clone it at its original size or larger",
+            part.index, entry.target_size_bytes, part.size_bytes
+        )));
+    }
 
     // --- Shrink relocation (NTFS only) ---
     let relocation: Option<RelocationMap> =
