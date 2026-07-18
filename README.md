@@ -59,3 +59,5 @@ For capture modes, freeze behavior, and the full CLI/GUI reference, see the [bac
 ## License
 
 GNU General Public License v3.0 or later (GPL-3.0-or-later). See [LICENSE](LICENSE).
+
+The bundled [Inter](https://github.com/rsms/inter) fonts are licensed under the SIL Open Font License 1.1 — see [assets/OFL.txt](assets/OFL.txt).
