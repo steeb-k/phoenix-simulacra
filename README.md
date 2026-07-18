@@ -1,6 +1,6 @@
 # Phoenix Simulacra
 
-**[Download the latest release](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)** — installer and portable ZIP, x64 + ARM64 in one download.
+**[Download the latest release](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)** -- installer and portable ZIP, x64 + ARM64 in one download.
 
 A disk backup, restore, and cloning tool for Windows, written in Rust.
 
@@ -9,15 +9,15 @@ Phoenix Simulacra images the partitions you pick into a single compressed `.phnx
 ## Features
 
 - **Backs up only what's used.** NTFS, FAT, and exFAT partitions are captured used-blocks-only, so images stay close to the size of your data, not the size of the disk.
-- **Backs up live systems.** Idle volumes are captured under an exclusive lock; busy ones (like the running `C:`) automatically go through a VSS snapshot. There's no switch to get wrong — the engine picks the strongest freeze the volume allows, and refuses to capture anything it can't freeze.
+- **Backs up live systems.** Idle volumes are captured under an exclusive lock; busy ones (like the running `C:`) automatically go through a VSS snapshot. There's no switch to get wrong; the engine picks the strongest freeze the volume allows, and refuses to capture anything it can't freeze.
 - **Verifies its own work.** Every chunk is BLAKE3-hashed, and by default every backup ends with a full verification pass — the CLI re-reads the source and confirms the image matches it; the GUI re-checks every chunk of the written image.
 - **Restores with resizing.** Grow or shrink partitions during restore, with a drag-and-drop layout editor in the GUI and an editable plan file in the CLI.
 - **Clones disk-to-disk.** Full or partial, with resizing, straight from a live system.
 - **Mounts backups in place.** Browse a `.phnx` in Explorer with drive letters and essentially zero extra disk space, read-only or with a writable copy-on-write overlay. (Requires [WinFsp](https://winfsp.dev); the installer sets it up.)
 - **Repairs boot files.** A built-in Boot Repair tool (`bcdboot`/`bootsect`, UEFI and BIOS), and clone/restore can fix up the target's boot files automatically so a restored disk actually boots.
 - **Handles BitLocker.** Unlocked volumes back up as normal plaintext images; locked volumes are captured as raw ciphertext (clearly flagged) and restore still locked.
-- **Handles 4Kn disks.** Native 4096-byte-sector support end to end, plus opt-in 4Kn→512e conversion when restoring or cloning to a 512-byte-sector disk.
-- **Works in WinPE.** The GUI renders on the CPU — no GPU, WebView2, or OpenGL needed — so it runs in recovery environments.
+- **Handles 4Kn disks.** Native 4096-byte-sector support end to end, plus opt-in 4Kn→512e conversion when restoring or cloning to a 512-byte-sector disk, meaning you can clone from UFS media to standard drives.
+- **Works in WinPE.** The GUI renders on the CPU. No GPU, WebView2, or OpenGL needed; so it runs in recovery environments.
 
 ## Download
 
@@ -51,8 +51,7 @@ For capture modes, freeze behavior, and the full CLI/GUI reference, see the [bac
 
 ## Requirements
 
-- Windows 10/11, x64 or ARM64 (32-bit is out of scope)
-- Administrator privileges (requested automatically)
+- Windows 10/11, x64 or ARM64
 - [WinFsp](https://winfsp.dev) for mounting backups — bundled with the installer
 - Restoring to different hardware may need Windows Startup Repair; the built-in Boot Repair covers the common cases
 
