@@ -2,9 +2,10 @@
 
 Notable changes per release. Releases are published on the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases).
 
-## Unreleased
+## 0.5.0 — 2026-07-18
 
-- **ReFS support**: ReFS volumes are detected (mounted-volume query plus boot-sector `ReFS`/`FSRS` signature), captured used-blocks via `FSCTL_GET_VOLUME_BITMAP`, restored, cloned, and mountable like any other volume. BitLocker-on-ReFS is recognized in both locked and unlocked states. Resize policy: shrink is refused (ReFS has no offline shrink); grow extends the restored volume via `FSCTL_EXTEND_VOLUME`.
+- **ReFS support**: ReFS volumes are detected (mounted-volume query plus boot-sector `ReFS`/`FSRS` signature), captured used-blocks via `FSCTL_GET_VOLUME_BITMAP`, restored, cloned, and mountable like any other volume. BitLocker-on-ReFS is recognized in both locked and unlocked states. Resize policy: shrink is refused (ReFS has no offline shrink); grow extends the restored volume via `FSCTL_EXTEND_VOLUME`. Validated end-to-end on real hardware (352 GB ReFS partition → 360 MB used-block image, byte-verified restore, grow, and mount).
+- **Grow-restore fixes** (affected NTFS too, on USB/slow targets): the restored disk is now brought online *before* the volume-extend pass — a re-signatured disk that Windows' SAN/duplicate-signature policy left offline has no volume devices, so the extend silently timed out and the volume stayed at source size. The extend pass also finds un-lettered `\\?\Volume{GUID}` devices now, instead of waiting for a drive letter that can lag the mount by many seconds.
 
 ## 0.4.1 — 2026-07-18
 
