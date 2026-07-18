@@ -29,7 +29,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use phoenix_core::disk::find_volume_for_partition;
+use phoenix_core::disk::{find_volume_for_partition, find_volume_guid_for_partition};
 use phoenix_core::error::{PhoenixError, Result};
 use tracing::{info, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
@@ -107,8 +107,9 @@ pub fn extend_ntfs_volume(
                     partition_offset_bytes,
                     partition_size_bytes,
                     wait_secs = MOUNT_WAIT.as_secs(),
-                    "extend_ntfs_volume: volume did not mount within timeout; leaving NTFS at \
-                 source size (user can extend manually via Disk Management)"
+                    "extend_ntfs_volume: no volume device (lettered or GUID) appeared within \
+                 timeout; leaving the volume at source size (user can extend manually via \
+                 Disk Management)"
                 );
                 return Ok(());
             }
@@ -144,16 +145,28 @@ pub fn extend_ntfs_volume(
     result
 }
 
-/// Loop on `find_volume_for_partition` until either we get a match or
-/// the deadline expires. Splitting this out keeps the FSCTL call site
-/// linear and lets the poll loop be unit-tested in isolation if we
-/// ever decide we need that — for now the loop body is pure I/O so
-/// there's no test value-add, but the structure makes it cheap to
-/// inject a clock later.
+/// Loop until the restored partition's volume device shows up or the
+/// deadline expires. Two discovery paths, tried in order each tick:
+///
+/// 1. `find_volume_for_partition` — the `\\.\X:` drive-letter device.
+/// 2. `find_volume_guid_for_partition` — the un-lettered
+///    `\\?\Volume{GUID}` device. Mountmgr creates this as soon as it
+///    recognizes the volume, **well before** it gets around to letter
+///    assignment — on a USB-attached spinning disk the letter can lag the
+///    device by tens of seconds (observed live on a real ReFS restore to a
+///    USB HDD: the 30s letter-only wait expired, the letter arrived 5s
+///    later, and the volume was silently left at source size). The FSCTL
+///    only needs *a* volume handle, so the GUID device is just as good.
+///
+/// Splitting this out keeps the FSCTL call site linear and makes it cheap
+/// to inject a clock later if the loop ever needs unit-testing.
 fn poll_for_volume(disk_index: u32, offset: u64, length: u64) -> Option<String> {
     let deadline = Instant::now() + MOUNT_WAIT;
     loop {
         if let Some(path) = find_volume_for_partition(disk_index, offset, length) {
+            return Some(path);
+        }
+        if let Some(path) = find_volume_guid_for_partition(disk_index, offset, length) {
             return Some(path);
         }
         if Instant::now() >= deadline {
