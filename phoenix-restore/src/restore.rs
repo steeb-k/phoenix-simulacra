@@ -251,14 +251,20 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     } else {
         None
     };
+    // Online comes BEFORE resize in both this list and execution: the extend
+    // pass needs mounted volumes, and a restored disk whose (re-stamped)
+    // signature trips the SAN/duplicate-signature policy stays offline — with
+    // no volume devices at all — until `bring_disk_online` runs. Extending
+    // first meant the poll always timed out on such disks (caught on a real
+    // USB target whose volume appeared seconds after the online phase).
+    steps.push("Bringing disk online".to_string());
+    let online_step = steps.len() - 1;
     let resize_step = if any_grow {
         steps.push("Resizing partitions".to_string());
         Some(steps.len() - 1)
     } else {
         None
     };
-    steps.push("Bringing disk online".to_string());
-    let online_step = steps.len() - 1;
 
     if let Some(ref p) = opts.progress {
         p.set_steps(steps);
@@ -646,9 +652,26 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // against PHASE 4 is unmistakable rather than relying on end-of-scope.
     drop(locked_target_volumes);
 
-    // PHASE 4 — for every NTFS partition we wrote at a larger size
-    // than the source, ask NTFS to extend its `$Bitmap` / `$MFT` /
-    // `total_sectors` to fill the new slot. We deliberately left the
+    // PHASE 4 — clear the "offline" disk attribute so volumes
+    // auto-mount with drive letters. Without this the user has to
+    // right-click → Online in Disk Management every time. See
+    // `bring_disk_online` for the full rationale (SAN policy +
+    // duplicate-signature handling). Best-effort: a warn is logged on
+    // failure, but the restored data is already valid on disk.
+    //
+    // This MUST precede the extend pass below: a restored disk whose
+    // re-stamped signature keeps it offline has no volume devices, so
+    // `extend_ntfs_volume`'s mount-wait can only time out (observed on a
+    // real USB target — the volume appeared seconds after onlining).
+    if let Some(ref p) = opts.progress {
+        p.set_step(online_step);
+        p.set_detail(String::new());
+    }
+    bring_disk_online(&disk.path);
+
+    // PHASE 5 — for every NTFS/ReFS partition we wrote at a larger size
+    // than the source, ask the filesystem to extend its allocation
+    // metadata to fill the new slot. We deliberately left the
     // boot sector at source size in `patch_ntfs_size` so the volume
     // would actually mount (Windows refuses to mount NTFS where
     // `$Bitmap` doesn't cover the cluster range advertised by the
@@ -705,18 +728,6 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             );
         }
     }
-
-    // PHASE 5 — clear the "offline" disk attribute so volumes
-    // auto-mount with drive letters. Without this the user has to
-    // right-click → Online in Disk Management every time. See
-    // `bring_disk_online` for the full rationale (SAN policy +
-    // duplicate-signature handling). Best-effort: a warn is logged on
-    // failure, but the restored data is already valid on disk.
-    if let Some(ref p) = opts.progress {
-        p.set_step(online_step);
-        p.set_detail(String::new());
-    }
-    bring_disk_online(&disk.path);
 
     // PHASE 6 — if we restored any BitLocker-locked (ciphertext) partition,
     // nudge Windows to re-read its volume. The ciphertext bytes were written
