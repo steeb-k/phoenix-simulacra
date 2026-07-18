@@ -1,6 +1,6 @@
 # Phoenix Simulacra
 
-**[Download the latest release](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)** -- installer and portable ZIP, x64 + ARM64 in one download.
+**[Download the latest release here.](https://github.com/steeb-k/phoenix-simulacra-binaries/releases/latest)**  Installer and portable ZIP, x64 + ARM64 in one download.
 
 A disk backup, restore, and cloning tool for Windows, written in Rust. Simulacra is designed to be fast, portable, and low on resources. Intended for use by computer repair technicians with no paywalled features, no complicated setup, and an easy-to-use interface. A CLI version is available for headless use, scripting or automating, if required. 
 
