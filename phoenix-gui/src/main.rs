@@ -6,6 +6,7 @@
 
 mod about_panel;
 mod action_bar;
+mod bootrepair_table;
 mod clone_panel;
 mod confirm_dialog;
 mod disk_dropdown;
@@ -3782,12 +3783,10 @@ impl PhoenixApp {
             page_header(ui, &self.palette, "Boot Repair", "");
             ui.label(
                 egui::RichText::new(
-                    "Point a drive's boot configuration at a Windows installation on it — for \
+                    "Point a drive's boot configuration at a Windows installation on it; for \
                      a clone that won't start, a restored system disk, or a drive moved from \
-                     another machine. The boot files are rebuilt with Windows' own bcdboot \
-                     (plus bootsect and the active flag on legacy MBR disks). Only the \
-                     selected drive is modified; this PC's firmware boot entries are never \
-                     touched.",
+                     another machine. The boot files are rebuilt with Windows' own built-in \
+                     utilities. Only the selected drive is modified.",
                 )
                 .color(self.palette.subtle_text),
             );
@@ -3810,92 +3809,93 @@ impl PhoenixApp {
             }
             let installs = self.bootrepair_installs.clone().unwrap_or_default();
 
-            if installs.is_empty() {
-                ui.label(
-                    egui::RichText::new("No Windows installations were detected.")
-                        .font(fonts::bold(15.0)),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "An installation is recognized by its \\Windows\\System32 tree, so a \
-                         drive whose volumes Windows can't read (unformatted, BitLocker-locked, \
-                         or offline) won't appear here. Attach the drive and press F5 to rescan.",
-                    )
-                    .color(self.palette.subtle_text),
-                );
-            } else {
-                ui.label(egui::RichText::new("Windows installations").font(fonts::bold(16.0)));
-                ui.add_space(6.0);
-                for install in &installs {
-                    let key = (install.disk_index, install.partition_index);
-                    let selected = self.bootrepair_selected == Some(key);
-                    let style = match self.disks.iter().find(|d| d.index == install.disk_index) {
-                        Some(d) if d.is_gpt => "GPT · UEFI boot",
-                        Some(_) => "MBR · legacy BIOS boot",
-                        None => "disk missing",
-                    };
-                    let row = ui.selectable_label(
-                        selected,
-                        egui::RichText::new(format!("{}    ({style})", install.display()))
-                            .font(fonts::regular(14.0)),
-                    );
-                    if row.clicked() {
-                        self.bootrepair_selected = Some(key);
-                    }
-                }
+            let rows: Vec<bootrepair_table::InstallRow> = installs
+                .iter()
+                .map(|install| bootrepair_table::InstallRow {
+                    version: install
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| "Windows".to_string()),
+                    drive: install
+                        .drive_letter
+                        .map(|l| format!("{l}:"))
+                        .unwrap_or_default(),
+                    disk: install.disk_index.to_string(),
+                    partition: install.partition_index.to_string(),
+                    label: install.volume_label.clone().unwrap_or_default(),
+                    boot: match self.disks.iter().find(|d| d.index == install.disk_index) {
+                        Some(d) if d.is_gpt => "GPT · UEFI".to_string(),
+                        Some(_) => "MBR · BIOS".to_string(),
+                        None => String::new(),
+                    },
+                })
+                .collect();
+            let selected_row = self.bootrepair_selected.and_then(|sel| {
+                installs
+                    .iter()
+                    .position(|i| (i.disk_index, i.partition_index) == sel)
+            });
+            // Same width discipline as the History table: fill the pane, and
+            // below the columns' minimum hand over to a horizontal scroller.
+            let viewport_width = ui.available_width();
+            let table_width = viewport_width.max(bootrepair_table::min_width());
+            let palette = self.palette;
+            let clicked = egui::ScrollArea::horizontal()
+                .id_salt("bootrepair_table")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    bootrepair_table::show(ui, table_width, &rows, selected_row, &palette)
+                })
+                .inner;
+            if let Some(i) = clicked {
+                self.bootrepair_selected =
+                    Some((installs[i].disk_index, installs[i].partition_index));
+            }
 
-                if let Some(sel) = self.bootrepair_selected {
-                    let stale = self
-                        .bootrepair_plan
-                        .as_ref()
-                        .map(|(key, _)| *key != sel)
-                        .unwrap_or(true);
-                    if stale {
-                        let plan = match (
-                            self.disks.iter().find(|d| d.index == sel.0),
-                            installs
-                                .iter()
-                                .find(|i| (i.disk_index, i.partition_index) == sel),
-                        ) {
-                            (Some(disk), Some(install)) => {
-                                bootrepair::plan_boot_repair(disk, install)
-                                    .map_err(|e| e.to_string())
-                            }
-                            _ => Err("the selected disk is no longer present".to_string()),
-                        };
-                        self.bootrepair_plan = Some((sel, plan));
-                    }
-                    ui.add_space(16.0);
-                    ui.label(egui::RichText::new("What will happen").font(fonts::bold(16.0)));
-                    ui.add_space(6.0);
-                    match &self.bootrepair_plan.as_ref().expect("computed above").1 {
-                        Ok(plan) => {
-                            for action in &plan.actions {
-                                ui.label(
-                                    egui::RichText::new(format!("•  {action}"))
-                                        .color(self.palette.subtle_text),
-                                );
-                            }
-                            if bootrepair::system_disk_index(&self.disks) == Some(sel.0) {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "This is the disk this PC is currently running from — \
-                                         the live system's own boot files will be rewritten.",
-                                    )
-                                    .color(self.palette.warning),
-                                );
-                            }
+            // The plan itself is previewed by the confirmation dialog; here we
+            // only surface the cases that need saying before the click — an
+            // unrepairable pick, or a pick aimed at the live system disk.
+            if let Some(sel) = self.bootrepair_selected {
+                let stale = self
+                    .bootrepair_plan
+                    .as_ref()
+                    .map(|(key, _)| *key != sel)
+                    .unwrap_or(true);
+                if stale {
+                    let plan = match (
+                        self.disks.iter().find(|d| d.index == sel.0),
+                        installs
+                            .iter()
+                            .find(|i| (i.disk_index, i.partition_index) == sel),
+                    ) {
+                        (Some(disk), Some(install)) => {
+                            bootrepair::plan_boot_repair(disk, install).map_err(|e| e.to_string())
                         }
-                        Err(e) => {
+                        _ => Err("the selected disk is no longer present".to_string()),
+                    };
+                    self.bootrepair_plan = Some((sel, plan));
+                }
+                match &self.bootrepair_plan.as_ref().expect("computed above").1 {
+                    Ok(_) => {
+                        if bootrepair::system_disk_index(&self.disks) == Some(sel.0) {
+                            ui.add_space(10.0);
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "This installation can't be repaired: {e}"
-                                ))
+                                egui::RichText::new(
+                                    "This is the disk this PC is currently running from — the \
+                                     live system's own boot files will be rewritten.",
+                                )
                                 .color(self.palette.warning),
                             );
                         }
+                    }
+                    Err(e) => {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "This installation can't be repaired: {e}"
+                            ))
+                            .color(self.palette.warning),
+                        );
                     }
                 }
             }
