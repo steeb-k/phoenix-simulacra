@@ -80,10 +80,10 @@ pub struct HostOptions {
     /// User-mode (slirp) networking with an `e1000e` NIC (inbox driver). When
     /// false, no NIC at all — for forensic boots of possibly-hostile images.
     pub network: bool,
-    /// Cap the guest display via the video adapter's EDID preferred mode.
-    /// Without it a guest (WinPE especially) happily picks a mode far larger
-    /// than the host's monitor. `None` leaves QEMU's default VGA untouched;
-    /// callers normally pass [`usable_guest_resolution`].
+    /// Advisory usable-screen size ([`usable_guest_resolution`]). No longer
+    /// steers the video device — virtio-vga's GOP tops out at 1920x1080 and
+    /// zoom-to-fit scales the picture to the (maximized) window — but kept
+    /// for future use as a native-mode hint.
     pub max_resolution: Option<(u32, u32)>,
 }
 
@@ -97,24 +97,6 @@ impl Default for HostOptions {
             network: true,
             max_resolution: None,
         }
-    }
-}
-
-/// The largest power-of-two VGA VRAM (MB) whose largest offered video mode
-/// still fits in `w`×`h`. The guest takes the biggest mode the firmware
-/// offers, and the firmware offers everything from its fixed table that fits
-/// in VRAM — the tallest/widest modes per tier (edk2 QemuVideoDxe's bochs
-/// table): 32 MB → 3840x2160 + 3200x2400, 16 MB → 2560x1600 + 2048x2048,
-/// 8 MB → 1920x1080 + 1600x1200, 4 MB → 1360x768 + 1280x800.
-fn vgamem_mb_for(w: u32, h: u32) -> u32 {
-    if w >= 3840 && h >= 2400 {
-        32
-    } else if w >= 2560 && h >= 2048 {
-        16
-    } else if w >= 1920 && h >= 1200 {
-        8
-    } else {
-        4
     }
 }
 
@@ -349,22 +331,23 @@ impl VmConfig {
         let booting_iso = spec.iso.is_some() && spec.boot_iso_first;
         let disk_bootindex = if booting_iso { 1 } else { 0 };
 
-        // Video, ONLY when booting the rescue ISO: std VGA with VRAM sized so
-        // no offered mode exceeds the host's usable screen. PE takes the
-        // LARGEST mode the firmware GOP offers and ignores EDID outright
-        // (measured: 1920x1080 with an EDID preferring 1592x832, and again at
-        // 1024x640); OVMF's QemuVideoDxe filters a fixed mode table by what
-        // fits in VRAM — so VRAM size is the one reliable cap. A disk boot
-        // keeps QEMU's default VGA: the installed guest manages its own
-        // display modes.
-        if booting_iso {
-            if let Some((w, h)) = self.max_resolution {
-                push("-vga");
-                push("none");
-                push("-device");
-                push(&format!("VGA,vgamem_mb={}", vgamem_mb_for(w, h)));
-            }
-        }
+        // Video: virtio-vga, always. Two reasons over std VGA:
+        // - The virtio-win guest tools install display drivers, and recent
+        //   QXL-DOD builds CLAIM QEMU's stdvga and render black at WDDM
+        //   handoff (observed: guest framebuffer black at the DOD-default
+        //   1280x800 after installing tools). virtio-vga is driven by the
+        //   maintained viogpu driver instead — and boots fine driverless too
+        //   (Basic Display over the GOP framebuffer; PE validated).
+        // - Its firmware GOP tops out at 1920x1080 (measured), and with
+        //   zoom-to-fit + the maximized window the picture scales to the
+        //   screen, which retires the old VGA vgamem-capping hack entirely.
+        // The device must be STABLE across a session's boots (a swap makes
+        // Windows re-detect displays), so this is unconditional, not
+        // per-boot-kind.
+        push("-vga");
+        push("none");
+        push("-device");
+        push("virtio-vga");
 
         match &spec.disk {
             DiskSource::RawPhysicalDrive(n) => {
@@ -719,44 +702,29 @@ mod tests {
     }
 
     #[test]
-    fn max_resolution_caps_vga_vram_only_for_iso_boots() {
+    fn video_is_virtio_vga_for_every_boot_kind() {
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
-        // A 1080p-ish usable area: 8 MB would still offer 1920x1080 (too tall
-        // once chrome is gone) so the tier drops to 4 MB → 1360x768 max.
-        let host = HostOptions {
-            max_resolution: Some((1904, 968)),
-            ..HostOptions::default()
-        };
-        let cfg = VmConfig::from_manifest(&m, &host).unwrap();
-
-        // Booting the rescue ISO → capped VGA.
-        let iso_spec = BootSpec {
-            iso: Some(r"D:\winpe.iso".to_string()),
-            boot_iso_first: true,
-            ..spec_uefi_raw()
-        };
-        let args = cfg.qemu_args(&iso_spec).join(" ");
-        assert!(args.contains("-vga none"));
-        assert!(args.contains("VGA,vgamem_mb=4"));
-
-        // Roomier hosts get the larger tiers.
-        assert_eq!(vgamem_mb_for(2560, 1300), 8);
-        assert_eq!(vgamem_mb_for(2560, 2100), 16);
-        assert_eq!(vgamem_mb_for(3840, 2400), 32);
-
-        // A disk boot — even with the ISO merely attached — keeps the default
-        // VGA: the installed guest manages its own display modes.
-        let attached_spec = BootSpec {
-            iso: Some(r"D:\winpe.iso".to_string()),
-            boot_iso_first: false,
-            ..spec_uefi_raw()
-        };
-        let args = cfg.qemu_args(&attached_spec).join(" ");
-        assert!(!args.contains("vgamem"));
-        assert!(!args.contains("-vga"));
-        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
-        assert!(!args.contains("vgamem"));
-        assert!(!args.contains("-vga"));
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        // Disk boot, ISO boot, ISO merely attached: the device never changes
+        // (a swap makes Windows re-detect displays mid-session).
+        for spec in [
+            spec_uefi_raw(),
+            BootSpec {
+                iso: Some(r"D:\winpe.iso".to_string()),
+                boot_iso_first: true,
+                ..spec_uefi_raw()
+            },
+            BootSpec {
+                iso: Some(r"D:\winpe.iso".to_string()),
+                boot_iso_first: false,
+                ..spec_uefi_raw()
+            },
+        ] {
+            let args = cfg.qemu_args(&spec).join(" ");
+            assert!(args.contains("-vga none"));
+            assert!(args.contains("-device virtio-vga"));
+            assert!(!args.contains("vgamem"));
+        }
     }
 
     #[test]
