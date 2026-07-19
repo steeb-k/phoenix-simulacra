@@ -85,6 +85,12 @@ pub struct HostOptions {
     /// zoom-to-fit scales the picture to the (maximized) window — but kept
     /// for future use as a native-mode hint.
     pub max_resolution: Option<(u32, u32)>,
+    /// Attach the qemu-vdagent clipboard channel. OFF by default while under
+    /// investigation: with the virtio-win SPICE agent running in the guest,
+    /// the screen goes black right when the agent starts (healthy OS, black
+    /// scanout, on stdvga AND virtio-vga) — suspected bad monitor-topology
+    /// apply when the agent talks to qemu-vdagent's partial SPICE protocol.
+    pub clipboard_agent: bool,
 }
 
 impl Default for HostOptions {
@@ -96,6 +102,7 @@ impl Default for HostOptions {
             controller_override: None,
             network: true,
             max_resolution: None,
+            clipboard_agent: false,
         }
     }
 }
@@ -197,6 +204,8 @@ pub struct VmConfig {
     pub network: bool,
     /// See [`HostOptions::max_resolution`].
     pub max_resolution: Option<(u32, u32)>,
+    /// See [`HostOptions::clipboard_agent`].
+    pub clipboard_agent: bool,
 }
 
 impl VmConfig {
@@ -249,6 +258,7 @@ impl VmConfig {
             smp: host.smp,
             network: host.network,
             max_resolution: host.max_resolution,
+            clipboard_agent: host.clipboard_agent,
         })
     }
 
@@ -300,16 +310,17 @@ impl VmConfig {
         }
 
         // Host↔guest clipboard: the GTK display speaks the SPICE agent
-        // protocol over a qemu-vdagent chardev. Inert until the guest runs
-        // the SPICE vdagent service (installed by the virtio-win guest-tools
-        // on the drivers ISO) — attached unconditionally so installing the
-        // tools is the only step.
-        push("-device");
-        push("virtio-serial-pci");
-        push("-chardev");
-        push("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on");
-        push("-device");
-        push("virtserialport,chardev=vdagent0,name=com.redhat.spice.0");
+        // protocol over a qemu-vdagent chardev, used by the guest's SPICE
+        // vdagent service (virtio-win guest tools). Gated — see
+        // [`HostOptions::clipboard_agent`] for why it is currently off.
+        if self.clipboard_agent {
+            push("-device");
+            push("virtio-serial-pci");
+            push("-chardev");
+            push("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on");
+            push("-device");
+            push("virtserialport,chardev=vdagent0,name=com.redhat.spice.0");
+        }
 
         // Firmware: UEFI needs a writable copy of BOTH pflash units. Attaching
         // the code flash read-only maps it as ROM, and WHPX cannot execute from
@@ -653,15 +664,26 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_agent_always_attached() {
+    fn clipboard_agent_gated_off_by_default() {
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        // Default: no vdagent (suspected guest black-screen interaction).
         let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(!args.contains("vdagent"));
+        assert!(!args.contains("virtio-serial-pci"));
+        // The display is still GTK, scaled to the (maximized) window.
+        assert!(args.contains("-display gtk,zoom-to-fit=on"));
+
+        // Opted in: the full channel appears.
+        let host = HostOptions {
+            clipboard_agent: true,
+            ..HostOptions::default()
+        };
+        let cfg = VmConfig::from_manifest(&m, &host).unwrap();
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(args.contains("virtio-serial-pci"));
         assert!(args.contains("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on"));
         assert!(args.contains("virtserialport,chardev=vdagent0,name=com.redhat.spice.0"));
-        // The clipboard-capable display, scaled to the (maximized) window.
-        assert!(args.contains("-display gtk,zoom-to-fit=on"));
     }
 
     #[test]
