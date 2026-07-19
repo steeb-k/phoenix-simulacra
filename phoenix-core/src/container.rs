@@ -85,7 +85,9 @@ pub struct Extent {
     pub sector_count: u64,
 }
 
-#[derive(Debug, Clone)]
+// All fields are plain integers, so `Copy` lets hot read paths pass one around
+// without touching the heap (see `phoenix-mount::chunkstore`).
+#[derive(Debug, Clone, Copy)]
 pub struct ChunkIndex {
     pub file_offset: u64,
     pub compressed_len: u32,
