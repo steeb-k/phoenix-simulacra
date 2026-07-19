@@ -372,21 +372,24 @@ fn drivers_section(
                 .text(egui::RichText::new(text).small()),
         );
     } else if drivers.present {
-        let mut on = state.attach_drivers_on();
-        if ui
-            .checkbox(&mut on, "Attach guest tools and driver ISO")
-            .changed()
-        {
-            state.attach_drivers = Some(on);
-        }
-        let update = ui.link(
-            egui::RichText::new("Check for updates")
-                .small()
-                .color(palette.accent),
-        );
-        if update.clicked() {
-            *action = VmAction::CheckDriversUpdate;
-        }
+        ui.horizontal(|ui| {
+            let mut on = state.attach_drivers_on();
+            if ui
+                .checkbox(&mut on, "Attach guest tools and driver ISO")
+                .changed()
+            {
+                state.attach_drivers = Some(on);
+            }
+            ui.add_space(6.0);
+            let update = ui.link(
+                egui::RichText::new("Check for updates")
+                    .small()
+                    .color(palette.accent),
+            );
+            if update.clicked() {
+                *action = VmAction::CheckDriversUpdate;
+            }
+        });
     } else {
         // No ISO yet: the download link stands in for the checkbox.
         let link = ui.link(

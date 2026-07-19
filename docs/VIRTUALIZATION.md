@@ -259,6 +259,14 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
 - **The ISO CD needs its own SATA port** (`ide-cd,...,bus=ide.1`): q35 AHCI
   ports are single-unit, and QEMU auto-places an unbussed CD as unit 1 of the
   port the OS disk owns, refusing to start.
+- **WHPX cannot reset a VP in place (2026-07-19).** A guest-initiated reboot
+  (Windows Restart, PE exit, bugcheck auto-restart) surfaces as `WHPX:
+  Unexpected VP exit code 4` in qemu.log and QEMU exits *cleanly* — from the
+  user's view any restart killed the VM. Fix: `boot()` relaunches QEMU against
+  the same session when it sees that signature (overlay/varstore/QMP port all
+  persist), with a crash-loop guard (min 15 s uptime, max 32 relaunches). The
+  relaunch drops `boot_iso_first`, which makes the one-shot ISO chain *more*
+  correct: restarting out of a rescue ISO lands on the disk.
 - **Known gap:** MBR/BIOS captures — the synthesis currently always presents
   GPT, so a BIOS-mode guest can't boot its MBR layout yet. Needs MBR
   synthesis before SeaBIOS boots are real.

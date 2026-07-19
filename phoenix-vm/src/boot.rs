@@ -169,55 +169,93 @@ pub fn boot(
     // (ACPI) instead of killing QEMU. The port is recorded in the session so a
     // separate process can find it.
     let qmp_port = crate::qmp::pick_free_port().ok();
-    let spec = BootSpec {
-        name: format!("Phoenix Simulacra — {}", manifest.hostname),
-        firmware_code: fw_code,
-        firmware_vars: fw_vars,
-        disk,
-        iso: iso.map(|p| p.display().to_string()),
-        boot_iso_first,
-        qmp_port,
-        drivers_iso: drivers_iso.map(|p| p.display().to_string()),
-    };
-    let args = cfg.qemu_args(&spec);
-
     session.mark_booting(now_rfc3339())?;
     if let Some(port) = qmp_port {
         let _ = std::fs::write(session.qmp_port_file(), port.to_string());
     }
     tracing::info!(
-        "booting {} ({} write layer, {}resume) with {} args",
+        "booting {} ({} write layer, {}resume)",
         backup.display(),
         match write_layer {
             WriteLayer::Avhdx => "avhdx",
             WriteLayer::Qcow2 => "qcow2",
         },
         if resuming { "" } else { "no " },
-        args.len()
     );
-    // QEMU's console output goes to the session's `qemu.log` — from the GUI
-    // there is no console to inherit (Windows would pop one up and any early
-    // error would vanish with it), and a persistent log is the better story
-    // from the CLI too.
+
+    // WHPX cannot reset a virtual processor in place: a guest-initiated reboot
+    // (Windows Restart, exiting a PE session, a bugcheck auto-restart) surfaces
+    // as "WHPX: Unexpected VP exit code 4" and QEMU exits *cleanly* instead of
+    // resetting. Relaunching against the same session IS the reboot — the
+    // overlay, varstore, serve, and QMP port all persist. The one-shot ISO
+    // boot is consumed by the first launch (`boot_iso_now` drops to false), so
+    // restarting out of a rescue ISO lands on the disk — exactly what "next
+    // boot only" means.
+    let mut boot_iso_now = boot_iso_first;
+    let mut launches = 0u32;
+    /// Reboot-loop backstop: a guest legitimately restarts a handful of times
+    /// (driver installs, updates); a guest that resets endlessly should stop
+    /// coming back.
+    const MAX_RELAUNCHES: u32 = 32;
+    /// A reset this soon after launch is a crash loop (the guest can't even
+    /// reach Windows in that time), not a user-driven restart — stop.
+    const MIN_UPTIME_FOR_RELAUNCH: std::time::Duration = std::time::Duration::from_secs(15);
+
+    // QEMU's console output goes to the session's `qemu.log` (truncated per
+    // launch) — from the GUI there is no console to inherit (Windows would pop
+    // one up and any early error would vanish with it), and a persistent log
+    // is the better story from the CLI too.
     let qemu_log_path = session.dir().join("qemu.log");
-    let log_out = std::fs::File::create(&qemu_log_path)
-        .with_context(|| format!("create {}", qemu_log_path.display()))?;
-    let log_err = log_out.try_clone().context("clone qemu.log handle")?;
-    let status = Command::new(&qemu.system)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(log_out)
-        .stderr(log_err)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .with_context(|| format!("launch {}", qemu.system.display()))?;
-    if !status.success() {
-        tracing::warn!(
-            "QEMU exited with {:?}; its output is in {}",
-            status.code(),
-            qemu_log_path.display()
-        );
-    }
+    let status = loop {
+        launches += 1;
+        let spec = BootSpec {
+            name: format!("Phoenix Simulacra — {}", manifest.hostname),
+            firmware_code: fw_code.clone(),
+            firmware_vars: fw_vars.clone(),
+            disk: disk.clone(),
+            iso: iso.map(|p| p.display().to_string()),
+            boot_iso_first: boot_iso_now,
+            qmp_port,
+            drivers_iso: drivers_iso.map(|p| p.display().to_string()),
+        };
+        let args = cfg.qemu_args(&spec);
+
+        let log_out = std::fs::File::create(&qemu_log_path)
+            .with_context(|| format!("create {}", qemu_log_path.display()))?;
+        let log_err = log_out.try_clone().context("clone qemu.log handle")?;
+        let started = std::time::Instant::now();
+        let status = Command::new(&qemu.system)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(log_out)
+            .stderr(log_err)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .with_context(|| format!("launch {}", qemu.system.display()))?;
+
+        let log_text = std::fs::read_to_string(&qemu_log_path).unwrap_or_default();
+        let guest_reset = log_text.contains("Unexpected VP exit code");
+        if guest_reset
+            && launches < MAX_RELAUNCHES
+            && started.elapsed() >= MIN_UPTIME_FOR_RELAUNCH
+        {
+            tracing::info!(
+                "guest restart (WHPX cannot reset in place) — relaunching to continue \
+                 the session (launch {})",
+                launches + 1
+            );
+            boot_iso_now = false;
+            continue;
+        }
+        if !status.success() {
+            tracing::warn!(
+                "QEMU exited with {:?}; its output is in {}",
+                status.code(),
+                qemu_log_path.display()
+            );
+        }
+        break status;
+    };
 
     // --- teardown: detach the child, THEN stop the serve helper -------------
     // Order still matters: the child's detach reads/closes the parent, so the
