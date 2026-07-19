@@ -125,6 +125,19 @@ impl Session {
         &self.dir
     }
 
+    /// The VM working root this session lives under — `dir` is
+    /// `<root>\vm-sessions\<backup-id>`. Resuming/stopping/discarding must use
+    /// THIS root, not one re-derived from the current scratch-drive choice:
+    /// the choice may have changed since the session was created (bit a user
+    /// on 2026-07-19 — Resume silently started a fresh session elsewhere).
+    pub fn vm_root(&self) -> PathBuf {
+        self.dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.dir.clone())
+    }
+
     pub fn write_layer(&self) -> WriteLayer {
         self.meta.write_layer
     }

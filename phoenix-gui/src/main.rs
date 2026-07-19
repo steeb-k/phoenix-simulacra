@@ -640,6 +640,10 @@ struct VmRun {
     /// The `net use` command mapping this run's shared folder in the guest,
     /// when the share is active.
     share_cmd: Option<String>,
+    /// The VM working root this run actually uses (session, serve scratch,
+    /// QMP port file) — captured at boot so Stop can't be misdirected by a
+    /// later scratch-dropdown change.
+    vm_root: std::path::PathBuf,
     result: std::sync::mpsc::Receiver<anyhow::Result<phoenix_vm::boot::BootOutcome>>,
 }
 
@@ -849,8 +853,9 @@ struct PhoenixApp {
     /// the Active-mounts table index (real rows first, then demo rows).
     pending_enable_write: Option<usize>,
     /// Boot VM was clicked while saved sessions exist: the resume-or-new
-    /// hazard dialog is up. Holds every saved session's backup path.
-    vm_boot_prompt: Option<Vec<String>>,
+    /// hazard dialog is up. Holds every saved session's (backup path, its own
+    /// VM working root) — resume must go where the session lives.
+    vm_boot_prompt: Option<Vec<(String, std::path::PathBuf)>>,
     /// Acknowledgement-checkbox state for the enable-write dialog.
     enable_write_ack: bool,
     /// Virtualize page controls (backup, knobs, scratch drive, ISO).
@@ -1054,6 +1059,11 @@ impl PhoenixApp {
             app.page = Page::Mount;
             app.pending_enable_write = Some(0);
         }
+        // Restore the persisted Virtualize scratch-drive choice.
+        app.vm.scratch = match app.settings.vm_scratch_drive {
+            Some(c) => vm_panel::ScratchChoice::Drive(c),
+            None => vm_panel::ScratchChoice::SameAsImage,
+        };
         app.init_updates();
         app
     }
@@ -4289,17 +4299,21 @@ impl PhoenixApp {
             }
             vm_panel::VmAction::LoadSummary => self.load_vm_summary(),
             vm_panel::VmAction::Stop => self.stop_vm(),
-            vm_panel::VmAction::Resume(path) => {
-                self.vm.backup_path = path;
+            vm_panel::VmAction::Resume { backup_path, vm_root } => {
+                self.vm.backup_path = backup_path;
                 self.load_vm_summary();
-                self.start_vm(false);
+                // Resume where the session lives — never where the scratch
+                // dropdown currently points.
+                self.start_vm(false, Some(vm_root));
             }
-            vm_panel::VmAction::Discard(path) => {
-                match phoenix_core::container::PhnxReader::open(std::path::Path::new(&path)) {
+            vm_panel::VmAction::Discard { backup_path, vm_root } => {
+                match phoenix_core::container::PhnxReader::open(std::path::Path::new(&backup_path))
+                {
                     Ok(reader) => {
                         let id = reader.header.backup_id;
                         drop(reader);
-                        match phoenix_vm::SessionManager::for_backup(std::path::Path::new(&path))
+                        // Discard at the session's own root, same reasoning.
+                        match phoenix_vm::SessionManager::new(vm_root.join("vm-sessions"))
                             .discard(&id)
                         {
                             Ok(()) => self.vm_last_status = "Session discarded.".into(),
@@ -4309,6 +4323,17 @@ impl PhoenixApp {
                     Err(e) => self.vm_last_status = format!("Can't open backup: {e}"),
                 }
             }
+        }
+
+        // Persist the scratch-drive choice the moment it changes — a fresh
+        // launch otherwise resets to the default and surprises the next boot.
+        let scratch_now = match self.vm.scratch {
+            vm_panel::ScratchChoice::SameAsImage => None,
+            vm_panel::ScratchChoice::Drive(c) => Some(c),
+        };
+        if scratch_now != self.settings.vm_scratch_drive {
+            self.settings.vm_scratch_drive = scratch_now;
+            let _ = self.settings.save();
         }
     }
 
@@ -4357,12 +4382,13 @@ impl PhoenixApp {
         if self.vm_run.is_some() || self.vm_boot_prompt.is_some() {
             return;
         }
-        let sessions: Vec<String> = phoenix_vm::SessionManager::list_all_sessions()
-            .into_iter()
-            .map(|s| s.meta().backup_path.clone())
-            .collect();
+        let sessions: Vec<(String, std::path::PathBuf)> =
+            phoenix_vm::SessionManager::list_all_sessions()
+                .into_iter()
+                .map(|s| (s.meta().backup_path.clone(), s.vm_root()))
+                .collect();
         if sessions.is_empty() {
-            self.start_vm(false);
+            self.start_vm(false, None);
         } else {
             self.vm_boot_prompt = Some(sessions);
         }
@@ -4377,12 +4403,12 @@ impl PhoenixApp {
         // that session's saved guest changes — hence the hazard framing.
         let selected_has_session = session_paths
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(self.vm.backup_path.trim()));
+            .any(|(p, _)| p.eq_ignore_ascii_case(self.vm.backup_path.trim()));
         let single = (session_paths.len() == 1).then(|| session_paths[0].clone());
 
         let action = {
             let (message, confirm_label, extra_label) = match &single {
-                Some(path) => {
+                Some((path, _root)) => {
                     let name = std::path::Path::new(path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -4435,29 +4461,33 @@ impl PhoenixApp {
         };
 
         match (action, &single) {
-            // Single session: Confirm = resume it (whatever backup is picked).
-            (ConfirmAction::Confirm, Some(path)) => {
+            // Single session: Confirm = resume it (whatever backup is picked),
+            // at the root it actually lives under.
+            (ConfirmAction::Confirm, Some((path, root))) => {
                 self.vm_boot_prompt = None;
                 self.vm.backup_path = path.clone();
                 self.load_vm_summary();
-                self.start_vm(false);
+                self.start_vm(false, Some(root.clone()));
             }
-            // Single session: Extra = start new from the selected backup.
+            // Single session: Extra = start new from the selected backup
+            // (the scratch choice governs where NEW sessions go).
             (ConfirmAction::Extra, Some(_)) => {
                 self.vm_boot_prompt = None;
-                self.start_vm(selected_has_session);
+                self.start_vm(selected_has_session, None);
             }
             // Multiple sessions: Confirm = start new from the selected backup.
             (ConfirmAction::Confirm, None) => {
                 self.vm_boot_prompt = None;
-                self.start_vm(selected_has_session);
+                self.start_vm(selected_has_session, None);
             }
             (ConfirmAction::Cancel, _) => self.vm_boot_prompt = None,
             _ => {}
         }
     }
 
-    fn start_vm(&mut self, fresh: bool) {
+    /// `vm_root_override` is the session's own root when resuming; `None`
+    /// derives the root from the scratch-drive choice (new sessions).
+    fn start_vm(&mut self, fresh: bool, vm_root_override: Option<std::path::PathBuf>) {
         if self.vm_run.is_some() {
             return;
         }
@@ -4486,7 +4516,7 @@ impl PhoenixApp {
             backup.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
         });
 
-        let vm_root = self.vm_root(&backup);
+        let vm_root = vm_root_override.unwrap_or_else(|| self.vm_root(&backup));
         let sessions = phoenix_vm::SessionManager::new(vm_root.join("vm-sessions"));
         let scratch = vm_root.join("vm-serve");
         let overlay_path = vm_root
@@ -4539,7 +4569,7 @@ impl PhoenixApp {
         // mapping the share is a double-click, not transcription.
         let helper_disk = share_active
             .then(|| {
-                let p = self.vm_root(&backup).join("share-helper.img");
+                let p = vm_root.join("share-helper.img");
                 match phoenix_vm::share::build_helper_disk(&p) {
                     Ok(()) => Some(p),
                     Err(e) => {
@@ -4598,6 +4628,7 @@ impl PhoenixApp {
             started: Instant::now(),
             overlay_path,
             share_cmd,
+            vm_root,
             result: rx,
         });
     }
@@ -4605,6 +4636,7 @@ impl PhoenixApp {
     fn stop_vm(&mut self) {
         let Some(run) = &self.vm_run else { return };
         let backup = run.backup.clone();
+        let vm_root = run.vm_root.clone();
         let id = match phoenix_core::container::PhnxReader::open(&backup) {
             Ok(r) => {
                 let id = r.header.backup_id;
@@ -4616,10 +4648,9 @@ impl PhoenixApp {
                 return;
             }
         };
-        // The QMP port file lives in the session dir under the SAME working root
-        // the boot used (respecting the scratch-drive choice).
-        let port_file = self
-            .vm_root(&backup)
+        // The QMP port file lives in the session dir under the root the boot
+        // ACTUALLY used (captured in VmRun — the dropdown may have moved on).
+        let port_file = vm_root
             .join("vm-sessions")
             .join(id.simple().to_string())
             .join("qmp.port");

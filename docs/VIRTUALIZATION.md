@@ -404,16 +404,13 @@ shippable. It is also the same engine work backup/restore/verify already want
   `qemu-img` conversion) if we still want it.
 - Readahead / parallel chunk decode (throughput), NVMe-on-stable-QEMU retest,
   MBR synthesis for BIOS captures, QEMU bundling — all as noted above.
-- **Scratch-drive choice must persist + Resume must ignore it** (user hit this
-  2026-07-19: Resume started a NEW session because the dropdown had reset to
-  default and the session lived on C:). Two parts: (1) persist the choice in
-  Settings (`vm_scratch_drive`); (2) the real bug — Resume/Stop derive
-  `vm_root` from the CURRENT dropdown instead of from where the session
-  actually lives, even though the table lists sessions from every drive.
-  Resume (table + boot dialog) should carry the session's own root through to
-  boot/stop; the scratch choice should only govern NEW sessions. Workaround
-  until then: set the dropdown back to the drive the session is on before
-  clicking Resume.
+- ~~Scratch-drive choice must persist + Resume must ignore it~~ **DONE
+  2026-07-19** (user hit it twice: Resume silently started a NEW session on
+  the default drive). The choice persists in Settings (`vm_scratch_drive`),
+  and Resume/Discard (table + boot dialog) now carry the session's own
+  `Session::vm_root()` through to boot; Stop uses the root captured in the
+  run. The dropdown governs NEW sessions only. Existing sessions resume
+  correctly — the fix is in the lookup, not the session data.
 - ~~QEMU window should open maximized~~ **DONE 2026-07-19**: `boot()` spawns a
   watcher that finds the QEMU process's main window (EnumWindows by pid) and
   maximizes it, and `-display gtk,zoom-to-fit=on` is pinned so the guest

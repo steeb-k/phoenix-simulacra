@@ -262,6 +262,10 @@ pub struct Settings {
     /// Rescue/PE ISOs the Virtualize page has attached before, newest first,
     /// so the ISO picker can offer them as a dropdown. Capped by the GUI.
     pub vm_iso_history: Vec<String>,
+    /// The Virtualize page's scratch-drive choice: `None` = same drive as the
+    /// image (the default), `Some('C')` = that drive. Persisted because a
+    /// fresh launch resetting it silently redirected new sessions.
+    pub vm_scratch_drive: Option<char>,
 }
 
 impl Default for Settings {
@@ -275,6 +279,7 @@ impl Default for Settings {
             clone_readback_verify: true,
             theme: ThemeChoice::System,
             vm_iso_history: Vec::new(),
+            vm_scratch_drive: None,
         }
     }
 }
