@@ -182,6 +182,50 @@ found — and the runtime path still honors a user-supplied QEMU.
 - **Multi-disk systems:** one `.phnx` is one disk. Booting a system that
   spans disks needs multi-backup sessions — out of scope, note in docs.
 
+## Boot-smoke findings (2026-07-18 — milestone 5 reached same-day)
+
+A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
+**booted to the login screen** in QEMU, served on demand from the `.phnx`
+(qcow2 write path). The validated recipe, and every trap found on the way:
+
+- **GPT identity must be boot-faithful.** The mount paths derive fresh
+  disk/partition GUIDs (double-attach protection), but the BCD references the
+  OS partition by disk GUID + PartitionId — derived GUIDs fail `winload.efi`
+  with 0xc000000e. `SyntheticVhd::build_vhdx_original_identity` /
+  `WinFspServe::serve_for_vm` restore the manifest's original identity (plus
+  GPT attribute bits). Never host-attach an image served this way.
+- **WHPX cannot execute from ROM-mapped pflash.** OVMF attached with
+  `readonly=on` never reaches video init (100% CPU trap-storm). Fix: give
+  QEMU per-session **writable copies** of both firmware flashes.
+- **Never `-cpu max` under WHPX** on new hosts (APX-era): exposes features the
+  hypervisor can't virtualize and the guest spins pre-video. Use a rich named
+  model (`Skylake-Client-v4` clears Win11's SSE4.2/POPCNT floor).
+- **Don't pass `kernel-irqchip=off`.** With it, Windows wedges at early kernel
+  init (~450 MB in, no I/O, no bugcheck) — userspace-APIC timer starvation.
+  Default WHPX irqchip boots clean.
+- **Pin the OS disk with `bootindex=0`**, or a fresh OVMF varstore burns
+  minutes on PXE/HTTP and drops to the UEFI shell without trying the disk.
+- **NVRAM varstore is per-topology session state**: reuse it only while the
+  disk controller layout is unchanged, else stale Boot#### entries dangle.
+- **AHCI (`ide-hd` on q35) boots Windows 11 fine** — the inbox `storahci`
+  driver came up on a capture from NVMe hardware; no 0x7B, no injection
+  needed on this guest. QEMU's `nvme` device was invisible to this build's
+  OVMF even with explicit `nvme-ns` (dev-snapshot suspicion) — retest on
+  stable QEMU; NVMe remains required for 4Kn (IDE is 512-only).
+- **Use a stable QEMU release.** winget's SoftwareFreedomConservancy.QEMU was
+  a master-branch dev snapshot (11.0.50) with a broken/hanging OVMF; the
+  bundled-installer decision above should pin a known-good stable build.
+- **Throughput is the felt bottleneck**: a booting guest issues scattered 4K
+  reads, and every chunk-cache miss decompresses a whole 4 MiB chunk (up to
+  1000x amplification). Raising the chunkstore cache to 1.5 GiB made boots
+  practical; the real fix is readahead + parallel chunk decode (ROADMAP P3).
+  Boot-to-login was ~4 minutes on this rig, wall-clock dominated by that.
+- **TPM caveat confirmed as predicted**: Windows Hello PIN unavailable in the
+  guest (TPM-sealed); password sign-in works.
+- **Known gap:** MBR/BIOS captures — the synthesis currently always presents
+  GPT, so a BIOS-mode guest can't boot its MBR layout yet. Needs MBR
+  synthesis before SeaBIOS boots are real.
+
 ## Milestones
 
 1. **Plan + branch** (this document).

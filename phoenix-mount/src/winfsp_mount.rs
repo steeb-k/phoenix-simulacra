@@ -463,10 +463,30 @@ impl WinFspServe {
     /// `force_vhdx` wraps even a 512e backup in VHDX — required when the served
     /// image is to be a differencing parent, since a fixed VHD cannot be one.
     pub fn serve(backup: &Path, scratch_dir: &Path, force_vhdx: bool) -> Result<Self> {
+        Self::serve_inner(backup, scratch_dir, force_vhdx, false)
+    }
+
+    /// As [`WinFspServe::serve`] with `force_vhdx`, but the synthesized GPT
+    /// keeps the SOURCE disk's identity (disk GUID, partition unique GUIDs,
+    /// attribute bits) so a VM can boot it — the BCD resolves its boot device
+    /// by those GUIDs. The served image must NOT be attached to the host;
+    /// it is meant to back a VM disk (see docs/VIRTUALIZATION.md).
+    pub fn serve_for_vm(backup: &Path, scratch_dir: &Path) -> Result<Self> {
+        Self::serve_inner(backup, scratch_dir, true, true)
+    }
+
+    fn serve_inner(
+        backup: &Path,
+        scratch_dir: &Path,
+        force_vhdx: bool,
+        original_identity: bool,
+    ) -> Result<Self> {
         ensure_winfsp()?;
         let reader = PhnxReader::open(backup)?;
         let backup_id = reader.header.backup_id;
-        let vhd = if force_vhdx {
+        let vhd = if original_identity {
+            SyntheticVhd::build_vhdx_original_identity(reader)?
+        } else if force_vhdx {
             SyntheticVhd::build_vhdx(reader)?
         } else {
             SyntheticVhd::build(reader)?
