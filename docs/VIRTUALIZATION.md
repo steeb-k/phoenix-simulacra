@@ -314,6 +314,38 @@ Design constraints:
 This is a legitimate recovery capability for the machine's owner acting on
 their own backup; it is deliberately session-scoped and reversible.
 
+## Boot-from-ISO, next-boot-only (planned feature)
+
+Let the user **attach an ISO and boot the VM from it on the next boot only** —
+to drop into an emergency PE / rescue environment (WinPE, a Windows recovery
+ISO, a live Linux) and inspect or repair the captured drive from the outside,
+then fall back to booting the disk normally.
+
+Why this is almost free in our model: we launch a fresh QEMU process on every
+boot, so "next boot only" isn't persistent state to track and revert — it's
+just a per-launch flag. A boot with the flag adds a read-only CD-ROM device
+for the ISO and gives it boot priority; the *next* boot (without the flag)
+simply doesn't, so it reverts automatically. No NVRAM varstore surgery, no
+one-shot bookkeeping.
+
+Sketch:
+
+- Add the ISO as a read-only optical device (`-drive
+  file=<iso>,media=cdrom,if=none,id=cd0` + an `ide-cd`/`scsi-cd`), and give it
+  `bootindex=0` for that launch so firmware tries it before the disk. (QEMU's
+  `-boot once=d` is the BIOS-path equivalent; with OVMF the per-device
+  `bootindex` is the reliable lever.)
+- The disk overlay is still attached, so the PE environment sees the guest's
+  own drive — and any repair it makes lands in the throwaway session overlay,
+  never the `.phnx`. This pairs naturally with the login-prep idea above (boot
+  PE → fix the OS volume offline → next boot into the repaired system).
+- UI: a "Boot from ISO next time" affordance on the session (pick a file);
+  it's inherently one-shot, so nothing to un-set.
+
+Notably this needs no new engine work — it's purely QEMU command-line
+assembly in `VmConfig`/`BootSpec`, so it slots in wherever the boot options
+UI lands.
+
 ## Open questions (want your input)
 
 - Overlay: does session interop (mount the same session you boot) justify
