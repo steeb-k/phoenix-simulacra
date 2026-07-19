@@ -270,6 +270,11 @@ pub struct Settings {
     pub vm_memory_mib: Option<u64>,
     /// The Virtualize page's processor slider. `None` = the built-in default.
     pub vm_cpus: Option<u32>,
+    /// Directory holding `qemu-system-x86_64.exe`. `None` = autodetect
+    /// (`PATH`, then the stock installer locations). Set this to run a
+    /// side-by-side QEMU without disturbing the system-wide install — e.g.
+    /// an 11.1+ build, which is what clipboard sharing needs.
+    pub vm_qemu_dir: Option<String>,
 }
 
 impl Default for Settings {
@@ -286,6 +291,7 @@ impl Default for Settings {
             vm_scratch_drive: None,
             vm_memory_mib: None,
             vm_cpus: None,
+            vm_qemu_dir: None,
         }
     }
 }
