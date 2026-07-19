@@ -1946,12 +1946,19 @@ impl PhoenixApp {
         // to `titlebar::show` along with the floating corner pill. That pill
         // hosts the app's one Refresh button — live only when the window is
         // otherwise idle (no job, no modal, no refresh already in flight).
+        // Belt and braces: the sidebar hides unavailable pages, but nothing
+        // stops `self.page` holding one that arrived by another route. Fall
+        // back rather than render a page this build cannot support.
+        if !sidebar::page_available(self.page, self.portable) {
+            self.page = Page::Backup;
+        }
         let nav = sidebar::show(
             ctx,
             &mut self.page,
             &self.palette,
             modal_open,
             &mut self.settings.theme,
+            self.portable,
         );
         let brand_rect = nav.brand_rect;
         if nav.theme_changed {
@@ -5258,9 +5265,8 @@ fn start_page_from_args() -> Option<Page> {
                 "restore" => Some(Page::Restore),
                 "verify" => Some(Page::Verify),
                 "mount" => Some(Page::Mount),
-                "virtualize" | "vm" => {
-                    Some(Page::Virtualize).filter(|p| sidebar::page_available(*p))
-                }
+                "virtualize" | "vm" => Some(Page::Virtualize)
+                    .filter(|p| sidebar::page_available(*p, updater::is_portable())),
                 "bootrepair" | "boot-repair" => Some(Page::BootRepair),
                 "history" => Some(Page::History),
                 "about" => Some(Page::About),
