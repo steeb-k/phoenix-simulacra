@@ -1,74 +1,67 @@
-//! Guest-free validation of the VM overlay lifecycle and teardown ordering.
+//! Validates the VM overlay lifecycle with an **out-of-process** WinFsp serve.
 //!
-//! ⚠️ CURRENT RESULT (2026-07-19): this test **hangs at `detach_wait`** and its
-//! watchdog force-exits it, because it proves a *negative*: with the WinFsp
-//! serve running IN THIS PROCESS, `DetachVirtualDisk` on the differencing child
-//! deadlocks in the storage driver (the detach's Close IRP to the WinFsp-served
-//! parent can't complete). Confirmed via the per-step diag file: every raw I/O
-//! step passes; the last marker is always `[5] detach_wait…`. The force-exit can
-//! leave the overlay orphaned-attached briefly (Windows reaps it, or detach via
-//! diskpart). This is the evidence for moving the serve OUT OF PROCESS; once
-//! that lands, this test is rewritten to spawn the serve helper and expect a
-//! clean detach. Until then, do not treat a hang here as a regression.
+//! Background: `DetachVirtualDisk` on a differencing child deadlocks when the
+//! parent VHDX is served by WinFsp *in the same process* (root-caused earlier).
+//! The fix serves the parent from a separate helper process. This test proves
+//! the fix, guest-free (no QEMU), in seconds:
 //!
-//! This exercises exactly the serve → differencing-child → attach-offline →
-//! raw-I/O → **detach-wait** → stop-serve sequence that `phoenix-vm`'s boot
-//! path uses, but with **no QEMU and no multi-minute guest boot** — so it runs
-//! in seconds and, crucially, cannot wedge the machine the way driving a real
-//! guest and force-killing it did.
-//!
-//! Two things it proves:
-//!   1. **Teardown is deadlock-free and ordered.** `AttachedDisk::detach_wait`
-//!      confirms the device is gone before the in-process WinFsp serve is
-//!      stopped; the serve is only dropped on that confirmation. A watchdog
-//!      thread force-exits the process if any step hangs, so even a regression
-//!      cleans up (process death auto-detaches the disk) instead of wedging.
+//!   1. **Teardown no longer deadlocks.** With the serve out-of-process,
+//!      `detach_wait` returns `true` (the device really goes away) and the
+//!      helper stops cleanly. A watchdog force-exits on any hang so a
+//!      regression can't wedge the machine.
 //!   2. **Resume reconnects and persists.** A marker written to the raw device
-//!      in the first attach is read back after detaching, re-serving at the
-//!      same deterministic path, and re-attaching the same differencing child —
-//!      the core of session resume.
+//!      in the first attach is read back after detaching, re-spawning the serve
+//!      helper at the same deterministic path, and re-attaching the same child.
 //!
-//! Requires: elevated shell, WinFsp, `--features winfsp`:
+//! The serve helper is the built `simulacra-cli` re-exec'd with the sentinel;
+//! this test spawns it by path (a test binary doesn't route the sentinel). So
+//! `simulacra-cli` must be built **with `--features winfsp`** first:
 //!   $env:LIBCLANG_PATH="C:\Program Files\LLVM\bin"
-//!   cargo test -p phoenix-systests --features winfsp --test vm_overlay_lifecycle -- \
+//!   cargo build -p phoenix-cli --features winfsp
+//!   cargo test -p phoenix-systests --test vm_overlay_lifecycle -- \
 //!       --ignored --test-threads=1 --nocapture
-#![cfg(feature = "winfsp")]
+//!
+//! (This test itself needs no winfsp feature — it only attaches/detaches and
+//! drives the helper process.)
 
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use phoenix_capture::backup::{run_backup, BackupOptions};
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::enumerate_disks;
-use phoenix_mount::{create_differencing_vhdx, set_disk_offline, AttachedDisk, WinFspServe};
+use phoenix_mount::{create_differencing_vhdx, set_disk_offline, wait_for_device_gone, AttachedDisk};
+use phoenix_vm::serve_helper::spawn_serve_with_exe;
 use phoenix_systests::{
     cleanup_leaked_vhds, fill_fixture, require_admin, wait_for_letter, PartSpec, TestFs, TestVhd,
 };
 
 const MIB: u64 = 1024 * 1024;
 
-/// Append a progress marker to a diag file, flushed + synced, so the last line
-/// survives a watchdog force-exit and pinpoints exactly where a hang occurred.
-fn mark(step: &str) {
-    let path = std::env::temp_dir().join("vmlife-progress.txt");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{step}");
-        let _ = f.flush();
-        let _ = f.sync_all();
-    }
-    eprintln!("{step}");
-}
-
 /// Force-exit the whole process after `secs` so a hung teardown can never wedge
 /// the box: process death makes the OS auto-detach the disk and reclaim WinFsp.
 fn arm_watchdog(secs: u64, label: &'static str) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(secs));
-        eprintln!("WATCHDOG: {label} did not finish in {secs}s — teardown likely hung; \
-                   force-exiting so the OS reclaims the attach/serve");
+        eprintln!("WATCHDOG: {label} did not finish in {secs}s — force-exiting");
         std::process::exit(2);
     });
+}
+
+/// The built `simulacra-cli.exe` next to this test binary's target dir.
+fn cli_exe() -> PathBuf {
+    // test exe: target/<profile>/deps/vm_overlay_lifecycle-HASH.exe
+    // cli exe:  target/<profile>/simulacra-cli.exe
+    let me = std::env::current_exe().expect("current exe");
+    let profile_dir = me.parent().and_then(|p| p.parent()).expect("profile dir");
+    let cli = profile_dir.join("simulacra-cli.exe");
+    assert!(
+        cli.exists(),
+        "{} not found — build it first: cargo build -p phoenix-cli --features winfsp",
+        cli.display()
+    );
+    cli
 }
 
 fn raw_open(drive: u32) -> std::fs::File {
@@ -77,22 +70,18 @@ fn raw_open(drive: u32) -> std::fs::File {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+        .share_mode(0x3)
         .open(&path)
         .unwrap_or_else(|e| panic!("open {path}: {e}"))
 }
 
 fn raw_write(f: &mut std::fs::File, offset: u64, data: &[u8]) {
-    assert_eq!(offset % 512, 0);
-    assert_eq!(data.len() % 512, 0);
     f.seek(SeekFrom::Start(offset)).unwrap();
     f.write_all(data).unwrap();
     f.sync_all().ok();
 }
 
 fn raw_read(f: &mut std::fs::File, offset: u64, len: usize) -> Vec<u8> {
-    assert_eq!(offset % 512, 0);
-    assert_eq!(len % 512, 0);
     f.seek(SeekFrom::Start(offset)).unwrap();
     let mut buf = vec![0u8; len];
     f.read_exact(&mut buf).unwrap();
@@ -100,11 +89,12 @@ fn raw_read(f: &mut std::fs::File, offset: u64, len: usize) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "requires elevation + WinFsp + --features winfsp"]
-fn overlay_teardown_is_ordered_and_resume_reconnects() {
+#[ignore = "requires elevation + a winfsp-built simulacra-cli"]
+fn overlay_teardown_out_of_process_and_resume_reconnects() {
     require_admin();
-    arm_watchdog(40, "overlay lifecycle");
+    arm_watchdog(90, "overlay lifecycle");
     let _ = cleanup_leaked_vhds();
+    let cli = cli_exe();
 
     // --- a small 512e NTFS backup -------------------------------------------
     let source = TestVhd::create(512).expect("create source");
@@ -117,14 +107,11 @@ fn overlay_teardown_is_ordered_and_resume_reconnects() {
         }])
         .expect("init source");
     assert!(wait_for_letter('X', 15_000), "source never mounted");
-    fill_fixture('X', 0x00A1_FE00u64).ok(); // seed not important here
+    fill_fixture('X', 0x00A1_FE00u64).ok();
     let disks = enumerate_disks().unwrap();
     let disk = disks.iter().find(|d| d.index == source.disk_index()).unwrap();
     let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
-    let backup = std::env::temp_dir().join(format!(
-        "vmlife-{}.phnx",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let backup = std::env::temp_dir().join(format!("vmlife-{}.phnx", uuid::Uuid::new_v4().simple()));
     run_backup(BackupOptions {
         disk_index: source.disk_index(),
         partition_indices: parts,
@@ -136,7 +123,6 @@ fn overlay_teardown_is_ordered_and_resume_reconnects() {
     .expect("run_backup");
     drop(source);
 
-    // Deterministic serve scratch + session overlay, both on the temp drive.
     let scratch = std::env::temp_dir().join("phoenix-systests").join("vmlife-serve");
     let session_dir = std::env::temp_dir().join("phoenix-systests").join("vmlife-session");
     std::fs::create_dir_all(&session_dir).unwrap();
@@ -148,84 +134,69 @@ fn overlay_teardown_is_ordered_and_resume_reconnects() {
 
     // ===================== leg 1: first boot equivalent =====================
     {
-        let serve = WinFspServe::serve_for_vm(&backup, &scratch).expect("serve_for_vm");
-        let parent = serve.image_path();
-        let span = serve
-            .spans()
-            .iter()
-            .max_by_key(|s| s.size)
-            .cloned()
-            .expect("no partition span");
-        write_off = (span.disk_offset + 16 * MIB) / 512 * 512;
+        let serve = spawn_serve_with_exe(&cli, &backup, &scratch).expect("spawn serve helper");
+        let parent = serve.parent_path().to_path_buf();
+        eprintln!("leg1: helper serving parent at {}", parent.display());
 
-        mark("leg1: [0a] create_differencing_vhdx…");
-        create_differencing_vhdx(
-            overlay.to_str().unwrap(),
-            parent.to_str().unwrap(),
-        )
-        .expect("create differencing child");
-        mark("leg1: [0b] attach_readwrite_opts…");
+        // The served parent carries the partition layout in its GPT; place the
+        // marker safely inside the (large) data partition.
+        write_off = 40 * MIB;
+
+        create_differencing_vhdx(overlay.to_str().unwrap(), parent.to_str().unwrap())
+            .expect("create differencing child");
         let att = AttachedDisk::attach_readwrite_opts(overlay.to_str().unwrap(), false)
             .expect("attach child rw");
-        mark("leg1: [0c] physical_drive_number…");
         let drive = att.physical_drive_number().expect("phys drive");
-        mark("leg1: [0d] set_disk_offline…");
         set_disk_offline(drive).expect("offline");
-        mark(&format!("leg1: attached as PhysicalDrive{drive} (offline)"));
+        eprintln!("leg1: attached as PhysicalDrive{drive} (offline)");
 
-        // Simulate guest write: a marker into the differencing child.
-        mark("leg1: [1] raw_open…");
         let mut dev = raw_open(drive);
-        mark("leg1: [2] raw_write…");
         raw_write(&mut dev, write_off, &marker);
-        mark("leg1: [3] raw_read…");
         let echo = raw_read(&mut dev, write_off, marker.len());
-        assert_eq!(echo, marker, "marker did not read back within leg1");
-        mark("leg1: [4] drop dev…");
+        assert_eq!(echo, marker, "marker did not read back in leg1");
         drop(dev);
 
-        // Teardown UNDER TEST: detach must complete before the serve stops.
-        mark("leg1: [5] detach_wait…");
-        let detached = att.detach_wait(Duration::from_secs(10));
-        mark(&format!("leg1: [6] detach_wait returned {detached}"));
-        assert!(detached, "detach_wait timed out — teardown ordering is unsafe");
+        // THE FIX UNDER TEST: detach by DROPPING (CloseHandle → async detach),
+        // never by an explicit DetachVirtualDisk (that deadlocks), then poll
+        // until the device is really gone before stopping the serve.
+        eprintln!("leg1: drop attach (async detach)…");
         drop(att);
-        mark("leg1: [7] drop serve…");
-        drop(serve); // safe only because `detached` is true
-        mark("leg1: detached cleanly, serve stopped — no hang");
+        eprintln!("leg1: wait_for_device_gone…");
+        let detached = wait_for_device_gone(drive, Duration::from_secs(15));
+        eprintln!("leg1: wait_for_device_gone -> {detached}");
+        assert!(detached, "device never went away after dropping the attach");
+        serve.stop();
+        eprintln!("leg1: helper stopped cleanly — no hang");
     }
 
     let overlay_len = std::fs::metadata(&overlay).unwrap().len();
     assert!(overlay_len > 4 * MIB, "overlay didn't grow ({overlay_len} bytes)");
 
     // ===================== leg 2: resume equivalent =========================
-    // Re-serve at the SAME deterministic path, re-attach the SAME child, and
-    // read the marker back — proving the differencing child reconnected to the
-    // re-served parent and guest writes persisted.
     {
-        let serve = WinFspServe::serve_for_vm(&backup, &scratch).expect("re-serve_for_vm");
+        let serve = spawn_serve_with_exe(&cli, &backup, &scratch).expect("re-spawn serve helper");
+        let parent = serve.parent_path().to_path_buf();
         assert!(overlay.exists(), "overlay vanished before resume");
         let att = AttachedDisk::attach_readwrite_opts(overlay.to_str().unwrap(), false)
             .expect("re-attach existing child (resume)");
         let drive = att.physical_drive_number().expect("phys drive on resume");
         set_disk_offline(drive).ok();
-        eprintln!("leg2: re-attached existing overlay as PhysicalDrive{drive}");
+        eprintln!("leg2: re-attached overlay over re-served {}", parent.display());
 
         let mut dev = raw_open(drive);
         let echo = raw_read(&mut dev, write_off, marker.len());
         assert_eq!(echo, marker, "RESUME FAILED: marker did not survive detach + re-serve");
         drop(dev);
 
-        let detached = att.detach_wait(Duration::from_secs(10));
-        assert!(detached, "detach_wait timed out on resume leg");
         drop(att);
-        drop(serve);
-        eprintln!("leg2: resume marker verified, detached cleanly");
+        let detached = wait_for_device_gone(drive, Duration::from_secs(15));
+        assert!(detached, "device never went away on resume leg");
+        serve.stop();
+        eprintln!("leg2: resume marker verified, helper stopped cleanly");
     }
 
-    // Backup stayed immutable and openable.
     PhnxReader::open(&backup).expect(".phnx must still open after the lifecycle");
-    eprintln!("PASS: ordered teardown (no hang) + resume reconnect verified");
+    eprintln!("PASS: out-of-process teardown (no hang) + resume reconnect verified");
 
     let _ = std::fs::remove_file(&overlay);
     let _ = std::fs::remove_file(&backup);

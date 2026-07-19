@@ -206,6 +206,19 @@ enum VmCommands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // If we were re-exec'd as an out-of-process WinFsp serve helper for a VM
+    // boot, run that and exit — before any argument parsing, so the sentinel
+    // isn't rejected by clap. (VM detach deadlocks against an in-process serve;
+    // see phoenix_vm::serve_helper.)
+    let raw_args: Vec<String> = std::env::args().collect();
+    if let Some(res) = phoenix_vm::serve_helper::maybe_run(&raw_args) {
+        if let Err(e) = res {
+            eprintln!("vm serve helper failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Match the GUI's default filter so a user running the CLI also sees
     // capture/restore progress events without having to set `RUST_LOG`.
     // The catch-all `warn` keeps third-party libs quiet.
