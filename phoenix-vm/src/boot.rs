@@ -171,16 +171,40 @@ pub fn boot(
         .status()
         .with_context(|| format!("launch {}", qemu.system.display()))?;
 
-    // --- teardown: detach the child, then stop the serve --------------------
+    // --- teardown: detach the child, THEN stop the serve --------------------
+    // Order is load-bearing. The differencing child is backed by the WinFsp
+    // serve running IN THIS PROCESS; the detach's final I/O to the parent needs
+    // the serve's filesystem threads alive. So detach synchronously and wait for
+    // the device to actually vanish (bounded) BEFORE dropping the serve — a
+    // fixed sleep here instead of a real wait is what deadlocked teardown into
+    // an unkillable process.
+    let detached = _attached
+        .as_ref()
+        .map(|att| att.detach_wait(std::time::Duration::from_secs(10)))
+        .unwrap_or(true);
     drop(_attached);
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    drop(serve);
+    if detached {
+        drop(serve);
+    } else {
+        // The overlay didn't detach in time. Stopping the in-process serve now
+        // would race the in-flight detach and deadlock the storage driver
+        // (unkillable process). Instead, forget the serve and let normal
+        // process exit reclaim both the serve and the attach — the OS tears
+        // them down cleanly on death. The CLI returns from here and exits
+        // immediately; a long-lived host would leak one serve until it exits.
+        tracing::error!(
+            "session overlay did not detach cleanly; leaving serve teardown to process \
+             exit to avoid a storage-driver deadlock"
+        );
+        std::mem::forget(serve);
+    }
     session.mark_clean()?;
 
     let overlay_bytes = std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0);
-    let backup_intact = PhnxReader::open(backup)
-        .and_then(|mut r| r.verify_all(true))
-        .is_ok();
+    // Cheap integrity signal: opening a .phnx validates its footer CRC, manifest
+    // and index hashes. A full `verify_all` re-reads the whole backup and does
+    // not belong on the exit path of every boot.
+    let backup_intact = PhnxReader::open(backup).is_ok();
 
     Ok(BootOutcome {
         exit_ok: status.success(),
