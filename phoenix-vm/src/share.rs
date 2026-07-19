@@ -166,13 +166,70 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         .write_all(cmd.as_bytes())
         .context("write MapShare.cmd")?;
 
+    // Driver install that deliberately SKIPS the display-only drivers
+    // (qxldod / viogpudo): both black-screen this VM at WDDM handoff
+    // (observed on stdvga and virtio-vga; guest healthy, scanout black),
+    // while the Basic Display works. pnputil against the CD's driver
+    // folders gives precise control the guest-tools installer doesn't.
+    let install = "@echo off\r\n\
+        title Simulacra guest driver install\r\n\
+        net session >nul 2>&1\r\n\
+        if errorlevel 1 (\r\n\
+        echo Requesting administrator rights...\r\n\
+        powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"\r\n\
+        exit /b\r\n\
+        )\r\n\
+        \r\n\
+        set VIODRV=\r\n\
+        for %%d in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (\r\n\
+        if exist \"%%d:\\virtio-win-gt-x64.msi\" set VIODRV=%%d:\r\n\
+        )\r\n\
+        if \"%VIODRV%\"==\"\" (\r\n\
+        echo Could not find the virtio-win driver CD. Is it attached?\r\n\
+        pause\r\n\
+        exit /b 1\r\n\
+        )\r\n\
+        echo Found the driver CD at %VIODRV%\r\n\
+        \r\n\
+        set OSDIR=w11\r\n\
+        if not exist \"%VIODRV%\\vioserial\\w11\" set OSDIR=w10\r\n\
+        \r\n\
+        echo Installing drivers (display drivers deliberately skipped)...\r\n\
+        for %%f in (vioserial NetKVM viostor vioscsi Balloon vioinput viorng viofs pvpanic qemupciserial fwcfg) do (\r\n\
+        if exist \"%VIODRV%\\%%f\\%OSDIR%\\amd64\" (\r\n\
+        echo   %%f\r\n\
+        pnputil /add-driver \"%VIODRV%\\%%f\\%OSDIR%\\amd64\\*.inf\" /install >nul\r\n\
+        )\r\n\
+        )\r\n\
+        \r\n\
+        if exist \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" (\r\n\
+        echo Installing the QEMU guest agent...\r\n\
+        msiexec /i \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" /qn\r\n\
+        )\r\n\
+        \r\n\
+        echo.\r\n\
+        echo Done. The display drivers were skipped on purpose: the basic\r\n\
+        echo display works, and the virtio/QXL display drivers currently\r\n\
+        echo blank the screen in this VM. Do NOT run the guest-tools\r\n\
+        echo installer from the CD - it would install them.\r\n\
+        pause\r\n";
+    root.create_file("InstallGuestDrivers.cmd")
+        .context("create InstallGuestDrivers.cmd")?
+        .write_all(install.as_bytes())
+        .context("write InstallGuestDrivers.cmd")?;
+
     let readme = format!(
         "This drive belongs to Phoenix Simulacra (running on the host).\r\n\
          \r\n\
-         Run MapShare.cmd to map the host's shared folder as drive S:\r\n\
+         MapShare.cmd           - map the host's shared folder as drive S:\r\n\
          (the folder next to the backup image, \\\\10.0.2.2\\{SHARE_NAME}).\r\n\
+         Anything you copy into S: appears on the host, and vice versa.\r\n\
          \r\n\
-         Anything you copy into S: appears on the host, and vice versa.\r\n"
+         InstallGuestDrivers.cmd - install the virtio-win drivers and the\r\n\
+         QEMU guest agent from the attached driver CD, SKIPPING the display\r\n\
+         drivers (they blank the screen in this VM - the basic display is\r\n\
+         the supported path). Use this instead of the CD's own\r\n\
+         virtio-win-guest-tools installer.\r\n"
     );
     root.create_file("README.txt")
         .context("create README.txt")?
@@ -220,6 +277,18 @@ mod tests {
             .unwrap();
         assert!(cmd.contains(r"\\10.0.2.2\SimulacraShare"));
         assert!(cmd.contains("net use S:"));
+
+        // The driver script must never install the display drivers.
+        let mut inst = String::new();
+        fs.root_dir()
+            .open_file("InstallGuestDrivers.cmd")
+            .unwrap()
+            .read_to_string(&mut inst)
+            .unwrap();
+        assert!(inst.contains("pnputil"));
+        assert!(inst.contains("vioserial"));
+        assert!(!inst.contains("qxldod"));
+        assert!(!inst.contains("viogpudo"));
         drop(fs);
         std::fs::remove_file(&img).ok();
     }

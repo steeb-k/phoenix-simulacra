@@ -259,6 +259,19 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
 - **The ISO CD needs its own SATA port** (`ide-cd,...,bus=ide.1`): q35 AHCI
   ports are single-unit, and QEMU auto-places an unbussed CD as unit 1 of the
   port the OS disk owns, refusing to start.
+- **virtio-win DISPLAY drivers black-screen this VM (2026-07-19, unresolved
+  upstream-wise).** After installing guest tools, the guest renders black at
+  1280x800 from WDDM handoff onward — on stdvga (QXL-DOD claims it) AND on
+  virtio-vga (viogpu), with the vdagent channel removed, guest fully alive
+  (QMP blockstats), deaf to wake keys and Win+P. Basic Display works
+  perfectly. Policy: the SIMULACRA helper disk ships
+  `InstallGuestDrivers.cmd`, which pnputil-installs every useful driver
+  family + qemu-ga from the CD and DELIBERATELY SKIPS qxldod/viogpudo; users
+  should run it instead of the CD's guest-tools installer. A session that
+  already installed the display drivers needs safe-mode driver removal or a
+  fresh session. Clipboard (vdagent) remains open — needs a route that
+  doesn't involve the display drivers; `HostOptions::clipboard_agent` stays
+  off meanwhile.
 - **WHPX cannot reset a VP in place (2026-07-19).** A guest-initiated reboot
   (Windows Restart, PE exit, bugcheck auto-restart) surfaces as `WHPX:
   Unexpected VP exit code 4` in qemu.log and QEMU exits *cleanly* — from the
