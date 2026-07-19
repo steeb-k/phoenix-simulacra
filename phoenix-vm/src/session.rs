@@ -173,6 +173,12 @@ impl Session {
         self.dir.join("qmp.port")
     }
 
+    /// Where the live guest-agent channel port is recorded (same lifecycle as
+    /// the QMP port file).
+    pub fn qga_port_file(&self) -> PathBuf {
+        self.dir.join("qga.port")
+    }
+
     /// Copy the UEFI firmware into the session if not already present. Idempotent
     /// across resumes — the varstore is only seeded once so boot-order changes
     /// survive. Pass the QEMU master blobs.

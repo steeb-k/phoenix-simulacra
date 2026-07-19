@@ -170,9 +170,13 @@ pub fn boot(
     // (ACPI) instead of killing QEMU. The port is recorded in the session so a
     // separate process can find it.
     let qmp_port = crate::qmp::pick_free_port().ok();
+    let qga_port = crate::qmp::pick_free_port().ok();
     session.mark_booting(now_rfc3339())?;
     if let Some(port) = qmp_port {
         let _ = std::fs::write(session.qmp_port_file(), port.to_string());
+    }
+    if let Some(port) = qga_port {
+        let _ = std::fs::write(session.qga_port_file(), port.to_string());
     }
     tracing::info!(
         "booting {} ({} write layer, {}resume)",
@@ -217,6 +221,7 @@ pub fn boot(
             iso: iso.map(|p| p.display().to_string()),
             boot_iso_first: boot_iso_now,
             qmp_port,
+            qga_port,
             drivers_iso: drivers_iso.map(|p| p.display().to_string()),
             helper_disk: helper_disk.map(|p| p.display().to_string()),
         };
@@ -285,6 +290,7 @@ pub fn boot(
     }
     serve.stop(); // kills the helper process — clean, it holds no attach
     let _ = std::fs::remove_file(session.qmp_port_file());
+    let _ = std::fs::remove_file(session.qga_port_file());
     session.mark_clean()?;
 
     let overlay_bytes = std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0);

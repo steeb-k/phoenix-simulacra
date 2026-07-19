@@ -207,6 +207,10 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         msiexec /i \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" /qn\r\n\
         )\r\n\
         \r\n\
+        echo Blocking driver delivery via Windows Update (it pushes the same\r\n\
+        echo display driver this script skips, blanking the screen on reboot)...\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
+        \r\n\
         echo.\r\n\
         echo Done. The display drivers were skipped on purpose: the basic\r\n\
         echo display works, and the virtio/QXL display drivers currently\r\n\
@@ -287,6 +291,7 @@ mod tests {
             .unwrap();
         assert!(inst.contains("pnputil"));
         assert!(inst.contains("vioserial"));
+        assert!(inst.contains("ExcludeWUDriversInQualityUpdate"));
         assert!(!inst.contains("qxldod"));
         assert!(!inst.contains("viogpudo"));
         drop(fs);
