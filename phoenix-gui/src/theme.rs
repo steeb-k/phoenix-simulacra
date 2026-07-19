@@ -61,13 +61,20 @@ impl Palette {
 /// `ctx`. Returns the [`Palette`] used by the sidebar widget.
 pub fn refresh(ctx: &egui::Context, choice: ThemeChoice) -> Palette {
     let accent = read_accent_color();
-    let light_mode = match choice {
+    let light_mode = is_light(choice);
+    apply(ctx, accent, light_mode);
+    palette_for(accent, light_mode)
+}
+
+/// Resolve `choice` to light or dark, following Windows only for
+/// [`ThemeChoice::System`]. Split out so code with no `egui::Context` to
+/// hand — spawning a QEMU window, say — can ask the same question.
+pub fn is_light(choice: ThemeChoice) -> bool {
+    match choice {
         ThemeChoice::System => read_apps_use_light_theme(),
         ThemeChoice::Light => true,
         ThemeChoice::Dark => false,
-    };
-    apply(ctx, accent, light_mode);
-    palette_for(accent, light_mode)
+    }
 }
 
 fn palette_for(accent: Color32, light_mode: bool) -> Palette {
