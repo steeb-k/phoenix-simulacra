@@ -400,14 +400,17 @@ fn show_sessions(
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| meta.backup_path.clone());
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(name).font(fonts::bold(13.0)));
-                            ui.label(
-                                egui::RichText::new(&meta.backup_path)
-                                    .small()
-                                    .color(palette.subtle_text),
-                            );
-                        });
+                        // Extend, never wrap: a Grid column takes its width from
+                        // its cells, and a wrapping label collapses to the header's
+                        // width and breaks the name one character per line. The
+                        // full path lives in the tooltip.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(name).font(fonts::bold(13.0)),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                        )
+                        .on_hover_text(&meta.backup_path);
 
                         if !meta.clean_shutdown {
                             ui.label(
