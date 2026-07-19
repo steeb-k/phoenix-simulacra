@@ -254,6 +254,8 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
   table by what fits in VRAM, so `VGA,vgamem_mb={4,8,16,32}` is the reliable
   cap (4 MB → 1360x768 confirmed exactly). `vgamem_mb_for` maps the host's
   usable screen (work area minus QEMU window chrome) to the largest safe tier.
+  Applied ONLY when booting the rescue ISO — a disk boot keeps QEMU's default
+  VGA, since the installed guest manages its own display modes.
 - **The ISO CD needs its own SATA port** (`ide-cd,...,bus=ide.1`): q35 AHCI
   ports are single-unit, and QEMU auto-places an unbussed CD as unit 1 of the
   port the OS disk owns, refusing to start.

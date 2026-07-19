@@ -297,19 +297,6 @@ impl VmConfig {
             push("none");
         }
 
-        // Video: std VGA with VRAM sized so no offered mode exceeds the host's
-        // usable screen. The Windows boot loader takes the LARGEST mode the
-        // firmware GOP offers and ignores EDID outright (measured: PE picked
-        // 1920x1080 with an EDID preferring 1592x832, and again at 1024x640).
-        // OVMF's QemuVideoDxe builds its mode list from a fixed table filtered
-        // by what fits in VRAM — so VRAM size is the one reliable cap.
-        if let Some((w, h)) = self.max_resolution {
-            push("-vga");
-            push("none");
-            push("-device");
-            push(&format!("VGA,vgamem_mb={}", vgamem_mb_for(w, h)));
-        }
-
         // Firmware: UEFI needs a writable copy of BOTH pflash units. Attaching
         // the code flash read-only maps it as ROM, and WHPX cannot execute from
         // ROM-mapped memory — OVMF then hangs at 100% CPU before video init.
@@ -329,6 +316,23 @@ impl VmConfig {
         // the ISO this launch, the CD takes priority (0) and the disk follows.
         let booting_iso = spec.iso.is_some() && spec.boot_iso_first;
         let disk_bootindex = if booting_iso { 1 } else { 0 };
+
+        // Video, ONLY when booting the rescue ISO: std VGA with VRAM sized so
+        // no offered mode exceeds the host's usable screen. PE takes the
+        // LARGEST mode the firmware GOP offers and ignores EDID outright
+        // (measured: 1920x1080 with an EDID preferring 1592x832, and again at
+        // 1024x640); OVMF's QemuVideoDxe filters a fixed mode table by what
+        // fits in VRAM — so VRAM size is the one reliable cap. A disk boot
+        // keeps QEMU's default VGA: the installed guest manages its own
+        // display modes.
+        if booting_iso {
+            if let Some((w, h)) = self.max_resolution {
+                push("-vga");
+                push("none");
+                push("-device");
+                push(&format!("VGA,vgamem_mb={}", vgamem_mb_for(w, h)));
+            }
+        }
 
         match &spec.disk {
             DiskSource::RawPhysicalDrive(n) => {
@@ -605,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn max_resolution_caps_vga_vram() {
+    fn max_resolution_caps_vga_vram_only_for_iso_boots() {
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
         // A 1080p-ish usable area: 8 MB would still offer 1920x1080 (too tall
         // once chrome is gone) so the tier drops to 4 MB → 1360x768 max.
@@ -614,7 +618,14 @@ mod tests {
             ..HostOptions::default()
         };
         let cfg = VmConfig::from_manifest(&m, &host).unwrap();
-        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+
+        // Booting the rescue ISO → capped VGA.
+        let iso_spec = BootSpec {
+            iso: Some(r"D:\winpe.iso".to_string()),
+            boot_iso_first: true,
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&iso_spec).join(" ");
         assert!(args.contains("-vga none"));
         assert!(args.contains("VGA,vgamem_mb=4"));
 
@@ -623,8 +634,16 @@ mod tests {
         assert_eq!(vgamem_mb_for(2560, 2100), 16);
         assert_eq!(vgamem_mb_for(3840, 2400), 32);
 
-        // Without a cap the default VGA is left alone.
-        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        // A disk boot — even with the ISO merely attached — keeps the default
+        // VGA: the installed guest manages its own display modes.
+        let attached_spec = BootSpec {
+            iso: Some(r"D:\winpe.iso".to_string()),
+            boot_iso_first: false,
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&attached_spec).join(" ");
+        assert!(!args.contains("vgamem"));
+        assert!(!args.contains("-vga"));
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(!args.contains("vgamem"));
         assert!(!args.contains("-vga"));
