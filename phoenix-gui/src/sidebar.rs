@@ -84,14 +84,21 @@ const TOP_ITEMS: &[NavItem] = &[
     },
 ];
 
-/// Whether a page exists in this build. Virtualization is x86_64-only:
-/// Windows-on-ARM QEMU has no useful acceleration for the x86 guests our
-/// backups mostly are (TCG emulation only), and ARM-Windows machines vary too
-/// much in guest-visible hardware for a booted backup to be a good bet — so
-/// ARM builds hide the page entirely rather than ship a trap.
-pub const fn page_available(page: Page) -> bool {
+/// Whether a page exists in this build. Virtualization is hidden twice over.
+///
+/// It is x86_64-only: Windows-on-ARM QEMU has no useful acceleration for the
+/// x86 guests our backups mostly are (TCG emulation only), and ARM-Windows
+/// machines vary too much in guest-visible hardware for a booted backup to be
+/// a good bet — so ARM builds hide the page rather than ship a trap.
+///
+/// It is also absent from portable builds. Booting a backup needs an
+/// installed WinFsp to serve the disk and an installed QEMU to run it;
+/// neither is something a portable copy can assume or provide, and the whole
+/// point of the portable build is that it installs nothing. A page that
+/// could only ever report missing prerequisites is worse than no page.
+pub fn page_available(page: Page, portable: bool) -> bool {
     match page {
-        Page::Virtualize => cfg!(target_arch = "x86_64"),
+        Page::Virtualize => cfg!(target_arch = "x86_64") && !portable,
         _ => true,
     }
 }
@@ -198,6 +205,8 @@ pub fn show(
     palette: &Palette,
     busy: bool,
     theme: &mut ThemeChoice,
+    // See [`page_available`] — hides pages this build cannot offer.
+    portable: bool,
 ) -> SidebarOutput {
     // Alt+<first letter> jumps straight to a page. Consumed here (before any
     // widget sees the key) but only while navigation is allowed, mirroring
@@ -205,7 +214,7 @@ pub fn show(
     // modifier held, so Ctrl+Alt combos (e.g. AltGr input) pass through.
     if !busy {
         for item in TOP_ITEMS.iter().chain(BOTTOM_ITEMS) {
-            if !page_available(item.page) {
+            if !page_available(item.page, portable) {
                 continue;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, item.key)) {
@@ -274,7 +283,7 @@ pub fn show(
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for item in TOP_ITEMS {
-                                    if !page_available(item.page) {
+                                    if !page_available(item.page, portable) {
                                         continue;
                                     }
                                     nav_row(ui, item, current, palette);

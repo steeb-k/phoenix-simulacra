@@ -240,7 +240,7 @@ pub fn boot(
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .with_context(|| format!("launch {}", qemu.system.display()))?;
-        maximize_window_of(child.id());
+        maximize_window_of(child.id(), host.dark_window);
         spawn_reset_watchdog(child.id(), qemu_log_path.clone());
         let status = child.wait().context("wait for QEMU")?;
 
@@ -404,12 +404,17 @@ fn qemu_process_handle_op(pid: u32, terminate: bool) -> bool {
     matches
 }
 
-/// Maximize QEMU's window once it appears. QEMU has no "start maximized"
-/// switch (`full-screen=on` is borderless fullscreen — a different thing), so
-/// a watcher thread waits for the freshly-spawned process's main window and
-/// asks the OS to maximize it. Paired with `zoom-to-fit=on` in the display
-/// args so the guest picture fills the window.
-fn maximize_window_of(pid: u32) {
+/// Maximize QEMU's window once it appears, and optionally darken its title
+/// bar. QEMU has no "start maximized" switch (`full-screen=on` is borderless
+/// fullscreen — a different thing), so a watcher thread waits for the
+/// freshly-spawned process's main window and asks the OS to maximize it.
+/// Paired with `zoom-to-fit=on` in the display args so the guest picture
+/// fills the window.
+///
+/// `dark_titlebar` is a separate lever from `GTK_THEME`: GTK on Windows uses
+/// the *native* frame, so the theme darkens the menu bar but leaves the
+/// title bar light. Only DWM can repaint that, per window.
+fn maximize_window_of(pid: u32, dark_titlebar: bool) {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, GW_OWNER,
@@ -449,6 +454,9 @@ fn maximize_window_of(pid: u32) {
             // `search`, which outlives it.
             unsafe { EnumWindows(Some(enum_cb), &mut search as *mut Search as LPARAM) };
             if !search.hwnd.is_null() {
+                if dark_titlebar {
+                    set_dark_titlebar(search.hwnd);
+                }
                 // SAFETY: worst case the window died since — ShowWindow then
                 // fails harmlessly.
                 unsafe { ShowWindow(search.hwnd, SW_MAXIMIZE) };
@@ -457,6 +465,39 @@ fn maximize_window_of(pid: u32) {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     });
+}
+
+/// Ask DWM to paint this window's title bar dark.
+///
+/// The attribute number moved: Windows 10 1809–1903 used 19, and 20 from
+/// 2004 onwards (and on 11). Passing the wrong one is simply refused with
+/// an error HRESULT and no side effect, so trying 20 and falling back to 19
+/// is both safe and the cheapest way to cover every version — there is no
+/// supported build-number query that maps cleanly onto this.
+#[cfg(windows)]
+fn set_dark_titlebar(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+
+    const USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const USE_IMMERSIVE_DARK_MODE_PRE_20H1: u32 = 19;
+
+    let on: i32 = 1;
+    for attr in [USE_IMMERSIVE_DARK_MODE, USE_IMMERSIVE_DARK_MODE_PRE_20H1] {
+        // SAFETY: `hwnd` is live here, and the value is the BOOL-sized i32
+        // the attribute expects. A version that doesn't know `attr` returns
+        // a failure HRESULT and changes nothing.
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attr,
+                &on as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        if hr >= 0 {
+            return;
+        }
+    }
 }
 
 /// The last `max_bytes` of a log file as lossy UTF-8, trimmed — what gets
