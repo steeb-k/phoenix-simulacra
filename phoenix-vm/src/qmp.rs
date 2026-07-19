@@ -63,6 +63,42 @@ pub fn quit(port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Plug or unplug the guest's virtual network cable at `127.0.0.1:port`.
+///
+/// The only part of a slirp NIC that can be changed while the VM runs:
+/// `restrict` is fixed at creation, `netdev_del` silently no-ops while a
+/// device references the backend, and there is no hot-swap for a live NIC's
+/// backend. Link state is the one lever, and it is host-side — the guest
+/// cannot raise its own cable.
+///
+/// `id` is the *device* id (`nic0`), which is why the NIC is created with an
+/// explicit one rather than through `-nic`, whose generated id is not
+/// something we can reliably name later.
+pub fn set_link(port: u16, id: &str, up: bool) -> Result<()> {
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect to QMP on 127.0.0.1:{port}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    reader.read_line(&mut line).context("read QMP greeting")?;
+    writeln!(writer, "{{\"execute\":\"qmp_capabilities\"}}")?;
+    line.clear();
+    reader.read_line(&mut line).context("read qmp_capabilities reply")?;
+    writeln!(
+        writer,
+        "{{\"execute\":\"set_link\",\"arguments\":{{\"name\":\"{id}\",\"up\":{up}}}}}"
+    )?;
+    line.clear();
+    reader.read_line(&mut line).context("read set_link reply")?;
+    if line.contains("\"error\"") {
+        anyhow::bail!("set_link failed: {}", line.trim());
+    }
+    Ok(())
+}
+
 /// Bind an ephemeral loopback port, then release it, returning the number. The
 /// caller passes it to QEMU's `-qmp` and to a later `system_powerdown`. There
 /// is a small window where another process could take the port before QEMU

@@ -241,6 +241,9 @@ pub fn boot(
             .spawn()
             .with_context(|| format!("launch {}", qemu.system.display()))?;
         maximize_window_of(child.id(), host.dark_window);
+        if !host.network {
+            unplug_network(spec.qmp_port);
+        }
         spawn_reset_watchdog(child.id(), qemu_log_path.clone());
         let status = child.wait().context("wait for QEMU")?;
 
@@ -464,6 +467,35 @@ fn maximize_window_of(pid: u32, dark_titlebar: bool) {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+    });
+}
+
+/// Pull the guest's network cable as soon as QEMU will answer QMP.
+///
+/// Networking is opt-in, but neither `e1000e` nor `virtio-net-pci` exposes a
+/// link-down property to start with (checked), so the cable can only be
+/// pulled once the machine exists. The window this leaves is milliseconds
+/// wide and sits in the firmware phase, long before any guest OS brings up a
+/// network stack — but it is a window, not an airtight guarantee, and it is
+/// the reason this runs before anything else touches the VM.
+fn unplug_network(qmp_port: Option<u16>) {
+    let Some(port) = qmp_port else {
+        tracing::warn!("no QMP port: the guest starts with its network connected");
+        return;
+    };
+    std::thread::spawn(move || {
+        // QMP binds with the process, but "spawned" and "listening" are not
+        // the same instant; retry briefly rather than lose the race.
+        for _ in 0..100 {
+            match crate::qmp::set_link(port, crate::config::NET_DEVICE_ID, false) {
+                Ok(()) => {
+                    tracing::info!("guest network starts unplugged");
+                    return;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+        tracing::error!("could not unplug the guest network — it may have a connection");
     });
 }
 

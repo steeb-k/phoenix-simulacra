@@ -29,13 +29,9 @@ pub struct VmPageState {
     pub summary: Option<BackupSummary>,
     pub mem_mib: u64,
     pub cpus: u32,
-    pub network: bool,
     pub scratch: ScratchChoice,
     pub iso_path: String,
     pub boot_iso: bool,
-    /// Share a folder next to the image with the guest over the host's SMB
-    /// server. Effective only with networking on (SMB rides the NAT).
-    pub share: bool,
     /// "Attach guest tools and driver ISO": `None` means the default —
     /// checked whenever the ISO is present on disk. `Some` is an explicit
     /// user choice.
@@ -56,11 +52,9 @@ impl Default for VmPageState {
             summary: None,
             mem_mib: 6144,
             cpus: 4,
-            network: false,
             scratch: ScratchChoice::SameAsImage,
             iso_path: String::new(),
             boot_iso: false,
-            share: true,
             attach_drivers: None,
             grab_keyboard: false,
             free_mem: None,
@@ -137,6 +131,8 @@ pub enum VmAction {
     BrowseQemuDir,
     /// Go back to autodetecting QEMU.
     ClearQemuDir,
+    /// Plug or unplug the running guest's network cable.
+    SetNetwork(bool),
 }
 
 /// A running VM, for the header status line.
@@ -150,6 +146,8 @@ pub struct RunningView<'a> {
     /// The `net use` command that maps the shared folder inside the guest,
     /// when a share is active for this run.
     pub share_cmd: Option<&'a str>,
+    /// Whether the guest's virtual network cable is currently plugged in.
+    pub network_connected: bool,
 }
 
 /// What we know about the QEMU we're driving, for the page footer.
@@ -224,6 +222,48 @@ pub fn show(
             )
             .small()
             .color(palette.subtle_text),
+        );
+
+        // Networking, granted after the fact. Every VM boots with its cable
+        // unplugged, so this is the only way the guest gets online — and the
+        // guest cannot plug itself in, since link state is host-side.
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("Network").font(fonts::bold(14.0)));
+        ui.add_space(4.0);
+        let (icon, text, note) = if run.network_connected {
+            (
+                egui_phosphor::regular::PLUGS_CONNECTED,
+                "Disconnect network",
+                "The guest is online. Windows Update may push a display driver \
+                 that blanks the screen on the next reboot.",
+            )
+        } else {
+            (
+                egui_phosphor::regular::PLUGS,
+                "Connect network",
+                "The guest's network cable is unplugged. Connect it to reach the \
+                 internet or the shared folder.",
+            )
+        };
+        let net_label = crate::icon_label(
+            icon,
+            fonts::icon(16.0),
+            text,
+            fonts::regular(14.0),
+            ui.visuals().widgets.inactive.fg_stroke.color,
+        );
+        if ui.add(egui::Button::new(net_label)).clicked() {
+            action = VmAction::SetNetwork(!run.network_connected);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(note)
+                .small()
+                .color(if run.network_connected {
+                    palette.warning
+                } else {
+                    palette.subtle_text
+                }),
         );
 
         // Shared folder: the guest can't be auto-mounted (we can't reach into
@@ -387,20 +427,12 @@ pub fn show(
             });
             ui.end_row();
 
-            ui.label("Networking");
-            ui.checkbox(&mut state.network, "Give the guest internet (user-mode NAT)");
-            ui.end_row();
-
-            // The share rides the NAT (the guest reaches the host's SMB server
-            // at 10.0.2.2), so it greys out when networking is off.
-            ui.label("Shared folder");
-            ui.add_enabled_ui(state.network, |ui| {
-                ui.checkbox(
-                    &mut state.share,
-                    "Share a folder next to the image with the guest (SMB)",
-                );
-            });
-            ui.end_row();
+            // Networking and the shared folder used to be checkboxes here.
+            // Both are gone: the share is always set up, and every VM now
+            // boots with its network cable unplugged, connected on demand
+            // from the running view. Opt-in is the safer default — a guest
+            // that reaches Windows Update gets a screen-blanking display
+            // driver pushed to it within moments of first login.
 
             // Scratch-drive picker: every mounted drive + its free space, with
             // "same drive as the image" as the default.

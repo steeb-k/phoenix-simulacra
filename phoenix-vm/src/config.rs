@@ -13,6 +13,13 @@
 use anyhow::{bail, Result};
 use phoenix_core::manifest::BackupManifest;
 
+/// Id of the user-mode network backend.
+pub const NET_BACKEND_ID: &str = "net0";
+/// Id of the NIC device. Named explicitly so `set_link` can plug and unplug
+/// its cable while the VM runs — the `-nic` shorthand generates an id that
+/// cannot be referred to reliably afterwards.
+pub const NET_DEVICE_ID: &str = "nic0";
+
 /// Guest firmware, selected from the source disk's partitioning style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Firmware {
@@ -77,14 +84,19 @@ pub struct HostOptions {
     /// Force a controller instead of the manifest-derived default. `None` uses
     /// the default (AHCI for 512e, NVMe for 4Kn).
     pub controller_override: Option<DiskController>,
-    /// User-mode (slirp) networking with an `e1000e` NIC (inbox driver). When
-    /// false, no NIC at all — for forensic boots of possibly-hostile images.
+    /// Start with the guest's network cable plugged in.
     ///
-    /// Defaults OFF. A connected guest gets a display driver pushed by
-    /// Windows Update within moments of first login — well before any
-    /// in-guest script can block it — and that driver blanks the screen on
-    /// the next reboot. The CD's own driver is fine, so the practical fix
-    /// is to stay offline while installing the guest tools.
+    /// Defaults OFF, and the GUI never turns it on at boot: a connected
+    /// guest gets a display driver pushed by Windows Update within moments
+    /// of first login — well before any in-guest script can block it — and
+    /// that driver blanks the screen on the next reboot. Networking is
+    /// therefore opt-in, granted after boot with
+    /// [`qmp::set_link`](crate::qmp::set_link).
+    ///
+    /// The NIC itself is always present regardless; this is link state, not
+    /// hardware. Link state is host-side and the guest cannot raise its own
+    /// cable, so an unplugged NIC isolates the guest just as an absent one
+    /// would — while leaving something to plug in later.
     pub network: bool,
     /// Advisory usable-screen size ([`usable_guest_resolution`]). No longer
     /// steers the video device — virtio-vga's GOP tops out at 1920x1080 and
@@ -361,13 +373,18 @@ impl VmConfig {
             push(&format!("tcp:127.0.0.1:{port},server,nowait"));
         }
 
-        if self.network {
-            push("-nic");
-            push("user,model=e1000e");
-        } else {
-            push("-nic");
-            push("none");
-        }
+        // The NIC always exists; what changes is whether its cable is
+        // plugged in (see [`HostOptions::network`]). Spelled out as a
+        // netdev plus a device rather than the shorthand `-nic` because
+        // only this form lets us name the device — `set_link` needs that
+        // name to unplug or plug the cable while the VM runs, and `-nic`
+        // generates an id we cannot reliably refer to afterwards.
+        push("-netdev");
+        push(&format!("user,id={NET_BACKEND_ID}"));
+        push("-device");
+        push(&format!(
+            "e1000e,netdev={NET_BACKEND_ID},id={NET_DEVICE_ID}"
+        ));
 
         // One virtio-serial controller carries both optional channels below.
         if self.clipboard_agent || spec.qga_port.is_some() {
@@ -809,14 +826,25 @@ mod tests {
     }
 
     #[test]
-    fn network_is_off_by_default() {
-        // Windows Update pushes a screen-blanking display driver to a
-        // connected guest before any in-guest script can block it.
+    fn nic_is_always_present_and_nameable() {
+        // Networking is opt-in (Windows Update pushes a screen-blanking
+        // display driver to a connected guest before any in-guest script can
+        // block it), but the NIC must exist even when the cable starts
+        // unplugged — otherwise there is nothing for set_link to plug in.
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
-        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
-        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
-        assert!(args.contains("-nic none"));
-        assert!(!args.contains("e1000e"));
+        for network in [false, true] {
+            let host = HostOptions {
+                network,
+                ..HostOptions::default()
+            };
+            let cfg = VmConfig::from_manifest(&m, &host).unwrap();
+            let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+            assert!(args.contains("-netdev user,id=net0"));
+            // Explicit ids, not the `-nic` shorthand: set_link addresses the
+            // device by name, and a generated id cannot be relied on.
+            assert!(args.contains("-device e1000e,netdev=net0,id=nic0"));
+            assert!(!args.contains("-nic"));
+        }
     }
 
     #[test]
@@ -914,16 +942,4 @@ mod tests {
         assert!(!cfg.qemu_args(&spec_uefi_raw()).join(" ").contains("-qmp"));
     }
 
-    #[test]
-    fn no_network_uses_nic_none() {
-        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
-        let host = HostOptions {
-            network: false,
-            ..HostOptions::default()
-        };
-        let cfg = VmConfig::from_manifest(&m, &host).unwrap();
-        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
-        assert!(args.contains("-nic none"));
-        assert!(!args.contains("e1000e"));
-    }
 }

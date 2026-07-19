@@ -183,10 +183,11 @@ enum VmCommands {
         /// Guest vCPUs.
         #[arg(long, default_value_t = 4)]
         cpus: u32,
-        /// Give the guest networking. Off by default: a connected Windows
-        /// guest gets a display driver pushed by Windows Update that blanks
-        /// the screen on the next reboot, and an untrusted image should not
-        /// reach the network at all.
+        /// Boot with the guest's network cable plugged in. Off by default: a
+        /// connected Windows guest gets a display driver pushed by Windows
+        /// Update that blanks the screen on the next reboot. The NIC is
+        /// always present either way — this is link state, and the GUI can
+        /// plug it in later without a reboot.
         #[arg(long, default_value_t = false)]
         network: bool,
         /// Directory of the QEMU install (else PATH / default locations).

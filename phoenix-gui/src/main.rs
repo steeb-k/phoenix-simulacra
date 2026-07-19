@@ -644,6 +644,9 @@ struct VmRun {
     /// QMP port file) — captured at boot so Stop can't be misdirected by a
     /// later scratch-dropdown change.
     vm_root: std::path::PathBuf,
+    /// Whether the guest's virtual network cable is plugged in. Every VM
+    /// boots unplugged; the running view grants it.
+    network_connected: bool,
     result: std::sync::mpsc::Receiver<anyhow::Result<phoenix_vm::boot::BootOutcome>>,
 }
 
@@ -4481,6 +4484,7 @@ impl PhoenixApp {
                 r.started.elapsed().as_secs(),
                 overlay_mib,
                 r.share_cmd.clone(),
+                r.network_connected,
             )
         });
         let last = self.vm_last_status.clone();
@@ -4503,15 +4507,17 @@ impl PhoenixApp {
 
         page_scroll_shell(ui, "virtualize_page", |ui| {
             page_header_badged(ui, &palette, "Virtualize", "", "Experimental");
-            let running = running_owned.as_ref().map(|(n, b, e, o, share)| {
-                vm_panel::RunningView {
-                    name: n,
-                    backup_path: b,
-                    elapsed_secs: *e,
-                    overlay_mib: *o,
-                    share_cmd: share.as_deref(),
-                }
-            });
+            let running =
+                running_owned
+                    .as_ref()
+                    .map(|(n, b, e, o, share, net)| vm_panel::RunningView {
+                        name: n,
+                        backup_path: b,
+                        elapsed_secs: *e,
+                        overlay_mib: *o,
+                        share_cmd: share.as_deref(),
+                        network_connected: *net,
+                    });
             action = vm_panel::show(
                 ui,
                 &mut vm_state,
@@ -4554,6 +4560,34 @@ impl PhoenixApp {
                     hist.insert(0, picked);
                     hist.truncate(8);
                     let _ = self.settings.save();
+                }
+            }
+            vm_panel::VmAction::SetNetwork(up) => {
+                match self.running_vm_qmp_port() {
+                    Some(port) => {
+                        match phoenix_vm::qmp::set_link(
+                            port,
+                            phoenix_vm::config::NET_DEVICE_ID,
+                            up,
+                        ) {
+                            Ok(()) => {
+                                if let Some(run) = self.vm_run.as_mut() {
+                                    run.network_connected = up;
+                                }
+                                self.vm_last_status = if up {
+                                    "Network connected — the guest is online.".into()
+                                } else {
+                                    "Network disconnected.".into()
+                                };
+                            }
+                            Err(e) => {
+                                self.vm_last_status = format!("Couldn't change the network: {e}")
+                            }
+                        }
+                    }
+                    None => {
+                        self.vm_last_status = "Couldn't find the VM's control port.".into()
+                    }
                 }
             }
             vm_panel::VmAction::BrowseQemuDir => {
@@ -4842,7 +4876,8 @@ impl PhoenixApp {
         let host = phoenix_vm::HostOptions {
             memory_mib: self.vm.mem_mib,
             smp: self.vm.cpus,
-            network: self.vm.network,
+            // Always boot unplugged; the running view grants it on demand.
+            network: false,
             // Cap the guest display so the QEMU window (chrome included)
             // fits the monitor — PE otherwise picks a huge video mode.
             max_resolution: phoenix_vm::usable_guest_resolution(),
@@ -4870,8 +4905,12 @@ impl PhoenixApp {
         // Shared folder: create/point the Windows share before boot so the
         // Running view can show the guest-side command immediately. A failure
         // is surfaced but never blocks the boot.
+        // Always set up: there is no longer a checkbox for it. The share
+        // costs nothing while the guest's cable is unplugged, and having it
+        // ready means connecting the network is the only step between a
+        // running guest and the shared folder.
         let mut share_warning = None;
-        let share_cmd = if self.vm.share && self.vm.network {
+        let share_cmd = {
             let dir = phoenix_vm::share::share_dir_for_backup(&backup);
             match phoenix_vm::share::ensure_share(&dir) {
                 Ok(()) => Some(phoenix_vm::share::guest_mount_command()),
@@ -4881,8 +4920,6 @@ impl PhoenixApp {
                     None
                 }
             }
-        } else {
-            None
         };
         let share_active = share_cmd.is_some();
         // The "SIMULACRA" helper disk carries MapShare.cmd into the guest so
@@ -4950,6 +4987,8 @@ impl PhoenixApp {
             overlay_path,
             share_cmd,
             vm_root,
+            // Boot unplugs the cable as soon as QMP answers.
+            network_connected: false,
             result: rx,
         });
     }
