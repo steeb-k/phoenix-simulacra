@@ -2920,17 +2920,28 @@ fn page_header_badged(
     // vertically-centred 13pt aside floats halfway up the title's cap
     // height. Aligning the boxes' bottoms puts the two descender lines
     // together, which reads as sitting on the same baseline.
-    ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
-        ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
-        if !badge.is_empty() {
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(badge)
-                    .font(fonts::regular(13.0))
-                    .color(palette.subtle_text),
-            );
-        }
-    });
+    //
+    // The row MUST be allocated at the title's own height. A bottom-aligned
+    // layout fills the height it is given, so handing it the available
+    // space (as `with_layout` does) bottom-aligns the title against the
+    // whole viewport and pushes the page off the bottom of the screen.
+    let title_font = fonts::bold(22.0);
+    let row_h = ui.fonts(|f| f.row_height(&title_font));
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), row_h),
+        egui::Layout::left_to_right(egui::Align::Max),
+        |ui| {
+            ui.label(egui::RichText::new(title).font(title_font.clone()));
+            if !badge.is_empty() {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(badge)
+                        .font(fonts::regular(13.0))
+                        .color(palette.subtle_text),
+                );
+            }
+        },
+    );
     if !subtitle.is_empty() {
         ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
     }
