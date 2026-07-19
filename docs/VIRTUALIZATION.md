@@ -404,6 +404,16 @@ shippable. It is also the same engine work backup/restore/verify already want
   `qemu-img` conversion) if we still want it.
 - Readahead / parallel chunk decode (throughput), NVMe-on-stable-QEMU retest,
   MBR synthesis for BIOS captures, QEMU bundling — all as noted above.
+- **Scratch-drive choice must persist + Resume must ignore it** (user hit this
+  2026-07-19: Resume started a NEW session because the dropdown had reset to
+  default and the session lived on C:). Two parts: (1) persist the choice in
+  Settings (`vm_scratch_drive`); (2) the real bug — Resume/Stop derive
+  `vm_root` from the CURRENT dropdown instead of from where the session
+  actually lives, even though the table lists sessions from every drive.
+  Resume (table + boot dialog) should carry the session's own root through to
+  boot/stop; the scratch choice should only govern NEW sessions. Workaround
+  until then: set the dropdown back to the drive the session is on before
+  clicking Resume.
 - **QEMU window should open maximized** (user request 2026-07-19). QEMU's GTK
   display has no "maximized" CLI option (`full-screen=on` is true fullscreen,
   not this). Likely shape: `-display gtk,zoom-to-fit=on` so the guest scales
