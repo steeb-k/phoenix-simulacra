@@ -51,13 +51,12 @@ impl Default for VmPageState {
     }
 }
 
-/// A one-line read of a backup's manifest, shown after it is picked.
+/// What the manifest load extracted from a picked backup: the VM's display
+/// name, and any reason it can't boot. (The load doubles as validation — the
+/// action bar stays disabled until a backup has parsed cleanly.)
 #[derive(Clone)]
 pub struct BackupSummary {
     pub hostname: String,
-    pub firmware: &'static str,
-    pub sector_size: u32,
-    pub partitions: usize,
     /// A reason the backup can't boot (locked BitLocker), if any.
     pub blocker: Option<String>,
 }
@@ -65,7 +64,6 @@ pub struct BackupSummary {
 /// What the user did this frame.
 pub enum VmAction {
     None,
-    BrowseBackup,
     BrowseIso,
     /// Gracefully power down the running VM.
     Stop,
@@ -85,12 +83,16 @@ pub struct RunningView<'a> {
 }
 
 /// Render the page. `qemu` is `Some(version)` when QEMU was found.
+/// `iso_history` is the settings-persisted list of previously-attached ISOs
+/// (newest first) that seeds the Rescue ISO dropdown.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     state: &mut VmPageState,
     palette: &Palette,
     qemu: Option<&str>,
+    history: &phoenix_core::appdata::History,
+    iso_history: &[String],
     sessions: &[SessionMeta],
     running: Option<RunningView<'_>>,
     last_status: &str,
@@ -140,52 +142,55 @@ pub fn show(
     }
 
     // --- backup picker ------------------------------------------------------
-    ui.horizontal(|ui| {
-        ui.label("Backup:");
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut state.backup_path)
-                .hint_text("Select or browse for a .phnx backup")
-                .desired_width(ui.available_width() - 90.0),
-        );
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            action = VmAction::LoadSummary;
-        }
-        if ui.button("Browse…").clicked() {
-            action = VmAction::BrowseBackup;
-        }
-    });
-    // Auto-load the manifest when the path changes.
+    // The same history-dropdown + Browse… row every other backup-consuming
+    // page uses (Restore / Verify / Mount).
+    if crate::backup_path_picker(
+        ui,
+        "Backup",
+        "Select or browse for a .phnx backup",
+        &mut state.backup_path,
+        history,
+        None,
+    ) {
+        action = VmAction::LoadSummary;
+    }
+    // Auto-load when the path changed some other way (Resume fills it in).
     if state.loaded_path != state.backup_path.trim() && !state.backup_path.trim().is_empty() {
         action = VmAction::LoadSummary;
     }
 
-    if let Some(sum) = &state.summary {
+    // The manifest load is silent when it succeeds — only a boot blocker
+    // (locked BitLocker) is worth a line here.
+    if let Some(blk) = state.summary.as_ref().and_then(|s| s.blocker.as_ref()) {
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "{} · {} · {}-byte sectors · {} partition(s)",
-                sum.hostname, sum.firmware, sum.sector_size, sum.partitions
-            ))
-            .color(palette.subtle_text),
-        );
-        if let Some(blk) = &sum.blocker {
-            ui.label(egui::RichText::new(format!("⚠ {blk}")).color(palette.warning));
-        }
+        ui.label(egui::RichText::new(format!("⚠ {blk}")).color(palette.warning));
     }
 
     ui.add_space(14.0);
 
     // --- knobs --------------------------------------------------------------
+    let (host_mem_mib, host_cpus) = host_caps_cached();
+    let mem_max = host_mem_mib.max(2048);
+    let cpu_max = host_cpus.max(1);
     egui::Grid::new("vm_knobs")
         .num_columns(2)
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
-            ui.label("Memory (MB)");
-            ui.add(egui::DragValue::new(&mut state.mem_mib).range(1024..=131072).speed(256));
+            // VirtualBox-style sliders, capped at what this host actually has.
+            ui.spacing_mut().slider_width = 320.0;
+
+            ui.label("Memory");
+            state.mem_mib = state.mem_mib.clamp(1024, mem_max);
+            ui.add(
+                egui::Slider::new(&mut state.mem_mib, 1024..=mem_max)
+                    .step_by(256.0)
+                    .suffix(" MB"),
+            );
             ui.end_row();
 
-            ui.label("vCPUs");
-            ui.add(egui::DragValue::new(&mut state.cpus).range(1..=32));
+            ui.label("Processors");
+            state.cpus = state.cpus.clamp(1, cpu_max);
+            ui.add(egui::Slider::new(&mut state.cpus, 1..=cpu_max));
             ui.end_row();
 
             ui.label("Networking");
@@ -212,17 +217,7 @@ pub fn show(
     ui.add_space(14.0);
 
     // --- rescue ISO ---------------------------------------------------------
-    ui.label(egui::RichText::new("Rescue ISO (optional)").font(fonts::bold(14.0)));
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut state.iso_path)
-                .hint_text("Attach a WinPE / recovery ISO as a CD-ROM")
-                .desired_width(ui.available_width() - 90.0),
-        );
-        if ui.button("Browse…").clicked() {
-            action = VmAction::BrowseIso;
-        }
-    });
+    iso_picker(ui, state, iso_history, &mut action);
     ui.add_enabled_ui(!state.iso_path.trim().is_empty(), |ui| {
         ui.checkbox(
             &mut state.boot_iso,
@@ -246,6 +241,86 @@ pub fn show(
     ui.label(egui::RichText::new(format!("Using {version}")).small().color(palette.subtle_text));
 
     action
+}
+
+/// Host RAM/CPU ceilings for the sliders, queried once — they don't change
+/// while we run, and the page redraws every frame.
+fn host_caps_cached() -> (u64, u32) {
+    static CAPS: std::sync::OnceLock<(u64, u32)> = std::sync::OnceLock::new();
+    *CAPS.get_or_init(phoenix_vm::host_caps)
+}
+
+/// "Rescue ISO" row: a dropdown of previously-attached ISOs with Browse… for a
+/// new one — the same layout as `backup_path_picker` so the rows line up.
+/// Picking an entry takes effect directly on `state`; only Browse… needs the
+/// caller (it opens the file dialog and persists the pick into settings).
+fn iso_picker(ui: &mut Ui, state: &mut VmPageState, iso_history: &[String], action: &mut VmAction) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Rescue ISO").font(fonts::bold(14.0)));
+
+        let spacing = ui.spacing().item_spacing.x;
+        let combo_w = (ui.available_width() - crate::FORM_BUTTON_W - spacing).max(0.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = crate::ACTION_BUTTON_HEIGHT;
+            let selected = if state.iso_path.trim().is_empty() {
+                egui::RichText::new("None — optionally boot a WinPE / recovery ISO")
+                    .font(fonts::regular(16.0))
+                    .color(ui.visuals().weak_text_color())
+            } else {
+                egui::RichText::new(state.iso_path.as_str()).font(fonts::regular(16.0))
+            };
+            egui::ComboBox::from_id_salt("vm_iso_combo")
+                .width(combo_w)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    let none_now = state.iso_path.trim().is_empty();
+                    if ui
+                        .selectable_label(
+                            none_now,
+                            egui::RichText::new("None").font(fonts::regular(14.0)),
+                        )
+                        .clicked()
+                    {
+                        state.iso_path.clear();
+                        state.boot_iso = false;
+                    }
+                    // Stat only while the popup is open, and skip dead paths so
+                    // the list never offers an ISO that has since moved.
+                    for iso in iso_history {
+                        if !std::path::Path::new(iso).is_file() {
+                            continue;
+                        }
+                        let is_current = iso.eq_ignore_ascii_case(&state.iso_path);
+                        if ui
+                            .selectable_label(
+                                is_current,
+                                egui::RichText::new(iso).font(fonts::regular(14.0)),
+                            )
+                            .clicked()
+                        {
+                            state.iso_path = iso.clone();
+                        }
+                    }
+                });
+        });
+
+        let browse_label = crate::icon_label(
+            egui_phosphor::regular::FOLDER,
+            fonts::icon(16.0),
+            "Browse…",
+            fonts::regular(14.0),
+            ui.visuals().widgets.inactive.fg_stroke.color,
+        );
+        if ui
+            .add_sized(
+                [crate::FORM_BUTTON_W, crate::ACTION_BUTTON_HEIGHT],
+                egui::Button::new(browse_label),
+            )
+            .clicked()
+        {
+            *action = VmAction::BrowseIso;
+        }
+    });
 }
 
 fn scratch_dropdown(ui: &mut Ui, state: &mut VmPageState) {

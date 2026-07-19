@@ -108,6 +108,20 @@ const STATUS_BAR_HEIGHT_ESTIMATE: f32 = 40.0;
 const MIN_WINDOW_WIDTH: f32 = 640.0;
 
 fn main() {
+    // Serve-helper re-exec: booting a VM re-execs THIS exe with a sentinel
+    // argv[1] to become the out-of-process WinFsp serve for the backup (see
+    // `phoenix_vm::serve_helper`). Route it before anything else — without
+    // this, the child comes up as a second GUI, the single-instance guard
+    // swallows it, and the boot times out waiting for its READY handshake.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(res) = phoenix_vm::serve_helper::maybe_run(&args) {
+        if let Err(e) = res {
+            eprintln!("serve helper failed: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--debug` re-enables the console this GUI-subsystem build normally
     // suppresses. Attach it BEFORE logging init so the stderr layer binds to a
     // live console handle (Rust resolves the std handles lazily per write, and
@@ -4131,6 +4145,8 @@ impl PhoenixApp {
                 &mut vm_state,
                 &palette,
                 version.as_deref(),
+                &self.history,
+                &self.settings.vm_iso_history,
                 &sessions,
                 running,
                 &last,
@@ -4140,23 +4156,21 @@ impl PhoenixApp {
 
         match action {
             vm_panel::VmAction::None => {}
-            vm_panel::VmAction::BrowseBackup => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Phoenix backup", &["phnx"])
-                    .set_title("Choose a .phnx backup to boot")
-                    .pick_file()
-                {
-                    self.vm.backup_path = p.display().to_string();
-                    self.load_vm_summary();
-                }
-            }
             vm_panel::VmAction::BrowseIso => {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("Disc image", &["iso"])
                     .set_title("Choose a rescue / PE ISO")
                     .pick_file()
                 {
-                    self.vm.iso_path = p.display().to_string();
+                    let picked = p.display().to_string();
+                    self.vm.iso_path = picked.clone();
+                    // Remember it for the dropdown: newest first, deduped,
+                    // capped so the popup stays a list rather than a history.
+                    let hist = &mut self.settings.vm_iso_history;
+                    hist.retain(|h| !h.eq_ignore_ascii_case(&picked));
+                    hist.insert(0, picked);
+                    hist.truncate(8);
+                    let _ = self.settings.save();
                 }
             }
             vm_panel::VmAction::LoadSummary => self.load_vm_summary(),
@@ -4184,8 +4198,9 @@ impl PhoenixApp {
         }
     }
 
-    /// Read the picked backup's manifest into a one-line summary (and refuse a
-    /// locked-BitLocker OS volume up front).
+    /// Parse the picked backup's manifest — the VM's display name plus any
+    /// boot blocker (a locked-BitLocker OS volume is refused up front). A
+    /// clean parse is also what arms the Boot VM action.
     fn load_vm_summary(&mut self) {
         let path = self.vm.backup_path.trim().to_string();
         self.vm.loaded_path = path.clone();
@@ -4203,9 +4218,6 @@ impl PhoenixApp {
                     .map(|p| format!("partition {} is a locked BitLocker volume — can't boot", p.index));
                 self.vm.summary = Some(vm_panel::BackupSummary {
                     hostname: m.hostname.clone(),
-                    firmware: if m.disk.style.eq_ignore_ascii_case("gpt") { "UEFI (GPT)" } else { "BIOS (MBR)" },
-                    sector_size: m.disk.sector_size,
-                    partitions: m.partitions.len(),
                     blocker,
                 });
             }
