@@ -84,6 +84,18 @@ const TOP_ITEMS: &[NavItem] = &[
     },
 ];
 
+/// Whether a page exists in this build. Virtualization is x86_64-only:
+/// Windows-on-ARM QEMU has no useful acceleration for the x86 guests our
+/// backups mostly are (TCG emulation only), and ARM-Windows machines vary too
+/// much in guest-visible hardware for a booted backup to be a good bet — so
+/// ARM builds hide the page entirely rather than ship a trap.
+pub const fn page_available(page: Page) -> bool {
+    match page {
+        Page::Virtualize => cfg!(target_arch = "x86_64"),
+        _ => true,
+    }
+}
+
 const BOTTOM_ITEMS: &[NavItem] = &[
     NavItem {
         page: Page::History,
@@ -193,6 +205,9 @@ pub fn show(
     // modifier held, so Ctrl+Alt combos (e.g. AltGr input) pass through.
     if !busy {
         for item in TOP_ITEMS.iter().chain(BOTTOM_ITEMS) {
+            if !page_available(item.page) {
+                continue;
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, item.key)) {
                 *current = item.page;
             }
@@ -259,6 +274,9 @@ pub fn show(
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for item in TOP_ITEMS {
+                                    if !page_available(item.page) {
+                                        continue;
+                                    }
                                     nav_row(ui, item, current, palette);
                                 }
                             });

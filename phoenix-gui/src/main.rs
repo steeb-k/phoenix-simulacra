@@ -6,6 +6,7 @@
 
 mod about_panel;
 mod action_bar;
+mod virtio_iso;
 mod vm_panel;
 mod bootrepair_table;
 mod clone_panel;
@@ -638,6 +639,14 @@ struct VmRun {
     result: std::sync::mpsc::Receiver<anyhow::Result<phoenix_vm::boot::BootOutcome>>,
 }
 
+/// A guest-tools ISO download (or update check) running on a worker thread;
+/// the Virtualize page polls `rx` and shows `progress` as a bar.
+struct DriversDl {
+    rx: std::sync::mpsc::Receiver<virtio_iso::DlEvent>,
+    /// (bytes downloaded, total or 0) — updated from `Progress` events.
+    progress: (u64, u64),
+}
+
 /// The two ends of the running job, named the way a person would name them
 /// ("Samsung SSD 990 PRO (Disk 1)", `D:\Backups\work.phnx`).
 ///
@@ -843,6 +852,10 @@ struct PhoenixApp {
     vm_run: Option<VmRun>,
     /// Last VM outcome/status shown on the Virtualize page.
     vm_last_status: String,
+    /// An in-flight guest-tools ISO download/update-check, if any.
+    drivers_dl: Option<DriversDl>,
+    /// One-line outcome of the last drivers download / update check.
+    drivers_note: String,
     /// Discovered QEMU install, or `None` when it isn't found — the page then
     /// shows an install notice (mirrors `mount_available`).
     qemu: Option<phoenix_vm::Qemu>,
@@ -990,6 +1003,8 @@ impl PhoenixApp {
             vm: vm_panel::VmPageState::default(),
             vm_run: None,
             vm_last_status: String::new(),
+            drivers_dl: None,
+            drivers_note: String::new(),
             // Probe for QEMU once at startup; the page shows an install notice
             // when it's missing.
             qemu: phoenix_vm::Qemu::discover(None).ok(),
@@ -4129,6 +4144,42 @@ impl PhoenixApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
 
+        // Poll the guest-tools ISO worker (download or update check).
+        if let Some(dl) = &mut self.drivers_dl {
+            loop {
+                match dl.rx.try_recv() {
+                    Ok(virtio_iso::DlEvent::Progress { downloaded, total }) => {
+                        dl.progress = (downloaded, total);
+                    }
+                    Ok(virtio_iso::DlEvent::Done) => {
+                        self.drivers_note = "Guest tools & driver ISO is ready.".into();
+                        self.drivers_dl = None;
+                        break;
+                    }
+                    Ok(virtio_iso::DlEvent::UpToDate) => {
+                        self.drivers_note = "The driver ISO is up to date.".into();
+                        self.drivers_dl = None;
+                        break;
+                    }
+                    Ok(virtio_iso::DlEvent::Failed(m)) => {
+                        tracing::warn!("drivers ISO: {m}");
+                        self.drivers_note = m;
+                        self.drivers_dl = None;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.drivers_note = "Download worker ended unexpectedly.".into();
+                        self.drivers_dl = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if self.drivers_dl.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+
         // Pull everything the page needs out of `self` into owned locals so the
         // scroll-shell closure doesn't borrow `self` (which would conflict: it
         // needs `&mut self.vm` while a running view borrows `self.vm_run`).
@@ -4138,17 +4189,28 @@ impl PhoenixApp {
             let overlay_mib = std::fs::metadata(&r.overlay_path)
                 .map(|m| m.len() / (1024 * 1024))
                 .unwrap_or(0);
-            (r.name.clone(), r.started.elapsed().as_secs(), overlay_mib)
+            (
+                r.name.clone(),
+                r.backup.display().to_string(),
+                r.started.elapsed().as_secs(),
+                overlay_mib,
+            )
         });
         let last = self.vm_last_status.clone();
+        let drivers = vm_panel::DriversView {
+            present: virtio_iso::installed().is_some(),
+            downloading: self.drivers_dl.as_ref().map(|d| d.progress),
+            note: self.drivers_note.clone(),
+        };
         let palette = self.palette;
         let mut vm_state = std::mem::take(&mut self.vm);
         let mut action = vm_panel::VmAction::None;
 
         page_scroll_shell(ui, "virtualize_page", |ui| {
             page_header(ui, &palette, "Virtualize", "");
-            let running = running_owned.as_ref().map(|(n, e, o)| vm_panel::RunningView {
+            let running = running_owned.as_ref().map(|(n, b, e, o)| vm_panel::RunningView {
                 name: n,
+                backup_path: b,
                 elapsed_secs: *e,
                 overlay_mib: *o,
             });
@@ -4159,6 +4221,7 @@ impl PhoenixApp {
                 version.as_deref(),
                 &self.history,
                 &self.settings.vm_iso_history,
+                &drivers,
                 &sessions,
                 running,
                 &last,
@@ -4183,6 +4246,22 @@ impl PhoenixApp {
                     hist.insert(0, picked);
                     hist.truncate(8);
                     let _ = self.settings.save();
+                }
+            }
+            vm_panel::VmAction::DownloadDrivers => {
+                if self.drivers_dl.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    virtio_iso::spawn_download(tx);
+                    self.drivers_note.clear();
+                    self.drivers_dl = Some(DriversDl { rx, progress: (0, 0) });
+                }
+            }
+            vm_panel::VmAction::CheckDriversUpdate => {
+                if self.drivers_dl.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    virtio_iso::spawn_update_check(tx);
+                    self.drivers_note = "Checking for a newer driver ISO…".into();
+                    self.drivers_dl = Some(DriversDl { rx, progress: (0, 0) });
                 }
             }
             vm_panel::VmAction::LoadSummary => self.load_vm_summary(),
@@ -4299,6 +4378,13 @@ impl PhoenixApp {
             if t.is_empty() { None } else { Some(std::path::PathBuf::from(t)) }
         };
         let boot_iso = self.vm.boot_iso;
+        // The guest-tools / driver ISO rides along when present and the
+        // checkbox (default on) says so.
+        let drivers_iso = if self.vm.attach_drivers_on() {
+            virtio_iso::installed()
+        } else {
+            None
+        };
 
         let (tx, rx) = std::sync::mpsc::channel();
         let backup_thread = backup.clone();
@@ -4311,13 +4397,23 @@ impl PhoenixApp {
                 false,
                 iso.as_deref(),
                 boot_iso,
+                drivers_iso.as_deref(),
                 &qemu,
                 &sessions,
                 &scratch,
             );
             #[cfg(not(feature = "winfsp"))]
             let res: anyhow::Result<phoenix_vm::boot::BootOutcome> = {
-                let _ = (&backup_thread, &host, &iso, boot_iso, &qemu, &sessions, &scratch);
+                let _ = (
+                    &backup_thread,
+                    &host,
+                    &iso,
+                    boot_iso,
+                    &drivers_iso,
+                    &qemu,
+                    &sessions,
+                    &scratch,
+                );
                 Err(anyhow::anyhow!("this build lacks the winfsp feature required to boot a VM"))
             };
             let _ = tx.send(res);
@@ -4746,6 +4842,9 @@ fn start_page_from_args() -> Option<Page> {
                 "restore" => Some(Page::Restore),
                 "verify" => Some(Page::Verify),
                 "mount" => Some(Page::Mount),
+                "virtualize" | "vm" => {
+                    Some(Page::Virtualize).filter(|p| sidebar::page_available(*p))
+                }
                 "bootrepair" | "boot-repair" => Some(Page::BootRepair),
                 "history" => Some(Page::History),
                 "about" => Some(Page::About),

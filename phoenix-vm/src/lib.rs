@@ -23,8 +23,8 @@ pub mod session;
 pub mod boot;
 
 pub use config::{
-    host_caps, usable_guest_resolution, Accel, DiskController, DiskSource, Firmware, HostOptions,
-    VmConfig,
+    host_caps, host_free_mem_mib, usable_guest_resolution, Accel, DiskController, DiskSource,
+    Firmware, HostOptions, VmConfig,
 };
 pub use qemu::Qemu;
 pub use session::{

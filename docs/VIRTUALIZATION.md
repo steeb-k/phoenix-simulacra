@@ -387,10 +387,10 @@ shippable. It is also the same engine work backup/restore/verify already want
   scoped to `vm-serve` and never touches kept overlays, and now reaps an
   orphaned serve helper first (PID file per live helper; only terminates a
   process whose image name is really ours, since PIDs get recycled).
-- **Graceful guest shutdown is missing.** Stopping a VM today means killing
-  QEMU — a power-cut from the guest's point of view. Windows recovers (proven
-  above), but the GUI's "Stop VM" needs a real ACPI shutdown: add a QMP socket
-  to the VM config and send `system_powerdown`. Worth doing with the GUI.
+- ~~Graceful guest shutdown is missing.~~ **DONE 2026-07-19**: every boot opens
+  a QMP socket on an ephemeral loopback port (recorded in the session), and
+  `vm stop` / the GUI's Stop button send `system_powerdown` — a real ACPI
+  shutdown the guest performs itself.
 - ~~Boot-it-or-mount-it interop~~ — **dropped** with the qcow2 pivot. Browsing a
   VM session's files needs a different route (`qemu-nbd`, or an offline
   `qemu-img` conversion) if we still want it.
@@ -401,7 +401,15 @@ shippable. It is also the same engine work backup/restore/verify already want
   serve, drop-based detach, light I/O, and a different attach storage-type
   parameter). Not on the critical path now.
 
-## Guest access / login prep (planned feature)
+## Guest access / login prep (DROPPED 2026-07-18)
+
+**Not building this.** The password/PIN bypass needs bootkit-like patching that
+trips antivirus; blanking passwords is useless against Microsoft accounts; and
+the qcow2 write layer means there is no offline-mountable overlay volume to
+edit a SAM hive in anyway. The locked-out-of-the-guest case is covered by the
+rescue-ISO boot instead. The original design notes stay below for the record.
+
+
 
 When you boot someone's backup to recover data or triage a dead machine, you
 often don't have their password — and Windows Hello PIN never works in a VM
@@ -501,10 +509,27 @@ way to get drivers/helpers into it. These are one cluster:
   the installer.
 
 Rough plan when we build it: (1) a read-only VVFAT default share rooted next to
-the image, shown as a drive in the guest; (2) an "attach drivers ISO" affordance
-(bundle or point at virtio-win); (3) a small guest-tools installer we place in
-the share. Decide the *writable* out-of-guest channel (writable scratch disk vs.
-host SMB) separately — it's the only genuinely hard part.
+the image, shown as a drive in the guest; (2) ~~an "attach drivers ISO"
+affordance~~ **DONE 2026-07-19**: the GUI offers "Attach guest tools and driver
+ISO" (virtio-win, downloaded on demand next to the app with progress + a
+check-for-updates HEAD comparison; attached as a second never-booted CD on
+`ide.2`); (3) a small guest-tools installer we place in the share.
+
+**Writable channel decision (user, 2026-07-19): SMB is the target.** An SMB
+share is what the user ultimately wants for host↔guest exchange — planned as
+the next feature after the driver-ISO set lands. On a Windows host that means
+either exposing a host Windows file share to the guest over slirp
+(`10.0.2.2`-routed, with host credentials), or an in-app userspace SMB server
+bound to the slirp network — to be designed; VVFAT stays the zero-driver
+read-only fallback.
+
+### ARM64: feature hidden
+
+Windows-on-ARM QEMU has no useful acceleration for x86 guests (TCG emulation
+only — unusably slow for Windows), and ARM-Windows guests are too
+hardware-variable for booted backups to be dependable. ARM64 builds hide the
+Virtualize page entirely (`sidebar::page_available`), rather than shipping a
+trap.
 
 ## Open questions (want your input)
 

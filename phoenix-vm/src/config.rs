@@ -118,6 +118,19 @@ fn vgamem_mb_for(w: u32, h: u32) -> u32 {
     }
 }
 
+/// Currently *available* (free) physical RAM in MiB — for advisory UI like
+/// coloring the memory slider. `None` if the query fails.
+pub fn host_free_mem_mib() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `st` is a zeroed, properly-sized MEMORYSTATUSEX with dwLength
+    // set; a failed call returns 0 and the struct is not read.
+    unsafe {
+        let mut st: MEMORYSTATUSEX = std::mem::zeroed();
+        st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut st) != 0).then(|| st.ullAvailPhys / (1024 * 1024))
+    }
+}
+
 /// The largest guest resolution whose QEMU window still fits on the host's
 /// primary display: the work area (screen minus taskbar) less the window's own
 /// chrome (title bar, resize frame, and QEMU's menu bar). `None` if the query
@@ -377,6 +390,16 @@ impl VmConfig {
             push("-device");
             push(&format!("ide-cd,drive=cd0,bus=ide.1,bootindex={cd_bootindex}"));
         }
+
+        // Guest-tools / driver ISO (virtio-win) as a second CD on its own SATA
+        // port. Deliberately no bootindex: it exists to be browsed from inside
+        // the guest, never booted.
+        if let Some(iso) = &spec.drivers_iso {
+            push("-drive");
+            push(&format!("file={iso},format=raw,if=none,id=cd1,media=cdrom,readonly=on"));
+            push("-device");
+            push("ide-cd,drive=cd1,bus=ide.2");
+        }
         a
     }
 }
@@ -401,10 +424,14 @@ pub struct BootSpec {
     /// ACPI shutdown (`system_powerdown`) instead of killing QEMU. `None` omits
     /// the socket.
     pub qmp_port: Option<u16>,
+    /// The guest-tools / driver ISO (virtio-win), attached as a second
+    /// read-only CD-ROM. Never given boot priority — the guest browses it to
+    /// install drivers and helpers.
+    pub drivers_iso: Option<String>,
 }
 
 impl BootSpec {
-    /// Minimal spec: no ISO, no QMP. Callers set the optional fields.
+    /// Minimal spec: no ISOs, no QMP. Callers set the optional fields.
     pub fn new(name: String, disk: DiskSource) -> Self {
         BootSpec {
             name,
@@ -414,6 +441,7 @@ impl BootSpec {
             iso: None,
             boot_iso_first: false,
             qmp_port: None,
+            drivers_iso: None,
         }
     }
 }
@@ -606,6 +634,25 @@ mod tests {
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(!args.contains("cdrom"));
         assert!(!args.contains("ide-cd"));
+    }
+
+    #[test]
+    fn drivers_iso_rides_its_own_port_and_never_boots() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let spec = BootSpec {
+            iso: Some(r"D:\winpe.iso".to_string()),
+            boot_iso_first: true,
+            drivers_iso: Some(r"C:\app\virtio-win.iso".to_string()),
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&spec).join(" ");
+        assert!(args.contains(r"file=C:\app\virtio-win.iso,format=raw,if=none,id=cd1,media=cdrom,readonly=on"));
+        assert!(args.contains("ide-cd,drive=cd1,bus=ide.2"));
+        // The drivers CD carries no bootindex — only the rescue CD and disk do.
+        assert!(!args.contains("cd1,bus=ide.2,bootindex"));
+        // And it coexists with the rescue CD on its separate port.
+        assert!(args.contains("ide-cd,drive=cd0,bus=ide.1,bootindex=0"));
     }
 
     #[test]

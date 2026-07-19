@@ -201,6 +201,10 @@ enum VmCommands {
         /// Attach an ISO as a CD-ROM (e.g. a WinPE / rescue environment).
         #[arg(long)]
         iso: Option<PathBuf>,
+        /// Attach a guest-tools / driver ISO (e.g. virtio-win) as a second,
+        /// never-booted CD-ROM.
+        #[arg(long)]
+        drivers_iso: Option<PathBuf>,
         /// Boot from the `--iso` this launch instead of the disk (one-shot: the
         /// next boot without this flag boots the disk normally).
         #[arg(long, default_value_t = false)]
@@ -403,6 +407,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             fresh,
             iso,
             boot_iso,
+            drivers_iso,
         } => {
             let write_layer = match write.to_ascii_lowercase().as_str() {
                 "avhdx" => {
@@ -445,6 +450,9 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                 if let Some(iso) = &iso {
                     anyhow::ensure!(iso.exists(), "ISO not found: {}", iso.display());
                 }
+                if let Some(iso) = &drivers_iso {
+                    anyhow::ensure!(iso.exists(), "drivers ISO not found: {}", iso.display());
+                }
                 let outcome = phoenix_vm::boot::boot(
                     &backup,
                     &host,
@@ -452,6 +460,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                     fresh,
                     iso.as_deref(),
                     boot_iso,
+                    drivers_iso.as_deref(),
                     &qemu,
                     &sessions,
                     &scratch,
@@ -484,7 +493,17 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "winfsp"))]
             {
-                let _ = (&host, write_layer, fresh, &iso, boot_iso, &qemu, &sessions, &scratch);
+                let _ = (
+                    &host,
+                    write_layer,
+                    fresh,
+                    &iso,
+                    boot_iso,
+                    &drivers_iso,
+                    &qemu,
+                    &sessions,
+                    &scratch,
+                );
                 anyhow::bail!(
                     "this build lacks the `winfsp` feature required to boot a VM; \
                      rebuild with --features winfsp"
