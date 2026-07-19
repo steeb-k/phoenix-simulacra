@@ -11,13 +11,18 @@ use phoenix_core::error::{PhoenixError, Result};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::Vhd::{
-    AttachVirtualDisk, CreateVirtualDisk, GetVirtualDiskPhysicalPath, OpenVirtualDisk,
-    ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
+    AttachVirtualDisk, CreateVirtualDisk, DetachVirtualDisk, GetVirtualDiskPhysicalPath,
+    OpenVirtualDisk, ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
     ATTACH_VIRTUAL_DISK_PARAMETERS, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
-    CREATE_VIRTUAL_DISK_VERSION_2, OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
-    VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO,
-    VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+    CREATE_VIRTUAL_DISK_VERSION_2, DETACH_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_FLAG_NONE,
+    OPEN_VIRTUAL_DISK_PARAMETERS, VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_ATTACH_RW,
+    VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE,
+    VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
 };
+
+/// ERROR_SHARING_VIOLATION — the overlay file is still open (usually attached
+/// from a previous run that didn't exit cleanly).
+const ERROR_SHARING_VIOLATION: u32 = 32;
 
 // VIRTUAL_STORAGE_TYPE_DEVICE_UNKNOWN = 0 — let the API detect VHD vs VHDX
 // from the file contents rather than asserting a device type ourselves.
@@ -145,6 +150,13 @@ impl AttachedDisk {
             )
         };
         if rc != 0 {
+            if rc == ERROR_SHARING_VIOLATION {
+                return Err(PhoenixError::Disk(format!(
+                    "the overlay {vhd_path} is still in use — it is most likely attached from a \
+                     previous VM run that didn't exit cleanly. Close any running VM for this \
+                     backup (or reboot) and try again."
+                )));
+            }
             return Err(PhoenixError::Disk(format!(
                 "OpenVirtualDisk (read-write) failed for {vhd_path} (Win32 error {})",
                 describe_vhd_error(rc)
@@ -204,10 +216,48 @@ impl AttachedDisk {
     }
 }
 
+impl AttachedDisk {
+    /// Explicitly detach the disk and block until its physical device is gone,
+    /// up to `timeout`.
+    ///
+    /// This MUST run before any in-process WinFsp serve backing the disk is
+    /// stopped. Merely closing the handle (as `Drop` does) triggers an
+    /// *asynchronous* detach; if the serve is then stopped while that detach is
+    /// still draining the parent handle, the two race and deadlock in the
+    /// storage driver — an unkillable process. So here we detach synchronously
+    /// and poll until the device actually disappears while the serve's
+    /// filesystem threads are still alive to service the final I/O.
+    ///
+    /// Returns `true` if the device was confirmed gone within `timeout`. A
+    /// caller backing the disk with an in-process serve MUST only stop that
+    /// serve on `true`: if this returns `false` the detach is still in flight,
+    /// and stopping the serve then is exactly the deadlock — better to leave
+    /// serve teardown to process exit (the OS reclaims both cleanly on death).
+    #[must_use]
+    pub fn detach_wait(&self, timeout: std::time::Duration) -> bool {
+        // SAFETY: `handle` is a live virtual-disk handle for this call.
+        unsafe {
+            DetachVirtualDisk(self.handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            // Once detached, the disk no longer resolves to a physical path.
+            if self.physical_drive_number().is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        tracing::warn!("virtual disk did not detach within {timeout:?}");
+        false
+    }
+}
+
 impl Drop for AttachedDisk {
     fn drop(&mut self) {
         // Closing the handle detaches the disk (no PERMANENT_LIFETIME flag was
-        // requested), so no explicit DetachVirtualDisk is needed.
+        // requested). Callers that back the disk with an in-process WinFsp serve
+        // must call `detach_wait` FIRST so the detach completes before the serve
+        // stops; this is the fallback for the read-only / no-serve cases.
         if self.handle != INVALID_HANDLE_VALUE {
             unsafe { CloseHandle(self.handle) };
         }
