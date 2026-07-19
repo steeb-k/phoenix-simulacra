@@ -22,10 +22,16 @@ use std::path::PathBuf;
 /// argv[1] value that turns a normal invocation into a serve helper.
 pub const HELPER_SENTINEL: &str = "__vm_serve_helper";
 
+/// Extension for the file recording a live helper's PID, so a later run can
+/// reap one that outlived its parent (see [`reap_orphan_helpers`]).
+const PID_EXT: &str = "helperpid";
+
 /// A running serve-helper process and the path it serves the parent VHDX at.
 pub struct ServeProcess {
     child: std::process::Child,
     parent_path: PathBuf,
+    /// PID file removed on clean stop; its presence later means an orphan.
+    pid_file: Option<PathBuf>,
 }
 
 impl ServeProcess {
@@ -44,6 +50,9 @@ impl ServeProcess {
         drop(self.child.stdin.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(p) = self.pid_file.take() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -52,7 +61,93 @@ impl Drop for ServeProcess {
         // Safety net if `stop` wasn't called (e.g. an error path unwound past it).
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(p) = self.pid_file.take() {
+            let _ = std::fs::remove_file(p);
+        }
     }
+}
+
+/// Kill serve helpers left running by a previous run that died before it could
+/// stop them.
+///
+/// The helper normally self-exits when its parent closes the stdin pipe (which
+/// the OS does even on a force-kill), so orphans should be rare — this is the
+/// belt-and-braces path for when that doesn't happen. Each live helper records
+/// its PID in `scratch`; a PID file still present at startup means nobody
+/// cleaned up. PIDs get recycled, so we only terminate a process whose image
+/// name is actually ours.
+pub fn reap_orphan_helpers(scratch: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(scratch) else {
+        return;
+    };
+    let ours = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|f| f.to_ascii_lowercase()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(PID_EXT) {
+            continue;
+        }
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            if let Some(ours) = &ours {
+                if terminate_if_named(pid, ours) {
+                    tracing::warn!("reaped orphaned serve helper (pid {pid})");
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Terminate `pid` only if its image file name matches `expected_name`
+/// (case-insensitive). Returns true if it was terminated.
+fn terminate_if_named(pid: u32, expected_name: &std::ffi::OsString) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    // SAFETY: a failed open returns null, which we check before any use.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return false; // already gone (or not ours to touch)
+    }
+
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    // SAFETY: handle is live; buf/len describe a valid writable buffer.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT::default(),
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    let mut terminated = false;
+    if ok != 0 {
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = std::path::Path::new(&full)
+            .file_name()
+            .map(|f| f.to_ascii_lowercase());
+        if name.as_ref() == Some(expected_name) {
+            // SAFETY: handle was opened with PROCESS_TERMINATE.
+            terminated = unsafe { TerminateProcess(handle, 1) } != 0;
+        }
+    }
+    // SAFETY: handle came from OpenProcess and is not used after this.
+    unsafe { CloseHandle(handle) };
+    terminated
 }
 
 /// Spawn a serve-helper subprocess for `backup`, serving at `scratch`, and wait
@@ -104,7 +199,17 @@ pub fn spawn_serve_with_exe(
         Ok(Ok(line)) => {
             if let Some(path) = line.trim_end().strip_prefix("READY\t") {
                 let parent_path = PathBuf::from(path);
-                Ok(ServeProcess { child, parent_path })
+                // Record the PID so a later run can reap this helper if we die
+                // before stopping it.
+                let pid_file = scratch.join(format!("{}.{PID_EXT}", child.id()));
+                let pid_file = std::fs::write(&pid_file, child.id().to_string())
+                    .ok()
+                    .map(|_| pid_file);
+                Ok(ServeProcess {
+                    child,
+                    parent_path,
+                    pid_file,
+                })
             } else {
                 let _ = child.kill();
                 anyhow::bail!("serve helper did not report READY (said: {:?})", line.trim_end());
