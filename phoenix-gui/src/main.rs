@@ -2849,30 +2849,39 @@ fn vm_wiki_notice(ui: &mut egui::Ui, palette: &Palette) {
         .rounding(egui::Rounding::same(8.0))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+            // Two columns: the icon owns the left one at a size that reads as
+            // a mark rather than punctuation, and the prose wraps in the
+            // right one without flowing back under it. `horizontal` centres
+            // on the cross axis, so the icon sits against the middle of
+            // however many lines the text takes.
+            ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(egui_phosphor::regular::BOOK_OPEN)
-                        .font(fonts::icon(16.0))
+                        .font(fonts::icon(30.0))
                         .color(palette.accent),
                 );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("You are strongly encouraged to read the")
-                        .color(palette.subtle_text),
-                );
-                ui.hyperlink_to(
-                    egui::RichText::new("Virtualization best practices guide")
-                        .color(palette.accent),
-                    VM_WIKI_URL,
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "before booting a backup — it covers guest tools, networking, \
-                         and how sessions keep your changes.",
-                    )
-                    .color(palette.subtle_text),
-                );
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(
+                            egui::RichText::new("You are strongly encouraged to read the")
+                                .color(palette.subtle_text),
+                        );
+                        ui.hyperlink_to(
+                            egui::RichText::new("Virtualization best practices guide")
+                                .color(palette.accent),
+                            VM_WIKI_URL,
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "before booting a backup — it covers guest tools, \
+                                 networking, and how sessions keep your changes.",
+                            )
+                            .color(palette.subtle_text),
+                        );
+                    });
+                });
             });
         });
     ui.add_space(12.0);
