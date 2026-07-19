@@ -9,8 +9,8 @@
 //! - [`session`] — persistent, resumable VM sessions on disk (pure I/O; tested).
 //! - [`boot`] — tie it together and launch (behind the `winfsp` feature).
 //!
-//! See `docs/VIRTUALIZATION.md` for the design and the boot-smoke findings the
-//! defaults encode.
+//! See `docs/VIRTUALIZATION.md` for the design and the findings these defaults
+//! encode.
 
 pub mod config;
 pub mod drives;
