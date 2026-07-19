@@ -222,14 +222,7 @@ impl SessionManager {
     /// dirs — because sessions live on their image's drive, `list` has to look
     /// on every drive, not one fixed root.
     pub fn list_all() -> Vec<SessionMeta> {
-        let mut out = Vec::new();
-        for letter in b'A'..=b'Z' {
-            let root = PathBuf::from(format!("{}:\\", letter as char))
-                .join("PhoenixSimulacra")
-                .join("vm-sessions");
-            out.extend(SessionManager::new(root).list());
-        }
-        out
+        Self::list_all_sessions().into_iter().map(|s| s.meta).collect()
     }
 
     /// The sessions root this manager writes to.
@@ -280,17 +273,37 @@ impl SessionManager {
 
     /// Every session under the root (best-effort; skips unreadable entries).
     pub fn list(&self) -> Vec<SessionMeta> {
+        self.list_sessions().into_iter().map(|s| s.meta).collect()
+    }
+
+    /// Like [`SessionManager::list`], but returns full [`Session`] handles
+    /// (directory + metadata) for callers that also need on-disk detail, e.g.
+    /// the overlay's size.
+    pub fn list_sessions(&self) -> Vec<Session> {
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return out;
         };
         for e in entries.flatten() {
-            let meta_path = e.path().join("session.json");
+            let dir = e.path();
+            let meta_path = dir.join("session.json");
             if let Ok(text) = std::fs::read_to_string(&meta_path) {
                 if let Ok(meta) = serde_json::from_str::<SessionMeta>(&text) {
-                    out.push(meta);
+                    out.push(Session { dir, meta });
                 }
             }
+        }
+        out
+    }
+
+    /// [`SessionManager::list_sessions`] across every drive's session root.
+    pub fn list_all_sessions() -> Vec<Session> {
+        let mut out = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let root = PathBuf::from(format!("{}:\\", letter as char))
+                .join("PhoenixSimulacra")
+                .join("vm-sessions");
+            out.extend(SessionManager::new(root).list_sessions());
         }
         out
     }

@@ -5,8 +5,15 @@
 //! overlay, build the QEMU command line, launch, and tear down. Gated behind
 //! `winfsp` because the serve path needs it (and libclang + WinFsp to build).
 
+use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+/// Spawn console-subsystem children (qemu-img, qemu-system) without a console
+/// window — launched from the windowed GUI they otherwise each pop one up, and
+/// qemu-system's error text vanishes with it when the launch dies early. Their
+/// output goes to handles we set explicitly, which work fine without a console.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use anyhow::{bail, Context, Result};
 use phoenix_core::container::PhnxReader;
@@ -30,6 +37,9 @@ pub struct BootOutcome {
     pub resumed: bool,
     /// True if the resumed session was left dirty by a previous crashed boot.
     pub resumed_dirty: bool,
+    /// The tail of QEMU's own output (the session's `qemu.log`) when it exited
+    /// non-zero — the actual reason a launch died, for surfacing in the UI.
+    pub qemu_log_tail: Option<String>,
 }
 
 /// Boot `backup` as a VM. Blocks until the guest window is closed (the serve
@@ -114,6 +124,7 @@ pub fn boot(
                     .args(["create", "-f", "qcow2", "-F", "vhdx", "-b"])
                     .arg(&parent)
                     .arg(&overlay)
+                    .creation_flags(CREATE_NO_WINDOW)
                     .output()
                     .context("qemu-img create qcow2 overlay")?;
                 if !out.status.success() {
@@ -181,10 +192,29 @@ pub fn boot(
         if resuming { "" } else { "no " },
         args.len()
     );
+    // QEMU's console output goes to the session's `qemu.log` — from the GUI
+    // there is no console to inherit (Windows would pop one up and any early
+    // error would vanish with it), and a persistent log is the better story
+    // from the CLI too.
+    let qemu_log_path = session.dir().join("qemu.log");
+    let log_out = std::fs::File::create(&qemu_log_path)
+        .with_context(|| format!("create {}", qemu_log_path.display()))?;
+    let log_err = log_out.try_clone().context("clone qemu.log handle")?;
     let status = Command::new(&qemu.system)
         .args(&args)
+        .stdin(Stdio::null())
+        .stdout(log_out)
+        .stderr(log_err)
+        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .with_context(|| format!("launch {}", qemu.system.display()))?;
+    if !status.success() {
+        tracing::warn!(
+            "QEMU exited with {:?}; its output is in {}",
+            status.code(),
+            qemu_log_path.display()
+        );
+    }
 
     // --- teardown: detach the child, THEN stop the serve helper -------------
     // Order still matters: the child's detach reads/closes the parent, so the
@@ -217,11 +247,26 @@ pub fn boot(
     // not belong on the exit path of every boot.
     let backup_intact = PhnxReader::open(backup).is_ok();
 
+    let qemu_log_tail = if status.success() {
+        None
+    } else {
+        Some(log_tail(&qemu_log_path, 1500))
+    };
+
     Ok(BootOutcome {
         exit_ok: status.success(),
         overlay_bytes,
         backup_intact,
         resumed: resuming,
         resumed_dirty,
+        qemu_log_tail,
     })
+}
+
+/// The last `max_bytes` of a log file as lossy UTF-8, trimmed — what gets
+/// quoted to the user when QEMU dies before the guest appears.
+fn log_tail(path: &Path, max_bytes: usize) -> String {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }

@@ -520,7 +520,7 @@ fn init_logging(debug: bool) -> Option<tracing_appender::non_blocking::WorkerGua
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         "phoenix_core=info,phoenix_gui=info,phoenix_capture=info,\
              phoenix_restore=info,phoenix_vss=info,phoenix_build=info,\
-             phoenix_mount=info,phoenix_clone=info,warn"
+             phoenix_mount=info,phoenix_clone=info,phoenix_vm=info,warn"
             .into()
     });
 
@@ -4093,15 +4093,27 @@ impl PhoenixApp {
         if let Some(run) = &self.vm_run {
             match run.result.try_recv() {
                 Ok(Ok(outcome)) => {
-                    self.vm_last_status = format!(
-                        "VM exited ({}). Session overlay holds {:.1} GB of guest writes; backup {}.",
-                        if outcome.exit_ok { "clean" } else { "non-zero" },
-                        outcome.overlay_bytes as f64 / 1e9,
-                        if outcome.backup_intact { "still verifies" } else { "FAILED verification" },
-                    );
+                    self.vm_last_status = if outcome.exit_ok {
+                        format!(
+                            "VM exited cleanly. Session overlay holds {:.1} GB of guest writes; backup {}.",
+                            outcome.overlay_bytes as f64 / 1e9,
+                            if outcome.backup_intact { "still verifies" } else { "FAILED verification" },
+                        )
+                    } else {
+                        // The launch died — quote QEMU's own words, they name
+                        // the actual problem (bad option, missing WHPX, …).
+                        let why = outcome
+                            .qemu_log_tail
+                            .as_deref()
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or("(no output captured — see the session's qemu.log)");
+                        tracing::warn!("QEMU exited non-zero: {why}");
+                        format!("QEMU exited with an error: {why}")
+                    };
                     self.vm_run = None;
                 }
                 Ok(Err(e)) => {
+                    tracing::warn!("VM boot failed: {e:#}");
                     self.vm_last_status = format!("VM failed: {e:#}");
                     self.vm_run = None;
                 }
@@ -4121,7 +4133,7 @@ impl PhoenixApp {
         // scroll-shell closure doesn't borrow `self` (which would conflict: it
         // needs `&mut self.vm` while a running view borrows `self.vm_run`).
         let version = self.qemu.as_ref().map(|q| q.version.clone());
-        let sessions = phoenix_vm::SessionManager::list_all();
+        let sessions = phoenix_vm::SessionManager::list_all_sessions();
         let running_owned = self.vm_run.as_ref().map(|r| {
             let overlay_mib = std::fs::metadata(&r.overlay_path)
                 .map(|m| m.len() / (1024 * 1024))
