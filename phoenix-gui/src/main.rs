@@ -637,6 +637,9 @@ struct VmRun {
     started: Instant,
     /// Path to the session overlay, polled to show how much the guest has written.
     overlay_path: std::path::PathBuf,
+    /// The `net use` command mapping this run's shared folder in the guest,
+    /// when the share is active.
+    share_cmd: Option<String>,
     result: std::sync::mpsc::Receiver<anyhow::Result<phoenix_vm::boot::BootOutcome>>,
 }
 
@@ -4210,6 +4213,7 @@ impl PhoenixApp {
                 r.backup.display().to_string(),
                 r.started.elapsed().as_secs(),
                 overlay_mib,
+                r.share_cmd.clone(),
             )
         });
         let last = self.vm_last_status.clone();
@@ -4224,11 +4228,14 @@ impl PhoenixApp {
 
         page_scroll_shell(ui, "virtualize_page", |ui| {
             page_header(ui, &palette, "Virtualize", "");
-            let running = running_owned.as_ref().map(|(n, b, e, o)| vm_panel::RunningView {
-                name: n,
-                backup_path: b,
-                elapsed_secs: *e,
-                overlay_mib: *o,
+            let running = running_owned.as_ref().map(|(n, b, e, o, share)| {
+                vm_panel::RunningView {
+                    name: n,
+                    backup_path: b,
+                    elapsed_secs: *e,
+                    overlay_mib: *o,
+                    share_cmd: share.as_deref(),
+                }
             });
             action = vm_panel::show(
                 ui,
@@ -4510,6 +4517,25 @@ impl PhoenixApp {
             None
         };
 
+        // Shared folder: create/point the Windows share before boot so the
+        // Running view can show the guest-side command immediately. A failure
+        // is surfaced but never blocks the boot.
+        let mut share_warning = None;
+        let share_cmd = if self.vm.share && self.vm.network {
+            let dir = phoenix_vm::share::share_dir_for_backup(&backup);
+            match phoenix_vm::share::ensure_share(&dir) {
+                Ok(()) => Some(phoenix_vm::share::guest_mount_command()),
+                Err(e) => {
+                    tracing::warn!("shared folder setup failed: {e:#}");
+                    share_warning = Some(format!("Shared folder unavailable: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let share_active = share_cmd.is_some();
+
         let (tx, rx) = std::sync::mpsc::channel();
         let backup_thread = backup.clone();
         std::thread::spawn(move || {
@@ -4541,15 +4567,21 @@ impl PhoenixApp {
                 );
                 Err(anyhow::anyhow!("this build lacks the winfsp feature required to boot a VM"))
             };
+            // The share exists for the guest; the guest is gone. (The folder
+            // and its contents stay.)
+            if share_active {
+                phoenix_vm::share::remove_share();
+            }
             let _ = tx.send(res);
         });
 
-        self.vm_last_status.clear();
+        self.vm_last_status = share_warning.unwrap_or_default();
         self.vm_run = Some(VmRun {
             backup,
             name,
             started: Instant::now(),
             overlay_path,
+            share_cmd,
             result: rx,
         });
     }

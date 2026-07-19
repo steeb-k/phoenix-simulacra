@@ -205,6 +205,10 @@ enum VmCommands {
         /// never-booted CD-ROM.
         #[arg(long)]
         drivers_iso: Option<PathBuf>,
+        /// Share a folder next to the image with the guest over the host's SMB
+        /// server (prints the `net use` command to run inside the guest).
+        #[arg(long, default_value_t = false)]
+        share: bool,
         /// Boot from the `--iso` this launch instead of the disk (one-shot: the
         /// next boot without this flag boots the disk normally).
         #[arg(long, default_value_t = false)]
@@ -408,6 +412,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             iso,
             boot_iso,
             drivers_iso,
+            share,
         } => {
             let write_layer = match write.to_ascii_lowercase().as_str() {
                 "avhdx" => {
@@ -453,6 +458,15 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                 if let Some(iso) = &drivers_iso {
                     anyhow::ensure!(iso.exists(), "drivers ISO not found: {}", iso.display());
                 }
+                if share {
+                    let dir = phoenix_vm::share::share_dir_for_backup(&backup);
+                    phoenix_vm::share::ensure_share(&dir)?;
+                    println!("Sharing {} with the guest.", dir.display());
+                    println!(
+                        "Inside the guest, map it with:  {}",
+                        phoenix_vm::share::guest_mount_command()
+                    );
+                }
                 let outcome = phoenix_vm::boot::boot(
                     &backup,
                     &host,
@@ -464,7 +478,13 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                     &qemu,
                     &sessions,
                     &scratch,
-                )?;
+                );
+                // The share exists for the guest; drop it even when the boot
+                // errored (the folder and its contents stay).
+                if share {
+                    phoenix_vm::share::remove_share();
+                }
+                let outcome = outcome?;
                 if outcome.resumed {
                     println!(
                         "Resumed existing session{}.",
@@ -500,6 +520,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                     &iso,
                     boot_iso,
                     &drivers_iso,
+                    share,
                     &qemu,
                     &sessions,
                     &scratch,
