@@ -424,6 +424,9 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                 memory_mib: mem,
                 smp: cpus,
                 network: !no_network,
+                // Cap the guest display so the QEMU window (chrome included)
+                // fits the monitor — PE otherwise picks a huge video mode.
+                max_resolution: phoenix_vm::usable_guest_resolution(),
                 ..HostOptions::default()
             };
             // Everything (session overlay + serve scratch) stays on the image's

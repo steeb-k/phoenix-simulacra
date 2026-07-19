@@ -80,6 +80,11 @@ pub struct HostOptions {
     /// User-mode (slirp) networking with an `e1000e` NIC (inbox driver). When
     /// false, no NIC at all — for forensic boots of possibly-hostile images.
     pub network: bool,
+    /// Cap the guest display via the video adapter's EDID preferred mode.
+    /// Without it a guest (WinPE especially) happily picks a mode far larger
+    /// than the host's monitor. `None` leaves QEMU's default VGA untouched;
+    /// callers normally pass [`usable_guest_resolution`].
+    pub max_resolution: Option<(u32, u32)>,
 }
 
 impl Default for HostOptions {
@@ -90,8 +95,52 @@ impl Default for HostOptions {
             accel: Accel::Whpx,
             controller_override: None,
             network: true,
+            max_resolution: None,
         }
     }
+}
+
+/// The largest guest resolution whose QEMU window still fits on the host's
+/// primary display: the work area (screen minus taskbar) less the window's own
+/// chrome (title bar, resize frame, and QEMU's menu bar). `None` if the query
+/// fails (headless session).
+pub fn usable_guest_resolution() -> Option<(u32, u32)> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SystemParametersInfoW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
+        SM_CYCAPTION, SM_CYSIZEFRAME, SPI_GETWORKAREA,
+    };
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: rect is a properly-sized writable RECT; a failed call returns 0
+    // and rect is not read.
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut rect as *mut RECT as *mut _, 0)
+    };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: GetSystemMetrics takes no pointers.
+    let (frame_x, frame_y, caption, padded) = unsafe {
+        (
+            GetSystemMetrics(SM_CXSIZEFRAME),
+            GetSystemMetrics(SM_CYSIZEFRAME),
+            GetSystemMetrics(SM_CYCAPTION),
+            GetSystemMetrics(SM_CXPADDEDBORDER),
+        )
+    };
+    // QEMU's GTK display puts its own menu bar under the title bar; there is
+    // no system metric for another process's widgets, so allow a fixed band.
+    const QEMU_MENUBAR: i32 = 32;
+    let w = (rect.right - rect.left) - 2 * (frame_x + padded);
+    let h = (rect.bottom - rect.top) - caption - QEMU_MENUBAR - 2 * (frame_y + padded);
+    // Round down to multiples of 8 — tidy video-mode numbers.
+    (w > 0 && h > 0).then(|| ((w as u32) & !7, (h as u32) & !7))
 }
 
 /// Host ceilings for the memory / vCPU knobs: (total physical RAM in MiB,
@@ -133,6 +182,8 @@ pub struct VmConfig {
     pub memory_mib: u64,
     pub smp: u32,
     pub network: bool,
+    /// See [`HostOptions::max_resolution`].
+    pub max_resolution: Option<(u32, u32)>,
 }
 
 impl VmConfig {
@@ -184,6 +235,7 @@ impl VmConfig {
             memory_mib: host.memory_mib,
             smp: host.smp,
             network: host.network,
+            max_resolution: host.max_resolution,
         })
     }
 
@@ -225,6 +277,16 @@ impl VmConfig {
         } else {
             push("-nic");
             push("none");
+        }
+
+        // Video: explicit std VGA whose EDID prefers (at most) the host's
+        // screen size — OVMF's GOP and the guest take the EDID preferred mode,
+        // so PE no longer opens a display far larger than the monitor.
+        if let Some((w, h)) = self.max_resolution {
+            push("-vga");
+            push("none");
+            push("-device");
+            push(&format!("VGA,edid=on,xres={w},yres={h}"));
         }
 
         // Firmware: UEFI needs a writable copy of BOTH pflash units. Attaching
@@ -519,6 +581,25 @@ mod tests {
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(!args.contains("cdrom"));
         assert!(!args.contains("ide-cd"));
+    }
+
+    #[test]
+    fn max_resolution_caps_the_vga_edid() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let host = HostOptions {
+            max_resolution: Some((1920, 1080)),
+            ..HostOptions::default()
+        };
+        let cfg = VmConfig::from_manifest(&m, &host).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(args.contains("-vga none"));
+        assert!(args.contains("VGA,edid=on,xres=1920,yres=1080"));
+
+        // Without a cap the default VGA is left alone.
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(!args.contains("edid"));
+        assert!(!args.contains("-vga"));
     }
 
     #[test]
