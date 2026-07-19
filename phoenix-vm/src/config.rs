@@ -94,6 +94,30 @@ impl Default for HostOptions {
     }
 }
 
+/// Host ceilings for the memory / vCPU knobs: (total physical RAM in MiB,
+/// logical CPU count). Falls back to 16 GiB / 8 if the OS queries fail, so a
+/// slider built from this is never empty.
+pub fn host_caps() -> (u64, u32) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `st` is a zeroed, properly-sized MEMORYSTATUSEX with dwLength
+    // set, as GlobalMemoryStatusEx requires; a failed call returns 0 and the
+    // struct is not read.
+    let mem_mib = unsafe {
+        let mut st: MEMORYSTATUSEX = std::mem::zeroed();
+        st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut st) != 0 {
+            st.ullTotalPhys / (1024 * 1024)
+        } else {
+            16 * 1024
+        }
+    };
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(8);
+    (mem_mib, cpus)
+}
+
 /// A fully-resolved VM configuration: manifest-derived choices plus host knobs.
 #[derive(Debug, Clone)]
 pub struct VmConfig {

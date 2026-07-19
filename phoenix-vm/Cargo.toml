@@ -16,11 +16,13 @@ uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 # Reaping an orphaned serve helper: open the recorded PID, confirm the image
-# name is really ours (PIDs get reused), then terminate it.
+# name is really ours (PIDs get reused), then terminate it. SystemInformation
+# is for GlobalMemoryStatusEx (host RAM ceiling for the GUI's memory slider).
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
 ] }
 
 [features]

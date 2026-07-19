@@ -259,6 +259,9 @@ pub struct Settings {
     pub default_verify_quick: bool,
     pub clone_readback_verify: bool,
     pub theme: ThemeChoice,
+    /// Rescue/PE ISOs the Virtualize page has attached before, newest first,
+    /// so the ISO picker can offer them as a dropdown. Capped by the GUI.
+    pub vm_iso_history: Vec<String>,
 }
 
 impl Default for Settings {
@@ -271,6 +274,7 @@ impl Default for Settings {
             default_verify_quick: true,
             clone_readback_verify: true,
             theme: ThemeChoice::System,
+            vm_iso_history: Vec::new(),
         }
     }
 }
