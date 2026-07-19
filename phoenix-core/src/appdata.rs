@@ -270,9 +270,6 @@ pub struct Settings {
     pub vm_memory_mib: Option<u64>,
     /// The Virtualize page's processor slider. `None` = the built-in default.
     pub vm_cpus: Option<u32>,
-    /// Grab input while the pointer is over the QEMU window, so guest
-    /// hotkeys reach the guest. Off by default, as in QEMU.
-    pub vm_grab_keyboard: bool,
     /// Backups reached via Browse…, newest first. The dropdowns are built
     /// from the job history, which only knows about backups this machine
     /// created, verified or restored — so one browsed from elsewhere used to
@@ -300,7 +297,6 @@ impl Default for Settings {
             vm_scratch_drive: None,
             vm_memory_mib: None,
             vm_cpus: None,
-            vm_grab_keyboard: false,
             browsed_backups: Vec::new(),
             vm_qemu_dir: None,
         }

@@ -36,9 +36,6 @@ pub struct VmPageState {
     /// checked whenever the ISO is present on disk. `Some` is an explicit
     /// user choice.
     pub attach_drivers: Option<bool>,
-    /// Grab input whenever the pointer is over the QEMU window, so hotkeys
-    /// reach the guest. Off by default, as in QEMU itself.
-    pub grab_keyboard: bool,
     /// Free-RAM snapshot for the memory slider's color coding, refreshed
     /// when stale so "at the time of loading this pane" stays honest.
     free_mem: Option<(std::time::Instant, u64)>,
@@ -56,7 +53,6 @@ impl Default for VmPageState {
             iso_path: String::new(),
             boot_iso: false,
             attach_drivers: None,
-            grab_keyboard: false,
             free_mem: None,
         }
     }
@@ -275,7 +271,7 @@ pub fn show(
             ui.label(
                 egui::RichText::new(
                     "To browse the folder shared next to the image: inside the guest, \
-                     open the SIMULACRA drive and run MapShare.cmd — or run this in a \
+                     open the VMSCRIPTS drive and run MapShare.cmd — or run this in a \
                      Command Prompt:",
                 )
                 .small()
@@ -573,30 +569,11 @@ fn drivers_section(
             .color(palette.subtle_text),
         );
     }
-    // Keyboard capture sits here because it is the same subject: installing
-    // the guest tools is what STOPS the VM grabbing input. The agent gives
-    // the guest absolute pointer positioning, so QEMU no longer needs to
-    // grab anything — better for the mouse, but hotkeys then land on the
-    // host. Off by default, matching QEMU, because merely moving the
-    // pointer across the window would otherwise steal the keyboard.
-    ui.horizontal(|ui| {
-        ui.checkbox(
-            &mut state.grab_keyboard,
-            "Capture keyboard while the pointer is over the VM",
-        );
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(egui_phosphor::regular::QUESTION)
-                .font(fonts::icon(14.0))
-                .color(palette.subtle_text),
-        )
-        .on_hover_text(
-            "Sends hotkeys like Alt+Tab and the Windows key to the guest instead \
-             of the host.\n\nYou can also toggle capture by hand at any time with \
-             Ctrl+Alt+G, without this setting.\n\nCtrl+Alt+Del is always taken by \
-             the host — use the QEMU window's Machine menu to send it to the guest.",
-        );
-    });
+    // There was a "capture keyboard" checkbox here, driving
+    // `-display gtk,grab-on-hover=on`. Removed: it did not reliably capture,
+    // and while enabled it broke Ctrl+Alt+G, the manual toggle that works
+    // perfectly well on its own. A setting that breaks the thing it
+    // duplicates is worse than no setting.
 
     if !drivers.note.is_empty() {
         ui.label(

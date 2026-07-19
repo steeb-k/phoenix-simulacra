@@ -96,7 +96,7 @@ pub fn guest_mount_command() -> String {
 
 /// Build the guest helper disk: a small FAT image (regenerated every boot)
 /// holding `MapShare.cmd`, attached to the guest as an extra drive labelled
-/// `SIMULACRA`. Clipboard sharing needs guest tools the guest may not have
+/// `VMSCRIPTS`. Clipboard sharing needs guest tools the guest may not have
 /// yet, and hand-typing the mount command is miserable — double-clicking a
 /// script on a drive that is simply *there* needs neither. A real image
 /// rather than QEMU's VVFAT: writable VVFAT is corruption-prone and IDE disks
@@ -125,7 +125,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
     // A real MBR with one FAT16 partition. A FIXED disk (which `ide-hd`
     // presents) MUST carry a partition table: Windows mounts partitionless
     // "superfloppy" layouts only from removable media, and shows a fixed one
-    // as an uninitialized disk with no drive letter (observed — the SIMULACRA
+    // as an uninitialized disk with no drive letter (observed — the VMSCRIPTS
     // drive was invisible in the guest).
     let total_sectors = (DISK_SIZE / SECTOR) as u32;
     let part_sectors = total_sectors - PART_START_LBA;
@@ -147,7 +147,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         .context("slice helper partition")?;
     fatfs::format_volume(
         &mut part,
-        fatfs::FormatVolumeOptions::new().volume_label(*b"SIMULACRA  "),
+        fatfs::FormatVolumeOptions::new().volume_label(*b"VMSCRIPTS  "),
     )
     .context("format helper disk")?;
     let fs = fatfs::FileSystem::new(part, fatfs::FsOptions::new())
@@ -321,7 +321,7 @@ mod tests {
         let part =
             fscommon::StreamSlice::new(file, 2048 * 512, 16 * 1024 * 1024).unwrap();
         let fs = fatfs::FileSystem::new(part, fatfs::FsOptions::new()).unwrap();
-        assert_eq!(fs.volume_label(), "SIMULACRA");
+        assert_eq!(fs.volume_label(), "VMSCRIPTS");
         let mut cmd = String::new();
         fs.root_dir()
             .open_file("MapShare.cmd")
