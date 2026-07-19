@@ -94,8 +94,11 @@ pub fn remove_share() {
 pub fn guest_mount_command() -> String {
     let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "HOST".into());
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    // `/user:` belongs on BOTH: cmdkey needs it to key the stored credential,
+    // and net use needs it or it prompts for a username of its own — the
+    // stored credential answers "what is the password", never "who are you".
     format!(
-        r"cmdkey /add:10.0.2.2 /user:{host}\{user} /pass && net use S: \\10.0.2.2\{SHARE_NAME} /persistent:yes"
+        r"cmdkey /add:10.0.2.2 /user:{host}\{user} /pass && net use S: \\10.0.2.2\{SHARE_NAME} /user:{host}\{user} /persistent:yes"
     )
 }
 
@@ -348,6 +351,9 @@ mod tests {
         // would break the mapping outright rather than degrade it.
         assert!(cmd.contains("cmdkey /add:10.0.2.2"));
         assert!(!cmd.contains("/savecred"));
+        // BOTH commands need /user: — a stored credential supplies the
+        // password, never the username, so net use without it prompts.
+        assert_eq!(cmd.matches("/user:").count(), 2);
         // The script must run exactly the command the UI offers to copy, so
         // the two can't drift apart.
         assert!(cmd.contains(&guest_mount_command()));
