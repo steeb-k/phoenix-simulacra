@@ -37,6 +37,7 @@ pub mod winfsp_mount;
 
 #[cfg(windows)]
 pub use active::ActiveMount;
+pub use attach::{create_differencing_vhdx, set_disk_offline, AttachedDisk};
 pub use chunkstore::{plan_layout, ChunkStore, PartitionSpan};
 #[cfg(windows)]
 pub use letters::MountedVolume;

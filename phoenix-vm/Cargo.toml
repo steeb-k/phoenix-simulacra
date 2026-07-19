@@ -1,0 +1,25 @@
+[package]
+name = "phoenix-vm"
+description = "Boot Phoenix Simulacra backups as QEMU virtual machines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-core.workspace = true
+phoenix-mount.workspace = true
+anyhow.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[features]
+# The live boot path serves the backup on demand through WinFsp, so the
+# orchestration in `boot.rs` needs the same feature (and libclang + WinFsp)
+# the mount crate does. Config synthesis, QEMU discovery, and the session
+# store build and test WITHOUT it — the high-value, deterministic parts.
+default = []
+winfsp = ["phoenix-mount/winfsp"]
