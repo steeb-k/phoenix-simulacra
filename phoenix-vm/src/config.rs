@@ -189,6 +189,12 @@ impl VmConfig {
         push("-name");
         push(&spec.name);
 
+        // QMP control socket for graceful ACPI shutdown (system_powerdown).
+        if let Some(port) = spec.qmp_port {
+            push("-qmp");
+            push(&format!("tcp:127.0.0.1:{port},server,nowait"));
+        }
+
         if self.network {
             push("-nic");
             push("user,model=e1000e");
@@ -211,8 +217,12 @@ impl VmConfig {
             }
         }
 
-        // Disk backing + controller. bootindex=0 pins the OS disk first, or a
-        // fresh UEFI varstore burns minutes on PXE/HTTP and drops to the shell.
+        // Boot order. bootindex must be set (a fresh UEFI varstore otherwise
+        // burns minutes on PXE/HTTP and drops to the shell). When booting from
+        // the ISO this launch, the CD takes priority (0) and the disk follows.
+        let booting_iso = spec.iso.is_some() && spec.boot_iso_first;
+        let disk_bootindex = if booting_iso { 1 } else { 0 };
+
         match &spec.disk {
             DiskSource::RawPhysicalDrive(n) => {
                 push("-drive");
@@ -226,7 +236,7 @@ impl VmConfig {
         match self.controller {
             DiskController::Ahci => {
                 push("-device");
-                push("ide-hd,drive=disk0,bootindex=0");
+                push(&format!("ide-hd,drive=disk0,bootindex={disk_bootindex}"));
             }
             DiskController::Nvme => {
                 push("-device");
@@ -234,13 +244,23 @@ impl VmConfig {
                 // Controller + namespace as separate devices: the legacy
                 // `nvme,drive=` shorthand left the controller namespace-less
                 // and OVMF found no disk (fell through to PXE).
-                let mut ns = "nvme-ns,drive=disk0,bus=nvm0,bootindex=0".to_string();
+                let mut ns = format!("nvme-ns,drive=disk0,bus=nvm0,bootindex={disk_bootindex}");
                 if self.sector_size == 4096 {
                     ns.push_str(",logical_block_size=4096,physical_block_size=4096");
                 }
                 push("-device");
                 push(&ns);
             }
+        }
+
+        // Optional rescue/PE ISO as a read-only CD-ROM. AHCI CD (ide-cd on q35)
+        // has inbox drivers in every guest we target.
+        if let Some(iso) = &spec.iso {
+            push("-drive");
+            push(&format!("file={iso},format=raw,if=none,id=cd0,media=cdrom,readonly=on"));
+            let cd_bootindex = if booting_iso { 0 } else { 2 };
+            push("-device");
+            push(&format!("ide-cd,drive=cd0,bootindex={cd_bootindex}"));
         }
         a
     }
@@ -255,6 +275,32 @@ pub struct BootSpec {
     /// UEFI NVRAM varstore (per-session, boot order persists here). `None` for BIOS.
     pub firmware_vars: Option<String>,
     pub disk: DiskSource,
+    /// An optional read-only CD-ROM ISO (rescue / PE environment).
+    pub iso: Option<String>,
+    /// Boot from the ISO *this launch* (the "next boot only" affordance). Since
+    /// every boot launches a fresh QEMU, "next boot only" is simply a per-launch
+    /// flag: set it once, and the *next* launch — without it — boots the disk
+    /// normally. When true the CD is given boot priority over the disk.
+    pub boot_iso_first: bool,
+    /// TCP port for a QMP control socket (`127.0.0.1:PORT`). Enables graceful
+    /// ACPI shutdown (`system_powerdown`) instead of killing QEMU. `None` omits
+    /// the socket.
+    pub qmp_port: Option<u16>,
+}
+
+impl BootSpec {
+    /// Minimal spec: no ISO, no QMP. Callers set the optional fields.
+    pub fn new(name: String, disk: DiskSource) -> Self {
+        BootSpec {
+            name,
+            firmware_code: None,
+            firmware_vars: None,
+            disk,
+            iso: None,
+            boot_iso_first: false,
+            qmp_port: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,10 +342,9 @@ mod tests {
 
     fn spec_uefi_raw() -> BootSpec {
         BootSpec {
-            name: "t".to_string(),
             firmware_code: Some("code.fd".to_string()),
             firmware_vars: Some("vars.fd".to_string()),
-            disk: DiskSource::RawPhysicalDrive(4),
+            ..BootSpec::new("t".to_string(), DiskSource::RawPhysicalDrive(4))
         }
     }
 
@@ -407,6 +452,59 @@ mod tests {
         };
         let args = cfg.qemu_args(&spec).join(" ");
         assert!(args.contains("file=session.qcow2,format=qcow2,if=none,id=disk0"));
+    }
+
+    #[test]
+    fn iso_boot_first_gives_cd_priority_over_disk() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let spec = BootSpec {
+            iso: Some(r"D:\winpe.iso".to_string()),
+            boot_iso_first: true,
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&spec).join(" ");
+        assert!(args.contains(r"file=D:\winpe.iso,format=raw,if=none,id=cd0,media=cdrom,readonly=on"));
+        // CD boots first, disk second.
+        assert!(args.contains("ide-cd,drive=cd0,bootindex=0"));
+        assert!(args.contains("ide-hd,drive=disk0,bootindex=1"));
+    }
+
+    #[test]
+    fn iso_present_but_not_first_leaves_disk_booting() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let spec = BootSpec {
+            iso: Some("rescue.iso".to_string()),
+            boot_iso_first: false,
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&spec).join(" ");
+        assert!(args.contains("ide-hd,drive=disk0,bootindex=0")); // disk still first
+        assert!(args.contains("ide-cd,drive=cd0,bootindex=2")); // CD attached, lower priority
+    }
+
+    #[test]
+    fn no_iso_means_no_cdrom() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(!args.contains("cdrom"));
+        assert!(!args.contains("ide-cd"));
+    }
+
+    #[test]
+    fn qmp_port_adds_control_socket() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let spec = BootSpec {
+            qmp_port: Some(45123),
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&spec).join(" ");
+        assert!(args.contains("-qmp tcp:127.0.0.1:45123,server,nowait"));
+        // and absent by default
+        assert!(!cfg.qemu_args(&spec_uefi_raw()).join(" ").contains("-qmp"));
     }
 
     #[test]

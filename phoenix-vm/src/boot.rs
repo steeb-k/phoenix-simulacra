@@ -40,6 +40,8 @@ pub fn boot(
     host: &HostOptions,
     write_layer: WriteLayer,
     fresh: bool,
+    iso: Option<&Path>,
+    boot_iso_first: bool,
     qemu: &Qemu,
     sessions: &SessionManager,
     scratch_dir: &Path,
@@ -150,15 +152,25 @@ pub fn boot(
     };
 
     // --- assemble + launch --------------------------------------------------
+    // A QMP control socket so `vm stop` can shut the guest down gracefully
+    // (ACPI) instead of killing QEMU. The port is recorded in the session so a
+    // separate process can find it.
+    let qmp_port = crate::qmp::pick_free_port().ok();
     let spec = BootSpec {
         name: format!("Phoenix Simulacra — {}", manifest.hostname),
         firmware_code: fw_code,
         firmware_vars: fw_vars,
         disk,
+        iso: iso.map(|p| p.display().to_string()),
+        boot_iso_first,
+        qmp_port,
     };
     let args = cfg.qemu_args(&spec);
 
     session.mark_booting(now_rfc3339())?;
+    if let Some(port) = qmp_port {
+        let _ = std::fs::write(session.qmp_port_file(), port.to_string());
+    }
     tracing::info!(
         "booting {} ({} write layer, {}resume) with {} args",
         backup.display(),
@@ -196,6 +208,7 @@ pub fn boot(
         tracing::warn!("session overlay did not detach within the timeout; stopping serve anyway");
     }
     serve.stop(); // kills the helper process — clean, it holds no attach
+    let _ = std::fs::remove_file(session.qmp_port_file());
     session.mark_clean()?;
 
     let overlay_bytes = std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0);

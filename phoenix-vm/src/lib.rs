@@ -14,6 +14,7 @@
 
 pub mod config;
 pub mod qemu;
+pub mod qmp;
 pub mod serve_helper;
 pub mod session;
 

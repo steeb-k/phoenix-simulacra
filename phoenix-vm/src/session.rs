@@ -152,6 +152,14 @@ impl Session {
         self.dir.join("session.json")
     }
 
+    /// Runtime file holding the QMP control port of a currently-running boot, so
+    /// `vm stop` can find the socket to send a graceful shutdown. Written at
+    /// boot, removed at teardown; its presence is not authoritative (a crash
+    /// leaves it stale).
+    pub fn qmp_port_file(&self) -> PathBuf {
+        self.dir.join("qmp.port")
+    }
+
     /// Copy the UEFI firmware into the session if not already present. Idempotent
     /// across resumes — the varstore is only seeded once so boot-order changes
     /// survive. Pass the QEMU master blobs.

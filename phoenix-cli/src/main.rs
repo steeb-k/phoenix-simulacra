@@ -198,7 +198,16 @@ enum VmCommands {
         /// a session that won't boot). Keeps the session identity.
         #[arg(long, default_value_t = false)]
         fresh: bool,
+        /// Attach an ISO as a CD-ROM (e.g. a WinPE / rescue environment).
+        #[arg(long)]
+        iso: Option<PathBuf>,
+        /// Boot from the `--iso` this launch instead of the disk (one-shot: the
+        /// next boot without this flag boots the disk normally).
+        #[arg(long, default_value_t = false)]
+        boot_iso: bool,
     },
+    /// Gracefully power down a running VM (ACPI), instead of killing it.
+    Stop { backup: PathBuf },
     /// List saved VM sessions.
     List,
     /// Delete a backup's VM session (overlay + firmware; the .phnx is untouched).
@@ -392,6 +401,8 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             qemu_dir,
             vm_dir,
             fresh,
+            iso,
+            boot_iso,
         } => {
             let write_layer = match write.to_ascii_lowercase().as_str() {
                 "avhdx" => {
@@ -428,11 +439,16 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             println!("Booting {} — close the VM window to end.", backup.display());
             #[cfg(feature = "winfsp")]
             {
+                if let Some(iso) = &iso {
+                    anyhow::ensure!(iso.exists(), "ISO not found: {}", iso.display());
+                }
                 let outcome = phoenix_vm::boot::boot(
                     &backup,
                     &host,
                     write_layer,
                     fresh,
+                    iso.as_deref(),
+                    boot_iso,
                     &qemu,
                     &sessions,
                     &scratch,
@@ -460,12 +476,35 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "winfsp"))]
             {
-                let _ = (&host, write_layer, fresh, &qemu, &sessions, &scratch);
+                let _ = (&host, write_layer, fresh, &iso, boot_iso, &qemu, &sessions, &scratch);
                 anyhow::bail!(
                     "this build lacks the `winfsp` feature required to boot a VM; \
                      rebuild with --features winfsp"
                 );
             }
+        }
+        VmCommands::Stop { backup } => {
+            let reader = phoenix_core::container::PhnxReader::open(&backup)?;
+            let id = reader.header.backup_id;
+            drop(reader);
+            let session = SessionManager::for_backup(&backup).open_or_create(
+                id,
+                &backup,
+                WriteLayer::Qcow2,
+                phoenix_vm::now_rfc3339(),
+            )?;
+            let port_file = session.qmp_port_file();
+            let port: u16 = std::fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no running VM for {} (no QMP port recorded)",
+                        backup.display()
+                    )
+                })?;
+            phoenix_vm::qmp::system_powerdown(port)?;
+            println!("Sent ACPI power-down to the VM; it will shut down gracefully.");
         }
         VmCommands::List => {
             // Sessions live on their image's drive, so scan every volume.
