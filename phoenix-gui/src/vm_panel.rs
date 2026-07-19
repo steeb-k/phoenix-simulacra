@@ -116,10 +116,18 @@ pub enum VmAction {
     Stop,
     /// Load the manifest summary for the current `backup_path`.
     LoadSummary,
-    /// Boot this saved session's backup (fills the picker and boots).
-    Resume(String),
-    /// Discard this saved session (backup path).
-    Discard(String),
+    /// Boot this saved session's backup (fills the picker and boots). Carries
+    /// the session's OWN working root — resume must go where the session
+    /// lives, not where the scratch dropdown currently points.
+    Resume {
+        backup_path: String,
+        vm_root: std::path::PathBuf,
+    },
+    /// Discard this saved session, at its own root (same reasoning).
+    Discard {
+        backup_path: String,
+        vm_root: std::path::PathBuf,
+    },
 }
 
 /// A running VM, for the header status line.
@@ -642,10 +650,16 @@ fn show_sessions(
         .show(ui, |ui| {
             match vm_sessions_table::show(ui, width, &rows, running.is_none(), palette) {
                 SessionAction::Resume(i) => {
-                    *action = VmAction::Resume(sessions[i].meta().backup_path.clone());
+                    *action = VmAction::Resume {
+                        backup_path: sessions[i].meta().backup_path.clone(),
+                        vm_root: sessions[i].vm_root(),
+                    };
                 }
                 SessionAction::Discard(i) => {
-                    *action = VmAction::Discard(sessions[i].meta().backup_path.clone());
+                    *action = VmAction::Discard {
+                        backup_path: sessions[i].meta().backup_path.clone(),
+                        vm_root: sessions[i].vm_root(),
+                    };
                 }
                 SessionAction::None => {}
             }
