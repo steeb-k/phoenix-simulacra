@@ -12,7 +12,10 @@ phoenix-mount.workspace = true
 anyhow.workspace = true
 # Building the tiny "SIMULACRA" helper disk (a real FAT image holding
 # MapShare.cmd) that gets attached to the guest alongside the SMB share.
+# fscommon provides StreamSlice so the FAT volume can live inside an MBR
+# partition (a fixed disk without one won't mount in Windows).
 fatfs = "0.3"
+fscommon = "0.1"
 serde = { workspace = true }
 serde_json.workspace = true
 uuid.workspace = true
