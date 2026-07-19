@@ -2916,11 +2916,13 @@ fn page_header_badged(
     badge: &str,
 ) {
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    // Bottom-aligned rather than the default centre: against 22pt bold, a
+    // vertically-centred 13pt aside floats halfway up the title's cap
+    // height. Aligning the boxes' bottoms puts the two descender lines
+    // together, which reads as sitting on the same baseline.
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
         ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
         if !badge.is_empty() {
-            // Baseline-ish alignment: the title's cap height is far taller
-            // than the badge's, so without a nudge the small text floats.
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(badge)
@@ -2936,7 +2938,14 @@ fn page_header_badged(
 }
 
 /// Height of the decorative hazard band at the top of the Virtualize page.
-const PAGE_HAZARD_BAND_H: f32 = 104.0;
+const PAGE_HAZARD_BAND_H: f32 = 54.0;
+
+/// Stripe width for that band. Fixed, NOT derived from the band's height:
+/// the confirm dialog's tape is only a stripe or two tall so height works
+/// there, but at this size it yields 70px slabs that read as blocks rather
+/// than tape, and the diagonal edges then cross the fade so slowly that the
+/// gradient looks stepped.
+const PAGE_HAZARD_STRIPE_W: f32 = 22.0;
 
 /// Hazard tape bled across the top of the page and dissolved into the panel
 /// behind it. Allocates no layout space and is painted before the page's
@@ -2948,7 +2957,14 @@ const PAGE_HAZARD_BAND_H: f32 = 104.0;
 /// vision and then get out of the way — full-strength tape behind body text
 /// would be unreadable and would cry wolf.
 fn paint_page_hazard_band(ui: &egui::Ui) {
-    let area = ui.max_rect();
+    // `clip_rect`, not `max_rect`: the latter is inset by the panel frame's
+    // margin, which leaves the band stopping short of both edges instead of
+    // bleeding off them. Intersected with the screen so an unbounded clip
+    // rect can't turn into an absurd mesh.
+    let area = ui.clip_rect().intersect(ui.ctx().screen_rect());
+    if !area.is_positive() {
+        return;
+    }
     let rect = egui::Rect::from_min_size(
         area.left_top(),
         egui::vec2(area.width(), PAGE_HAZARD_BAND_H.min(area.height())),
@@ -2957,7 +2973,7 @@ fn paint_page_hazard_band(ui: &egui::Ui) {
     let yellow = egui::Color32::from_rgb(0xF6, 0xC4, 0x00);
     let black = egui::Color32::from_rgb(0x16, 0x16, 0x16);
     painter.rect_filled(rect, 0.0, black);
-    stripes::paint(&painter, rect, yellow, rect.height() * 0.7, 0.0);
+    stripes::paint(&painter, rect, yellow, PAGE_HAZARD_STRIPE_W, 0.0);
     // Wash it back most of the way at the top, then all the way by the
     // bottom edge, so the band has no hard border to give itself away.
     stripes::fade_into(&painter, rect, ui.visuals().panel_fill, 205);
