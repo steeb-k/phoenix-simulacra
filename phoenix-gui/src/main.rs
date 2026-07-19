@@ -2827,6 +2827,10 @@ const BROWSED_BACKUPS_MAX: usize = 12;
 /// Record a hand-picked backup as the newest entry, dropping any duplicate
 /// and any path that has since disappeared.
 fn remember_browsed_backup(browsed: &mut Vec<String>, picked: &str) {
+    let picked = picked.trim();
+    if picked.is_empty() {
+        return;
+    }
     browsed.retain(|p| !p.eq_ignore_ascii_case(picked) && Path::new(p).is_file());
     browsed.insert(0, picked.to_string());
     browsed.truncate(BROWSED_BACKUPS_MAX);
@@ -2949,16 +2953,18 @@ fn page_header_badged(
     let title_font = fonts::bold(22.0);
     let title = ui.label(egui::RichText::new(title).font(title_font));
     if !badge.is_empty() {
-        // Painted, not laid out, so it displaces neither the title nor
-        // anything below it. It sits BELOW the title: above the title it
-        // landed under the window's drag-area reservation and got clipped,
-        // and the gap the header already leaves underneath fits it without
-        // any clip-rect games.
+        // To the right of the title, bottom-aligned to it so the two sit on
+        // a common baseline. Painted rather than laid out: a bottom-aligned
+        // *layout* fills whatever height it is handed, which once pushed
+        // the whole page off the bottom of the screen, and painting also
+        // guarantees the badge displaces nothing. Above the title it fell
+        // under the window's drag-area reservation and got clipped; below
+        // it simply looked wrong.
         ui.painter().text(
-            egui::pos2(title.rect.left(), title.rect.bottom() + 1.0),
-            egui::Align2::LEFT_TOP,
+            egui::pos2(title.rect.right() + 8.0, title.rect.bottom()),
+            egui::Align2::LEFT_BOTTOM,
             badge,
-            fonts::regular(12.0),
+            fonts::regular(13.0),
             palette.subtle_text,
         );
     }
@@ -3017,6 +3023,21 @@ fn paint_page_hazard_band(ui: &egui::Ui) {
 }
 
 impl PhoenixApp {
+    /// Record a backup as recently used, so every page's dropdown offers it.
+    ///
+    /// Browsing is not the only way a backup gets chosen — Resume fills the
+    /// path in from a saved session, and the job history only learns about a
+    /// file once a *job* completes, which a VM boot or a mount never
+    /// produces. Actually using a backup is the strongest signal that it
+    /// belongs in the list, so every entry point records here.
+    fn remember_backup_in_use(&mut self, path: &str) {
+        let before = self.settings.browsed_backups.clone();
+        remember_browsed_backup(&mut self.settings.browsed_backups, path);
+        if self.settings.browsed_backups != before {
+            let _ = self.settings.save();
+        }
+    }
+
     fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
         // Whole-page scroll: when the window is too short, the entire backup
         // page (header, fields, drive list, options) scrolls as a unit above
@@ -3372,6 +3393,7 @@ impl PhoenixApp {
             return;
         };
         self.restore_backup_path = backup_path.display().to_string();
+        self.remember_backup_in_use(&self.restore_backup_path.clone());
         let Some(layout) = self.restore_layout.as_ref() else {
             self.status = "No restore layout — load a backup first".into();
             return;
@@ -3482,6 +3504,7 @@ impl PhoenixApp {
             return;
         };
         self.restore_backup_path = path.display().to_string();
+        self.remember_backup_in_use(&self.restore_backup_path.clone());
         self.completed = None;
         self.status = "Verify in progress…".into();
         self.job_subject = JobSubject {
@@ -4218,6 +4241,7 @@ impl PhoenixApp {
             return;
         }
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
+        self.remember_backup_in_use(&self.mount_backup_path.clone());
         let scratch = phoenix_mount::mount_scratch_dir();
         let selected: Vec<u32> = self.mount_selection.iter().map(|&(_, part)| part).collect();
         self.status = if phoenix_mount::ActiveMount::space_efficient() {
@@ -4672,6 +4696,7 @@ impl PhoenixApp {
             return;
         }
         let backup = std::path::PathBuf::from(self.vm.backup_path.trim());
+        self.remember_backup_in_use(&self.vm.backup_path.clone());
         if !backup.exists() {
             self.vm_last_status = "Pick a backup file first.".into();
             return;
