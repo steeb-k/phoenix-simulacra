@@ -4289,6 +4289,9 @@ impl PhoenixApp {
             memory_mib: self.vm.mem_mib,
             smp: self.vm.cpus,
             network: self.vm.network,
+            // Cap the guest display so the QEMU window (chrome included)
+            // fits the monitor — PE otherwise picks a huge video mode.
+            max_resolution: phoenix_vm::usable_guest_resolution(),
             ..phoenix_vm::HostOptions::default()
         };
         let iso = {

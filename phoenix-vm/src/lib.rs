@@ -22,7 +22,10 @@ pub mod session;
 #[cfg(feature = "winfsp")]
 pub mod boot;
 
-pub use config::{host_caps, Accel, DiskController, DiskSource, Firmware, HostOptions, VmConfig};
+pub use config::{
+    host_caps, usable_guest_resolution, Accel, DiskController, DiskSource, Firmware, HostOptions,
+    VmConfig,
+};
 pub use qemu::Qemu;
 pub use session::{
     serve_scratch_for_backup, sweep_serve_scratch, vm_root_for_backup, volume_root, Session,
