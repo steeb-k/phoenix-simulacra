@@ -18,6 +18,7 @@ pub mod qemu;
 pub mod qmp;
 pub mod serve_helper;
 pub mod session;
+pub mod share;
 
 #[cfg(feature = "winfsp")]
 pub mod boot;

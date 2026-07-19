@@ -523,13 +523,25 @@ ISO" (virtio-win, downloaded on demand next to the app with progress + a
 check-for-updates HEAD comparison; attached as a second never-booted CD on
 `ide.2`); (3) a small guest-tools installer we place in the share.
 
-**Writable channel decision (user, 2026-07-19): SMB is the target.** An SMB
-share is what the user ultimately wants for host↔guest exchange — planned as
-the next feature after the driver-ISO set lands. On a Windows host that means
-either exposing a host Windows file share to the guest over slirp
-(`10.0.2.2`-routed, with host credentials), or an in-app userspace SMB server
-bound to the slirp network — to be designed; VVFAT stays the zero-driver
-read-only fallback.
+**Writable channel: SMB — SHIPPED v1 2026-07-19 (copy-paste mount).** No new
+server needed: Windows already runs an SMB server on 445, and a slirp guest
+reaches the host's loopback at the gateway address `10.0.2.2`. The app
+`net share`s a `SimulacraShare` folder next to the image at boot (elevated
+already; share re-pointed per run, removed at teardown, one at a time like the
+VMs), and the Running view / CLI hand the user the one command to paste inside
+the guest:
+
+```text
+net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user
+```
+
+authenticated with the host account's password (Microsoft-account PCs: the
+Microsoft-account password). Mapping can't be automatic — the guest can't be
+reached before it boots. GUI: "Shared folder" checkbox (default on, requires
+networking); CLI: `--share`. Auto-mapping via a guest-tools script placed in
+the share is the natural follow-up. Caveats to watch on real guests: inbound
+NTLM disabled by policy, or SMB-client guest-auth hardening (authenticated
+access is fine on defaults).
 
 ### ARM64: feature hidden
 

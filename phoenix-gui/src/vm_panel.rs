@@ -33,6 +33,9 @@ pub struct VmPageState {
     pub scratch: ScratchChoice,
     pub iso_path: String,
     pub boot_iso: bool,
+    /// Share a folder next to the image with the guest over the host's SMB
+    /// server. Effective only with networking on (SMB rides the NAT).
+    pub share: bool,
     /// "Attach guest tools and driver ISO": `None` means the default —
     /// checked whenever the ISO is present on disk. `Some` is an explicit
     /// user choice.
@@ -54,6 +57,7 @@ impl Default for VmPageState {
             scratch: ScratchChoice::SameAsImage,
             iso_path: String::new(),
             boot_iso: false,
+            share: true,
             attach_drivers: None,
             free_mem: None,
         }
@@ -126,6 +130,9 @@ pub struct RunningView<'a> {
     pub backup_path: &'a str,
     pub elapsed_secs: u64,
     pub overlay_mib: u64,
+    /// The `net use` command that maps the shared folder inside the guest,
+    /// when a share is active for this run.
+    pub share_cmd: Option<&'a str>,
 }
 
 /// Render the page. `qemu` is `Some(version)` when QEMU was found.
@@ -189,6 +196,56 @@ pub fn show(
             .small()
             .color(palette.subtle_text),
         );
+
+        // Shared folder: the guest can't be auto-mounted (we can't reach into
+        // it), so hand over the one command to paste, with a Copy button.
+        if let Some(cmd) = run.share_cmd {
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("Shared folder").font(fonts::bold(14.0)));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "To browse the folder shared next to the image, open a Command \
+                     Prompt inside the guest and run:",
+                )
+                .small()
+                .color(palette.subtle_text),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                egui::Frame::none()
+                    .fill(palette.input_bg)
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(cmd).font(fonts::regular(13.0)),
+                            )
+                            .selectable(true),
+                        );
+                    });
+                let copy = crate::icon_label(
+                    egui_phosphor::regular::COPY_SIMPLE,
+                    fonts::icon(14.0),
+                    "Copy",
+                    fonts::regular(13.0),
+                    ui.visuals().widgets.inactive.fg_stroke.color,
+                );
+                if ui.add(egui::Button::new(copy)).clicked() {
+                    ui.ctx().copy_text(cmd.to_string());
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Sign in with the password for that account on this PC (on a \
+                     Microsoft-account PC, the Microsoft account password).",
+                )
+                .small()
+                .color(palette.subtle_text),
+            );
+        }
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(8.0);
@@ -301,6 +358,17 @@ pub fn show(
 
             ui.label("Networking");
             ui.checkbox(&mut state.network, "Give the guest internet (user-mode NAT)");
+            ui.end_row();
+
+            // The share rides the NAT (the guest reaches the host's SMB server
+            // at 10.0.2.2), so it greys out when networking is off.
+            ui.label("Shared folder");
+            ui.add_enabled_ui(state.network, |ui| {
+                ui.checkbox(
+                    &mut state.share,
+                    "Share a folder next to the image with the guest (SMB)",
+                );
+            });
             ui.end_row();
 
             // Scratch-drive picker: every mounted drive + its free space, with
