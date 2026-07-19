@@ -8,6 +8,7 @@ mod about_panel;
 mod action_bar;
 mod virtio_iso;
 mod vm_panel;
+mod vm_sessions_table;
 mod bootrepair_table;
 mod clone_panel;
 mod confirm_dialog;

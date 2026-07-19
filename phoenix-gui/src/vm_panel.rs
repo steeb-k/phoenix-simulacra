@@ -522,8 +522,8 @@ fn scratch_dropdown(ui: &mut Ui, state: &mut VmPageState) {
         });
 }
 
-/// The saved-sessions table, in a card of its own (contrasting fill) so it
-/// reads as existing state rather than more knobs for the next boot.
+/// The saved-sessions table — mount-table styling (header hairline + one card
+/// per session + chip buttons), rendered by [`crate::vm_sessions_table`].
 fn show_sessions(
     ui: &mut Ui,
     palette: &Palette,
@@ -531,113 +531,54 @@ fn show_sessions(
     running: Option<&RunningView<'_>>,
     action: &mut VmAction,
 ) {
-    let is_running = running.is_some();
-    egui::Frame::none()
-        .fill(palette.content_card_bg)
-        .rounding(egui::Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+    use crate::vm_sessions_table::{self, RowState, SessionAction, SessionRow};
+
+    let rows: Vec<SessionRow> = sessions
+        .iter()
+        .map(|s| {
+            let meta = s.meta();
+            let path = std::path::Path::new(&meta.backup_path);
+            // The dirty flag is set for the whole time a guest runs, so the
+            // ACTIVE session must read "running", not "interrupted".
+            let is_this_running = running
+                .is_some_and(|r| r.backup_path.eq_ignore_ascii_case(&meta.backup_path));
+            let state = if is_this_running {
+                RowState::Running
+            } else if !meta.clean_shutdown {
+                RowState::Interrupted
+            } else {
+                RowState::LastBooted(short_time(meta.last_booted_at.as_deref()))
+            };
+            SessionRow {
+                folder: path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| meta.backup_path.clone()),
+                state,
+                overlay_bytes: std::fs::metadata(s.overlay_path()).map(|m| m.len()).unwrap_or(0),
+            }
+        })
+        .collect();
+
+    // Same width discipline as the mount table: fill the viewport, scroll
+    // horizontally rather than crush the columns when the window is cramped.
+    let viewport = ui.available_width();
+    let width = viewport.max(vm_sessions_table::min_width());
+    egui::ScrollArea::horizontal()
+        .id_salt("vm_sessions_hscroll")
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if sessions.is_empty() {
-                ui.label(
-                    egui::RichText::new("No saved sessions yet — boot a backup to create one.")
-                        .color(palette.subtle_text),
-                );
-                return;
-            }
-            // Hand-rolled columns instead of a Grid: the name column flexes to
-            // absorb all free width, so the fixed columns and the buttons sit
-            // in the same place on every row — buttons flush right.
-            const BOOTED_W: f32 = 130.0;
-            const WRITES_W: f32 = 110.0;
-            // Reserved for the Resume/Discard pair when computing the flex width.
-            const BUTTONS_W: f32 = 190.0;
-            fn cell(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui)) {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(w, 0.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(w);
-                        add(ui);
-                    },
-                );
-            }
-            let name_w =
-                (ui.available_width() - BOOTED_W - WRITES_W - BUTTONS_W).max(140.0);
-
-            ui.horizontal(|ui| {
-                for (w, h) in [(name_w, "Backup"), (BOOTED_W, "Last booted"), (WRITES_W, "Guest writes")] {
-                    cell(ui, w, |ui| {
-                        ui.label(
-                            egui::RichText::new(h)
-                                .small()
-                                .strong()
-                                .color(palette.subtle_text),
-                        );
-                    });
+            match vm_sessions_table::show(ui, width, &rows, running.is_none(), palette) {
+                SessionAction::Resume(i) => {
+                    *action = VmAction::Resume(sessions[i].meta().backup_path.clone());
                 }
-            });
-
-            for s in sessions {
-                let meta = s.meta();
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let name = std::path::Path::new(&meta.backup_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| meta.backup_path.clone());
-                    cell(ui, name_w, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(name).font(fonts::bold(13.0)),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Truncate),
-                        )
-                        .on_hover_text(&meta.backup_path);
-                    });
-
-                    // The dirty flag is set for the whole time a guest runs, so
-                    // the ACTIVE session must read "running", not "interrupted".
-                    let is_this_running = running
-                        .is_some_and(|r| r.backup_path.eq_ignore_ascii_case(&meta.backup_path));
-                    cell(ui, BOOTED_W, |ui| {
-                        if is_this_running {
-                            ui.label(egui::RichText::new("running").color(palette.accent));
-                        } else if !meta.clean_shutdown {
-                            ui.label(
-                                egui::RichText::new("interrupted").color(palette.warning),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new(short_time(meta.last_booted_at.as_deref()))
-                                    .color(palette.subtle_text),
-                            );
-                        }
-                    });
-
-                    let overlay_bytes = std::fs::metadata(s.overlay_path())
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    cell(ui, WRITES_W, |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:.1} GB", overlay_bytes as f64 / 1e9))
-                                .color(palette.subtle_text),
-                        );
-                    });
-
-                    // Right-pinned actions: right_to_left adds from the edge,
-                    // so Discard first keeps the visual order Resume | Discard.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled_ui(!is_running, |ui| {
-                            if ui.button("Discard").clicked() {
-                                *action = VmAction::Discard(meta.backup_path.clone());
-                            }
-                            if ui.button("Resume").clicked() {
-                                *action = VmAction::Resume(meta.backup_path.clone());
-                            }
-                        });
-                    });
-                });
+                SessionAction::Discard(i) => {
+                    *action = VmAction::Discard(sessions[i].meta().backup_path.clone());
+                }
+                SessionAction::None => {}
             }
         });
 }
