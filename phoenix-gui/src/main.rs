@@ -4740,6 +4740,8 @@ impl PhoenixApp {
             // Clipboard sharing only where the QEMU we found supports it
             // (11.1+); asking an older build for it fails the launch.
             clipboard_agent: self.qemu.as_ref().is_some_and(|q| q.gtk_clipboard),
+            // Dress the QEMU window to match the app's theme.
+            dark_window: !theme::is_light(self.settings.theme),
             ..phoenix_vm::HostOptions::default()
         };
         let iso = {

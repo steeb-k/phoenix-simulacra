@@ -91,6 +91,14 @@ pub struct HostOptions {
     /// zoom-to-fit scales the picture to the (maximized) window — but kept
     /// for future use as a native-mode hint.
     pub max_resolution: Option<(u32, u32)>,
+    /// Dress the QEMU window's GTK chrome — menu bar, borders, the padding
+    /// around the guest picture — in a dark theme, to match the app.
+    ///
+    /// QEMU has no flag for this; GTK reads it from the environment, so it
+    /// is set on the QEMU child process only and never leaks to other GTK
+    /// apps on the machine. Affects the chrome alone: the guest's own
+    /// picture is whatever the guest paints.
+    pub dark_window: bool,
     /// Host↔guest clipboard: both halves of it, since neither works alone —
     /// `clipboard=on` on the GTK display (the host-side peer) and the
     /// qemu-vdagent channel the guest's SPICE vdagent talks to.
@@ -105,6 +113,22 @@ pub struct HostOptions {
     pub clipboard_agent: bool,
 }
 
+impl HostOptions {
+    /// Extra environment for the QEMU child process.
+    ///
+    /// GTK picks its theme up from the environment, which is the only lever
+    /// QEMU exposes here — there is no `-display gtk,dark=on`. Adwaita and
+    /// its dark variant are compiled into GTK3, so this needs no theme
+    /// files installed. Empty when not wanted, so QEMU just inherits ours.
+    pub fn gtk_env(&self) -> Vec<(&'static str, &'static str)> {
+        if self.dark_window {
+            vec![("GTK_THEME", "Adwaita:dark")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 impl Default for HostOptions {
     fn default() -> Self {
         HostOptions {
@@ -113,6 +137,7 @@ impl Default for HostOptions {
             accel: Accel::Whpx,
             controller_override: None,
             network: false,
+            dark_window: false,
             max_resolution: None,
             clipboard_agent: false,
         }
@@ -726,6 +751,22 @@ mod tests {
         assert!(args.contains("virtio-serial-pci"));
         assert!(args.contains("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on"));
         assert!(args.contains("virtserialport,chardev=vdagent0,name=com.redhat.spice.0"));
+    }
+
+    #[test]
+    fn dark_window_only_sets_the_gtk_theme_env() {
+        // QEMU has no dark-mode flag; GTK reads the environment. Set on the
+        // child only, so it can never affect other GTK apps on the machine.
+        assert!(HostOptions::default().gtk_env().is_empty());
+        let host = HostOptions {
+            dark_window: true,
+            ..HostOptions::default()
+        };
+        assert_eq!(host.gtk_env(), vec![("GTK_THEME", "Adwaita:dark")]);
+        // It is environment only — never an argument.
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &host).unwrap();
+        assert!(!cfg.qemu_args(&spec_uefi_raw()).join(" ").contains("GTK_THEME"));
     }
 
     #[test]

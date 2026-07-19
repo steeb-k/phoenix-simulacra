@@ -233,6 +233,7 @@ pub fn boot(
         let started = std::time::Instant::now();
         let mut child = Command::new(&qemu.system)
             .args(&args)
+            .envs(host.gtk_env())
             .stdin(Stdio::null())
             .stdout(log_out)
             .stderr(log_err)
