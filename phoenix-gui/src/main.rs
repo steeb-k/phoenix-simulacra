@@ -2949,14 +2949,14 @@ fn page_header_badged(
     let title_font = fonts::bold(22.0);
     let title = ui.label(egui::RichText::new(title).font(title_font));
     if !badge.is_empty() {
-        // Painted, not laid out: the badge stacks directly above the title
-        // without displacing it or anything below it. It overhangs the
-        // content area into the page's top margin, so the painter's clip
-        // rect is expanded — otherwise it would be silently cut off.
-        let painter = ui.painter().with_clip_rect(ui.clip_rect().expand(24.0));
-        painter.text(
-            egui::pos2(title.rect.left(), title.rect.top() - 1.0),
-            egui::Align2::LEFT_BOTTOM,
+        // Painted, not laid out, so it displaces neither the title nor
+        // anything below it. It sits BELOW the title: above the title it
+        // landed under the window's drag-area reservation and got clipped,
+        // and the gap the header already leaves underneath fits it without
+        // any clip-rect games.
+        ui.painter().text(
+            egui::pos2(title.rect.left(), title.rect.bottom() + 1.0),
+            egui::Align2::LEFT_TOP,
             badge,
             fonts::regular(12.0),
             palette.subtle_text,
