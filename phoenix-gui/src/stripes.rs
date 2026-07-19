@@ -63,6 +63,23 @@ pub fn sheen(painter: &egui::Painter, rect: Rect, alpha: u8) {
     painter.with_clip_rect(rect).add(Shape::mesh(mesh));
 }
 
+/// A top-down fade *into* `fill`: `fill` at `top_alpha` along the top edge,
+/// fully opaque `fill` by the bottom. The inverse of [`sheen`] — that one
+/// shades a strip to sell it as tape, this one dissolves a strip into the
+/// surface behind it so decoration can sit under content without competing
+/// with it.
+pub fn fade_into(painter: &egui::Painter, rect: Rect, fill: Color32, top_alpha: u8) {
+    let top = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), top_alpha);
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), fill);
+    mesh.colored_vertex(rect.left_bottom(), fill);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.with_clip_rect(rect).add(Shape::mesh(mesh));
+}
+
 /// Repaint each of `rect`'s rounded corners' spandrels — the sliver between the
 /// corner square and the quarter-circle arc that should be cut out of it — in
 /// `fill`, the color showing *behind* the widget.

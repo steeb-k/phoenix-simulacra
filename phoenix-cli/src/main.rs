@@ -463,7 +463,15 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                 if let Some(iso) = &drivers_iso {
                     anyhow::ensure!(iso.exists(), "drivers ISO not found: {}", iso.display());
                 }
+                // The helper disk rides along on every boot, share or not: it
+                // also carries InstallGuestDrivers.cmd, which matters most
+                // when the guest has no network to fetch anything with.
+                let img = vm_root.join("share-helper.img");
                 let mut helper_disk = None;
+                match phoenix_vm::share::build_helper_disk(&img) {
+                    Ok(()) => helper_disk = Some(img),
+                    Err(e) => eprintln!("warning: helper disk build failed: {e:#}"),
+                }
                 if share {
                     let dir = phoenix_vm::share::share_dir_for_backup(&backup);
                     phoenix_vm::share::ensure_share(&dir)?;
@@ -472,11 +480,6 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                         "In the guest: open the SIMULACRA drive and run MapShare.cmd, or run:  {}",
                         phoenix_vm::share::guest_mount_command()
                     );
-                    let img = vm_root.join("share-helper.img");
-                    match phoenix_vm::share::build_helper_disk(&img) {
-                        Ok(()) => helper_disk = Some(img),
-                        Err(e) => eprintln!("warning: helper disk build failed: {e:#}"),
-                    }
                 }
                 let outcome = phoenix_vm::boot::boot(
                     &backup,
