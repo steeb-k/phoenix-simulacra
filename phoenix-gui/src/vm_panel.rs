@@ -121,7 +121,16 @@ pub fn show(
             .color(palette.subtle_text),
         );
         ui.add_space(8.0);
-        if ui.button("⏻  Stop VM (graceful)").clicked() {
+        // Phosphor POWER, not the ⏻ char — that codepoint isn't in our fonts
+        // and renders as a "?" box.
+        let stop_label = crate::icon_label(
+            egui_phosphor::regular::POWER,
+            fonts::icon(16.0),
+            "Stop VM (graceful)",
+            fonts::regular(14.0),
+            ui.visuals().widgets.inactive.fg_stroke.color,
+        );
+        if ui.add(egui::Button::new(stop_label)).clicked() {
             action = VmAction::Stop;
         }
         ui.add_space(4.0);
@@ -380,38 +389,58 @@ fn show_sessions(
                 );
                 return;
             }
-            egui::Grid::new("vm_sessions_table")
-                .num_columns(4)
-                .spacing([28.0, 10.0])
-                .show(ui, |ui| {
-                    for h in ["Backup", "Last booted", "Guest writes", ""] {
+            // Hand-rolled columns instead of a Grid: the name column flexes to
+            // absorb all free width, so the fixed columns and the buttons sit
+            // in the same place on every row — buttons flush right.
+            const BOOTED_W: f32 = 130.0;
+            const WRITES_W: f32 = 110.0;
+            // Reserved for the Resume/Discard pair when computing the flex width.
+            const BUTTONS_W: f32 = 190.0;
+            fn cell(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui)) {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, 0.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(w);
+                        add(ui);
+                    },
+                );
+            }
+            let name_w =
+                (ui.available_width() - BOOTED_W - WRITES_W - BUTTONS_W).max(140.0);
+
+            ui.horizontal(|ui| {
+                for (w, h) in [(name_w, "Backup"), (BOOTED_W, "Last booted"), (WRITES_W, "Guest writes")] {
+                    cell(ui, w, |ui| {
                         ui.label(
                             egui::RichText::new(h)
                                 .small()
                                 .strong()
                                 .color(palette.subtle_text),
                         );
-                    }
-                    ui.end_row();
+                    });
+                }
+            });
 
-                    for s in sessions {
-                        let meta = s.meta();
-                        let name = std::path::Path::new(&meta.backup_path)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| meta.backup_path.clone());
-                        // Extend, never wrap: a Grid column takes its width from
-                        // its cells, and a wrapping label collapses to the header's
-                        // width and breaks the name one character per line. The
-                        // full path lives in the tooltip.
+            for s in sessions {
+                let meta = s.meta();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let name = std::path::Path::new(&meta.backup_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| meta.backup_path.clone());
+                    cell(ui, name_w, |ui| {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(name).font(fonts::bold(13.0)),
                             )
-                            .wrap_mode(egui::TextWrapMode::Extend),
+                            .wrap_mode(egui::TextWrapMode::Truncate),
                         )
                         .on_hover_text(&meta.backup_path);
+                    });
 
+                    cell(ui, BOOTED_W, |ui| {
                         if !meta.clean_shutdown {
                             ui.label(
                                 egui::RichText::new("interrupted").color(palette.warning),
@@ -422,31 +451,32 @@ fn show_sessions(
                                     .color(palette.subtle_text),
                             );
                         }
+                    });
 
-                        let overlay_bytes = std::fs::metadata(s.overlay_path())
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                    let overlay_bytes = std::fs::metadata(s.overlay_path())
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    cell(ui, WRITES_W, |ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{:.1} GB",
-                                overlay_bytes as f64 / 1e9
-                            ))
-                            .color(palette.subtle_text),
+                            egui::RichText::new(format!("{:.1} GB", overlay_bytes as f64 / 1e9))
+                                .color(palette.subtle_text),
                         );
+                    });
 
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(!is_running, |ui| {
-                                if ui.button("Resume").clicked() {
-                                    *action = VmAction::Resume(meta.backup_path.clone());
-                                }
-                                if ui.button("Discard").clicked() {
-                                    *action = VmAction::Discard(meta.backup_path.clone());
-                                }
-                            });
+                    // Right-pinned actions: right_to_left adds from the edge,
+                    // so Discard first keeps the visual order Resume | Discard.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(!is_running, |ui| {
+                            if ui.button("Discard").clicked() {
+                                *action = VmAction::Discard(meta.backup_path.clone());
+                            }
+                            if ui.button("Resume").clicked() {
+                                *action = VmAction::Resume(meta.backup_path.clone());
+                            }
                         });
-                        ui.end_row();
-                    }
+                    });
                 });
+            }
         });
 }
 

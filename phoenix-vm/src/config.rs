@@ -278,13 +278,17 @@ impl VmConfig {
         }
 
         // Optional rescue/PE ISO as a read-only CD-ROM. AHCI CD (ide-cd on q35)
-        // has inbox drivers in every guest we target.
+        // has inbox drivers in every guest we target. The CD gets its OWN SATA
+        // port (`bus=ide.1`): q35's AHCI ports are single-unit, and without an
+        // explicit bus QEMU auto-places the CD as unit 1 of the port the OS
+        // disk already owns and refuses to start ("bus supports only 1 units").
+        // Port 1 is always free — the disk is ide.0 (AHCI) or on NVMe.
         if let Some(iso) = &spec.iso {
             push("-drive");
             push(&format!("file={iso},format=raw,if=none,id=cd0,media=cdrom,readonly=on"));
             let cd_bootindex = if booting_iso { 0 } else { 2 };
             push("-device");
-            push(&format!("ide-cd,drive=cd0,bootindex={cd_bootindex}"));
+            push(&format!("ide-cd,drive=cd0,bus=ide.1,bootindex={cd_bootindex}"));
         }
         a
     }
@@ -489,8 +493,8 @@ mod tests {
         };
         let args = cfg.qemu_args(&spec).join(" ");
         assert!(args.contains(r"file=D:\winpe.iso,format=raw,if=none,id=cd0,media=cdrom,readonly=on"));
-        // CD boots first, disk second.
-        assert!(args.contains("ide-cd,drive=cd0,bootindex=0"));
+        // CD boots first (on its own SATA port), disk second.
+        assert!(args.contains("ide-cd,drive=cd0,bus=ide.1,bootindex=0"));
         assert!(args.contains("ide-hd,drive=disk0,bootindex=1"));
     }
 
@@ -505,7 +509,7 @@ mod tests {
         };
         let args = cfg.qemu_args(&spec).join(" ");
         assert!(args.contains("ide-hd,drive=disk0,bootindex=0")); // disk still first
-        assert!(args.contains("ide-cd,drive=cd0,bootindex=2")); // CD attached, lower priority
+        assert!(args.contains("ide-cd,drive=cd0,bus=ide.1,bootindex=2")); // CD attached, lower priority
     }
 
     #[test]
