@@ -2321,6 +2321,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-mount",
  "phoenix-restore",
+ "phoenix-vm",
  "phoenix-vss",
  "raw-window-handle",
  "rayon",

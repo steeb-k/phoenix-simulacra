@@ -13,6 +13,7 @@
 //! defaults encode.
 
 pub mod config;
+pub mod drives;
 pub mod qemu;
 pub mod qmp;
 pub mod serve_helper;
