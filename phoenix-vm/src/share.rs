@@ -150,7 +150,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
          echo (Sign in with the account password you use on the host PC.)\r\n\
          echo.\r\n\
          net use S: /delete /y >nul 2>&1\r\n\
-         {mount} /persistent:no\r\n\
+         {mount} /persistent:yes\r\n\
          if errorlevel 1 (\r\n\
          echo.\r\n\
          echo Mapping failed - is the shared folder enabled on the host?\r\n\
@@ -317,6 +317,10 @@ mod tests {
             .unwrap();
         assert!(cmd.contains(r"\\10.0.2.2\SimulacraShare"));
         assert!(cmd.contains("net use S:"));
+        // A normal, remembered mapping — it should come back on its own
+        // after a guest reboot rather than needing the script again.
+        assert!(cmd.contains("/persistent:yes"));
+        assert!(!cmd.contains("/persistent:no"));
 
         // The driver script installs the CD's bundler (the only source of
         // the SPICE vdagent), never the loose driver-only MSI, and blocks
