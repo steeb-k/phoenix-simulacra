@@ -2388,6 +2388,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-mount",
  "phoenix-restore",
+ "phoenix-vm",
  "phoenix-vss",
  "uuid",
  "windows-sys 0.59.0",

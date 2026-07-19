@@ -10,10 +10,11 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use phoenix_core::container::PhnxReader;
-use phoenix_mount::{create_differencing_vhdx, set_disk_offline, AttachedDisk, WinFspServe};
+use phoenix_mount::{create_differencing_vhdx, set_disk_offline, AttachedDisk};
 
 use crate::config::{BootSpec, DiskSource, VmConfig};
 use crate::qemu::Qemu;
+use crate::serve_helper::spawn_serve;
 use crate::session::{SessionManager, WriteLayer};
 use crate::{now_rfc3339, HostOptions};
 
@@ -71,11 +72,13 @@ pub fn boot(
         );
     }
 
-    // --- serve the backup on demand (deterministic path → resume works) -----
+    // --- serve the backup on demand, IN A SEPARATE PROCESS ------------------
+    // The serve MUST NOT run in this process: DetachVirtualDisk on the child
+    // (below, at teardown) deadlocks against an in-process WinFsp-served parent.
+    // The helper serves at the same deterministic path, so resume still works.
     std::fs::create_dir_all(scratch_dir).ok();
-    let serve = WinFspServe::serve_for_vm(backup, scratch_dir)
-        .context("serve the backup for VM boot")?;
-    let parent = serve.image_path();
+    let serve = spawn_serve(backup, scratch_dir).context("start the serve helper for VM boot")?;
+    let parent = serve.parent_path().to_path_buf();
     let parent_str = parent
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 served parent path"))?;
@@ -171,33 +174,28 @@ pub fn boot(
         .status()
         .with_context(|| format!("launch {}", qemu.system.display()))?;
 
-    // --- teardown: detach the child, THEN stop the serve --------------------
-    // Order is load-bearing. The differencing child is backed by the WinFsp
-    // serve running IN THIS PROCESS; the detach's final I/O to the parent needs
-    // the serve's filesystem threads alive. So detach synchronously and wait for
-    // the device to actually vanish (bounded) BEFORE dropping the serve — a
-    // fixed sleep here instead of a real wait is what deadlocked teardown into
-    // an unkillable process.
-    let detached = _attached
+    // --- teardown: detach the child, THEN stop the serve helper -------------
+    // Order still matters: the child's detach reads/closes the parent, so the
+    // serve helper must stay alive across the detach. But because the serve is
+    // in a SEPARATE process now, this detach no longer deadlocks — its Close IRP
+    // is serviced by the helper's dispatcher, not this thread.
+    // Detach by DROPPING the attach (CloseHandle → async detach). Never call
+    // DetachVirtualDisk explicitly here: that synchronous call deadlocks in the
+    // storage driver when the parent lives on a WinFsp filesystem, regardless of
+    // which process serves it (measured). Then poll until the device is really
+    // gone, so stopping the serve can't race an in-flight detach.
+    let drive_to_wait = _attached
         .as_ref()
-        .map(|att| att.detach_wait(std::time::Duration::from_secs(10)))
-        .unwrap_or(true);
+        .and_then(|att| att.physical_drive_number().ok());
     drop(_attached);
-    if detached {
-        drop(serve);
-    } else {
-        // The overlay didn't detach in time. Stopping the in-process serve now
-        // would race the in-flight detach and deadlock the storage driver
-        // (unkillable process). Instead, forget the serve and let normal
-        // process exit reclaim both the serve and the attach — the OS tears
-        // them down cleanly on death. The CLI returns from here and exits
-        // immediately; a long-lived host would leak one serve until it exits.
-        tracing::error!(
-            "session overlay did not detach cleanly; leaving serve teardown to process \
-             exit to avoid a storage-driver deadlock"
-        );
-        std::mem::forget(serve);
+    let detached = match drive_to_wait {
+        Some(drive) => phoenix_mount::wait_for_device_gone(drive, std::time::Duration::from_secs(15)),
+        None => true,
+    };
+    if !detached {
+        tracing::warn!("session overlay did not detach within the timeout; stopping serve anyway");
     }
+    serve.stop(); // kills the helper process — clean, it holds no attach
     session.mark_clean()?;
 
     let overlay_bytes = std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0);

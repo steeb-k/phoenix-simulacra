@@ -11,13 +11,12 @@ use phoenix_core::error::{PhoenixError, Result};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::Vhd::{
-    AttachVirtualDisk, CreateVirtualDisk, DetachVirtualDisk, GetVirtualDiskPhysicalPath,
-    OpenVirtualDisk, ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
+    AttachVirtualDisk, CreateVirtualDisk, GetVirtualDiskPhysicalPath, OpenVirtualDisk,
+    ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
     ATTACH_VIRTUAL_DISK_PARAMETERS, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
-    CREATE_VIRTUAL_DISK_VERSION_2, DETACH_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_FLAG_NONE,
-    OPEN_VIRTUAL_DISK_PARAMETERS, VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_ATTACH_RW,
-    VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE,
-    VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+    CREATE_VIRTUAL_DISK_VERSION_2, OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
+    VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO,
+    VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
 };
 
 /// ERROR_SHARING_VIOLATION — the overlay file is still open (usually attached
@@ -216,40 +215,40 @@ impl AttachedDisk {
     }
 }
 
-impl AttachedDisk {
-    /// Explicitly detach the disk and block until its physical device is gone,
-    /// up to `timeout`.
-    ///
-    /// This MUST run before any in-process WinFsp serve backing the disk is
-    /// stopped. Merely closing the handle (as `Drop` does) triggers an
-    /// *asynchronous* detach; if the serve is then stopped while that detach is
-    /// still draining the parent handle, the two race and deadlock in the
-    /// storage driver — an unkillable process. So here we detach synchronously
-    /// and poll until the device actually disappears while the serve's
-    /// filesystem threads are still alive to service the final I/O.
-    ///
-    /// Returns `true` if the device was confirmed gone within `timeout`. A
-    /// caller backing the disk with an in-process serve MUST only stop that
-    /// serve on `true`: if this returns `false` the detach is still in flight,
-    /// and stopping the serve then is exactly the deadlock — better to leave
-    /// serve teardown to process exit (the OS reclaims both cleanly on death).
-    #[must_use]
-    pub fn detach_wait(&self, timeout: std::time::Duration) -> bool {
-        // SAFETY: `handle` is a live virtual-disk handle for this call.
-        unsafe {
-            DetachVirtualDisk(self.handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-        }
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            // Once detached, the disk no longer resolves to a physical path.
-            if self.physical_drive_number().is_err() {
-                return true;
+/// Wait until `\\.\PhysicalDrive{drive_number}` can no longer be opened — i.e.
+/// the virtual disk has finished detaching — up to `timeout`. Returns `true` if
+/// the device went away.
+///
+/// **Detach via `drop` (CloseHandle), then call this.** Do NOT call
+/// `DetachVirtualDisk` explicitly on a disk whose parent lives on a WinFsp
+/// filesystem: that synchronous call deadlocks in the storage driver, and it
+/// does so whether the serve runs in this process or another one (measured —
+/// see `vm_overlay_lifecycle`). The `Drop`/CloseHandle path performs the same
+/// detach asynchronously and does not wedge; this poll replaces the fixed sleep
+/// that used to race it, so callers can know the device is really gone before
+/// stopping the serve that backs it.
+#[must_use]
+pub fn wait_for_device_gone(drive_number: u32, timeout: std::time::Duration) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let path = format!(r"\\.\PhysicalDrive{drive_number}");
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(&path);
+        match opened {
+            Ok(f) => {
+                drop(f);
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The device is gone (or no longer openable): detach completed.
+            Err(_) => return true,
         }
-        tracing::warn!("virtual disk did not detach within {timeout:?}");
-        false
     }
+    tracing::warn!("{path} still present after {timeout:?}; detach may be incomplete");
+    false
 }
 
 impl Drop for AttachedDisk {
