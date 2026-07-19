@@ -101,12 +101,15 @@ const BOTTOM_ITEMS: &[NavItem] = &[
     },
 ];
 
-const SIDEBAR_WIDTH: f32 = 220.0;
+// Sized so the full sidebar (brand + 7 nav rows + pinned bottom block) fits
+// the default 720px window without the middle section scrolling — the brand
+// is deliberately compact-but-prominent rather than poster-sized.
+const SIDEBAR_WIDTH: f32 = 190.0;
 const ROW_HEIGHT: f32 = 40.0;
 /// Display width of the sidebar phoenix image. Source `phoenix-sidebar.png` is
 /// 1024×976, so the height follows via [`LOGO_ASPECT`] rather than forcing a
 /// square (which would squash the art).
-const LOGO_WIDTH: f32 = 192.0;
+const LOGO_WIDTH: f32 = 136.0;
 /// height / width of `phoenix-sidebar.png` (1024×976).
 const LOGO_ASPECT: f32 = 976.0 / 1024.0;
 /// Gap between the phoenix image and the "Simulacra" wordmark below it.
@@ -115,10 +118,10 @@ const BRAND_WORDMARK_GAP: f32 = 6.0;
 /// to size the OS window's minimum height (see [`min_content_height`]); the
 /// brand panel itself sizes to the real glyph height, so this only needs to be
 /// close.
-const WORDMARK_HEIGHT_EST: f32 = 48.0;
+const WORDMARK_HEIGHT_EST: f32 = 40.0;
 const SIDEBAR_H_PAD: f32 = 12.0;
-const BRAND_TOP_PAD: f32 = 18.0;
-const BRAND_BOTTOM_PAD: f32 = 18.0;
+const BRAND_TOP_PAD: f32 = 14.0;
+const BRAND_BOTTOM_PAD: f32 = 12.0;
 /// Trailing space inside `draw_brand` between the wordmark and the panel edge.
 const BRAND_IMAGE_TRAILER: f32 = 6.0;
 const BOTTOM_NAV_TOP_PAD: f32 = 8.0;
