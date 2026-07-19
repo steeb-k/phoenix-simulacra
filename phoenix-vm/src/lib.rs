@@ -22,8 +22,8 @@ pub mod boot;
 pub use config::{Accel, DiskController, DiskSource, Firmware, HostOptions, VmConfig};
 pub use qemu::Qemu;
 pub use session::{
-    serve_scratch_for_backup, vm_root_for_backup, volume_root, Session, SessionManager,
-    SessionMeta, WriteLayer,
+    serve_scratch_for_backup, sweep_serve_scratch, vm_root_for_backup, volume_root, Session,
+    SessionManager, SessionMeta, WriteLayer,
 };
 
 /// Current time as an RFC 3339 string, for session timestamps. Kept in one
