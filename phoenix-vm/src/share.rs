@@ -166,13 +166,17 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         .write_all(cmd.as_bytes())
         .context("write MapShare.cmd")?;
 
-    // Driver install that deliberately SKIPS the display-only drivers
-    // (qxldod / viogpudo): both black-screen this VM at WDDM handoff
-    // (observed on stdvga and virtio-vga; guest healthy, scanout black),
-    // while the Basic Display works. pnputil against the CD's driver
-    // folders gives precise control the guest-tools installer doesn't.
+    // Install the CD's own guest-tools bundler, in full. Earlier revisions
+    // hand-picked drivers with pnputil to skip the display ones after
+    // black screens at WDDM handoff — but that diagnosis was wrong. The
+    // CD's display driver is fine; the black screens came from the one
+    // Windows Update delivers, which it does within moments of the guest
+    // getting a network. Hence the ordering below: block WU driver
+    // delivery FIRST, then install. Only the bundler carries the SPICE
+    // vdagent (clipboard, guest display auto-resize) — the loose
+    // virtio-win-gt-x64.msi does not, so it is deliberately not used.
     let install = "@echo off\r\n\
-        title Simulacra guest driver install\r\n\
+        title Simulacra guest tools install\r\n\
         net session >nul 2>&1\r\n\
         if errorlevel 1 (\r\n\
         echo Requesting administrator rights...\r\n\
@@ -182,7 +186,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         \r\n\
         set VIODRV=\r\n\
         for %%d in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (\r\n\
-        if exist \"%%d:\\virtio-win-gt-x64.msi\" set VIODRV=%%d:\r\n\
+        if exist \"%%d:\\virtio-win-guest-tools.exe\" set VIODRV=%%d:\r\n\
         )\r\n\
         if \"%VIODRV%\"==\"\" (\r\n\
         echo Could not find the virtio-win driver CD. Is it attached?\r\n\
@@ -191,15 +195,18 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         )\r\n\
         echo Found the driver CD at %VIODRV%\r\n\
         \r\n\
-        set OSDIR=w11\r\n\
-        if not exist \"%VIODRV%\\vioserial\\w11\" set OSDIR=w10\r\n\
+        echo Blocking driver delivery via Windows Update first - it ships a\r\n\
+        echo display driver that blanks this VM on the next reboot, and it\r\n\
+        echo can win the race against this install on a connected guest.\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
         \r\n\
-        echo Installing drivers (display drivers deliberately skipped)...\r\n\
-        for %%f in (vioserial NetKVM viostor vioscsi Balloon vioinput viorng viofs pvpanic qemupciserial fwcfg) do (\r\n\
-        if exist \"%VIODRV%\\%%f\\%OSDIR%\\amd64\" (\r\n\
-        echo   %%f\r\n\
-        pnputil /add-driver \"%VIODRV%\\%%f\\%OSDIR%\\amd64\\*.inf\" /install >nul\r\n\
-        )\r\n\
+        echo Installing the virtio-win guest tools (this takes a minute)...\r\n\
+        \"%VIODRV%\\virtio-win-guest-tools.exe\" /install /quiet /norestart\r\n\
+        set RC=%ERRORLEVEL%\r\n\
+        if not \"%RC%\"==\"0\" if not \"%RC%\"==\"3010\" (\r\n\
+        echo Guest tools installer returned %RC%.\r\n\
+        pause\r\n\
+        exit /b %RC%\r\n\
         )\r\n\
         \r\n\
         if exist \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" (\r\n\
@@ -207,15 +214,10 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         msiexec /i \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" /qn\r\n\
         )\r\n\
         \r\n\
-        echo Blocking driver delivery via Windows Update (it pushes the same\r\n\
-        echo display driver this script skips, blanking the screen on reboot)...\r\n\
-        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
-        \r\n\
         echo.\r\n\
-        echo Done. The display drivers were skipped on purpose: the basic\r\n\
-        echo display works, and the virtio/QXL display drivers currently\r\n\
-        echo blank the screen in this VM. Do NOT run the guest-tools\r\n\
-        echo installer from the CD - it would install them.\r\n\
+        echo Done - reboot to finish. Keep the VM's network off unless you\r\n\
+        echo need it: Windows Update replaces the display driver installed\r\n\
+        echo here with one that blanks the screen.\r\n\
         pause\r\n";
     root.create_file("InstallGuestDrivers.cmd")
         .context("create InstallGuestDrivers.cmd")?
@@ -229,11 +231,13 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
          (the folder next to the backup image, \\\\10.0.2.2\\{SHARE_NAME}).\r\n\
          Anything you copy into S: appears on the host, and vice versa.\r\n\
          \r\n\
-         InstallGuestDrivers.cmd - install the virtio-win drivers and the\r\n\
-         QEMU guest agent from the attached driver CD, SKIPPING the display\r\n\
-         drivers (they blank the screen in this VM - the basic display is\r\n\
-         the supported path). Use this instead of the CD's own\r\n\
-         virtio-win-guest-tools installer.\r\n"
+         InstallGuestDrivers.cmd - install the virtio-win guest tools and\r\n\
+         the QEMU guest agent from the attached driver CD, and block driver\r\n\
+         delivery via Windows Update. Reboot afterwards.\r\n\
+         \r\n\
+         Leave the VM's network off unless you need it. Windows Update\r\n\
+         replaces the CD's display driver with one that blanks the screen\r\n\
+         on the next reboot; the CD's own driver is fine.\r\n"
     );
     root.create_file("README.txt")
         .context("create README.txt")?
@@ -282,18 +286,23 @@ mod tests {
         assert!(cmd.contains(r"\\10.0.2.2\SimulacraShare"));
         assert!(cmd.contains("net use S:"));
 
-        // The driver script must never install the display drivers.
+        // The driver script installs the CD's bundler (the only source of
+        // the SPICE vdagent), never the loose driver-only MSI, and blocks
+        // Windows Update's display driver BEFORE installing — WU otherwise
+        // wins the race on a connected guest and blanks the next boot.
         let mut inst = String::new();
         fs.root_dir()
             .open_file("InstallGuestDrivers.cmd")
             .unwrap()
             .read_to_string(&mut inst)
             .unwrap();
-        assert!(inst.contains("pnputil"));
-        assert!(inst.contains("vioserial"));
-        assert!(inst.contains("ExcludeWUDriversInQualityUpdate"));
-        assert!(!inst.contains("qxldod"));
-        assert!(!inst.contains("viogpudo"));
+        assert!(inst.contains("virtio-win-guest-tools.exe"));
+        assert!(inst.contains("/install /quiet /norestart"));
+        assert!(inst.contains("qemu-ga-x86_64.msi"));
+        assert!(!inst.contains("virtio-win-gt-x64.msi"));
+        let wu = inst.find("ExcludeWUDriversInQualityUpdate").unwrap();
+        let gt = inst.find("virtio-win-guest-tools.exe\" /install").unwrap();
+        assert!(wu < gt, "WU block must precede the guest-tools install");
         drop(fs);
         std::fs::remove_file(&img).ok();
     }

@@ -1019,8 +1019,12 @@ impl PhoenixApp {
             drivers_dl: None,
             drivers_note: String::new(),
             // Probe for QEMU once at startup; the page shows an install notice
-            // when it's missing.
-            qemu: phoenix_vm::Qemu::discover(None).ok(),
+            // when it's missing. A saved directory wins over autodetection so
+            // a side-by-side build can be used without touching the system one.
+            qemu: phoenix_vm::Qemu::discover(
+                settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
+            )
+            .ok(),
             bootrepair_installs: None,
             bootrepair_selected: None,
             bootrepair_plan: None,
@@ -4218,7 +4222,11 @@ impl PhoenixApp {
         // Pull everything the page needs out of `self` into owned locals so the
         // scroll-shell closure doesn't borrow `self` (which would conflict: it
         // needs `&mut self.vm` while a running view borrows `self.vm_run`).
-        let version = self.qemu.as_ref().map(|q| q.version.clone());
+        let qemu_info = self
+            .qemu
+            .as_ref()
+            .map(|q| (q.version.clone(), q.gtk_clipboard));
+        let qemu_dir = self.settings.vm_qemu_dir.clone();
         let sessions = phoenix_vm::SessionManager::list_all_sessions();
         let running_owned = self.vm_run.as_ref().map(|r| {
             let overlay_mib = std::fs::metadata(&r.overlay_path)
@@ -4257,7 +4265,11 @@ impl PhoenixApp {
                 ui,
                 &mut vm_state,
                 &palette,
-                version.as_deref(),
+                qemu_info.as_ref().map(|(v, c)| vm_panel::QemuView {
+                    version: v,
+                    clipboard: *c,
+                    dir: qemu_dir.as_deref(),
+                }),
                 &self.history,
                 &self.settings.vm_iso_history,
                 &drivers,
@@ -4286,6 +4298,37 @@ impl PhoenixApp {
                     hist.truncate(8);
                     let _ = self.settings.save();
                 }
+            }
+            vm_panel::VmAction::BrowseQemuDir => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("Choose the folder containing qemu-system-x86_64.exe")
+                    .pick_folder()
+                {
+                    // Re-probe immediately: a folder without the binaries (or
+                    // without the OVMF firmware) must not silently become the
+                    // saved choice, so only a successful discover sticks.
+                    match phoenix_vm::Qemu::discover(Some(&p)) {
+                        Ok(q) => {
+                            self.vm_last_status = format!("Using {}", q.version);
+                            self.qemu = Some(q);
+                            self.settings.vm_qemu_dir = Some(p.display().to_string());
+                            let _ = self.settings.save();
+                        }
+                        Err(e) => {
+                            self.vm_last_status =
+                                format!("That folder isn't a usable QEMU install: {e}");
+                        }
+                    }
+                }
+            }
+            vm_panel::VmAction::ClearQemuDir => {
+                self.settings.vm_qemu_dir = None;
+                let _ = self.settings.save();
+                self.qemu = phoenix_vm::Qemu::discover(None).ok();
+                self.vm_last_status = match self.qemu.as_ref() {
+                    Some(q) => format!("Autodetected {}", q.version),
+                    None => "QEMU not found".to_string(),
+                };
             }
             vm_panel::VmAction::DownloadDrivers => {
                 if self.drivers_dl.is_none() {
@@ -4543,6 +4586,9 @@ impl PhoenixApp {
             // Cap the guest display so the QEMU window (chrome included)
             // fits the monitor — PE otherwise picks a huge video mode.
             max_resolution: phoenix_vm::usable_guest_resolution(),
+            // Clipboard sharing only where the QEMU we found supports it
+            // (11.1+); asking an older build for it fails the launch.
+            clipboard_agent: self.qemu.as_ref().is_some_and(|q| q.gtk_clipboard),
             ..phoenix_vm::HostOptions::default()
         };
         let iso = {

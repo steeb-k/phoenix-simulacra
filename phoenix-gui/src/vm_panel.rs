@@ -53,7 +53,7 @@ impl Default for VmPageState {
             summary: None,
             mem_mib: 6144,
             cpus: 4,
-            network: true,
+            network: false,
             scratch: ScratchChoice::SameAsImage,
             iso_path: String::new(),
             boot_iso: false,
@@ -128,6 +128,11 @@ pub enum VmAction {
         backup_path: String,
         vm_root: std::path::PathBuf,
     },
+    /// Pick the directory holding `qemu-system-x86_64.exe`, to run a
+    /// side-by-side build instead of the autodetected one.
+    BrowseQemuDir,
+    /// Go back to autodetecting QEMU.
+    ClearQemuDir,
 }
 
 /// A running VM, for the header status line.
@@ -143,7 +148,17 @@ pub struct RunningView<'a> {
     pub share_cmd: Option<&'a str>,
 }
 
-/// Render the page. `qemu` is `Some(version)` when QEMU was found.
+/// What we know about the QEMU we're driving, for the page footer.
+pub struct QemuView<'a> {
+    /// Version banner line, e.g. "QEMU emulator version 11.0.50".
+    pub version: &'a str,
+    /// Whether this build's GTK display supports clipboard sharing (11.1+).
+    pub clipboard: bool,
+    /// The explicitly-chosen directory, when not autodetected.
+    pub dir: Option<&'a str>,
+}
+
+/// Render the page. `qemu` is `Some(..)` when QEMU was found.
 /// `iso_history` is the settings-persisted list of previously-attached ISOs
 /// (newest first) that seeds the Rescue ISO dropdown.
 #[allow(clippy::too_many_arguments)]
@@ -151,7 +166,7 @@ pub fn show(
     ui: &mut Ui,
     state: &mut VmPageState,
     palette: &Palette,
-    qemu: Option<&str>,
+    qemu: Option<QemuView<'_>>,
     history: &phoenix_core::appdata::History,
     iso_history: &[String],
     drivers: &DriversView,
@@ -159,7 +174,7 @@ pub fn show(
     running: Option<RunningView<'_>>,
     last_status: &str,
 ) -> VmAction {
-    let Some(version) = qemu else {
+    let Some(qemu) = qemu else {
         show_unavailable(ui, palette);
         return VmAction::None;
     };
@@ -408,9 +423,43 @@ pub fn show(
         ui.label(egui::RichText::new(last_status).color(palette.subtle_text));
     }
 
-    // Footer: which QEMU we found.
+    // Footer: which QEMU we found, whether it can do clipboard, and a way to
+    // point at a different install. Clipboard needs QEMU 11.1+ — before that
+    // no Windows build shipped the GTK clipboard code at all — so the state
+    // is worth surfacing rather than leaving the user guessing why copy and
+    // paste does nothing.
     ui.add_space(16.0);
-    ui.label(egui::RichText::new(format!("Using {version}")).small().color(palette.subtle_text));
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Using {}", qemu.version))
+                .small()
+                .color(palette.subtle_text),
+        );
+        let (note, tint) = if qemu.clipboard {
+            ("clipboard sharing available", palette.accent)
+        } else {
+            ("no clipboard sharing (needs QEMU 11.1+)", palette.subtle_text)
+        };
+        ui.label(egui::RichText::new("·").small().color(palette.subtle_text));
+        ui.label(egui::RichText::new(note).small().color(tint));
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .link(egui::RichText::new("Use a different QEMU…").small())
+            .clicked()
+        {
+            action = VmAction::BrowseQemuDir;
+        }
+        if let Some(dir) = qemu.dir {
+            ui.label(egui::RichText::new(dir).small().color(palette.subtle_text));
+            if ui
+                .link(egui::RichText::new("(autodetect)").small())
+                .clicked()
+            {
+                action = VmAction::ClearQemuDir;
+            }
+        }
+    });
 
     action
 }

@@ -79,17 +79,29 @@ pub struct HostOptions {
     pub controller_override: Option<DiskController>,
     /// User-mode (slirp) networking with an `e1000e` NIC (inbox driver). When
     /// false, no NIC at all — for forensic boots of possibly-hostile images.
+    ///
+    /// Defaults OFF. A connected guest gets a display driver pushed by
+    /// Windows Update within moments of first login — well before any
+    /// in-guest script can block it — and that driver blanks the screen on
+    /// the next reboot. The CD's own driver is fine, so the practical fix
+    /// is to stay offline while installing the guest tools.
     pub network: bool,
     /// Advisory usable-screen size ([`usable_guest_resolution`]). No longer
     /// steers the video device — virtio-vga's GOP tops out at 1920x1080 and
     /// zoom-to-fit scales the picture to the (maximized) window — but kept
     /// for future use as a native-mode hint.
     pub max_resolution: Option<(u32, u32)>,
-    /// Attach the qemu-vdagent clipboard channel. OFF by default while under
-    /// investigation: with the virtio-win SPICE agent running in the guest,
-    /// the screen goes black right when the agent starts (healthy OS, black
-    /// scanout, on stdvga AND virtio-vga) — suspected bad monitor-topology
-    /// apply when the agent talks to qemu-vdagent's partial SPICE protocol.
+    /// Host↔guest clipboard: both halves of it, since neither works alone —
+    /// `clipboard=on` on the GTK display (the host-side peer) and the
+    /// qemu-vdagent channel the guest's SPICE vdagent talks to.
+    ///
+    /// Requires a QEMU whose GTK display accepts `clipboard=on`
+    /// ([`Qemu::gtk_clipboard`](crate::Qemu::gtk_clipboard) probes it);
+    /// callers should set this from that probe. Off by default so a build
+    /// without the option never gets an argument it would reject.
+    ///
+    /// This was previously suspected of causing the black screens, and it
+    /// isn't: those came from the display driver Windows Update delivers.
     pub clipboard_agent: bool,
 }
 
@@ -100,7 +112,7 @@ impl Default for HostOptions {
             smp: 4,
             accel: Accel::Whpx,
             controller_override: None,
-            network: true,
+            network: false,
             max_resolution: None,
             clipboard_agent: false,
         }
@@ -288,12 +300,17 @@ impl VmConfig {
         push("-name");
         push(&spec.name);
 
-        // Explicit GTK display: the Windows backend with clipboard support
-        // wired to qemu-vdagent, and zoom-to-fit scales the guest to the
-        // window so the maximized window (boot.rs maximizes it once it
-        // appears) is actually filled instead of letterboxed.
+        // Explicit GTK display: zoom-to-fit scales the guest to the window
+        // so the maximized window (boot.rs maximizes it once it appears) is
+        // actually filled instead of letterboxed. `clipboard=on` is the
+        // host-side half of clipboard sharing and only exists on QEMU 11.1+
+        // — older builds reject the key outright, hence the gate.
         push("-display");
-        push("gtk,zoom-to-fit=on");
+        if self.clipboard_agent {
+            push("gtk,zoom-to-fit=on,clipboard=on");
+        } else {
+            push("gtk,zoom-to-fit=on");
+        }
 
         // QMP control socket for graceful ACPI shutdown (system_powerdown).
         if let Some(port) = spec.qmp_port {
@@ -315,10 +332,10 @@ impl VmConfig {
             push("virtio-serial-pci");
         }
 
-        // Host↔guest clipboard: the GTK display speaks the SPICE agent
-        // protocol over a qemu-vdagent chardev, used by the guest's SPICE
-        // vdagent service (virtio-win guest tools). Gated — see
-        // [`HostOptions::clipboard_agent`] for why it is currently off.
+        // Guest-side half of the clipboard: qemu-vdagent implements enough
+        // of the SPICE agent protocol in-process for the guest's vdagent
+        // service (from the CD's guest-tools bundler — NOT the loose
+        // driver MSI) to talk to, with no SPICE server or client involved.
         if self.clipboard_agent {
             push("-chardev");
             push("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on");
@@ -688,24 +705,38 @@ mod tests {
     #[test]
     fn clipboard_agent_gated_off_by_default() {
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
-        // Default: no vdagent (suspected guest black-screen interaction).
+        // Default off: a pre-11.1 QEMU rejects `clipboard=on` outright, so
+        // neither half may appear unless the caller probed for it.
         let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(!args.contains("vdagent"));
         assert!(!args.contains("virtio-serial-pci"));
-        // The display is still GTK, scaled to the (maximized) window.
         assert!(args.contains("-display gtk,zoom-to-fit=on"));
+        assert!(!args.contains("clipboard=on"));
 
-        // Opted in: the full channel appears.
+        // Opted in: BOTH halves appear — host-side peer on the display and
+        // the guest-facing vdagent channel. Neither is any use alone.
         let host = HostOptions {
             clipboard_agent: true,
             ..HostOptions::default()
         };
         let cfg = VmConfig::from_manifest(&m, &host).unwrap();
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(args.contains("-display gtk,zoom-to-fit=on,clipboard=on"));
         assert!(args.contains("virtio-serial-pci"));
         assert!(args.contains("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on"));
         assert!(args.contains("virtserialport,chardev=vdagent0,name=com.redhat.spice.0"));
+    }
+
+    #[test]
+    fn network_is_off_by_default() {
+        // Windows Update pushes a screen-blanking display driver to a
+        // connected guest before any in-guest script can block it.
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(args.contains("-nic none"));
+        assert!(!args.contains("e1000e"));
     }
 
     #[test]

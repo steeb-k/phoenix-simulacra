@@ -183,9 +183,12 @@ enum VmCommands {
         /// Guest vCPUs.
         #[arg(long, default_value_t = 4)]
         cpus: u32,
-        /// Disable guest networking (forensic boot of an untrusted image).
+        /// Give the guest networking. Off by default: a connected Windows
+        /// guest gets a display driver pushed by Windows Update that blanks
+        /// the screen on the next reboot, and an untrusted image should not
+        /// reach the network at all.
         #[arg(long, default_value_t = false)]
-        no_network: bool,
+        network: bool,
         /// Directory of the QEMU install (else PATH / default locations).
         #[arg(long)]
         qemu_dir: Option<PathBuf>,
@@ -405,7 +408,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             write,
             mem,
             cpus,
-            no_network,
+            network,
             qemu_dir,
             vm_dir,
             fresh,
@@ -433,10 +436,12 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             let host = HostOptions {
                 memory_mib: mem,
                 smp: cpus,
-                network: !no_network,
+                network,
                 // Cap the guest display so the QEMU window (chrome included)
                 // fits the monitor — PE otherwise picks a huge video mode.
                 max_resolution: phoenix_vm::usable_guest_resolution(),
+                // Clipboard sharing only where this build supports it (11.1+).
+                clipboard_agent: qemu.gtk_clipboard,
                 ..HostOptions::default()
             };
             // Everything (session overlay + serve scratch) stays on the image's
