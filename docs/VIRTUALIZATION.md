@@ -404,6 +404,12 @@ shippable. It is also the same engine work backup/restore/verify already want
   `qemu-img` conversion) if we still want it.
 - Readahead / parallel chunk decode (throughput), NVMe-on-stable-QEMU retest,
   MBR synthesis for BIOS captures, QEMU bundling — all as noted above.
+- **QEMU window should open maximized** (user request 2026-07-19). QEMU's GTK
+  display has no "maximized" CLI option (`full-screen=on` is true fullscreen,
+  not this). Likely shape: `-display gtk,zoom-to-fit=on` so the guest scales
+  to the window, plus a host-side nudge from `boot()` — poll `FindWindowW` for
+  the freshly-spawned QEMU window (we set `-name`) and `ShowWindow(SW_MAXIMIZE)`
+  it. Needs a live check that zoom-to-fit doesn't blur small guest modes.
 - **Root-cause the `.avhdx` detach hang** if Option A is ever revived. The one
   unexplained data point is the early spike that detached cleanly (in-process
   serve, drop-based detach, light I/O, and a different attach storage-type
