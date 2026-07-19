@@ -37,6 +37,32 @@ pub fn system_powerdown(port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Cut the VM's power at `127.0.0.1:port` — QEMU exits at once, the guest
+/// gets no say and no chance to flush.
+///
+/// The equivalent of pulling the plug, and used only where the alternative is
+/// worse: the app hosts the WinFsp filesystem serving the VM's disk, so if
+/// the app goes away the disk is yanked out from under a still-running guest.
+/// An immediate, honest power-off beats a guest that limps on against storage
+/// that has silently vanished. Prefer [`system_powerdown`] everywhere else.
+pub fn quit(port: u16) -> Result<()> {
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect to QMP on 127.0.0.1:{port}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    reader.read_line(&mut line).context("read QMP greeting")?;
+    writeln!(writer, "{{\"execute\":\"qmp_capabilities\"}}")?;
+    line.clear();
+    reader.read_line(&mut line).context("read qmp_capabilities reply")?;
+    // No reply is read for `quit`: QEMU may close the socket before it lands.
+    writeln!(writer, "{{\"execute\":\"quit\"}}")?;
+    Ok(())
+}
+
 /// Bind an ephemeral loopback port, then release it, returning the number. The
 /// caller passes it to QEMU's `-qmp` and to a later `system_powerdown`. There
 /// is a small window where another process could take the port before QEMU
