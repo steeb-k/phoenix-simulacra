@@ -194,6 +194,10 @@ enum VmCommands {
         /// nothing lands on the host OS drive.
         #[arg(long)]
         vm_dir: Option<PathBuf>,
+        /// Discard the kept overlay and start from a clean first boot (recover
+        /// a session that won't boot). Keeps the session identity.
+        #[arg(long, default_value_t = false)]
+        fresh: bool,
     },
     /// List saved VM sessions.
     List,
@@ -374,6 +378,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             no_network,
             qemu_dir,
             vm_dir,
+            fresh,
         } => {
             let write_layer = match write.to_ascii_lowercase().as_str() {
                 "avhdx" => WriteLayer::Avhdx,
@@ -395,13 +400,32 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             let sessions = SessionManager::new(vm_root.join("vm-sessions"));
             let scratch = vm_root.join("vm-serve");
             println!("VM working dir: {}", vm_root.display());
-            phoenix_mount::cleanup_leaked_mounts(&scratch);
+            // Session-aware sweep: reclaims stale serve junctions under
+            // vm-serve, never touches kept overlays under vm-sessions.
+            phoenix_vm::sweep_serve_scratch(&vm_root);
 
             println!("Booting {} — close the VM window to end.", backup.display());
             #[cfg(feature = "winfsp")]
             {
-                let outcome =
-                    phoenix_vm::boot::boot(&backup, &host, write_layer, &qemu, &sessions, &scratch)?;
+                let outcome = phoenix_vm::boot::boot(
+                    &backup,
+                    &host,
+                    write_layer,
+                    fresh,
+                    &qemu,
+                    &sessions,
+                    &scratch,
+                )?;
+                if outcome.resumed {
+                    println!(
+                        "Resumed existing session{}.",
+                        if outcome.resumed_dirty {
+                            " (was left DIRTY by a prior crash — use --fresh if it won't boot)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 println!(
                     "VM exited ({}). Session overlay holds {:.1} GB of guest writes; backup {}.",
                     if outcome.exit_ok { "clean" } else { "non-zero" },
@@ -415,7 +439,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "winfsp"))]
             {
-                let _ = (&host, write_layer, &qemu, &sessions, &scratch);
+                let _ = (&host, write_layer, fresh, &qemu, &sessions, &scratch);
                 anyhow::bail!(
                     "this build lacks the `winfsp` feature required to boot a VM; \
                      rebuild with --features winfsp"

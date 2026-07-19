@@ -25,6 +25,10 @@ pub struct BootOutcome {
     pub overlay_bytes: u64,
     /// True if the backing `.phnx` still passes a structural check afterward.
     pub backup_intact: bool,
+    /// True if this boot resumed an existing overlay rather than creating one.
+    pub resumed: bool,
+    /// True if the resumed session was left dirty by a previous crashed boot.
+    pub resumed_dirty: bool,
 }
 
 /// Boot `backup` as a VM. Blocks until the guest window is closed (the serve
@@ -34,6 +38,7 @@ pub fn boot(
     backup: &Path,
     host: &HostOptions,
     write_layer: WriteLayer,
+    fresh: bool,
     qemu: &Qemu,
     sessions: &SessionManager,
     scratch_dir: &Path,
@@ -46,7 +51,25 @@ pub fn boot(
 
     let cfg = VmConfig::from_manifest(&manifest, host)?;
     let mut session = sessions.open_or_create(backup_id, backup, write_layer, now_rfc3339())?;
+
+    // `--fresh` throws away the kept overlay + varstore so the next boot starts
+    // clean (recovery from a dirty/broken session), while keeping the session's
+    // identity and created-at.
+    if fresh && session.overlay_exists() {
+        std::fs::remove_file(session.overlay_path()).ok();
+        std::fs::remove_file(session.firmware_vars_path()).ok();
+        tracing::info!("--fresh: discarded the existing session overlay");
+    }
+
     let resuming = session.overlay_exists();
+    let resumed_dirty = resuming && !session.meta().clean_shutdown;
+    if resumed_dirty {
+        tracing::warn!(
+            "resuming a session left DIRTY by a previous crashed boot — the overlay is \
+             intact but may hold a torn last write; use `--fresh` to start over if the \
+             guest won't boot"
+        );
+    }
 
     // --- serve the backup on demand (deterministic path → resume works) -----
     std::fs::create_dir_all(scratch_dir).ok();
@@ -163,5 +186,7 @@ pub fn boot(
         exit_ok: status.success(),
         overlay_bytes,
         backup_intact,
+        resumed: resuming,
+        resumed_dirty,
     })
 }

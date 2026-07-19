@@ -43,6 +43,19 @@ pub fn serve_scratch_for_backup(backup: &Path) -> PathBuf {
     vm_root_for_backup(backup).join("vm-serve")
 }
 
+/// Reclaim leftovers from a crashed run — but ONLY under `vm-serve`.
+///
+/// This is the VM-session-aware crash sweep: `vm-serve` holds ephemeral WinFsp
+/// `serve-*` junctions (and any `child-*.avhdx` from the mount stack), which a
+/// dead process leaves behind and which are safe to delete. `vm-sessions`
+/// holds **kept** session overlays (`session.avhdx`) that must survive by
+/// design, so the sweep is pointed only at `vm-serve` and never at the sessions
+/// tree. A dirty session (its host died mid-boot) is surfaced on resume, not
+/// deleted — see [`Session::mark_booting`] / the `clean_shutdown` flag.
+pub fn sweep_serve_scratch(vm_root: &Path) {
+    phoenix_mount::cleanup_leaked_mounts(&vm_root.join("vm-serve"));
+}
+
 /// Where guest writes go. Both keep the backing `.phnx` immutable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -381,6 +394,27 @@ mod tests {
         let mgr = SessionManager::for_backup(Path::new(r"D:\x\y.phnx"));
         assert!(mgr.root().starts_with(r"D:\"));
         assert!(mgr.root().ends_with("vm-sessions"));
+    }
+
+    #[test]
+    fn sweep_reclaims_serve_scratch_but_never_kept_overlays() {
+        let vm_root = tmp_root();
+        // A kept session overlay (must survive).
+        let sess = vm_root.join("vm-sessions").join("abc");
+        std::fs::create_dir_all(&sess).unwrap();
+        let overlay = sess.join("session.avhdx");
+        std::fs::write(&overlay, b"precious guest writes").unwrap();
+        // Crash leftovers under vm-serve (must be reclaimed).
+        let serve = vm_root.join("vm-serve");
+        std::fs::create_dir_all(serve.join("serve-abc")).unwrap();
+        std::fs::write(serve.join("child-abc.avhdx"), b"leaked").unwrap();
+
+        sweep_serve_scratch(&vm_root);
+
+        assert!(overlay.exists(), "sweep destroyed a kept session overlay");
+        assert!(!serve.join("serve-abc").exists(), "stale serve junction survived");
+        assert!(!serve.join("child-abc.avhdx").exists(), "leaked child survived");
+        std::fs::remove_dir_all(&vm_root).ok();
     }
 
     #[test]
