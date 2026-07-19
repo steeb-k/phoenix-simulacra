@@ -2851,17 +2851,19 @@ fn vm_wiki_notice(ui: &mut egui::Ui, palette: &Palette) {
         .show(ui, |ui| {
             // Two columns: the icon owns the left one at a size that reads as
             // a mark rather than punctuation, and the prose wraps in the
-            // right one without flowing back under it. `horizontal` centres
-            // on the cross axis, so the icon sits against the middle of
-            // however many lines the text takes.
+            // right one without flowing back under it.
+            //
+            // The icon is PAINTED rather than laid out, after the text, so it
+            // can be centred against the text block's real height. A
+            // `horizontal` layout positions each item as it is added, before
+            // the row's final height is known, so adding the icon first pins
+            // it to the top no matter what the layout's cross-alignment says.
+            const ICON_W: f32 = 30.0;
+            const ICON_GAP: f32 = 14.0;
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(egui_phosphor::regular::BOOK_OPEN)
-                        .font(fonts::icon(30.0))
-                        .color(palette.accent),
-                );
-                ui.add_space(14.0);
-                ui.vertical(|ui| {
+                let icon_x = ui.cursor().left();
+                ui.add_space(ICON_W + ICON_GAP);
+                let column = ui.vertical(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.label(
@@ -2882,6 +2884,14 @@ fn vm_wiki_notice(ui: &mut egui::Ui, palette: &Palette) {
                         );
                     });
                 });
+                let mid = column.response.rect.center().y;
+                ui.painter().text(
+                    egui::pos2(icon_x, mid),
+                    egui::Align2::LEFT_CENTER,
+                    egui_phosphor::regular::BOOK_OPEN,
+                    fonts::icon(ICON_W),
+                    palette.accent,
+                );
             });
         });
     ui.add_space(12.0);
