@@ -33,6 +33,13 @@ pub struct VmPageState {
     pub scratch: ScratchChoice,
     pub iso_path: String,
     pub boot_iso: bool,
+    /// "Attach guest tools and driver ISO": `None` means the default —
+    /// checked whenever the ISO is present on disk. `Some` is an explicit
+    /// user choice.
+    pub attach_drivers: Option<bool>,
+    /// Free-RAM snapshot for the memory slider's color coding, refreshed
+    /// when stale so "at the time of loading this pane" stays honest.
+    free_mem: Option<(std::time::Instant, u64)>,
 }
 
 impl Default for VmPageState {
@@ -47,8 +54,40 @@ impl Default for VmPageState {
             scratch: ScratchChoice::SameAsImage,
             iso_path: String::new(),
             boot_iso: false,
+            attach_drivers: None,
+            free_mem: None,
         }
     }
+}
+
+impl VmPageState {
+    /// Whether the drivers ISO should be attached, given it is present.
+    pub fn attach_drivers_on(&self) -> bool {
+        self.attach_drivers.unwrap_or(true)
+    }
+
+    /// Free physical RAM in MiB, re-queried at most every few seconds.
+    fn free_mem_mib(&mut self) -> Option<u64> {
+        const STALE: std::time::Duration = std::time::Duration::from_secs(5);
+        match self.free_mem {
+            Some((at, v)) if at.elapsed() < STALE => Some(v),
+            _ => {
+                let v = phoenix_vm::host_free_mem_mib()?;
+                self.free_mem = Some((std::time::Instant::now(), v));
+                Some(v)
+            }
+        }
+    }
+}
+
+/// What the caller knows about the guest-tools / driver ISO this frame.
+pub struct DriversView {
+    /// The ISO exists next to the app.
+    pub present: bool,
+    /// An in-flight download: (bytes so far, total bytes or 0).
+    pub downloading: Option<(u64, u64)>,
+    /// One-line outcome of the last download / update check ("Up to date").
+    pub note: String,
 }
 
 /// What the manifest load extracted from a picked backup: the VM's display
@@ -65,6 +104,10 @@ pub struct BackupSummary {
 pub enum VmAction {
     None,
     BrowseIso,
+    /// Download the guest-tools / driver ISO (virtio-win).
+    DownloadDrivers,
+    /// Check whether a newer driver ISO exists; download it if so.
+    CheckDriversUpdate,
     /// Gracefully power down the running VM.
     Stop,
     /// Load the manifest summary for the current `backup_path`.
@@ -78,6 +121,9 @@ pub enum VmAction {
 /// A running VM, for the header status line.
 pub struct RunningView<'a> {
     pub name: &'a str,
+    /// The backup the VM is running from — matched against session rows so
+    /// the active one reads "running" instead of "interrupted".
+    pub backup_path: &'a str,
     pub elapsed_secs: u64,
     pub overlay_mib: u64,
 }
@@ -93,6 +139,7 @@ pub fn show(
     qemu: Option<&str>,
     history: &phoenix_core::appdata::History,
     iso_history: &[String],
+    drivers: &DriversView,
     sessions: &[Session],
     running: Option<RunningView<'_>>,
     last_status: &str,
@@ -151,6 +198,17 @@ pub fn show(
         return action;
     }
 
+    // --- saved sessions FIRST -----------------------------------------------
+    // Existing sessions lead the page so a user resumes what they already
+    // have instead of re-picking the image and accidentally starting fresh.
+    ui.label(egui::RichText::new("Saved sessions").font(fonts::bold(14.0)));
+    ui.add_space(8.0);
+    show_sessions(ui, palette, sessions, None, &mut action);
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(10.0);
+
     // --- backup picker ------------------------------------------------------
     // The same history-dropdown + Browse… row every other backup-consuming
     // page uses (Restore / Verify / Mount).
@@ -188,6 +246,7 @@ pub fn show(
         m - m % 512
     };
     let cpu_max = host_cpus.max(1);
+    let free_mib = state.free_mem_mib();
     egui::Grid::new("vm_knobs")
         .num_columns(2)
         .spacing([16.0, 10.0])
@@ -198,16 +257,46 @@ pub fn show(
             ui.label("Memory");
             state.mem_mib = state.mem_mib.clamp(1024, mem_max);
             state.mem_mib -= state.mem_mib % 512;
-            ui.add(
-                egui::Slider::new(&mut state.mem_mib, 1024..=mem_max)
-                    .step_by(512.0)
-                    .suffix(" MB"),
-            );
+            // Trailing fill colored by pressure on the RAM that is actually
+            // free right now: green ≤75% of free, yellow ≤90%, red above —
+            // thresholds snapped to the slider's 512 MB stops.
+            let mem_color = free_mib.map(|free| {
+                let snap = |v: u64| v - v % 512;
+                if state.mem_mib <= snap(free * 3 / 4) {
+                    palette.success
+                } else if state.mem_mib <= snap(free * 9 / 10) {
+                    palette.warning
+                } else {
+                    palette.danger
+                }
+            });
+            ui.scope(|ui| {
+                if let Some(c) = mem_color {
+                    ui.visuals_mut().selection.bg_fill = c;
+                }
+                ui.add(
+                    egui::Slider::new(&mut state.mem_mib, 1024..=mem_max)
+                        .step_by(512.0)
+                        .suffix(" MB")
+                        .trailing_fill(true),
+                );
+            });
             ui.end_row();
 
             ui.label("Processors");
             state.cpus = state.cpus.clamp(1, cpu_max);
-            ui.add(egui::Slider::new(&mut state.cpus, 1..=cpu_max));
+            // Same idea against total cores: green ≤ half, yellow ≤ 75%.
+            let cpu_color = if state.cpus <= cpu_max / 2 {
+                palette.success
+            } else if state.cpus * 4 <= cpu_max * 3 {
+                palette.warning
+            } else {
+                palette.danger
+            };
+            ui.scope(|ui| {
+                ui.visuals_mut().selection.bg_fill = cpu_color;
+                ui.add(egui::Slider::new(&mut state.cpus, 1..=cpu_max).trailing_fill(true));
+            });
             ui.end_row();
 
             ui.label("Networking");
@@ -221,16 +310,6 @@ pub fn show(
             ui.end_row();
         });
 
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(
-            "The session's write overlay lives here — the backup stays untouched. \
-             Only the overlay grows; put it on a drive with room (an SSD is faster).",
-        )
-        .small()
-        .color(palette.subtle_text),
-    );
-
     ui.add_space(14.0);
 
     // --- rescue ISO ---------------------------------------------------------
@@ -242,12 +321,10 @@ pub fn show(
         );
     });
 
-    ui.add_space(18.0);
-    ui.separator();
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("Saved sessions").font(fonts::bold(14.0)));
-    ui.add_space(8.0);
-    show_sessions(ui, palette, sessions, None, &mut action);
+    ui.add_space(14.0);
+
+    // --- guest tools / driver ISO -------------------------------------------
+    drivers_section(ui, state, palette, drivers, &mut action);
 
     if !last_status.is_empty() {
         ui.add_space(10.0);
@@ -259,6 +336,82 @@ pub fn show(
     ui.label(egui::RichText::new(format!("Using {version}")).small().color(palette.subtle_text));
 
     action
+}
+
+/// The guest-tools / driver ISO block: a checkbox when the ISO is present
+/// (checked by default), a download link in its place when it isn't, a
+/// progress bar while a download runs, and a "Check for updates" link.
+fn drivers_section(
+    ui: &mut Ui,
+    state: &mut VmPageState,
+    palette: &Palette,
+    drivers: &DriversView,
+    action: &mut VmAction,
+) {
+    if let Some((got, total)) = drivers.downloading {
+        let frac = if total > 0 {
+            got as f32 / total as f32
+        } else {
+            0.0
+        };
+        let text = if total > 0 {
+            format!(
+                "Downloading guest tools & driver ISO… {} / {} MB",
+                got / 1_000_000,
+                total / 1_000_000
+            )
+        } else {
+            format!(
+                "Downloading guest tools & driver ISO… {} MB",
+                got / 1_000_000
+            )
+        };
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_width(420.0)
+                .text(egui::RichText::new(text).small()),
+        );
+    } else if drivers.present {
+        let mut on = state.attach_drivers_on();
+        if ui
+            .checkbox(&mut on, "Attach guest tools and driver ISO")
+            .changed()
+        {
+            state.attach_drivers = Some(on);
+        }
+        let update = ui.link(
+            egui::RichText::new("Check for updates")
+                .small()
+                .color(palette.accent),
+        );
+        if update.clicked() {
+            *action = VmAction::CheckDriversUpdate;
+        }
+    } else {
+        // No ISO yet: the download link stands in for the checkbox.
+        let link = ui.link(
+            egui::RichText::new("Download the guest tools & driver ISO (virtio-win)")
+                .color(palette.accent),
+        );
+        if link.clicked() {
+            *action = VmAction::DownloadDrivers;
+        }
+        ui.label(
+            egui::RichText::new(
+                "One-time download (~700 MB), stored next to the app. The guest browses \
+                 it as a CD to install display/network drivers and helper tools.",
+            )
+            .small()
+            .color(palette.subtle_text),
+        );
+    }
+    if !drivers.note.is_empty() {
+        ui.label(
+            egui::RichText::new(&drivers.note)
+                .small()
+                .color(palette.subtle_text),
+        );
+    }
 }
 
 /// Host RAM/CPU ceilings for the sliders, queried once — they don't change
@@ -440,8 +593,14 @@ fn show_sessions(
                         .on_hover_text(&meta.backup_path);
                     });
 
+                    // The dirty flag is set for the whole time a guest runs, so
+                    // the ACTIVE session must read "running", not "interrupted".
+                    let is_this_running = running
+                        .is_some_and(|r| r.backup_path.eq_ignore_ascii_case(&meta.backup_path));
                     cell(ui, BOOTED_W, |ui| {
-                        if !meta.clean_shutdown {
+                        if is_this_running {
+                            ui.label(egui::RichText::new("running").color(palette.accent));
+                        } else if !meta.clean_shutdown {
                             ui.label(
                                 egui::RichText::new("interrupted").color(palette.warning),
                             );

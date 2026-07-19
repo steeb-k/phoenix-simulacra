@@ -45,6 +45,7 @@ pub struct BootOutcome {
 /// Boot `backup` as a VM. Blocks until the guest window is closed (the serve
 /// must outlive the guest). The session's overlay + varstore are kept for
 /// resume; call [`SessionManager::discard`] to throw the session away.
+#[allow(clippy::too_many_arguments)]
 pub fn boot(
     backup: &Path,
     host: &HostOptions,
@@ -52,6 +53,7 @@ pub fn boot(
     fresh: bool,
     iso: Option<&Path>,
     boot_iso_first: bool,
+    drivers_iso: Option<&Path>,
     qemu: &Qemu,
     sessions: &SessionManager,
     scratch_dir: &Path,
@@ -175,6 +177,7 @@ pub fn boot(
         iso: iso.map(|p| p.display().to_string()),
         boot_iso_first,
         qmp_port,
+        drivers_iso: drivers_iso.map(|p| p.display().to_string()),
     };
     let args = cfg.qemu_args(&spec);
 
