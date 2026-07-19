@@ -7,8 +7,7 @@
 //! one command to paste inside the guest:
 //!
 //! ```text
-//! cmdkey /add:10.0.2.2 /user:HOSTNAME\user /pass
-//! net use S: \\10.0.2.2\SimulacraShare /persistent:yes
+//! net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user /persistent:yes
 //! ```
 //!
 //! The guest prompts for the host account's password (a Microsoft-account PC
@@ -77,29 +76,22 @@ pub fn remove_share() {
 /// The command the user pastes INSIDE the guest to map the share. `10.0.2.2`
 /// is slirp's gateway — the host's loopback as seen from the guest.
 ///
-/// Two steps, because `net use` cannot do both at once: `/savecred` and
-/// `/persistent:yes` are mutually exclusive, so a mapping can be remembered
-/// or its credential can be, never both.
+/// A remembered mapping, and that is all: the drive comes back after a guest
+/// reboot, and Windows asks for the password again when it does.
 ///
-/// `cmdkey` sidesteps that by writing the credential into Credential Manager
-/// independently of any mapping — `/pass` with no value prompts for it once.
-/// The mapping is then a plain persistent one, and reconnects after a guest
-/// reboot resolve against the stored credential without prompting.
-///
-/// Both live in the guest's own profile, i.e. inside the session overlay —
-/// discarded with the session, never written back to the backup image.
+/// Saving the credential too was tried and abandoned. `net use` refuses to
+/// combine `/savecred` with `/persistent:yes` — a mapping can be remembered
+/// or its credential can be, never both. Storing it separately with `cmdkey`
+/// parses fine but does not work either: `net use` prompted for the password
+/// regardless, so the guest ended up asking twice rather than once. Not worth
+/// more machinery than the prompt it was meant to remove.
 ///
 /// The single source of truth: `MapShare.cmd` runs exactly this, and the
 /// Running view shows exactly this to copy.
 pub fn guest_mount_command() -> String {
     let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "HOST".into());
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    // `/user:` belongs on BOTH: cmdkey needs it to key the stored credential,
-    // and net use needs it or it prompts for a username of its own — the
-    // stored credential answers "what is the password", never "who are you".
-    format!(
-        r"cmdkey /add:10.0.2.2 /user:{host}\{user} /pass && net use S: \\10.0.2.2\{SHARE_NAME} /user:{host}\{user} /persistent:yes"
-    )
+    format!(r"net use S: \\10.0.2.2\{SHARE_NAME} /user:{host}\{user} /persistent:yes")
 }
 
 /// Build the guest helper disk: a small FAT image (regenerated every boot)
@@ -168,10 +160,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         "@echo off\r\n\
          title Simulacra shared folder\r\n\
          echo Mapping \\\\10.0.2.2\\{SHARE_NAME} as S: ...\r\n\
-         echo.\r\n\
-         echo Enter the password for the account you use on the host PC.\r\n\
-         echo It is saved here so the drive comes back on its own after a\r\n\
-         echo reboot - this VM's disk is scratch, discarded with the session.\r\n\
+         echo (Sign in with the account password you use on the host PC.)\r\n\
          echo.\r\n\
          net use S: /delete /y >nul 2>&1\r\n\
          {mount}\r\n\
@@ -346,14 +335,14 @@ mod tests {
         // script again or prompting.
         assert!(cmd.contains("/persistent:yes"));
         assert!(!cmd.contains("/persistent:no"));
-        // The credential is stored by cmdkey, NOT by /savecred — net use
-        // refuses to combine /savecred with /persistent:yes, so pairing them
-        // would break the mapping outright rather than degrade it.
-        assert!(cmd.contains("cmdkey /add:10.0.2.2"));
+        // /savecred must never come back: net use refuses to combine it with
+        // /persistent:yes, so pairing them breaks the mapping outright
+        // rather than merely failing to save anything.
         assert!(!cmd.contains("/savecred"));
-        // BOTH commands need /user: — a stored credential supplies the
-        // password, never the username, so net use without it prompts.
-        assert_eq!(cmd.matches("/user:").count(), 2);
+        // cmdkey was tried for the credential and prompted anyway, so the
+        // guest asked twice. One prompt beats two.
+        assert!(!cmd.contains("cmdkey"));
+        assert!(cmd.contains("/user:"));
         // The script must run exactly the command the UI offers to copy, so
         // the two can't drift apart.
         assert!(cmd.contains(&guest_mount_command()));
