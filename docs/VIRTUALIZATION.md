@@ -293,6 +293,27 @@ growing overlay. The engine already supports this (`--vm-dir` takes any root),
 so the GUI needs a drive picker (showing free space per volume) that writes the
 chosen root into settings, with "same drive as the image" as the default choice.
 
+### Throughput: the qcow2 path is ~3× slower to boot (now critical-path)
+
+End-to-end `simulacra-cli vm boot` on the real Win11 backup (2026-07-19):
+
+| write path | boot → lock screen | teardown |
+|---|---|---|
+| `.avhdx` raw passthrough | ~4 min | **hangs indefinitely** (needs reboot) |
+| **qcow2 (default)** | **~13 min** | **2 seconds, clean** |
+
+So the pivot bought correctness at a real cost in speed. Measured mid-boot:
+the **serve helper sits at ~50% of a single core** decompressing chunks while
+the guest absorbs only ~2 MB/s of writes, with ~1.2 GB resident in the chunk
+cache. The bottleneck is **single-threaded chunk decode in the serve process**,
+not QEMU and not the qcow2 layer: a booting guest issues scattered reads and
+each cache miss costs a whole 4 MiB chunk decompress.
+
+That promotes the throughput work (**readahead + parallel chunk decode**) from
+"nice to have" to **on the critical path** — 13 minutes to a lock screen is not
+shippable. It is also the same engine work backup/restore/verify already want
+(ROADMAP P3), so it pays off in both places.
+
 ### Still open before this is shippable
 
 - ~~Serve-path resume proof.~~ **DONE 2026-07-19** for the qcow2 path
