@@ -17,6 +17,7 @@ phoenix-vss.workspace = true
 phoenix-restore.workspace = true
 phoenix-clone.workspace = true
 phoenix-mount.workspace = true
+phoenix-vm.workspace = true
 # CPU-rendered egui: winit + softbuffer + a hand-written rasterizer (see the
 # Renderer in main.rs and tex_mgr.rs), NOT eframe/wgpu. Every GPU backend fails
 # in Windows PE / GPU-less recovery VMs — wgpu's DX12 path can't build egui's
@@ -82,7 +83,7 @@ windows-sys = { version = "0.59", features = [
 # build with --no-default-features on a machine without them (mount then uses
 # the full-size temp-VHD stopgap).
 default = ["winfsp"]
-winfsp = ["phoenix-mount/winfsp", "dep:winfsp"]
+winfsp = ["phoenix-mount/winfsp", "phoenix-vm/winfsp", "dep:winfsp"]
 
 [build-dependencies]
 winres.workspace = true

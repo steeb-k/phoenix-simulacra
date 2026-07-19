@@ -6,6 +6,7 @@
 
 mod about_panel;
 mod action_bar;
+mod vm_panel;
 mod bootrepair_table;
 mod clone_panel;
 mod confirm_dialog;
@@ -609,6 +610,20 @@ struct PendingBootRepair {
     ack: bool,
 }
 
+/// A VM booted on a background thread. `boot()` blocks for the whole guest
+/// session, so it can't run on the UI thread; the outcome comes back over
+/// `result` and the page polls it each frame.
+struct VmRun {
+    /// The backup this VM is running — used to locate its session (for the QMP
+    /// stop port) and to label the page.
+    backup: std::path::PathBuf,
+    name: String,
+    started: Instant,
+    /// Path to the session overlay, polled to show how much the guest has written.
+    overlay_path: std::path::PathBuf,
+    result: std::sync::mpsc::Receiver<anyhow::Result<phoenix_vm::boot::BootOutcome>>,
+}
+
 /// The two ends of the running job, named the way a person would name them
 /// ("Samsung SSD 990 PRO (Disk 1)", `D:\Backups\work.phnx`).
 ///
@@ -808,6 +823,15 @@ struct PhoenixApp {
     pending_enable_write: Option<usize>,
     /// Acknowledgement-checkbox state for the enable-write dialog.
     enable_write_ack: bool,
+    /// Virtualize page controls (backup, knobs, scratch drive, ISO).
+    vm: vm_panel::VmPageState,
+    /// A VM running on a background thread, if any (one at a time for now).
+    vm_run: Option<VmRun>,
+    /// Last VM outcome/status shown on the Virtualize page.
+    vm_last_status: String,
+    /// Discovered QEMU install, or `None` when it isn't found — the page then
+    /// shows an install notice (mirrors `mount_available`).
+    qemu: Option<phoenix_vm::Qemu>,
     /// Boot Repair page: Windows installations detected on the current disk
     /// list. `None` means "scan on next page render" — cleared whenever the
     /// disk list reloads so the page never shows installs from a stale world.
@@ -949,6 +973,12 @@ impl PhoenixApp {
             pending_close: false,
             pending_enable_write: None,
             enable_write_ack: false,
+            vm: vm_panel::VmPageState::default(),
+            vm_run: None,
+            vm_last_status: String::new(),
+            // Probe for QEMU once at startup; the page shows an install notice
+            // when it's missing.
+            qemu: phoenix_vm::Qemu::discover(None).ok(),
             bootrepair_installs: None,
             bootrepair_selected: None,
             bootrepair_plan: None,
@@ -1161,7 +1191,7 @@ impl PhoenixApp {
             Page::BootRepair => {
                 self.bootrepair_selected = None;
             }
-            Page::Verify | Page::Mount | Page::About => {}
+            Page::Verify | Page::Mount | Page::Virtualize | Page::About => {}
         }
     }
 
@@ -1765,6 +1795,26 @@ impl PhoenixApp {
                     }),
                 }
             }
+            Page::Virtualize => {
+                // No QEMU or a VM already running → withhold the bar (the page
+                // shows an install notice / the running-VM controls instead).
+                if self.qemu.is_none() || self.vm_run.is_some() {
+                    return None;
+                }
+                let ready = self.vm.summary.as_ref().is_some_and(|s| s.blocker.is_none());
+                StartAction {
+                    label: "Boot VM",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy && ready,
+                    disabled_hint: Some(if busy {
+                        "A job is already running"
+                    } else if self.vm.summary.is_none() {
+                        "Choose a backup file first"
+                    } else {
+                        "This backup can't boot — see the note above"
+                    }),
+                }
+            }
             Page::BootRepair => {
                 let plan_ok = self
                     .bootrepair_plan
@@ -1911,6 +1961,7 @@ impl PhoenixApp {
                     Page::Verify => self.start_verify(),
                     Page::Clone => self.start_clone(),
                     Page::Mount => self.start_mount(),
+                    Page::Virtualize => self.start_vm(),
                     Page::BootRepair => self.start_boot_repair(),
                     _ => {}
                 }
@@ -1945,6 +1996,10 @@ impl PhoenixApp {
                     Page::Restore => self.ui_restore(ui, busy),
                     Page::Verify => self.ui_verify(ui, busy),
                     Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
+                    // Not gated on `busy`: a running VM lives on a background
+                    // thread, not a modal job, so the page stays interactive
+                    // (Stop button, sessions). `modal_open` still disables it.
+                    Page::Virtualize => self.ui_virtualize(ui),
                     Page::BootRepair => disabled_when(ui, busy, |ui| self.ui_bootrepair(ui)),
                     Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
                     Page::About => disabled_when(ui, busy, |ui| self.ui_about(ui)),
@@ -4016,6 +4071,273 @@ impl PhoenixApp {
             Err(e) => {
                 self.status = format!("Mount failed: {e}");
             }
+        }
+    }
+
+    fn ui_virtualize(&mut self, ui: &mut egui::Ui) {
+        // Poll the background VM thread for completion.
+        if let Some(run) = &self.vm_run {
+            match run.result.try_recv() {
+                Ok(Ok(outcome)) => {
+                    self.vm_last_status = format!(
+                        "VM exited ({}). Session overlay holds {:.1} GB of guest writes; backup {}.",
+                        if outcome.exit_ok { "clean" } else { "non-zero" },
+                        outcome.overlay_bytes as f64 / 1e9,
+                        if outcome.backup_intact { "still verifies" } else { "FAILED verification" },
+                    );
+                    self.vm_run = None;
+                }
+                Ok(Err(e)) => {
+                    self.vm_last_status = format!("VM failed: {e:#}");
+                    self.vm_run = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.vm_last_status = "VM thread ended unexpectedly.".into();
+                    self.vm_run = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // Keep the elapsed timer / poll ticking while a VM runs.
+        if self.vm_run.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
+        // Pull everything the page needs out of `self` into owned locals so the
+        // scroll-shell closure doesn't borrow `self` (which would conflict: it
+        // needs `&mut self.vm` while a running view borrows `self.vm_run`).
+        let version = self.qemu.as_ref().map(|q| q.version.clone());
+        let sessions = phoenix_vm::SessionManager::list_all();
+        let running_owned = self.vm_run.as_ref().map(|r| {
+            let overlay_mib = std::fs::metadata(&r.overlay_path)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0);
+            (r.name.clone(), r.started.elapsed().as_secs(), overlay_mib)
+        });
+        let last = self.vm_last_status.clone();
+        let palette = self.palette;
+        let mut vm_state = std::mem::take(&mut self.vm);
+        let mut action = vm_panel::VmAction::None;
+
+        page_scroll_shell(ui, "virtualize_page", |ui| {
+            page_header(ui, &palette, "Virtualize", "");
+            let running = running_owned.as_ref().map(|(n, e, o)| vm_panel::RunningView {
+                name: n,
+                elapsed_secs: *e,
+                overlay_mib: *o,
+            });
+            action = vm_panel::show(
+                ui,
+                &mut vm_state,
+                &palette,
+                version.as_deref(),
+                &sessions,
+                running,
+                &last,
+            );
+        });
+        self.vm = vm_state;
+
+        match action {
+            vm_panel::VmAction::None => {}
+            vm_panel::VmAction::BrowseBackup => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Phoenix backup", &["phnx"])
+                    .set_title("Choose a .phnx backup to boot")
+                    .pick_file()
+                {
+                    self.vm.backup_path = p.display().to_string();
+                    self.load_vm_summary();
+                }
+            }
+            vm_panel::VmAction::BrowseIso => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Disc image", &["iso"])
+                    .set_title("Choose a rescue / PE ISO")
+                    .pick_file()
+                {
+                    self.vm.iso_path = p.display().to_string();
+                }
+            }
+            vm_panel::VmAction::LoadSummary => self.load_vm_summary(),
+            vm_panel::VmAction::Stop => self.stop_vm(),
+            vm_panel::VmAction::Resume(path) => {
+                self.vm.backup_path = path;
+                self.load_vm_summary();
+                self.start_vm();
+            }
+            vm_panel::VmAction::Discard(path) => {
+                match phoenix_core::container::PhnxReader::open(std::path::Path::new(&path)) {
+                    Ok(reader) => {
+                        let id = reader.header.backup_id;
+                        drop(reader);
+                        match phoenix_vm::SessionManager::for_backup(std::path::Path::new(&path))
+                            .discard(&id)
+                        {
+                            Ok(()) => self.vm_last_status = "Session discarded.".into(),
+                            Err(e) => self.vm_last_status = format!("Discard failed: {e}"),
+                        }
+                    }
+                    Err(e) => self.vm_last_status = format!("Can't open backup: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Read the picked backup's manifest into a one-line summary (and refuse a
+    /// locked-BitLocker OS volume up front).
+    fn load_vm_summary(&mut self) {
+        let path = self.vm.backup_path.trim().to_string();
+        self.vm.loaded_path = path.clone();
+        self.vm.summary = None;
+        if path.is_empty() {
+            return;
+        }
+        match phoenix_core::container::PhnxReader::open(std::path::Path::new(&path)) {
+            Ok(reader) => {
+                let m = &reader.manifest;
+                let blocker = m
+                    .partitions
+                    .iter()
+                    .find(|p| p.bitlocker.as_deref() == Some("locked"))
+                    .map(|p| format!("partition {} is a locked BitLocker volume — can't boot", p.index));
+                self.vm.summary = Some(vm_panel::BackupSummary {
+                    hostname: m.hostname.clone(),
+                    firmware: if m.disk.style.eq_ignore_ascii_case("gpt") { "UEFI (GPT)" } else { "BIOS (MBR)" },
+                    sector_size: m.disk.sector_size,
+                    partitions: m.partitions.len(),
+                    blocker,
+                });
+            }
+            Err(e) => self.vm_last_status = format!("Can't read backup: {e}"),
+        }
+    }
+
+    /// Compute the VM working root from the scratch-drive choice.
+    fn vm_root(&self, backup: &std::path::Path) -> std::path::PathBuf {
+        match self.vm.scratch {
+            vm_panel::ScratchChoice::SameAsImage => phoenix_vm::vm_root_for_backup(backup),
+            vm_panel::ScratchChoice::Drive(c) => {
+                std::path::PathBuf::from(format!("{c}:\\")).join("PhoenixSimulacra")
+            }
+        }
+    }
+
+    fn start_vm(&mut self) {
+        if self.vm_run.is_some() {
+            return;
+        }
+        let backup = std::path::PathBuf::from(self.vm.backup_path.trim());
+        if !backup.exists() {
+            self.vm_last_status = "Pick a backup file first.".into();
+            return;
+        }
+        let Some(qemu) = self.qemu.clone() else {
+            self.vm_last_status = "QEMU isn't installed.".into();
+            return;
+        };
+        // Session identity (for the overlay path we poll for progress).
+        let id = match phoenix_core::container::PhnxReader::open(&backup) {
+            Ok(r) => {
+                let id = r.header.backup_id;
+                drop(r);
+                id
+            }
+            Err(e) => {
+                self.vm_last_status = format!("Can't open backup: {e}");
+                return;
+            }
+        };
+        let name = self.vm.summary.as_ref().map(|s| s.hostname.clone()).unwrap_or_else(|| {
+            backup.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+        });
+
+        let vm_root = self.vm_root(&backup);
+        let sessions = phoenix_vm::SessionManager::new(vm_root.join("vm-sessions"));
+        let scratch = vm_root.join("vm-serve");
+        let overlay_path = vm_root
+            .join("vm-sessions")
+            .join(id.simple().to_string())
+            .join("session.qcow2");
+        phoenix_vm::sweep_serve_scratch(&vm_root);
+
+        let host = phoenix_vm::HostOptions {
+            memory_mib: self.vm.mem_mib,
+            smp: self.vm.cpus,
+            network: self.vm.network,
+            ..phoenix_vm::HostOptions::default()
+        };
+        let iso = {
+            let t = self.vm.iso_path.trim();
+            if t.is_empty() { None } else { Some(std::path::PathBuf::from(t)) }
+        };
+        let boot_iso = self.vm.boot_iso;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let backup_thread = backup.clone();
+        std::thread::spawn(move || {
+            #[cfg(feature = "winfsp")]
+            let res = phoenix_vm::boot::boot(
+                &backup_thread,
+                &host,
+                phoenix_vm::WriteLayer::Qcow2,
+                false,
+                iso.as_deref(),
+                boot_iso,
+                &qemu,
+                &sessions,
+                &scratch,
+            );
+            #[cfg(not(feature = "winfsp"))]
+            let res: anyhow::Result<phoenix_vm::boot::BootOutcome> = {
+                let _ = (&backup_thread, &host, &iso, boot_iso, &qemu, &sessions, &scratch);
+                Err(anyhow::anyhow!("this build lacks the winfsp feature required to boot a VM"))
+            };
+            let _ = tx.send(res);
+        });
+
+        self.vm_last_status.clear();
+        self.vm_run = Some(VmRun {
+            backup,
+            name,
+            started: Instant::now(),
+            overlay_path,
+            result: rx,
+        });
+    }
+
+    fn stop_vm(&mut self) {
+        let Some(run) = &self.vm_run else { return };
+        let backup = run.backup.clone();
+        let id = match phoenix_core::container::PhnxReader::open(&backup) {
+            Ok(r) => {
+                let id = r.header.backup_id;
+                drop(r);
+                id
+            }
+            Err(e) => {
+                self.vm_last_status = format!("Can't open backup: {e}");
+                return;
+            }
+        };
+        // The QMP port file lives in the session dir under the SAME working root
+        // the boot used (respecting the scratch-drive choice).
+        let port_file = self
+            .vm_root(&backup)
+            .join("vm-sessions")
+            .join(id.simple().to_string())
+            .join("qmp.port");
+        let port = std::fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+        match port {
+            Some(p) => match phoenix_vm::qmp::system_powerdown(p) {
+                Ok(()) => {
+                    self.vm_last_status = "Sent graceful shutdown; the guest is powering off…".into()
+                }
+                Err(e) => self.vm_last_status = format!("Graceful stop failed: {e}"),
+            },
+            None => self.vm_last_status = "Couldn't find the VM's control port.".into(),
         }
     }
 

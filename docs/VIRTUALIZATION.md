@@ -457,6 +457,42 @@ Notably this needs no new engine work — it's purely QEMU command-line
 assembly in `VmConfig`/`BootSpec`, so it slots in wherever the boot options
 UI lands.
 
+## Host↔guest file exchange + guest tooling (planned, spitballed 2026-07-18)
+
+The user wants an easy way to move files in and out of a booted guest, plus a
+way to get drivers/helpers into it. These are one cluster:
+
+- **The "just mount an SMB share" reflex doesn't work on a Windows host.**
+  QEMU's slirp SMB (`-netdev user,smb=…`) needs a host `smbd` (Samba), which
+  Windows doesn't have. virtio-9p/virtfs needs virtio drivers the guest lacks
+  inbox. So the obvious approach is a trap.
+- **What works with zero guest drivers: VVFAT.** `-drive file=fat:rw:<dir>`
+  exposes a host folder to the guest as a FAT disk (inbox driver + AHCI). A
+  **default shared folder next to the `.phnx`** could be surfaced this way and
+  show up as a drive letter in the guest. Caveat: QEMU's read-write VVFAT is
+  explicitly experimental and can corrupt — fine read-only, risky for guest
+  writes. So: read-only VVFAT is safe for *pushing* files in; for *pulling*
+  files out we may still want another channel (a second small writable disk
+  image the guest formats, or host SMB at `10.0.2.2` if we set up a share +
+  guest auth).
+- **Drivers/helpers as an ISO, not the share (user's refinement).** virtio-win
+  ships **as an ISO**, and we already have ISO attach + one-shot boot
+  (`--iso`/`--boot-iso`). So the driver-install story is just: attach a drivers
+  ISO as a second CD-ROM; the guest runs the installer from it. This sidesteps
+  the share-needs-drivers / drivers-need-share chicken-and-egg entirely.
+- **A guest-tools payload in the share (user's idea).** Drop a script/installer
+  (or a symlink) into the default share folder that installs QEMU/virtio
+  drivers and any helper software once run inside the guest. With a read-only
+  VVFAT share this is safe (guest reads + runs; doesn't write back), and it
+  composes with the drivers-ISO idea — the share can just *point at* or carry
+  the installer.
+
+Rough plan when we build it: (1) a read-only VVFAT default share rooted next to
+the image, shown as a drive in the guest; (2) an "attach drivers ISO" affordance
+(bundle or point at virtio-win); (3) a small guest-tools installer we place in
+the share. Decide the *writable* out-of-guest channel (writable scratch disk vs.
+host SMB) separately — it's the only genuinely hard part.
+
 ## Open questions (want your input)
 
 - Overlay: does session interop (mount the same session you boot) justify

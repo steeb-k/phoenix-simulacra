@@ -13,6 +13,7 @@ pub enum Page {
     Restore,
     Verify,
     Mount,
+    Virtualize,
     BootRepair,
     History,
     About,
@@ -66,6 +67,13 @@ const TOP_ITEMS: &[NavItem] = &[
         icon: egui_phosphor::regular::HARD_DRIVES,
         key: Key::M,
         accel: 'M',
+    },
+    NavItem {
+        page: Page::Virtualize,
+        label: "Virtualize",
+        icon: egui_phosphor::regular::MONITOR,
+        key: Key::Z,
+        accel: 'z',
     },
     NavItem {
         page: Page::BootRepair,
