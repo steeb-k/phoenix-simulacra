@@ -245,10 +245,52 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
    needs QEMU on the runner box and is heavy — likely a staged script plus a
    manual checklist entry, like the live-VSS checklist, rather than cargo tests.
 
+## Guest access / login prep (planned feature)
+
+When you boot someone's backup to recover data or triage a dead machine, you
+often don't have their password — and Windows Hello PIN never works in a VM
+anyway (TPM-sealed, confirmed in the boot smoke). So VM sessions should offer
+**optional, opt-in guest-login prep**, applied to the throwaway overlay before
+boot so the backing `.phnx` is never touched:
+
+- **Enable the built-in Administrator account.** Offline `SYSTEM`/`SAM` hive
+  edit on the mounted session overlay: clear the `ACB_DISABLED` bit on RID 500
+  (and optionally blank its password). This is the same account state a
+  clean-install recovery drops you into.
+- **Bypass the password/PIN prompt** (the "Windows Login Unlocker"-style
+  option): the robust, reversible way is to patch the on-disk password
+  verification so any password is accepted for the session, rather than
+  blanking hashes — because a blanked hash can cascade into losing DPAPI-
+  protected secrets (saved credentials, EFS, browser data) that are sealed to
+  the original password. Patching the check leaves those recoverable. Do this
+  against the overlay only; the original backup keeps the real hashes.
+
+Design constraints:
+
+- **Overlay-only, always.** Every edit lands in the session's `.avhdx`/qcow2,
+  never the `.phnx` — the immutability guarantee is the whole point of the tool.
+- **Opt-in and clearly labelled** in the session UI (a checkbox at boot time,
+  off by default), because it modifies the guest OS's security state.
+- **BitLocker-gated.** A locked BitLocker OS volume can't be edited offline
+  (raw ciphertext) — refuse, same as the writable mount. An unlocked-at-capture
+  volume (plaintext image, like our test backup) is fine.
+- **Implementation options to weigh:** shell out to `chntpw`/`reged`-style
+  offline hive tooling vs. a small native SAM/`SYSTEM`-hive editor in Rust.
+  The mount stack already gives us the volume — this rides on top of a
+  session mount (the Option-A interop we just built).
+
+This is a legitimate recovery capability for the machine's owner acting on
+their own backup; it is deliberately session-scoped and reversible.
+
 ## Open questions (want your input)
 
 - Overlay: does session interop (mount the same session you boot) justify
   Option A's raw-passthrough complexity, or is qcow2-only (B) good enough?
-  (Spike will inform, but the *product* preference matters too.)
+  **RESOLVED 2026-07-18: Option A committed** — it booted Windows 11 over the
+  `.avhdx` overlay and unlocks boot-it-or-mount-it interop; qcow2 kept as the
+  portable fallback.
 - Session UX: one session per backup, or multiple named sessions per backup?
   (Plan assumes one to start; the layout doesn't preclude more.)
+- Login prep (above): ship both "enable Administrator" and "bypass password",
+  or start with just enabling Administrator? Patch-the-check vs. blank-the-hash
+  for the bypass (patch preferred, for DPAPI safety).
