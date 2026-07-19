@@ -235,6 +235,7 @@ pub fn boot(
             .spawn()
             .with_context(|| format!("launch {}", qemu.system.display()))?;
         maximize_window_of(child.id());
+        spawn_reset_watchdog(child.id(), qemu_log_path.clone());
         let status = child.wait().context("wait for QEMU")?;
 
         let log_text = std::fs::read_to_string(&qemu_log_path).unwrap_or_default();
@@ -306,6 +307,94 @@ pub fn boot(
         resumed_dirty,
         qemu_log_tail,
     })
+}
+
+/// The line QEMU prints when a guest reset hits WHPX's unsupported-reset path.
+const WHPX_RESET_MARKER: &str = "Unexpected VP exit code";
+
+/// A WHPX guest reset does not always exit QEMU: sometimes only part of the
+/// VPs hit the unsupported-reset path and QEMU wedges ALIVE with scanout off
+/// (the GTK window shows "no video output"), stranding the relaunch loop,
+/// which only acts on process exit. Watch this launch's qemu.log for the
+/// reset marker; if QEMU is still running a grace period after it appears,
+/// kill it — the marker in the log then makes the relaunch loop treat the
+/// exit as a guest reset and bring the session straight back up.
+fn spawn_reset_watchdog(pid: u32, log_path: std::path::PathBuf) {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    std::thread::spawn(move || loop {
+        if !is_this_qemu_alive(pid) {
+            return; // exited on its own — the launch loop handles it
+        }
+        let logged = std::fs::read_to_string(&log_path)
+            .map(|t| t.contains(WHPX_RESET_MARKER))
+            .unwrap_or(false);
+        if logged {
+            // Give QEMU the chance to exit by itself (the common mode).
+            std::thread::sleep(GRACE);
+            if is_this_qemu_alive(pid) {
+                tracing::warn!(
+                    "guest reset wedged QEMU alive with no video output — killing it so \
+                     the relaunch loop can continue the session"
+                );
+                kill_this_qemu(pid);
+            }
+            return;
+        }
+        std::thread::sleep(POLL);
+    });
+}
+
+/// True while `pid` is a live process whose image is really QEMU — PIDs get
+/// recycled, so never trust the number alone.
+fn is_this_qemu_alive(pid: u32) -> bool {
+    qemu_process_handle_op(pid, false)
+}
+
+/// Terminate `pid` if it is (still) really QEMU.
+fn kill_this_qemu(pid: u32) {
+    qemu_process_handle_op(pid, true);
+}
+
+/// Shared open-check(-terminate) on `pid`: returns whether the process exists
+/// AND its image name is `qemu-system-x86_64.exe`; when `terminate` is set and
+/// it matches, it is killed.
+fn qemu_process_handle_op(pid: u32, terminate: bool) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let access = if terminate {
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
+    } else {
+        PROCESS_QUERY_LIMITED_INFORMATION
+    };
+    // SAFETY: a failed open returns null, checked before any use.
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    // SAFETY: handle is live; buf/len describe a valid writable buffer.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_FORMAT::default(), buf.as_mut_ptr(), &mut len)
+    };
+    let mut matches = false;
+    if ok != 0 {
+        let full = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
+        matches = full.ends_with("qemu-system-x86_64.exe");
+        if matches && terminate {
+            // SAFETY: handle was opened with PROCESS_TERMINATE.
+            unsafe { TerminateProcess(handle, 1) };
+        }
+    }
+    // SAFETY: handle came from OpenProcess and is not used after this.
+    unsafe { CloseHandle(handle) };
+    matches
 }
 
 /// Maximize QEMU's window once it appears. QEMU has no "start maximized"
