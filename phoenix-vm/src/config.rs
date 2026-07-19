@@ -309,17 +309,32 @@ impl VmConfig {
             push("none");
         }
 
+        // One virtio-serial controller carries both optional channels below.
+        if self.clipboard_agent || spec.qga_port.is_some() {
+            push("-device");
+            push("virtio-serial-pci");
+        }
+
         // Host↔guest clipboard: the GTK display speaks the SPICE agent
         // protocol over a qemu-vdagent chardev, used by the guest's SPICE
         // vdagent service (virtio-win guest tools). Gated — see
         // [`HostOptions::clipboard_agent`] for why it is currently off.
         if self.clipboard_agent {
-            push("-device");
-            push("virtio-serial-pci");
             push("-chardev");
             push("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on");
             push("-device");
             push("virtserialport,chardev=vdagent0,name=com.redhat.spice.0");
+        }
+
+        // QEMU guest agent channel: lets the host run diagnostics/repairs
+        // inside a guest that has qemu-ga (from the SIMULACRA driver script).
+        if let Some(port) = spec.qga_port {
+            push("-chardev");
+            push(&format!(
+                "socket,id=qga0,host=127.0.0.1,port={port},server=on,wait=off"
+            ));
+            push("-device");
+            push("virtserialport,chardev=qga0,name=org.qemu.guest_agent.0");
         }
 
         // Firmware: UEFI needs a writable copy of BOTH pflash units. Attaching
@@ -446,6 +461,12 @@ pub struct BootSpec {
     /// ACPI shutdown (`system_powerdown`) instead of killing QEMU. `None` omits
     /// the socket.
     pub qmp_port: Option<u16>,
+    /// TCP port for the QEMU guest-agent channel (`org.qemu.guest_agent.0`
+    /// virtserialport → loopback socket). Inert until the guest has the
+    /// vioserial driver + qemu-ga service (both installed by the SIMULACRA
+    /// disk's driver script); with them, the host can run diagnostics inside
+    /// the guest — the lever that cracked the black-screen investigation.
+    pub qga_port: Option<u16>,
     /// The guest-tools / driver ISO (virtio-win), attached as a second
     /// read-only CD-ROM. Never given boot priority — the guest browses it to
     /// install drivers and helpers.
@@ -467,6 +488,7 @@ impl BootSpec {
             iso: None,
             boot_iso_first: false,
             qmp_port: None,
+            qga_port: None,
             drivers_iso: None,
             helper_disk: None,
         }
@@ -747,6 +769,24 @@ mod tests {
             assert!(args.contains("-device virtio-vga"));
             assert!(!args.contains("vgamem"));
         }
+    }
+
+    #[test]
+    fn qga_port_adds_guest_agent_channel() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let spec = BootSpec {
+            qga_port: Some(45222),
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&spec).join(" ");
+        assert!(args.contains("virtio-serial-pci"));
+        assert!(args.contains("socket,id=qga0,host=127.0.0.1,port=45222,server=on,wait=off"));
+        assert!(args.contains("virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"));
+        // No channel requested → no serial controller at all.
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(!args.contains("virtio-serial-pci"));
+        assert!(!args.contains("qga0"));
     }
 
     #[test]
