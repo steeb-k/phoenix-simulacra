@@ -168,6 +168,8 @@ pub fn show(
     palette: &Palette,
     qemu: Option<QemuView<'_>>,
     history: &phoenix_core::appdata::History,
+    // Hand-browsed backups, newest first — Browse… appends to it.
+    browsed: &mut Vec<String>,
     iso_history: &[String],
     drivers: &DriversView,
     sessions: &[Session],
@@ -299,6 +301,7 @@ pub fn show(
         "Select or browse for a .phnx backup",
         &mut state.backup_path,
         history,
+        browsed,
         None,
     ) {
         action = VmAction::LoadSummary;

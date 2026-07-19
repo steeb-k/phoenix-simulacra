@@ -2786,24 +2786,50 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
 /// loses focus with a changed value, and immediately after Browse picks a file.
 /// Returns `true` if Browse selected a new file.
 /// Every `.phnx` the job history has ever named — backups created, files
-/// verified or restored from — deduplicated case-insensitively, newest
-/// mention first, and filtered to files that still exist so the dropdown
-/// never offers a dead path. Called from inside the combo's popup closure,
-/// so the `is_file` stats only run while the list is actually open.
-fn history_backup_choices(history: &phoenix_core::appdata::History) -> Vec<String> {
+/// verified or restored from — plus every one reached via Browse…,
+/// deduplicated case-insensitively, newest mention first, and filtered to
+/// files that still exist so the dropdown never offers a dead path. Called
+/// from inside the combo's popup closure, so the `is_file` stats only run
+/// while the list is actually open.
+///
+/// Browsed paths come first: they were chosen by hand just now, which is a
+/// stronger signal of intent than a job run months ago.
+fn history_backup_choices(
+    history: &phoenix_core::appdata::History,
+    browsed: &[String],
+) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut push = |cand: &String, out: &mut Vec<String>| {
+        if !cand.to_ascii_lowercase().ends_with(".phnx") {
+            return;
+        }
+        if seen.insert(cand.to_ascii_lowercase()) && Path::new(cand).is_file() {
+            out.push(cand.clone());
+        }
+    };
+    for cand in browsed {
+        push(cand, &mut out);
+    }
     for rec in history.records.iter().rev() {
         for cand in [&rec.target, &rec.source] {
-            if !cand.to_ascii_lowercase().ends_with(".phnx") {
-                continue;
-            }
-            if seen.insert(cand.to_ascii_lowercase()) && Path::new(cand).is_file() {
-                out.push(cand.clone());
-            }
+            push(cand, &mut out);
         }
     }
     out
+}
+
+/// How many hand-browsed backups to remember. Enough to cover working with
+/// a handful of external drives, short enough that the dropdown stays a
+/// list rather than an archive.
+const BROWSED_BACKUPS_MAX: usize = 12;
+
+/// Record a hand-picked backup as the newest entry, dropping any duplicate
+/// and any path that has since disappeared.
+fn remember_browsed_backup(browsed: &mut Vec<String>, picked: &str) {
+    browsed.retain(|p| !p.eq_ignore_ascii_case(picked) && Path::new(p).is_file());
+    browsed.insert(0, picked.to_string());
+    browsed.truncate(BROWSED_BACKUPS_MAX);
 }
 
 /// The backup chooser shared by the Restore, Verify, and Mount pages: a
@@ -2819,6 +2845,9 @@ fn backup_path_picker(
     hint: &str,
     path: &mut String,
     history: &phoenix_core::appdata::History,
+    // Hand-browsed backups, newest first. Browse… appends to this, so a
+    // backup the job history has never seen still shows up in the list.
+    browsed: &mut Vec<String>,
     mut on_path_changed: Option<&mut dyn FnMut()>,
 ) -> bool {
     ui.horizontal(|ui| {
@@ -2843,7 +2872,7 @@ fn backup_path_picker(
                 .width(combo_w)
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
-                    let choices = history_backup_choices(history);
+                    let choices = history_backup_choices(history, browsed);
                     if choices.is_empty() {
                         ui.label(
                             egui::RichText::new(
@@ -2890,6 +2919,7 @@ fn backup_path_picker(
         {
             if let Some(picked) = pick_backup_open_path(path) {
                 *path = picked.display().to_string();
+                remember_browsed_backup(browsed, path);
                 chosen = true;
                 if let Some(cb) = on_path_changed {
                     cb();
@@ -2916,32 +2946,22 @@ fn page_header_badged(
     badge: &str,
 ) {
     ui.add_space(4.0);
-    // Bottom-aligned rather than the default centre: against 22pt bold, a
-    // vertically-centred 13pt aside floats halfway up the title's cap
-    // height. Aligning the boxes' bottoms puts the two descender lines
-    // together, which reads as sitting on the same baseline.
-    //
-    // The row MUST be allocated at the title's own height. A bottom-aligned
-    // layout fills the height it is given, so handing it the available
-    // space (as `with_layout` does) bottom-aligns the title against the
-    // whole viewport and pushes the page off the bottom of the screen.
     let title_font = fonts::bold(22.0);
-    let row_h = ui.fonts(|f| f.row_height(&title_font));
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), row_h),
-        egui::Layout::left_to_right(egui::Align::Max),
-        |ui| {
-            ui.label(egui::RichText::new(title).font(title_font.clone()));
-            if !badge.is_empty() {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(badge)
-                        .font(fonts::regular(13.0))
-                        .color(palette.subtle_text),
-                );
-            }
-        },
-    );
+    let title = ui.label(egui::RichText::new(title).font(title_font));
+    if !badge.is_empty() {
+        // Painted, not laid out: the badge stacks directly above the title
+        // without displacing it or anything below it. It overhangs the
+        // content area into the page's top margin, so the painter's clip
+        // rect is expanded — otherwise it would be silently cut off.
+        let painter = ui.painter().with_clip_rect(ui.clip_rect().expand(24.0));
+        painter.text(
+            egui::pos2(title.rect.left(), title.rect.top() - 1.0),
+            egui::Align2::LEFT_BOTTOM,
+            badge,
+            fonts::regular(12.0),
+            palette.subtle_text,
+        );
+    }
     if !subtitle.is_empty() {
         ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
     }
@@ -2987,7 +3007,13 @@ fn paint_page_hazard_band(ui: &egui::Ui) {
     stripes::paint(&painter, rect, yellow, PAGE_HAZARD_STRIPE_W, 0.0);
     // Wash it back most of the way at the top, then all the way by the
     // bottom edge, so the band has no hard border to give itself away.
-    stripes::fade_into(&painter, rect, ui.visuals().panel_fill, 205);
+    //
+    // Lighter wash in light mode: the tape is dark-on-yellow, so a pale
+    // panel colour laid over it flattens the contrast far faster than a
+    // dark one does, and the same alpha that reads as "muted" on dark
+    // reads as "invisible" on light.
+    let wash = if ui.visuals().dark_mode { 205 } else { 165 };
+    stripes::fade_into(&painter, rect, ui.visuals().panel_fill, wash);
 }
 
 impl PhoenixApp {
@@ -3297,10 +3323,12 @@ impl PhoenixApp {
             "Select or browse for a .phnx backup",
             &mut self.restore_backup_path,
             &self.history,
+            &mut self.settings.browsed_backups,
             None,
         );
         if chosen {
             self.restore_backup_load_now = true;
+            let _ = self.settings.save();
         }
     }
 
@@ -3717,9 +3745,13 @@ impl PhoenixApp {
                     "Select or browse for a .phnx backup",
                     &mut self.mount_backup_path,
                     &self.history,
+                    &mut self.settings.browsed_backups,
                     None,
                 );
             });
+            if chosen {
+                let _ = self.settings.save();
+            }
             let path_changed = chosen && self.mount_backup_path != path_before;
             if path_changed
                 || (self.mount_source.is_none()
@@ -4328,6 +4360,10 @@ impl PhoenixApp {
         };
         let palette = self.palette;
         let mut vm_state = std::mem::take(&mut self.vm);
+        // Taken out and put back like `vm_state`: the page needs it mutably
+        // while other `self.settings` fields are borrowed alongside it.
+        let mut browsed = std::mem::take(&mut self.settings.browsed_backups);
+        let browsed_before = browsed.len();
         let mut action = vm_panel::VmAction::None;
 
         // Painted against the panel rather than inside the scroll shell, so
@@ -4355,6 +4391,7 @@ impl PhoenixApp {
                     dir: qemu_dir.as_deref(),
                 }),
                 &self.history,
+                &mut browsed,
                 &self.settings.vm_iso_history,
                 &drivers,
                 &sessions,
@@ -4363,6 +4400,11 @@ impl PhoenixApp {
             );
         });
         self.vm = vm_state;
+        let browsed_changed = browsed.len() != browsed_before;
+        self.settings.browsed_backups = browsed;
+        if browsed_changed {
+            let _ = self.settings.save();
+        }
 
         match action {
             vm_panel::VmAction::None => {}
