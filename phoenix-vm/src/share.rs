@@ -90,7 +90,12 @@ pub fn guest_mount_command() -> String {
 /// can't attach read-only, while guest writes to this image land in a
 /// throwaway per-session file — safe by construction.
 pub fn build_helper_disk(path: &Path) -> Result<()> {
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
+
+    const DISK_SIZE: u64 = 16 * 1024 * 1024;
+    const SECTOR: u64 = 512;
+    /// Partition start: 1 MiB, the standard alignment.
+    const PART_START_LBA: u32 = 2048;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -102,15 +107,37 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         .truncate(true)
         .open(path)
         .with_context(|| format!("create {}", path.display()))?;
-    // 16 MB → FAT16, which every Windows mounts as a plain (superfloppy) volume.
-    file.set_len(16 * 1024 * 1024).context("size helper disk")?;
+    file.set_len(DISK_SIZE).context("size helper disk")?;
 
+    // A real MBR with one FAT16 partition. A FIXED disk (which `ide-hd`
+    // presents) MUST carry a partition table: Windows mounts partitionless
+    // "superfloppy" layouts only from removable media, and shows a fixed one
+    // as an uninitialized disk with no drive letter (observed — the SIMULACRA
+    // drive was invisible in the guest).
+    let total_sectors = (DISK_SIZE / SECTOR) as u32;
+    let part_sectors = total_sectors - PART_START_LBA;
+    let mut mbr = [0u8; 512];
+    let entry = &mut mbr[0x1BE..0x1CE];
+    entry[0] = 0x00; // not bootable — this disk is never booted
+    entry[1..4].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS sentinel: use LBA
+    entry[4] = 0x0E; // FAT16 (LBA)
+    entry[5..8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    entry[8..12].copy_from_slice(&PART_START_LBA.to_le_bytes());
+    entry[12..16].copy_from_slice(&part_sectors.to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    file.seek(SeekFrom::Start(0)).context("seek to MBR")?;
+    file.write_all(&mbr).context("write MBR")?;
+
+    // Format the partition region (not the whole disk) as FAT.
+    let mut part = fscommon::StreamSlice::new(file, PART_START_LBA as u64 * SECTOR, DISK_SIZE)
+        .context("slice helper partition")?;
     fatfs::format_volume(
-        &mut file,
+        &mut part,
         fatfs::FormatVolumeOptions::new().volume_label(*b"SIMULACRA  "),
     )
     .context("format helper disk")?;
-    let fs = fatfs::FileSystem::new(file, fatfs::FsOptions::new())
+    let fs = fatfs::FileSystem::new(part, fatfs::FsOptions::new())
         .context("open helper disk filesystem")?;
     let root = fs.root_dir();
 
@@ -168,12 +195,22 @@ mod tests {
         let img = dir.join("helper.img");
         build_helper_disk(&img).unwrap();
 
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&img)
             .unwrap();
-        let fs = fatfs::FileSystem::new(file, fatfs::FsOptions::new()).unwrap();
+        // The MBR is what makes Windows mount a FIXED disk at all: one FAT16
+        // (LBA) partition at 1 MiB, boot signature present.
+        let mut mbr = [0u8; 512];
+        file.read_exact(&mut mbr).unwrap();
+        assert_eq!(&mbr[510..512], &[0x55, 0xAA]);
+        assert_eq!(mbr[0x1BE + 4], 0x0E);
+        assert_eq!(&mbr[0x1BE + 8..0x1BE + 12], &2048u32.to_le_bytes());
+
+        let part =
+            fscommon::StreamSlice::new(file, 2048 * 512, 16 * 1024 * 1024).unwrap();
+        let fs = fatfs::FileSystem::new(part, fatfs::FsOptions::new()).unwrap();
         assert_eq!(fs.volume_label(), "SIMULACRA");
         let mut cmd = String::new();
         fs.root_dir()
