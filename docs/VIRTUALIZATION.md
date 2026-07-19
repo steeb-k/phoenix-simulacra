@@ -264,7 +264,7 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
   1280x800 from WDDM handoff onward — on stdvga (QXL-DOD claims it) AND on
   virtio-vga (viogpu), with the vdagent channel removed, guest fully alive
   (QMP blockstats), deaf to wake keys and Win+P. Basic Display works
-  perfectly. Policy: the SIMULACRA helper disk ships
+  perfectly. Policy: the VMSCRIPTS helper disk ships
   `InstallGuestDrivers.cmd`, which pnputil-installs every useful driver
   family + qemu-ga from the CD and DELIBERATELY SKIPS qxldod/viogpudo; users
   should run it instead of the CD's guest-tools installer. A session that
@@ -570,10 +570,10 @@ is fine on defaults).
 **De-clunking (2026-07-19), since guest clipboard doesn't exist out of the
 box:**
 
-- **The "SIMULACRA" helper disk.** Sharing also builds a small real FAT16
+- **The "VMSCRIPTS" helper disk.** Sharing also builds a small real FAT16
   image per boot (`share::build_helper_disk`, `fatfs` crate) holding
   `MapShare.cmd` + README, attached as an extra never-booted disk on SATA port
-  `ide.3`. In the guest: open the SIMULACRA drive, double-click
+  `ide.3`. In the guest: open the VMSCRIPTS drive, double-click
   `MapShare.cmd` — no typing, no clipboard. A real image, NOT VVFAT: writable
   VVFAT is corruption-prone and IDE disks can't attach read-only; guest writes
   to this image land in a throwaway per-session file.

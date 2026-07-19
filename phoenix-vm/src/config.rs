@@ -103,17 +103,10 @@ pub struct HostOptions {
     /// zoom-to-fit scales the picture to the (maximized) window — but kept
     /// for future use as a native-mode hint.
     pub max_resolution: Option<(u32, u32)>,
-    /// Grab input whenever the pointer is over the QEMU window, so guest
-    /// hotkeys (Alt+Tab, the Windows key) reach the guest instead of the
-    /// host.
-    ///
-    /// Needed only once the SPICE agent is installed: the agent gives the
-    /// guest absolute pointer positioning, so QEMU stops grabbing input —
-    /// which is better for the mouse but sends hotkeys to the host. Off by
-    /// default, as in QEMU, because it means moving the pointer across the
-    /// window silently takes the keyboard. `Ctrl+Alt+G` toggles the same
-    /// grab by hand regardless of this setting.
-    pub grab_on_hover: bool,
+    // `grab_on_hover` lived here, driving `-display gtk,grab-on-hover=on` so
+    // guest hotkeys reached the guest. Removed after testing: it did not
+    // capture reliably, and while enabled it broke `Ctrl+Alt+G` — the manual
+    // grab toggle that works fine on its own. Use that instead.
     /// Dress the QEMU window's GTK chrome — menu bar, borders, the padding
     /// around the guest picture — in a dark theme, to match the app.
     ///
@@ -160,7 +153,6 @@ impl Default for HostOptions {
             accel: Accel::Whpx,
             controller_override: None,
             network: false,
-            grab_on_hover: false,
             dark_window: false,
             max_resolution: None,
             clipboard_agent: false,
@@ -267,8 +259,6 @@ pub struct VmConfig {
     pub max_resolution: Option<(u32, u32)>,
     /// See [`HostOptions::clipboard_agent`].
     pub clipboard_agent: bool,
-    /// See [`HostOptions::grab_on_hover`].
-    pub grab_on_hover: bool,
 }
 
 impl VmConfig {
@@ -322,7 +312,6 @@ impl VmConfig {
             network: host.network,
             max_resolution: host.max_resolution,
             clipboard_agent: host.clipboard_agent,
-            grab_on_hover: host.grab_on_hover,
         })
     }
 
@@ -360,9 +349,6 @@ impl VmConfig {
         let mut display = String::from("gtk,zoom-to-fit=on");
         if self.clipboard_agent {
             display.push_str(",clipboard=on");
-        }
-        if self.grab_on_hover {
-            display.push_str(",grab-on-hover=on");
         }
         push("-display");
         push(&display);
@@ -404,7 +390,7 @@ impl VmConfig {
         }
 
         // QEMU guest agent channel: lets the host run diagnostics/repairs
-        // inside a guest that has qemu-ga (from the SIMULACRA driver script).
+        // inside a guest that has qemu-ga (from the VMSCRIPTS driver script).
         if let Some(port) = spec.qga_port {
             push("-chardev");
             push(&format!(
@@ -506,7 +492,7 @@ impl VmConfig {
             push("ide-cd,drive=cd1,bus=ide.2");
         }
 
-        // The "SIMULACRA" helper disk (MapShare.cmd) on the next SATA port.
+        // The "VMSCRIPTS" helper disk (MapShare.cmd) on the next SATA port.
         // A plain raw disk, no bootindex — the guest just opens it.
         if let Some(img) = &spec.helper_disk {
             push("-drive");
@@ -540,7 +526,7 @@ pub struct BootSpec {
     pub qmp_port: Option<u16>,
     /// TCP port for the QEMU guest-agent channel (`org.qemu.guest_agent.0`
     /// virtserialport → loopback socket). Inert until the guest has the
-    /// vioserial driver + qemu-ga service (both installed by the SIMULACRA
+    /// vioserial driver + qemu-ga service (both installed by the VMSCRIPTS
     /// disk's driver script); with them, the host can run diagnostics inside
     /// the guest — the lever that cracked the black-screen investigation.
     pub qga_port: Option<u16>,
@@ -548,7 +534,7 @@ pub struct BootSpec {
     /// read-only CD-ROM. Never given boot priority — the guest browses it to
     /// install drivers and helpers.
     pub drivers_iso: Option<String>,
-    /// Path to the per-session "SIMULACRA" helper disk image (FAT, holds
+    /// Path to the per-session "VMSCRIPTS" helper disk image (FAT, holds
     /// MapShare.cmd; see `share::build_helper_disk`), attached as an extra
     /// never-booted disk.
     pub helper_disk: Option<String>,
@@ -789,24 +775,18 @@ mod tests {
     }
 
     #[test]
-    fn grab_on_hover_is_opt_in_and_composes_with_clipboard() {
+    fn grab_on_hover_never_comes_back() {
+        // It captured unreliably AND broke Ctrl+Alt+G, the manual toggle
+        // that works on its own. Nothing may put it back on the display arg.
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
-        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
-        assert!(!cfg
-            .qemu_args(&spec_uefi_raw())
-            .join(" ")
-            .contains("grab-on-hover"));
-
-        // Both display options are independent and must coexist on one
-        // `-display` argument, not fight over it.
         let host = HostOptions {
-            grab_on_hover: true,
             clipboard_agent: true,
             ..HostOptions::default()
         };
         let cfg = VmConfig::from_manifest(&m, &host).unwrap();
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
-        assert!(args.contains("-display gtk,zoom-to-fit=on,clipboard=on,grab-on-hover=on"));
+        assert!(!args.contains("grab-on-hover"));
+        assert!(args.contains("-display gtk,zoom-to-fit=on,clipboard=on"));
     }
 
     #[test]

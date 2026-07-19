@@ -1077,7 +1077,6 @@ impl PhoenixApp {
         if let Some(c) = app.settings.vm_cpus {
             app.vm.cpus = c;
         }
-        app.vm.grab_keyboard = app.settings.vm_grab_keyboard;
         app.init_updates();
         app
     }
@@ -2833,6 +2832,52 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
     });
 }
 
+/// Best-practices guide for booting backups as VMs.
+const VM_WIKI_URL: &str = "https://github.com/steeb-k/phoenix-simulacra/wiki";
+
+/// The "read the guide first" card under the Virtualize header.
+///
+/// Booting a backup has more sharp edges than the rest of the app — guest
+/// tools, when to connect the network, what a session actually keeps — and
+/// most of them are cheaper to read about than to discover. Styled as a card
+/// rather than a plain line so it reads as part of the page furniture and
+/// survives being scrolled past, but deliberately not hazard tape: the page
+/// header already carries that, and a second alarm devalues the first.
+fn vm_wiki_notice(ui: &mut egui::Ui, palette: &Palette) {
+    egui::Frame::none()
+        .fill(palette.content_card_bg)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    egui::RichText::new(egui_phosphor::regular::BOOK_OPEN)
+                        .font(fonts::icon(16.0))
+                        .color(palette.accent),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("You are strongly encouraged to read the")
+                        .color(palette.subtle_text),
+                );
+                ui.hyperlink_to(
+                    egui::RichText::new("Virtualization best practices guide")
+                        .color(palette.accent),
+                    VM_WIKI_URL,
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "before booting a backup — it covers guest tools, networking, \
+                         and how sessions keep your changes.",
+                    )
+                    .color(palette.subtle_text),
+                );
+            });
+        });
+    ui.add_space(12.0);
+}
+
 /// Ignore an overflow smaller than this — a stray pixel or two of rounding
 /// isn't "more to see", and an indicator that shows for it is noise.
 const MORE_BELOW_MIN: f32 = 6.0;
@@ -4507,6 +4552,7 @@ impl PhoenixApp {
 
         page_scroll_shell(ui, "virtualize_page", |ui| {
             page_header_badged(ui, &palette, "Virtualize", "", "Experimental");
+            vm_wiki_notice(ui, &palette);
             let running =
                 running_owned
                     .as_ref()
@@ -4674,12 +4720,10 @@ impl PhoenixApp {
         if scratch_now != self.settings.vm_scratch_drive
             || self.settings.vm_memory_mib != Some(self.vm.mem_mib)
             || self.settings.vm_cpus != Some(self.vm.cpus)
-            || self.settings.vm_grab_keyboard != self.vm.grab_keyboard
         {
             self.settings.vm_scratch_drive = scratch_now;
             self.settings.vm_memory_mib = Some(self.vm.mem_mib);
             self.settings.vm_cpus = Some(self.vm.cpus);
-            self.settings.vm_grab_keyboard = self.vm.grab_keyboard;
             let _ = self.settings.save();
         }
     }
@@ -4886,7 +4930,6 @@ impl PhoenixApp {
             clipboard_agent: self.qemu.as_ref().is_some_and(|q| q.gtk_clipboard),
             // Dress the QEMU window to match the app's theme.
             dark_window: !theme::is_light(self.settings.theme),
-            grab_on_hover: self.vm.grab_keyboard,
             ..phoenix_vm::HostOptions::default()
         };
         let iso = {
@@ -4922,7 +4965,7 @@ impl PhoenixApp {
             }
         };
         let share_active = share_cmd.is_some();
-        // The "SIMULACRA" helper disk carries MapShare.cmd into the guest so
+        // The "VMSCRIPTS" helper disk carries MapShare.cmd into the guest so
         // mapping the share is a double-click, not transcription — and
         // InstallGuestDrivers.cmd, which matters MOST with networking off,
         // since that is exactly when the guest can't fetch anything itself.

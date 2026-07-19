@@ -478,7 +478,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                     phoenix_vm::share::ensure_share(&dir)?;
                     println!("Sharing {} with the guest.", dir.display());
                     println!(
-                        "In the guest: open the SIMULACRA drive and run MapShare.cmd, or run:  {}",
+                        "In the guest: open the VMSCRIPTS drive and run MapShare.cmd, or run:  {}",
                         phoenix_vm::share::guest_mount_command()
                     );
                 }
