@@ -236,14 +236,35 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
    manifest (unit-tested matrix), command-line builder, process
    lifecycle + teardown.
 4. **Sessions:** persistent overlay + `session.json`, resume/discard,
-   orphan sweep. CLI: `phoenix vm boot|list|discard`.
-5. **Windows guest boot** on a real capture (AHCI path), working the 0x7B
-   list. This is where the exploration proves or disproves itself.
+   orphan sweep. CLI: `simulacra-cli vm boot|list|discard`. **DONE** — the
+   `phoenix-vm` crate (`config`/`qemu`/`session`/`boot`) + the CLI subcommand
+   ship the session manager; sessions live under
+   `%LOCALAPPDATA%\PhoenixSimulacra\vm-sessions\{backup_id}\`, keyed so resume
+   reuses the existing overlay. Validated: `vm boot` boots the real Win11
+   backup to the lock screen through the crate.
+5. **Windows guest boot** on a real capture (AHCI path). **DONE** (milestone 5
+   above) — both write layers boot; Option A (`.avhdx`) is committed.
 6. **GUI page:** "Virtualize" page (or an action on Mount) with the session
-   list, boot/discard, RAM/CPU knobs — sticky-action-bar pattern.
-7. **Tests:** T1 = config-matrix snapshots (no QEMU). T2-style boot smoke
-   needs QEMU on the runner box and is heavy — likely a staged script plus a
-   manual checklist entry, like the live-VSS checklist, rather than cargo tests.
+   list, boot/discard, RAM/CPU knobs — sticky-action-bar pattern. **NEXT.**
+7. **Tests:** T1 config-matrix snapshots **DONE** (`phoenix-vm` unit tests:
+   config synthesis + session create/resume/discard, no QEMU). Live boot stays
+   an env-gated systest + manual checklist (needs QEMU + elevation on the box).
+
+### Still open before this is shippable
+
+- **Serve-path resume proof.** The serve path is deterministic
+  (`serve-{backup_id}/backup.vhdx`) and `boot.rs` reuses an existing overlay,
+  but a full stop→resume→continue cycle hasn't been exercised live yet; verify
+  the differencing child reconnects to the re-served parent across process
+  restarts.
+- **Crash/orphan sweep for VM sessions.** The mount stack sweeps stale
+  `serve-*` junctions + `child-*.avhdx`; VM sessions keep their overlay by
+  design, so the sweep must distinguish "kept session overlay" from "leaked
+  attach" (a dirty `clean_shutdown=false` session whose host died).
+- **Boot-it-or-mount-it interop** (`vm mount`): open a session's `.avhdx`
+  through the writable-mount letters flow to browse/extract without booting.
+- Readahead / parallel chunk decode (throughput), NVMe-on-stable-QEMU retest,
+  MBR synthesis for BIOS captures, QEMU bundling — all as noted above.
 
 ## Guest access / login prep (planned feature)
 
