@@ -1,687 +1,205 @@
-# Virtualization: booting backups as virtual machines
+# Booting a backup as a virtual machine
 
-Status: **exploration branch** (`virtualization`). This supersedes and
-concretizes the earlier sketch in [QEMU-BOOT.md](QEMU-BOOT.md); that document
-stays as the original Phase 2 notes until this plan settles.
+Boot a `.phnx` backup as a live VM — to verify a backup actually boots, recover data from a running OS, or keep working off a dead machine's last backup. The backup is never modified and is never materialized to disk: QEMU reads the guest's disk on demand through a WinFsp filesystem that synthesizes it from the `.phnx`, and every guest write lands in a copy-on-write overlay.
 
-## Goal
+Simulacra drives an **external QEMU** with a generated command line rather than integrating a hypervisor. QEMU needs no service install (unlike the Hyper-V role or VirtualBox drivers), is scriptable, and is the only part of this feature not shipped in the app.
 
-Boot a `.phnx` backup as a live VM — verify a backup actually boots, recover
-data from a running OS, or keep working off a dead machine's last backup —
-without modifying the backup and without materializing it to disk.
+The feature is x86_64-only and absent from portable builds — see [Availability](#availability).
 
-Three decisions are taken as premises for this branch:
+## Scope
 
-1. **QEMU wrapper, not a hypervisor integration.** We drive an external QEMU
-   with an auto-generated command line. QEMU is open-source, scriptable,
-   cross-platform, and needs no service install (unlike Hyper-V role or
-   VirtualBox drivers). We do not bundle it initially — we detect it (see
-   below).
-2. **Reuse the write-overlay machinery from the writable mount.** The backup
-   stays immutable; all guest writes land in a copy-on-write layer, exactly
-   like "Enable Write Access" on the Mount page.
-3. **Sessions are persistent and tracked.** Unlike the writable mount's
-   ephemeral child (deleted on unmount), a VM session's overlay is *kept* by
-   default and tracked, so the user can shut the VM down, come back tomorrow,
-   and continue — and explicitly discard the session when done with it.
+**In:** UEFI/GPT Windows guests booted from a single-disk capture; persistent, resumable sessions; rescue-ISO boot; host↔guest file exchange; guest tooling and clipboard; opt-in guest networking.
 
-## Where it lives: in the main app, as a new crate
+**Out:** multi-disk systems (one `.phnx` is one disk — a system spanning disks would need multi-backup sessions); TPM emulation, and therefore Windows Hello PIN; Secure Boot; MBR/BIOS captures (see [Limitations](#limitations)).
 
-Recommendation: a new workspace crate **`phoenix-vm`** (library) wired into
-`phoenix-cli` (a `vm` subcommand) first and the GUI (a "Boot as VM" action)
-second — not a separate application.
-
-Rationale:
-
-- The read path *is* `phoenix-mount` (`WinFspServe` + `SyntheticVhd` +
-  `ChunkStore`). A separate app would either duplicate that stack or grow an
-  IPC layer for no benefit.
-- Session bookkeeping wants the same scratch-dir, cleanup-on-crash, and
-  "orphan sweep" discipline the mount code already has (`clean_stale_mount_dirs`).
-- The GUI already has the pattern for this: a page plus `current_page_action`
-  for the sticky Start bar, same as Mount/Clone/Boot-repair.
-- If it ever needs to ship separately, the crate boundary makes that cheap.
-  The reverse (extracting it out of a monolith later) is not.
-
-The one thing that stays external is QEMU itself.
+Deliberately **not built:** offline password or PIN bypass. Blanking a hash cascades into losing DPAPI-protected secrets sealed to the original password, patching the verification path is bootkit-shaped and trips antivirus, and neither helps against a Microsoft account. The locked-out-of-your-own-guest case is served by rescue-ISO boot instead.
 
 ## Architecture
 
-### Read path (settled)
+### Read path
 
-`WinFspServe` already projects the synthesized image as a **read-only VHDX
-file** on a WinFsp filesystem — a real path any program can open. Today that
-file is used as the differencing parent of the writable mount's `.avhdx`
-child; for VM use, the same served file is the VM disk's immutable base. Every
-read is answered on demand from the `.phnx` and BLAKE3-verified, footprint-free.
+`WinFspServe` projects the synthesized disk image as a read-only VHDX **file** on a WinFsp filesystem — a real path any program can open. Every read is answered on demand from the `.phnx` and BLAKE3-verified. Serving does not attach the disk to Windows, so nothing surfaces on the host while the guest runs and there is no double-mount hazard.
 
-Serving does not require attaching the disk to Windows, so nothing surfaces in
-the host while the guest runs — no double-mount hazard.
+**GPT identity must be boot-faithful.** The mount paths deliberately derive fresh disk and partition GUIDs as double-attach protection, but Windows' BCD references the OS partition by disk GUID plus PartitionId — derived GUIDs fail `winload.efi` with `0xc000000e`. `SyntheticVhd::build_vhdx_original_identity` / `WinFspServe::serve_for_vm` restore the manifest's original identity and GPT attribute bits. An image served this way must never be host-attached.
 
-### Write path — DECIDED: qcow2 (Option B)
+### Write path: qcow2
 
-> **Resolved 2026-07-19: qcow2 is the committed write path; Option A
-> (`.avhdx` raw passthrough) is EXPERIMENTAL and off by default.**
->
-> Option A boots Windows fine, but its **teardown is unreliable**: detaching a
-> differencing child whose parent lives on a WinFsp filesystem hangs in the
-> Windows storage driver. Measured across four configurations — in-process and
-> out-of-process serve, explicit `DetachVirtualDisk` and drop/`CloseHandle`
-> detach — **all four hang**; only one much earlier light-I/O spike ever
-> detached cleanly. A hang could leave an unkillable process needing a reboot.
-> qcow2 performs **no VHD attach anywhere**, so the entire deadlock class is
-> structurally impossible, and it is verified end-to-end (boots Windows 11;
-> lifecycle + resume green in `vm_overlay_lifecycle`).
->
-> Consequence, accepted deliberately: **mounts and VMs use different
-> differencing engines** — file-level mounts keep Windows differencing VHDX,
-> VMs use qcow2. The boot-it-or-mount-it interop that motivated Option A is
-> given up; browsing a VM session's files would need another route (expose the
-> qcow2 via `qemu-nbd`, or an offline `qemu-img` conversion/export).
->
-> The out-of-process serve helper built while chasing this is kept: it didn't
-> fix the detach, but it turned a hang from "unkillable process, reboot" into
-> "kill one helper, done".
+The served VHDX is the read-only backing file of a per-session qcow2 (`qemu-img create -f qcow2 -b <served>.vhdx -F vhdx session.qcow2`), and QEMU does copy-on-write into the qcow2. No VHD attach happens anywhere in this path.
 
-Constraint discovered up front: **QEMU's `vhdx` block driver does not support
-differencing (parented) VHDX images.** So QEMU cannot do its I/O directly
-against a `child-*.avhdx`. The two shapes considered:
+A raw-passthrough alternative exists (`WriteLayer::Avhdx`: a Windows differencing `.avhdx` attached offline, QEMU doing raw I/O against `\\.\PhysicalDriveN`) and is **experimental, off by default**. It boots fine; its *teardown* is unreliable. Detaching a differencing child whose parent lives on a WinFsp filesystem hangs in the Windows storage driver — measured across in-process and out-of-process serve, and across explicit `DetachVirtualDisk` and drop-based detach. A hang can leave an unkillable process needing a reboot, so qcow2 is the committed path: it makes the entire deadlock class structurally impossible.
 
-**Option A — raw physical-drive passthrough over the existing `.avhdx` child
-(EXPERIMENTAL; teardown unreliable — see the box above).** Reuse the shipped
-overlay *literally*:
+The accepted consequence is that **mounts and VMs use different differencing engines** — file-level mounts use Windows differencing VHDX, VMs use qcow2. A VM session's files therefore cannot be browsed with the writable mount; that would need `qemu-nbd` or an offline `qemu-img` conversion.
 
-1. Serve the parent VHDX via `WinFspServe` (as today).
-2. Create/open the session's differencing child (`create_differencing_vhdx`,
-   as today) and attach it **read-write with no drive letters and the disk
-   forced offline**, so the host's filesystem stack never touches the volumes.
-3. Point QEMU at the attached raw disk: `\\.\PhysicalDriveN`,
-   `format=raw`. Guest writes flow through the Windows storage stack into the
-   `.avhdx`; the parent stays read-only (`RWDepth = 1`, same as the writable
-   mount).
+### Sessions
 
-Pros: one overlay format for everything; a VM session's `.avhdx` can later be
-mounted with the *existing* writable mount to browse/extract files (VM boot
-and file-level mount become two views of the same session — not
-simultaneously, enforced by session state). All the attach/cleanup code
-exists. Cons: Windows-only, requires admin (the app already runs elevated),
-and QEMU-on-raw-physical-device is a less common configuration to get right
-(caching flags, exclusive access).
+A session is one backup plus one overlay plus its saved VM state: the qcow2, a per-session UEFI NVRAM varstore, and `session.json` (backup id, timestamps, resolved settings, clean/dirty flag). Guest writes are **kept** by default — stop the VM, come back later, resume — and discarded explicitly.
 
-**Option B — qcow2 overlay over the served VHDX.** QEMU-native: the served
-parent VHDX is the read-only backing file of a qcow2
-(`qemu-img create -f qcow2 -b <served>.vhdx -F vhdx session.qcow2`), QEMU does
-CoW into the qcow2. Pros: the boring, extremely well-trodden QEMU path; no
-disk attach at all; qcow2 internal snapshots come free; portable off-Windows
-someday. Cons: a *second* overlay format — a qcow2 session cannot be browsed
-by the Windows writable mount (only by booting the VM, or an offline
-`qemu-img` conversion); depends on QEMU's VHDX reader handling our synthesized
-VHDX (needs an early spike to confirm).
+Everything a session creates lives on the **same volume as the `.phnx`**, under `<image-drive>:\PhoenixSimulacra\{vm-sessions,vm-serve}`. A backup on `D:` must never fill `C:`. The GUI offers a scratch-drive picker (with free space per volume) for cases where the image's drive is the wrong home for a growing overlay — a slow or nearly-full external, say — and the choice persists in settings. It governs **new** sessions only: resume and discard follow the session's own root, captured in `Session::vm_root()`, so changing the dropdown can never redirect an existing session. `simulacra-cli vm boot --vm-dir` is the CLI equivalent; `vm list` scans every fixed volume, since sessions follow their image's drive and there is no single root to search.
 
-Both were spiked in milestone 2 and both booted Windows. A was chosen first for
-its session-interop appeal, then **reversed** once its teardown proved
-unreliable (box above). B — qcow2 — is the committed path, and is also the
-eventual non-Windows story.
+Only the overlay consumes real space. The served `backup.vhdx` is synthesized on demand, not materialized.
 
-### Session model
-
-A **VM session** = one backup + one overlay + one saved VM config.
-
-- Stored under a per-backup sessions directory next to the scratch dir:
-  overlay file + `session.json` (backup id, created/last-booted timestamps,
-  the resolved VM settings, dirty/clean shutdown flag).
-- Footprint = overlay growth only — the mount-space rule (never double a
-  backup's footprint) applies here unchanged.
-- Lifecycle verbs: `boot` (create session if none, else resume), `list`,
-  `discard`, and later `mount` (open the session's overlay in the writable
-  mount, Option A only) and possibly `commit` (fold a session into a new
-  `.phnx` — explicitly out of scope for this branch, noted so we don't design
-  it out).
-- Crash discipline: sessions survive crashes by design (they're persistent),
-  but a stale *attach* or WinFsp serve from a dead process gets swept exactly
-  like orphaned mount state today.
+Crash discipline: `sweep_serve_scratch` is scoped to `vm-serve` and never touches kept overlays. It also reaps an orphaned serve helper, identified by a per-helper PID file and only terminated after confirming the process image name is really ours — PIDs get recycled.
 
 ## Auto-configuration from the manifest
 
-The wrapper's job is "zero-question boot": derive every QEMU setting we can
-from what the backup already knows.
+The goal is zero-question boot: derive every setting from what the backup already knows. This is one pure function — manifest in, `VmConfig` out, then `VmConfig` to a command line — so the whole matrix is unit-tested without QEMU, WinFsp, or elevation.
 
 | Manifest fact | QEMU setting |
 |---|---|
-| `is_gpt` = true | UEFI firmware (edk2/OVMF `-drive if=pflash` pair — the Windows QEMU packages ship `edk2-x86_64-code.fd`), machine `q35` |
-| `is_gpt` = false (MBR) | SeaBIOS (default), machine `q35` still fine; `pc` as compat fallback |
-| `sector_size` = 4096 | `logical_block_size=4096,physical_block_size=4096` on the disk device (the guest saw 4Kn on real hardware; presenting 512e would break NTFS boot geometry assumptions) |
-| `size_bytes` | disk size (implicit from the base image) |
-| Partition `fs_kind` (NTFS/ReFS + ESP present) | Windows guest heuristics: AHCI controller (inbox `storahci` driver — avoids virtio 0x7B), `e1000e` NIC (inbox driver), `-cpu` with Hyper-V enlightenments |
-| Partition `fs_kind` (ext4/xfs/btrfs…) | Linux guest heuristics: virtio-blk + virtio-net directly (kernels carry the drivers), serial console available |
-| BitLocker state = locked | **Refuse to boot**, same message as the writable mount: a TPM-sealed volume cannot unseal on virtual hardware anyway |
-| BitLocker state = unlocked-at-capture | Boots (plaintext capture), but warn: guest may flip to recovery-key prompts on next lock/unlock cycles |
-| `drive_type` (SSD vs HDD) | `rotation_rate=1` for SSD-captured disks so the guest doesn't try to defrag/optimize as HDD |
+| `is_gpt` = true | UEFI firmware (edk2/OVMF pflash pair), machine `q35` |
+| `is_gpt` = false (MBR) | SeaBIOS; see [Limitations](#limitations) |
+| `sector_size` = 4096 | `logical_block_size=4096,physical_block_size=4096`, NVMe controller (IDE and AHCI are 512-byte only) |
+| Partition `fs_kind` (NTFS/ReFS + ESP) | AHCI `ide-hd` on q35 — Windows' inbox `storahci` boot driver, so no virtio injection and no `0x7B` |
+| `drive_type` = SSD | `rotation_rate=1`, so the guest doesn't schedule defragmentation |
+| BitLocker locked | **Refuse to boot** — a TPM-sealed volume cannot unseal on virtual hardware anyway |
+| BitLocker unlocked at capture | Boots from the plaintext capture; warn that the guest may prompt for a recovery key on later lock/unlock cycles |
 
-Host-side, not manifest-side:
+Host-side knobs (`HostOptions`): memory, vCPUs, acceleration, scratch drive, and the opt-in flags below. Memory and CPU sliders are colour-coded against the host's *available* RAM and total cores, and persist across launches.
 
-- **Acceleration:** probe for WHPX (`-accel whpx,kernel-irqchip=off`) and fall
-  back to TCG with a loud "this will be slow" warning. On ARM64 hosts there is
-  no WHPX for x86 guests at all — TCG only; document rather than block.
-- **RAM/CPUs:** default to min(half of host RAM, 8G) and min(host cores, 4),
-  user-overridable. These are the only knobs surfaced in the initial UI.
-- **Display/network:** QEMU's default GUI window; user-mode networking (slirp)
-  — no host network changes, guest gets outbound + DHCP, no inbound. A
-  "no network" toggle for forensic booting of possibly-compromised images.
+## The QEMU recipe
 
-Everything above lands in one pure function — manifest in, `VmConfig` out,
-then `VmConfig → Vec<String>` for the command line — so the whole matrix is
-unit-testable with snapshot tests, no QEMU needed (T1-friendly).
+Every element below is load-bearing; the reasons are recorded because they were expensive to find.
 
-## QEMU discovery
+- **`-machine q35`**, **`-accel whpx`** with the **default IRQ chip**. Passing `kernel-irqchip=off` wedges Windows at early kernel init — no bugcheck, no I/O, roughly 450 MB in — through userspace-APIC timer starvation.
+- **A rich named CPU model** (`Skylake-Client-v4`), which clears Windows 11's SSE4.2/POPCNT floor. **Never `-cpu max`** under WHPX: on APX-era hosts it exposes features the hypervisor cannot virtualize and the guest spins before video init.
+- **Writable copies of both pflash units.** Attaching the OVMF code flash `readonly=on` maps it as ROM, and **WHPX cannot execute from ROM-mapped memory** — OVMF then burns 100% CPU and never reaches video init.
+- **`bootindex` pinned on the OS disk.** Without it a fresh UEFI varstore spends minutes on PXE and HTTP boot attempts and drops to the UEFI shell without ever trying the disk.
+- **The NVRAM varstore is per-topology session state.** Reuse it only while the disk controller layout is unchanged, or stale `Boot####` entries dangle.
+- **`-vga none -device virtio-vga`, always.** Two reasons. Recent QXL-DOD builds *claim* QEMU's stdvga and render black at WDDM handoff, whereas virtio-vga is driven by the maintained viogpu driver — and boots fine driverless too, via Basic Display over the GOP framebuffer. And its firmware GOP tops out at 1920x1080, which combined with `zoom-to-fit` retires an older VRAM-capping hack entirely. The device must stay **stable across a session's boots**; swapping it makes the guest re-detect hardware.
+- **`-display gtk,zoom-to-fit=on`**, with `clipboard=on` appended only when the QEMU in use supports it. The window is maximized after launch (QEMU has no start-maximized switch — `full-screen=on` is borderless fullscreen, a different thing) by a watcher that finds the process's main window with `EnumWindows`.
+- **A CD gets its own SATA port** (`ide-cd,...,bus=ide.1`). q35 AHCI ports are single-unit, and QEMU auto-places an unbussed CD as unit 1 of the port the OS disk owns, then refuses to start. The drivers ISO takes `ide.2` and the helper disk `ide.3`; neither is ever given a `bootindex`.
+- **A QMP socket on an ephemeral loopback port**, recorded in the session. It carries graceful shutdown (`system_powerdown`), the network link toggle (`set_link`), and the immediate power-off used when the app closes.
 
-Search order: explicit setting (GUI settings / `--qemu-path`) → `PATH` →
-default install locations (`C:\Program Files\qemu`, the MSYS2 locations).
-Validate with `qemu-system-x86_64 --version` and record the version (feature
-gates: WHPX flags changed across versions). If not found, the GUI shows a
-"QEMU required" call-to-action with a link rather than failing cryptically.
+qemu-system and qemu-img are console applications; every spawn passes `CREATE_NO_WINDOW` and redirects output to a per-launch `qemu.log` in the session directory, whose tail is surfaced in the UI when a launch fails.
 
-**Bundling (decided): ship the QEMU installer in our installer, WinFsp-style.**
-Licensing is fine: QEMU is GPLv2, and bundling its unmodified installer next
-to our app is mere aggregation — it imposes nothing on our license, same as
-the WinFsp MSI we already ship. The GPL obligation we do pick up is
-*corresponding source*: pin the exact installer build we bundle and link (or
-archive) its matching source tarball in the release notes. Practicalities:
-the installer is large (~150–300 MB, a big jump for our installer), so the
-detect-first logic above stays — bundled QEMU installs only when none is
-found — and the runtime path still honors a user-supplied QEMU.
+### Guest restarts
 
-## Known hard parts (carried over, still true)
+**WHPX cannot reset a virtual processor in place.** A guest-initiated reboot — Windows Restart, exiting PE, a bugcheck auto-restart — surfaces as `WHPX: Unexpected VP exit code 4` in `qemu.log`, and QEMU then either exits cleanly or wedges alive with the scanout dead. Either way the user sees a restart kill the VM.
 
-- **`INACCESSIBLE_BOOT_DEVICE` (0x7B)** for physical-Windows captures whose
-  boot-critical storage driver doesn't match the virtual controller. AHCI
-  first (inbox driver on everything since Vista); virtio driver injection is a
-  later, optional "prep" feature, not milestone 1.
-- **Firmware NVRAM:** a UEFI guest wants a writable NVRAM varstore; per-session
-  copy of `edk2-i386-vars.fd` lives in the session directory (it's part of the
-  tracked session state — boot order changes persist with the session).
-- **TPM / Secure Boot / activation:** no TPM emulation initially (swtpm is
-  awkward on Windows); Secure Boot off; Windows may demand reactivation.
-  Documented limitations.
-- **Multi-disk systems:** one `.phnx` is one disk. Booting a system that
-  spans disks needs multi-backup sessions — out of scope, note in docs.
+`boot()` handles both. It relaunches QEMU against the same session when it sees that signature (the overlay, varstore and QMP port all persist), guarded against crash-looping by a 15-second minimum uptime and a 32-relaunch ceiling; a watchdog kills a QEMU that wedges rather than exits. The relaunch drops `boot_iso_first`, which makes the one-shot ISO semantics *more* correct: restarting out of a rescue ISO lands on the disk.
 
-## Boot-smoke findings (2026-07-18 — milestone 5 reached same-day)
+## Guest networking
 
-A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
-**booted to the login screen** in QEMU, served on demand from the `.phnx`
-(qcow2 write path). The validated recipe, and every trap found on the way:
+**Networking is opt-in and granted after boot, never at boot.** A connected Windows guest is offered a display driver by Windows Update within moments of first login, and that driver blanks the screen on the next reboot (see [Guest tools](#guest-tools-and-drivers)). Booting offline avoids the race entirely.
 
-- **GPT identity must be boot-faithful.** The mount paths derive fresh
-  disk/partition GUIDs (double-attach protection), but the BCD references the
-  OS partition by disk GUID + PartitionId — derived GUIDs fail `winload.efi`
-  with 0xc000000e. `SyntheticVhd::build_vhdx_original_identity` /
-  `WinFspServe::serve_for_vm` restore the manifest's original identity (plus
-  GPT attribute bits). Never host-attach an image served this way.
-- **WHPX cannot execute from ROM-mapped pflash.** OVMF attached with
-  `readonly=on` never reaches video init (100% CPU trap-storm). Fix: give
-  QEMU per-session **writable copies** of both firmware flashes.
-- **Never `-cpu max` under WHPX** on new hosts (APX-era): exposes features the
-  hypervisor can't virtualize and the guest spins pre-video. Use a rich named
-  model (`Skylake-Client-v4` clears Win11's SSE4.2/POPCNT floor).
-- **Don't pass `kernel-irqchip=off`.** With it, Windows wedges at early kernel
-  init (~450 MB in, no I/O, no bugcheck) — userspace-APIC timer starvation.
-  Default WHPX irqchip boots clean.
-- **Pin the OS disk with `bootindex=0`**, or a fresh OVMF varstore burns
-  minutes on PXE/HTTP and drops to the UEFI shell without trying the disk.
-- **NVRAM varstore is per-topology session state**: reuse it only while the
-  disk controller layout is unchanged, else stale Boot#### entries dangle.
-- **AHCI (`ide-hd` on q35) boots Windows 11 fine** — the inbox `storahci`
-  driver came up on a capture from NVMe hardware; no 0x7B, no injection
-  needed on this guest. QEMU's `nvme` device was invisible to this build's
-  OVMF even with explicit `nvme-ns` (dev-snapshot suspicion) — retest on
-  stable QEMU; NVMe remains required for 4Kn (IDE is 512-only).
-- **Use a stable QEMU release.** winget's SoftwareFreedomConservancy.QEMU was
-  a master-branch dev snapshot (11.0.50) with a broken/hanging OVMF; the
-  bundled-installer decision above should pin a known-good stable build.
-- **Throughput is the felt bottleneck**: a booting guest issues scattered 4K
-  reads, and every chunk-cache miss decompresses a whole 4 MiB chunk (up to
-  1000x amplification). Raising the chunkstore cache to 1.5 GiB made boots
-  practical; the real fix is readahead + parallel chunk decode (ROADMAP P3).
-  Boot-to-login was ~4 minutes on this rig, wall-clock dominated by that.
-- **TPM caveat confirmed as predicted**: Windows Hello PIN unavailable in the
-  guest (TPM-sealed); password sign-in works.
-- **Capping the guest resolution: only VRAM size works (2026-07-19).** The
-  Windows boot loader takes the LARGEST mode the firmware GOP offers and
-  ignores EDID outright — measured with headless PE boots + QMP `screendump`:
-  with `VGA,edid=on,xres=1592,yres=832` PE picked 1920x1080 (virtio-vga's GOP
-  ceiling), and again at 1024x640. OVMF's QemuVideoDxe filters a fixed mode
-  table by what fits in VRAM, so `VGA,vgamem_mb={4,8,16,32}` is the reliable
-  cap (4 MB → 1360x768 confirmed exactly). `vgamem_mb_for` maps the host's
-  usable screen (work area minus QEMU window chrome) to the largest safe tier.
-  Applied ONLY when booting the rescue ISO — a disk boot keeps QEMU's default
-  VGA, since the installed guest manages its own display modes.
-- **The ISO CD needs its own SATA port** (`ide-cd,...,bus=ide.1`): q35 AHCI
-  ports are single-unit, and QEMU auto-places an unbussed CD as unit 1 of the
-  port the OS disk owns, refusing to start.
-- **virtio-win DISPLAY drivers black-screen this VM (2026-07-19, unresolved
-  upstream-wise).** After installing guest tools, the guest renders black at
-  1280x800 from WDDM handoff onward — on stdvga (QXL-DOD claims it) AND on
-  virtio-vga (viogpu), with the vdagent channel removed, guest fully alive
-  (QMP blockstats), deaf to wake keys and Win+P. Basic Display works
-  perfectly. Policy: the VMSCRIPTS helper disk ships
-  `InstallGuestDrivers.cmd`, which pnputil-installs every useful driver
-  family + qemu-ga from the CD and DELIBERATELY SKIPS qxldod/viogpudo; users
-  should run it instead of the CD's guest-tools installer. A session that
-  already installed the display drivers needs safe-mode driver removal or a
-  fresh session. Clipboard (vdagent) remains open — needs a route that
-  doesn't involve the display drivers; `HostOptions::clipboard_agent` stays
-  off meanwhile.
-- **WHPX cannot reset a VP in place (2026-07-19).** A guest-initiated reboot
-  (Windows Restart, PE exit, bugcheck auto-restart) surfaces as `WHPX:
-  Unexpected VP exit code 4` in qemu.log and QEMU exits *cleanly* — from the
-  user's view any restart killed the VM. Fix: `boot()` relaunches QEMU against
-  the same session when it sees that signature (overlay/varstore/QMP port all
-  persist), with a crash-loop guard (min 15 s uptime, max 32 relaunches). The
-  relaunch drops `boot_iso_first`, which makes the one-shot ISO chain *more*
-  correct: restarting out of a rescue ISO lands on the disk.
-- **Known gap:** MBR/BIOS captures — the synthesis currently always presents
-  GPT, so a BIOS-mode guest can't boot its MBR layout yet. Needs MBR
-  synthesis before SeaBIOS boots are real.
+The NIC always exists; what changes is whether its cable is plugged in. The running-VM view has a Connect/Disconnect button that issues QMP `set_link` — instant, no reboot, nothing done inside the guest. Link state is host-side, so a guest cannot plug itself in, which makes an unplugged NIC as isolating as an absent one while leaving something to connect.
 
-## Milestones
+This is why the NIC is spelled out as `-netdev user,id=net0` plus `-device e1000e,netdev=net0,id=nic0` rather than the `-nic` shorthand: `set_link` addresses the device by name, and `-nic` generates an id that cannot be referred to reliably.
 
-1. **Plan + branch** (this document).
-2. **Write-path spike (decision point):** hand-drive both Option A (offline
-   attach + `\\.\PhysicalDriveN` raw) and Option B (qcow2 over served VHDX)
-   against a small Linux backup; measure stability and I/O sanity; pick.
-3. **`phoenix-vm` crate:** QEMU discovery, `VmConfig` synthesis from the
-   manifest (unit-tested matrix), command-line builder, process
-   lifecycle + teardown.
-4. **Sessions:** persistent overlay + `session.json`, resume/discard,
-   orphan sweep. CLI: `simulacra-cli vm boot|list|discard`. **DONE** — the
-   `phoenix-vm` crate (`config`/`qemu`/`session`/`boot`) + the CLI subcommand
-   ship the session manager; sessions live under
-   `%LOCALAPPDATA%\PhoenixSimulacra\vm-sessions\{backup_id}\`, keyed so resume
-   reuses the existing overlay. Validated: `vm boot` boots the real Win11
-   backup to the lock screen through the crate.
-5. **Windows guest boot** on a real capture (AHCI path). **DONE** (milestone 5
-   above) — both write layers boot; Option A (`.avhdx`) is committed.
-6. **GUI page:** "Virtualize" page (or an action on Mount) with the session
-   list, boot/discard, RAM/CPU knobs — sticky-action-bar pattern. **NEXT.**
-7. **Tests:** T1 config-matrix snapshots **DONE** (`phoenix-vm` unit tests:
-   config synthesis + session create/resume/discard, no QEMU). Live boot stays
-   an env-gated systest + manual checklist (needs QEMU + elevation on the box).
+One caveat: neither `e1000e` nor `virtio-net-pci` exposes a link-down property to start with, so the cable can only be pulled once the machine exists. `boot()` does it the moment QMP answers, retrying briefly. That window is milliseconds wide and sits in the firmware phase, long before a guest OS brings up a network stack — but it is a window, not a guarantee.
 
-### Storage location
+**slirp cannot express "host yes, internet no".** `restrict=on` is total isolation and drops guest→`10.0.2.2`, taking the SMB share with it. The `guestfwd` punch-through is a dead end: its chardev form is a single shared stream with no per-connection demultiplexing, so SMB's multiple connections would corrupt each other. The viable design is a Windows Firewall outbound rule scoped to `qemu-system-x86_64.exe`, since slirp turns guest→`10.0.2.2` into a loopback connection while internet traffic is an ordinary outbound socket from the same process. Unbuilt; loopback's exemption from WFP filtering wants verifying first.
 
-Everything a session creates — the write overlay, the per-session firmware,
-and the on-demand serve junctions — lives on the **same volume as the `.phnx`**,
-under `<image-drive>:\PhoenixSimulacra\{vm-sessions,vm-serve}`. Never the host
-OS drive: a backup on `D:` must not fill `C:`. `simulacra-cli vm boot --vm-dir`
-overrides the root; `vm list` scans every fixed volume (sessions follow their
-image's drive, so there is no single root to look in). Only the growing overlay
-consumes real space — the served `backup.vhdx` is a WinFsp file synthesized on
-demand, not materialized.
+## Host↔guest file exchange
 
-**Planned (GUI):** let the user pick the **scratch drive** for these difference
-files, rather than always defaulting to the image's volume. The image's drive is
-a good default, but it isn't always the right one — the backup may live on a
-slow or nearly-full external, while a fast local SSD is the better home for a
-growing overlay. The engine already supports this (`--vm-dir` takes any root),
-so the GUI needs a drive picker (showing free space per volume) that writes the
-chosen root into settings, with "same drive as the image" as the default choice.
+Windows already runs an SMB server on port 445, and a slirp guest reaches the host's loopback at the gateway address `10.0.2.2`. So the share needs no new server: the app `net share`s a folder next to the image at boot (it is already elevated), re-points it per run, and removes it at teardown. One share at a time, matching one VM at a time.
 
-### Throughput: fixed (~13 min → ~3 min to lock screen)
-
-**Resolved 2026-07-19.** The read path had three pathologies, all in
-`phoenix-mount::chunkstore`, and none of them were what the shape of the
-problem first suggested:
-
-1. **Every read cloned the whole `ExtentSpan`** — including its
-   `Vec<PlacedChunk>`, where each chunk carried a heap hex `String` hash. On a
-   108 GB partition that is tens of thousands of allocations *per read*. Fixed
-   by locating the chunk under an immutable borrow and copying out only the
-   (now heap-free, `Copy`) `PlacedChunk`; hashes are stored decoded as
-   `[u8; 32]`.
-2. **Every cache hit copied the whole 4 MiB chunk** to serve a 4 KiB read.
-   Fixed by caching `Arc<Vec<u8>>` so a hit is a refcount bump.
-3. **The cache was FIFO, not LRU** — `cache_order` was never touched on a hit,
-   so hot chunks were evicted on a fixed schedule and re-decompressed (and, on
-   a spinning disk, re-*seeked*). Fixed with promote-on-hit, plus
-   sequential-detection readahead.
-
-Measured (backup on a **7200-rpm HDD**, release build):
-
-| workload | before | after |
-|---|---|---|
-| random 4 KiB, cold | 52 reads/s (19.1 ms) | **200 reads/s (5.0 ms)** |
-| random 4 KiB, warm | 136 reads/s (7.4 ms) | **517 reads/s (1.9 ms)** |
-| sequential | 131 MB/s | 132 MB/s (already streaming) |
-| **boot → lock screen** | **~13 min** | **~3 min** |
-
-Two lessons worth keeping. **The backing store matters more than the CPU
-here:** on an HDD a cache miss costs a ~10 ms seek, so the wins came from
-*avoiding I/O* (LRU, readahead), not from decoding faster — parallel chunk
-decode would have been largely wasted, and parallel I/O on a spindle would
-have made it worse. And **measure the right workload**: sequential `dd` looked
-fine (131 MB/s) because it amortizes per-read cost over a whole 4 MiB chunk;
-only a scattered 4 KiB benchmark exposed the real problem.
-
-Still available if more is needed: reads all serialize on one mutex
-(`VhdFs::read` → `self.vhd.lock()`), so there is no read concurrency. On an
-HDD that matters little; on an SSD-backed image it would be the next lever.
-Putting the `.phnx` on an SSD is also simply faster — which is another reason
-for the GUI's scratch-drive picker.
-
-### (historical) Why this was thought to be a qcow2 problem
-
-End-to-end `simulacra-cli vm boot` on the real Win11 backup (2026-07-19):
-
-| write path | boot → lock screen | teardown |
-|---|---|---|
-| `.avhdx` raw passthrough | ~4 min | **hangs indefinitely** (needs reboot) |
-| **qcow2 (default)** | **~13 min** | **2 seconds, clean** |
-
-So the pivot bought correctness at a real cost in speed. Measured mid-boot:
-the **serve helper sits at ~50% of a single core** decompressing chunks while
-the guest absorbs only ~2 MB/s of writes, with ~1.2 GB resident in the chunk
-cache. The bottleneck is **single-threaded chunk decode in the serve process**,
-not QEMU and not the qcow2 layer: a booting guest issues scattered reads and
-each cache miss costs a whole 4 MiB chunk decompress.
-
-That promotes the throughput work (**readahead + parallel chunk decode**) from
-"nice to have" to **on the critical path** — 13 minutes to a lock screen is not
-shippable. It is also the same engine work backup/restore/verify already want
-(ROADMAP P3), so it pays off in both places.
-
-### Still open before this is shippable
-
-- ~~Serve-path resume proof.~~ **DONE 2026-07-19** for the qcow2 path
-  (`vm_overlay_lifecycle`): after stopping the serve helper and re-spawning it
-  at the same deterministic path, the qcow2 keeps its own writes *and* its
-  backing chain reconnects to the re-served parent (GPT still readable through
-  it). Guest-free, 12s, no attach.
-- ~~A full stop→resume→continue with a real guest.~~ **DONE 2026-07-19.**
-  boot 1 `--fresh` → lock screen → stop (teardown 2 s, no orphans); boot 2
-  reported "Resumed existing session", reused the overlay at exactly its prior
-  size (591 MB, not recreated), preserved `created_at`, and the guest booted
-  **without re-detecting hardware** — i.e. on its own previously-installed
-  device state, which is the real evidence of "continue". Overlay then grew
-  591 → 667 MB; `.phnx` still verifies.
-- ~~Crash/orphan sweep for VM sessions.~~ **DONE.** `sweep_serve_scratch` is
-  scoped to `vm-serve` and never touches kept overlays, and now reaps an
-  orphaned serve helper first (PID file per live helper; only terminates a
-  process whose image name is really ours, since PIDs get recycled).
-- ~~Graceful guest shutdown is missing.~~ **DONE 2026-07-19**: every boot opens
-  a QMP socket on an ephemeral loopback port (recorded in the session), and
-  `vm stop` / the GUI's Stop button send `system_powerdown` — a real ACPI
-  shutdown the guest performs itself.
-- ~~Boot-it-or-mount-it interop~~ — **dropped** with the qcow2 pivot. Browsing a
-  VM session's files needs a different route (`qemu-nbd`, or an offline
-  `qemu-img` conversion) if we still want it.
-- Readahead / parallel chunk decode (throughput), NVMe-on-stable-QEMU retest,
-  MBR synthesis for BIOS captures, QEMU bundling — all as noted above.
-- ~~Scratch-drive choice must persist + Resume must ignore it~~ **DONE
-  2026-07-19** (user hit it twice: Resume silently started a NEW session on
-  the default drive). The choice persists in Settings (`vm_scratch_drive`),
-  and Resume/Discard (table + boot dialog) now carry the session's own
-  `Session::vm_root()` through to boot; Stop uses the root captured in the
-  run. The dropdown governs NEW sessions only. Existing sessions resume
-  correctly — the fix is in the lookup, not the session data.
-- ~~QEMU window should open maximized~~ **DONE 2026-07-19**: `boot()` spawns a
-  watcher that finds the QEMU process's main window (EnumWindows by pid) and
-  maximizes it, and `-display gtk,zoom-to-fit=on` is pinned so the guest
-  scales to fill the window (GTK is also the clipboard-capable backend).
-  Watch for zoom-to-fit blur on small guest modes.
-- **Root-cause the `.avhdx` detach hang** if Option A is ever revived. The one
-  unexplained data point is the early spike that detached cleanly (in-process
-  serve, drop-based detach, light I/O, and a different attach storage-type
-  parameter). Not on the critical path now.
-
-## Guest access / login prep (DROPPED 2026-07-18)
-
-**Not building this.** The password/PIN bypass needs bootkit-like patching that
-trips antivirus; blanking passwords is useless against Microsoft accounts; and
-the qcow2 write layer means there is no offline-mountable overlay volume to
-edit a SAM hive in anyway. The locked-out-of-the-guest case is covered by the
-rescue-ISO boot instead. The original design notes stay below for the record.
-
-
-
-When you boot someone's backup to recover data or triage a dead machine, you
-often don't have their password — and Windows Hello PIN never works in a VM
-anyway (TPM-sealed, confirmed in the boot smoke). So VM sessions should offer
-**optional, opt-in guest-login prep**, applied to the throwaway overlay before
-boot so the backing `.phnx` is never touched:
-
-- **Enable the built-in Administrator account.** Offline `SYSTEM`/`SAM` hive
-  edit on the mounted session overlay: clear the `ACB_DISABLED` bit on RID 500
-  (and optionally blank its password). This is the same account state a
-  clean-install recovery drops you into.
-- **Bypass the password/PIN prompt** (the "Windows Login Unlocker"-style
-  option): the robust, reversible way is to patch the on-disk password
-  verification so any password is accepted for the session, rather than
-  blanking hashes — because a blanked hash can cascade into losing DPAPI-
-  protected secrets (saved credentials, EFS, browser data) that are sealed to
-  the original password. Patching the check leaves those recoverable. Do this
-  against the overlay only; the original backup keeps the real hashes.
-
-Design constraints:
-
-- **Overlay-only, always.** Every edit lands in the session's `.avhdx`/qcow2,
-  never the `.phnx` — the immutability guarantee is the whole point of the tool.
-- **Opt-in and clearly labelled** in the session UI (a checkbox at boot time,
-  off by default), because it modifies the guest OS's security state.
-- **BitLocker-gated.** A locked BitLocker OS volume can't be edited offline
-  (raw ciphertext) — refuse, same as the writable mount. An unlocked-at-capture
-  volume (plaintext image, like our test backup) is fine.
-- **Implementation options to weigh:** shell out to `chntpw`/`reged`-style
-  offline hive tooling vs. a small native SAM/`SYSTEM`-hive editor in Rust.
-  The mount stack already gives us the volume — this rides on top of a
-  session mount (the Option-A interop we just built).
-
-This is a legitimate recovery capability for the machine's owner acting on
-their own backup; it is deliberately session-scoped and reversible.
-
-## Boot-from-ISO, next-boot-only (planned feature)
-
-Let the user **attach an ISO and boot the VM from it on the next boot only** —
-to drop into an emergency PE / rescue environment (WinPE, a Windows recovery
-ISO, a live Linux) and inspect or repair the captured drive from the outside,
-then fall back to booting the disk normally.
-
-Why this is almost free in our model: we launch a fresh QEMU process on every
-boot, so "next boot only" isn't persistent state to track and revert — it's
-just a per-launch flag. A boot with the flag adds a read-only CD-ROM device
-for the ISO and gives it boot priority; the *next* boot (without the flag)
-simply doesn't, so it reverts automatically. No NVRAM varstore surgery, no
-one-shot bookkeeping.
-
-Sketch:
-
-- Add the ISO as a read-only optical device (`-drive
-  file=<iso>,media=cdrom,if=none,id=cd0` + an `ide-cd`/`scsi-cd`), and give it
-  `bootindex=0` for that launch so firmware tries it before the disk. (QEMU's
-  `-boot once=d` is the BIOS-path equivalent; with OVMF the per-device
-  `bootindex` is the reliable lever.)
-- The disk overlay is still attached, so the PE environment sees the guest's
-  own drive — and any repair it makes lands in the throwaway session overlay,
-  never the `.phnx`. This pairs naturally with the login-prep idea above (boot
-  PE → fix the OS volume offline → next boot into the repaired system).
-- UI: a "Boot from ISO next time" affordance on the session (pick a file);
-  it's inherently one-shot, so nothing to un-set.
-
-Notably this needs no new engine work — it's purely QEMU command-line
-assembly in `VmConfig`/`BootSpec`, so it slots in wherever the boot options
-UI lands.
-
-## Host↔guest file exchange + guest tooling (planned, spitballed 2026-07-18)
-
-The user wants an easy way to move files in and out of a booted guest, plus a
-way to get drivers/helpers into it. These are one cluster:
-
-- **The "just mount an SMB share" reflex doesn't work on a Windows host.**
-  QEMU's slirp SMB (`-netdev user,smb=…`) needs a host `smbd` (Samba), which
-  Windows doesn't have. virtio-9p/virtfs needs virtio drivers the guest lacks
-  inbox. So the obvious approach is a trap.
-- **What works with zero guest drivers: VVFAT.** `-drive file=fat:rw:<dir>`
-  exposes a host folder to the guest as a FAT disk (inbox driver + AHCI). A
-  **default shared folder next to the `.phnx`** could be surfaced this way and
-  show up as a drive letter in the guest. Caveat: QEMU's read-write VVFAT is
-  explicitly experimental and can corrupt — fine read-only, risky for guest
-  writes. So: read-only VVFAT is safe for *pushing* files in; for *pulling*
-  files out we may still want another channel (a second small writable disk
-  image the guest formats, or host SMB at `10.0.2.2` if we set up a share +
-  guest auth).
-- **Drivers/helpers as an ISO, not the share (user's refinement).** virtio-win
-  ships **as an ISO**, and we already have ISO attach + one-shot boot
-  (`--iso`/`--boot-iso`). So the driver-install story is just: attach a drivers
-  ISO as a second CD-ROM; the guest runs the installer from it. This sidesteps
-  the share-needs-drivers / drivers-need-share chicken-and-egg entirely.
-- **A guest-tools payload in the share (user's idea).** Drop a script/installer
-  (or a symlink) into the default share folder that installs QEMU/virtio
-  drivers and any helper software once run inside the guest. With a read-only
-  VVFAT share this is safe (guest reads + runs; doesn't write back), and it
-  composes with the drivers-ISO idea — the share can just *point at* or carry
-  the installer.
-
-Rough plan when we build it: (1) a read-only VVFAT default share rooted next to
-the image, shown as a drive in the guest; (2) ~~an "attach drivers ISO"
-affordance~~ **DONE 2026-07-19**: the GUI offers "Attach guest tools and driver
-ISO" (virtio-win, downloaded on demand next to the app with progress + a
-check-for-updates HEAD comparison; attached as a second never-booted CD on
-`ide.2`); (3) a small guest-tools installer we place in the share.
-
-**Writable channel: SMB — SHIPPED v1 2026-07-19 (copy-paste mount).** No new
-server needed: Windows already runs an SMB server on 445, and a slirp guest
-reaches the host's loopback at the gateway address `10.0.2.2`. The app
-`net share`s a `SimulacraShare` folder next to the image at boot (elevated
-already; share re-pointed per run, removed at teardown, one at a time like the
-VMs), and the Running view / CLI hand the user the one command to paste inside
-the guest:
+The guest maps it with:
 
 ```text
-net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user
+net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user /persistent:yes
 ```
 
-authenticated with the host account's password (Microsoft-account PCs: the
-Microsoft-account password). Mapping can't be automatic — the guest can't be
-reached before it boots. GUI: "Shared folder" checkbox (default on, requires
-networking); CLI: `--share`. Caveats to watch on real guests: inbound NTLM
-disabled by policy, or SMB-client guest-auth hardening (authenticated access
-is fine on defaults).
+authenticated with the host account's password — on a Microsoft-account PC, the Microsoft-account password. Mapping cannot be automatic, because the guest cannot be reached before it boots.
 
-**De-clunking (2026-07-19), since guest clipboard doesn't exist out of the
-box:**
+Saving the credential as well is not possible with one command: `net use` refuses to combine `/savecred` with `/persistent:yes`, so a mapping can be remembered or its credential can be, never both. Storing it separately with `cmdkey` parses but does not help — `net use` prompts anyway, so the guest asks twice rather than once. The mapping is remembered; the password is re-entered after a guest reboot.
 
-- **The "VMSCRIPTS" helper disk.** Sharing also builds a small real FAT16
-  image per boot (`share::build_helper_disk`, `fatfs` crate) holding
-  `MapShare.cmd` + README, attached as an extra never-booted disk on SATA port
-  `ide.3`. In the guest: open the VMSCRIPTS drive, double-click
-  `MapShare.cmd` — no typing, no clipboard. A real image, NOT VVFAT: writable
-  VVFAT is corruption-prone and IDE disks can't attach read-only; guest writes
-  to this image land in a throwaway per-session file.
-- **Clipboard sharing.** Every boot attaches `virtio-serial-pci` + a
-  `qemu-vdagent` chardev (`clipboard=on`) + `virtserialport`
-  (`com.redhat.spice.0`) — the GTK display speaks the SPICE agent protocol
-  natively. Inert until the guest installs the virtio-win guest-tools (on the
-  drivers ISO we attach), which include the vdagent service; after that,
-  host↔guest clipboard just works.
+### The VMSCRIPTS helper disk
 
-Alternatives considered and rejected for the simultaneous-write channel:
-virtio-fs/9p (no Windows-host daemon), writable VVFAT (experimental,
-corrupts), a dual-mounted disk image (two OSes on one filesystem = guaranteed
-corruption), WebDAV via an in-app server (the only real non-SMB option — inbox
-guest client at `http://10.0.2.2:port/`, anonymous; but a sizeable
-LOCK-compliant server build and slower; keep in the back pocket).
+Typing that command inside a guest with no clipboard is miserable, so every boot also builds a small **real FAT16 image** (`share::build_helper_disk`) attached as a never-booted disk on `ide.3`, labelled `VMSCRIPTS`. It carries `MapShare.cmd` (map the share and open Explorer on it), `InstallGuestDrivers.cmd`, and a README.
 
-### Black screens after reboot: it was Windows Update — SOLVED 2026-07-19
+It is a real image rather than QEMU's VVFAT because writable VVFAT is corruption-prone and IDE disks cannot attach read-only; guest writes to this image land in a throwaway per-session file instead.
 
-Full-Windows guests went black right after the boot spinner, on every reboot
-following a guest-tools install. Firmware rendered (BCD picker, spinner), the
-guest stayed healthy (QMP `query-blockstats` showed steady I/O deltas), but
-the scanout was black and it ignored wake keys and Win+P. It survived
-resumes, so the state lived in the overlay.
+The image needs a **real MBR partition** — type `0x0E`, starting at LBA 2048. Windows mounts partitionless "superfloppy" layouts only from removable media; on the fixed disk `ide-hd` presents, one appears as an uninitialized disk with no drive letter.
 
-Two wrong diagnoses cost real time. Neither the SPICE vdagent nor the driver
-CD's own display driver is at fault: **the culprit is the display driver
-Windows Update delivers**, which it does within moments of first login on a
-connected guest — well before any in-guest script can run, so the
-`ExcludeWUDriversInQualityUpdate` policy the script sets is always too late
-to win that race. Proven by booting offline and installing the *full*
-virtio-win suite, GPU driver included: reboots fine, indefinitely.
+The helper disk is **never** gated on the share or on networking. It carries the driver installer, which matters most precisely when the guest is offline.
 
-Consequences, all shipped:
+Alternatives rejected for a simultaneously-writable channel: virtio-fs and 9p (no Windows-host daemon), writable VVFAT (experimental, corrupts), a dual-mounted disk image (two operating systems on one filesystem is guaranteed corruption), and WebDAV via an in-app server — the only real non-SMB option, using the guest's inbox client at `http://10.0.2.2:port/`, but a sizeable LOCK-compliant server build and slower.
 
-- **Networking defaults OFF** (`HostOptions::network`, the GUI checkbox, and
-  the CLI's `--no-network` inverted to an opt-in `--network`).
-- The helper disk is **never** gated on the share or the network — it carries
-  the driver installer, which matters most when the guest is offline. (It was
-  gated for about an hour on 2026-07-19; that is the bug that produced "the
-  FAT partition isn't showing up".)
-- `InstallGuestDrivers.cmd` runs the CD's `virtio-win-guest-tools.exe`
-  bundler in full instead of hand-picking drivers around the misdiagnosis.
+## Guest tools and drivers
 
-Note slirp cannot express "host yes, internet no": `restrict=on` is total
-isolation (drops guest→10.0.2.2, so SMB dies with it), and the `guestfwd`
-punch-through is a dead end — its chardev form is a single shared stream with
-no per-connection demux, so SMB's multiple connections would corrupt. The
-viable design is a Windows Firewall outbound rule scoped to
-`qemu-system-x86_64.exe`, since slirp turns guest→10.0.2.2 into a loopback
-connection while internet traffic is an ordinary outbound socket from the
-same process. Unbuilt; loopback's WFP exemption wants verifying first.
+virtio-win ships as an ISO, which sidesteps the share-needs-drivers / drivers-need-share problem entirely. The GUI offers "Attach guest tools and driver ISO", downloading virtio-win on demand next to the app with a progress bar and a HEAD-comparison update check, and attaching it as a second never-booted CD on `ide.2`.
 
-### Clipboard needs QEMU 11.1+ — VALIDATED 2026-07-19
+**Install it with `InstallGuestDrivers.cmd` from the VMSCRIPTS drive**, which self-elevates, locks Windows Update down, disables Fast Startup, and then launches the CD's own installer.
 
-Host↔guest clipboard works, and it needed a newer QEMU than any Windows
-installer shipped at the time.
+Three details in that script are load-bearing:
 
-`ui/gtk-clipboard.c` sat behind the compile-time `--enable-gtk-clipboard`,
-default-off upstream and labelled "EXPERIMENTAL, MAY HANG" (clipboard
-retrieval was blocking, which hung the guest). **No Windows distributor
-enabled it** — not Weilnetz, not MSYS2, whose PKGBUILD passes no feature
-flags and so never auto-enabled a flag that defaulted to `false` rather than
-`auto`. QEMU 11.1 fixed the hang (`9a007326e83f`) and replaced the build flag
-with a runtime option (`335e32cbd0a2`): `-display gtk,clipboard=on`.
+- **It runs `virtio-win-guest-tools.exe`, the bundler — not `virtio-win-gt-x64.msi`.** Only the bundler carries the SPICE vdagent, so clipboard cannot work without it. (vdagent was absent from virtio-win entirely for several releases before returning in 0.1.262; want 0.1.262 or newer.)
+- **It does not install silently, and does not install `qemu-ga` unconditionally.** A hand install works reliably where a scripted one has produced black screens; a `/quiet` run takes bundle defaults where an interactive one can decide per device, and the bundler already ships `qemu-ga`, so an unconditional second pass ran two agent installs back to back while driver staging was still settling. The script launches the same installer a user would and only adds `qemu-ga` if the service is genuinely absent.
+- **Windows Update driver delivery is blocked *before* the install**, via `DontSearchWindowsUpdate`, `SearchOrderConfig=0`, `ExcludeWUDriversInQualityUpdate` and `NoAutoUpdate`. Applied afterwards, the policy has already lost the race on a connected guest. The service disables are belt-and-braces only — Windows revives `wuauserv` on its own, so the policy keys carry the load.
 
-Getting it needs no source build. Weilnetz publishes master snapshots in the
-same `w64/` listing as releases, so `qemu-w64-setup-20260501.exe` self-reports
-`11.0.50` — which **is** the 11.1 development tree (`VERSION` was bumped to
-11.0.50 by "Open 11.1 development tree"). Beware the numbering: the
-`20260422` build reports plain `11.0.0` because it landed exactly on the
-release tag, six days before the clipboard commit. Hence
-`Qemu::gtk_clipboard` **probes** by parse-checking the argument rather than
-comparing version strings — Windows builds are branch snapshots whose numbers
-don't track upstream tags.
+Fast Startup is disabled (`HiberbootEnabled=0`, plus `powercfg /h off`) because it makes shutdown a kernel hibernate rather than a real shutdown: the guest skips hardware re-enumeration between boots and leaves NTFS dirty in the overlay, both bad for a machine whose virtual hardware can change underneath it.
 
-Both halves are required and neither works alone: `clipboard=on` on the
-display (the host-side peer) and the `qemu-vdagent` chardev the guest's agent
-talks to. No SPICE server or client is involved — `qemu-vdagent` implements
-enough of the agent protocol in-process.
+### Black screens after reboot
 
-Guest side, the trap that made this look broken for longer than it was: the
-SPICE vdagent ships **only inside `virtio-win-guest-tools.exe`**, the
-bundler. The loose `virtio-win-gt-x64.msi` does not contain it, and that MSI
-is what the install script used — so clipboard could never have worked no
-matter what the host did. (vdagent was also absent from virtio-win entirely
-for several releases before returning in 0.1.262; want 0.1.262+.)
+Full-Windows guests used to go black immediately after the boot spinner on every reboot following a guest-tools install. Firmware rendered — BCD picker, spinner — and the guest stayed healthy (QMP `query-blockstats` showed steady I/O), but the scanout was black and it ignored wake keys and `Win`+`P`. It survived resumes, so the state lived in the overlay.
 
-**When bundling QEMU, ship 11.1 or newer.** Anything older silently loses
-clipboard.
+**The cause is the display driver Windows Update delivers**, not the SPICE vdagent and not the driver CD's own display driver, both of which were blamed first. Proven by booting offline and installing the full virtio-win suite, GPU driver included: it reboots indefinitely without incident. This is why networking is opt-in and why the script blocks WU driver delivery before installing anything.
 
-### ARM64: feature hidden
+## Clipboard
 
-Windows-on-ARM QEMU has no useful acceleration for x86 guests (TCG emulation
-only — unusably slow for Windows), and ARM-Windows guests are too
-hardware-variable for booted backups to be dependable. ARM64 builds hide the
-Virtualize page entirely (`sidebar::page_available`), rather than shipping a
-trap.
+Host↔guest clipboard needs **QEMU 11.1 or newer** and the guest-tools bundler. Both halves are required and neither works alone: `clipboard=on` on the GTK display is the host-side peer, and the `qemu-vdagent` chardev is what the guest's agent talks to. No SPICE server or client is involved — `qemu-vdagent` implements enough of the agent protocol in-process.
 
-## Open questions (want your input)
+`ui/gtk-clipboard.c` used to sit behind the compile-time `--enable-gtk-clipboard`, default-off upstream and labelled "EXPERIMENTAL, MAY HANG" because clipboard retrieval was blocking and hung the guest. **No Windows distributor enabled it.** QEMU 11.1 fixed the hang and replaced the build flag with a runtime option.
 
-- Overlay: does session interop (mount the same session you boot) justify
-  Option A's raw-passthrough complexity, or is qcow2-only (B) good enough?
-  **RESOLVED 2026-07-18: Option A committed** — it booted Windows 11 over the
-  `.avhdx` overlay and unlocks boot-it-or-mount-it interop; qcow2 kept as the
-  portable fallback.
-- Session UX: one session per backup, or multiple named sessions per backup?
-  (Plan assumes one to start; the layout doesn't preclude more.)
-- Login prep (above): ship both "enable Administrator" and "bypass password",
-  or start with just enabling Administrator? Patch-the-check vs. blank-the-hash
-  for the bypass (patch preferred, for DPAPI safety).
+Do not infer support from a version string. Windows QEMU builds are branch snapshots whose numbers do not track upstream tags — a Weilnetz snapshot self-reporting `11.0.50` *is* the 11.1 development tree, while one reporting a plain `11.0.0` landed exactly on the release tag days before the clipboard commit. `Qemu::gtk_clipboard` therefore **probes**, by parse-checking `-display gtk,clipboard=on` against `-machine help` and reading the exit status.
+
+Keyboard capture is a related trap worth recording: installing the guest tools is what *stops* the VM grabbing input, because the agent gives the guest absolute pointer positioning and QEMU no longer needs to grab anything. Hotkeys then reach the host instead of the guest. `Ctrl`+`Alt`+`G` toggles capture manually and works reliably; `grab-on-hover` was tried as a setting and removed, because it captured unreliably *and* broke `Ctrl`+`Alt`+`G` while enabled.
+
+## Rescue-ISO boot
+
+Attach an ISO and boot from it on the next boot only — to drop into WinPE, a Windows recovery ISO, or a live Linux, inspect or repair the captured drive from the outside, then fall back to booting the disk.
+
+This is nearly free in this model. A fresh QEMU process launches on every boot, so "next boot only" is not persistent state to track and revert; it is a per-launch flag. That launch adds a read-only CD and gives it boot priority, and the next launch simply does not. The disk overlay stays attached throughout, so the rescue environment sees the guest's own drive and any repair it makes lands in the session overlay, never in the `.phnx`.
+
+## QEMU discovery and bundling
+
+Search order: an explicit setting (`Settings::vm_qemu_dir`, or `--qemu-dir`) → `PATH` → the stock install locations. A directory only becomes the saved choice if `Qemu::discover` succeeds on it, so a wrong folder cannot be silently persisted. When nothing is found, the Virtualize page shows an install call-to-action rather than failing cryptically — mirroring the Mount page's WinFsp notice.
+
+Bundling QEMU in the installer, WinFsp-style, is the intended direction. Licensing is straightforward: QEMU is GPLv2 and shipping its unmodified installer alongside the app is mere aggregation. The obligation picked up is *corresponding source* — pin the exact bundled build and link or archive its matching source tarball in the release notes.
+
+Two practicalities. The installer is large (a step change for ours), so detect-first must stay: bundled QEMU installs only when none is found, and the runtime path keeps honouring a user-supplied install. And **the bundled build must be 11.1 or newer**, or clipboard silently disappears.
+
+## Throughput
+
+A booting guest issues scattered 4 KiB reads, and every chunk-cache miss decompresses a whole 4 MiB chunk. Three pathologies in `phoenix-mount::chunkstore` made this dominate boot time; all are fixed:
+
+1. **Every read cloned the whole `ExtentSpan`**, including a `Vec<PlacedChunk>` whose chunks each carried a heap hex `String` hash — tens of thousands of allocations per read on a large partition. Chunks are now located under an immutable borrow, with only the (heap-free, `Copy`) `PlacedChunk` copied out, and hashes stored decoded as `[u8; 32]`.
+2. **Every cache hit copied the whole 4 MiB chunk** to serve a 4 KiB read. The cache now holds `Arc<Vec<u8>>`, so a hit is a refcount bump.
+3. **The cache was FIFO, not LRU** — `cache_order` was never touched on a hit, so hot chunks were evicted on a fixed schedule and re-decompressed and, on a spinning disk, re-*seeked*. Now promote-on-hit, plus sequential-detection readahead.
+
+Measured with the backup on a 7200-rpm HDD, release build:
+
+| Workload | Before | After |
+|---|---|---|
+| Random 4 KiB, cold | 52 reads/s (19.1 ms) | **200 reads/s (5.0 ms)** |
+| Random 4 KiB, warm | 136 reads/s (7.4 ms) | **517 reads/s (1.9 ms)** |
+| Sequential | 131 MB/s | 132 MB/s (already streaming) |
+| Boot to lock screen | ~13 min | **~3 min** |
+
+Two lessons worth keeping. **The backing store matters more than the CPU here:** on an HDD a cache miss costs a ~10 ms seek, so the wins came from *avoiding* I/O, not decoding faster — parallel chunk decode would have been largely wasted and parallel I/O on a spindle would have hurt. And **measure the right workload**: a sequential benchmark looked fine at 131 MB/s because it amortizes per-read cost across a whole chunk; only a scattered 4 KiB benchmark exposed the problem.
+
+Still available if more is needed: reads serialize on one mutex (`VhdFs::read`), so there is no read concurrency. That matters little on an HDD; on an SSD-backed image it is the next lever. Putting the `.phnx` on an SSD is simply faster too — another reason for the scratch-drive picker.
+
+## Availability
+
+**ARM64 builds hide the Virtualize page entirely.** Windows-on-ARM QEMU has no useful acceleration for x86 guests — TCG emulation only, unusably slow for Windows — and ARM-Windows guests vary too much in guest-visible hardware for a booted backup to be dependable. Hiding the page beats shipping a trap.
+
+**Portable builds hide it too.** Booting a backup needs an installed WinFsp to serve the disk and an installed QEMU to run it, and installing nothing is the entire point of the portable build. A page that could only ever report missing prerequisites is worse than no page.
+
+Both are decided by `sidebar::page_available`, which also guards the `--page virtualize` argument and falls back to the Backup page if the current page ever becomes unavailable.
+
+## Safety rails
+
+- **A running VM freezes navigation** to the Virtualize page, the way a running job does. It is the only place to see or stop the VM.
+- **Closing the app is held for a hazard-tape confirmation** when a VM is running. The app hosts the WinFsp filesystem serving the guest's disk, so closing it pulls that disk out from under a live guest — the VM does not die cleanly, it degrades. Confirming powers the VM off immediately (QMP `quit` — a deliberate power cut, since a graceful shutdown cannot finish once its disk is gone), then unmounts, then closes.
+
+## Limitations
+
+- **MBR/BIOS captures do not boot.** The synthesis always presents GPT, so a BIOS-mode guest cannot boot its MBR layout. Needs MBR synthesis before SeaBIOS boots are real.
+- **No TPM emulation**, so Windows Hello PIN is unavailable in the guest; password sign-in works. Secure Boot is off. Windows may demand reactivation.
+- **NVMe is unverified on current QEMU.** It is required for 4Kn captures, since IDE and AHCI are 512-byte-sector only, but QEMU's `nvme` device was invisible to one build's OVMF even with an explicit `nvme-ns`. Retest before relying on 4Kn boot.
+- **One `.phnx` is one disk**; multi-disk systems are out of scope.
+- **Acceleration falls back to TCG** if WHPX is unavailable, which is correct but very slow for Windows guests.
+
+The original exploratory notes for this feature are kept in [QEMU-BOOT.md](QEMU-BOOT.md).

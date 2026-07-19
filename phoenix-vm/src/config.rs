@@ -7,7 +7,7 @@
 //! without QEMU, WinFsp, or elevation.
 //!
 //! The choices encode the recipe validated live against a real Windows 11
-//! backup (see `docs/VIRTUALIZATION.md` "Boot-smoke findings"); the reasons are
+//! backup (see `docs/VIRTUALIZATION.md` "The QEMU recipe"); the reasons are
 //! in the comments so they are not re-learned the hard way.
 
 use anyhow::{bail, Result};

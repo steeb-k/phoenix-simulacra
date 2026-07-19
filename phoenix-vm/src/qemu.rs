@@ -1,6 +1,7 @@
 //! Locating an external QEMU install and its firmware.
 //!
-//! QEMU is not bundled (yet — see `docs/VIRTUALIZATION.md`); we detect it. The
+//! QEMU is not bundled yet (see `docs/VIRTUALIZATION.md` "QEMU discovery and
+//! bundling" — a bundled build must be 11.1+); we detect it. The
 //! runtime path always honors a user-supplied location first, so a bundled
 //! copy and a user's own install can coexist.
 
