@@ -508,7 +508,9 @@ fn boot_smoke_windows_backup() {
     // is recreated fresh each run: the served parent lives under a per-serve
     // directory whose path changes between serves, and both formats record
     // the parent's location. (A real session manager will pin the serve path.)
-    let write_layer = std::env::var("PHOENIX_VM_WRITE").unwrap_or_else(|_| "avhdx".into());
+    // qcow2 is the committed write path (the .avhdx arm boots but its teardown
+    // deadlocks — see docs/VIRTUALIZATION.md); override with PHOENIX_VM_WRITE.
+    let write_layer = std::env::var("PHOENIX_VM_WRITE").unwrap_or_else(|_| "qcow2".into());
     let (_attached, disk_drive_arg): (Option<AttachedRw>, String) = match write_layer.as_str() {
         "qcow2" => {
             let overlay = session.join("session.qcow2");

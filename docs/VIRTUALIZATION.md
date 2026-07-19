@@ -58,14 +58,38 @@ read is answered on demand from the `.phnx` and BLAKE3-verified, footprint-free.
 Serving does not require attaching the disk to Windows, so nothing surfaces in
 the host while the guest runs — no double-mount hazard.
 
-### Write path (the main open decision)
+### Write path — DECIDED: qcow2 (Option B)
+
+> **Resolved 2026-07-19: qcow2 is the committed write path; Option A
+> (`.avhdx` raw passthrough) is EXPERIMENTAL and off by default.**
+>
+> Option A boots Windows fine, but its **teardown is unreliable**: detaching a
+> differencing child whose parent lives on a WinFsp filesystem hangs in the
+> Windows storage driver. Measured across four configurations — in-process and
+> out-of-process serve, explicit `DetachVirtualDisk` and drop/`CloseHandle`
+> detach — **all four hang**; only one much earlier light-I/O spike ever
+> detached cleanly. A hang could leave an unkillable process needing a reboot.
+> qcow2 performs **no VHD attach anywhere**, so the entire deadlock class is
+> structurally impossible, and it is verified end-to-end (boots Windows 11;
+> lifecycle + resume green in `vm_overlay_lifecycle`).
+>
+> Consequence, accepted deliberately: **mounts and VMs use different
+> differencing engines** — file-level mounts keep Windows differencing VHDX,
+> VMs use qcow2. The boot-it-or-mount-it interop that motivated Option A is
+> given up; browsing a VM session's files would need another route (expose the
+> qcow2 via `qemu-nbd`, or an offline `qemu-img` conversion/export).
+>
+> The out-of-process serve helper built while chasing this is kept: it didn't
+> fix the detach, but it turned a hang from "unkillable process, reboot" into
+> "kill one helper, done".
 
 Constraint discovered up front: **QEMU's `vhdx` block driver does not support
 differencing (parented) VHDX images.** So QEMU cannot do its I/O directly
-against a `child-*.avhdx`. Two viable shapes:
+against a `child-*.avhdx`. The two shapes considered:
 
 **Option A — raw physical-drive passthrough over the existing `.avhdx` child
-(recommended).** Reuse the shipped overlay *literally*:
+(EXPERIMENTAL; teardown unreliable — see the box above).** Reuse the shipped
+overlay *literally*:
 
 1. Serve the parent VHDX via `WinFspServe` (as today).
 2. Create/open the session's differencing child (`create_differencing_vhdx`,
@@ -94,10 +118,10 @@ by the Windows writable mount (only by booting the VM, or an offline
 `qemu-img` conversion); depends on QEMU's VHDX reader handling our synthesized
 VHDX (needs an early spike to confirm).
 
-Plan: **spike both in milestone 2 and let the results pick.** A is the default
-if raw-passthrough proves stable, because session interop (boot it *or* mount
-it) is a genuinely differentiating feature; B is the fallback and the eventual
-non-Windows story either way.
+Both were spiked in milestone 2 and both booted Windows. A was chosen first for
+its session-interop appeal, then **reversed** once its teardown proved
+unreliable (box above). B — qcow2 — is the committed path, and is also the
+eventual non-Windows story.
 
 ### Session model
 
@@ -261,21 +285,37 @@ image's drive, so there is no single root to look in). Only the growing overlay
 consumes real space — the served `backup.vhdx` is a WinFsp file synthesized on
 demand, not materialized.
 
+**Planned (GUI):** let the user pick the **scratch drive** for these difference
+files, rather than always defaulting to the image's volume. The image's drive is
+a good default, but it isn't always the right one — the backup may live on a
+slow or nearly-full external, while a fast local SSD is the better home for a
+growing overlay. The engine already supports this (`--vm-dir` takes any root),
+so the GUI needs a drive picker (showing free space per volume) that writes the
+chosen root into settings, with "same drive as the image" as the default choice.
+
 ### Still open before this is shippable
 
-- **Serve-path resume proof.** The serve path is deterministic
-  (`serve-{backup_id}/backup.vhdx`) and `boot.rs` reuses an existing overlay,
-  but a full stop→resume→continue cycle hasn't been exercised live yet; verify
-  the differencing child reconnects to the re-served parent across process
-  restarts.
-- **Crash/orphan sweep for VM sessions.** The mount stack sweeps stale
-  `serve-*` junctions + `child-*.avhdx`; VM sessions keep their overlay by
-  design, so the sweep must distinguish "kept session overlay" from "leaked
-  attach" (a dirty `clean_shutdown=false` session whose host died).
-- **Boot-it-or-mount-it interop** (`vm mount`): open a session's `.avhdx`
-  through the writable-mount letters flow to browse/extract without booting.
+- ~~Serve-path resume proof.~~ **DONE 2026-07-19** for the qcow2 path
+  (`vm_overlay_lifecycle`): after stopping the serve helper and re-spawning it
+  at the same deterministic path, the qcow2 keeps its own writes *and* its
+  backing chain reconnects to the re-served parent (GPT still readable through
+  it). Guest-free, 12s, no attach.
+- **A full stop→resume→continue with a real guest** still hasn't been run
+  end-to-end (the guest-free proof covers the mechanism, not a Windows boot
+  resuming its own prior state).
+- **Crash/orphan sweep for VM sessions.** `sweep_serve_scratch` already scopes
+  the sweep to `vm-serve` and never touches kept overlays (unit-tested). Still
+  to do: reap an **orphaned serve helper process** whose boot process died
+  (the helper self-exits on stdin EOF, so this is belt-and-braces).
+- ~~Boot-it-or-mount-it interop~~ — **dropped** with the qcow2 pivot. Browsing a
+  VM session's files needs a different route (`qemu-nbd`, or an offline
+  `qemu-img` conversion) if we still want it.
 - Readahead / parallel chunk decode (throughput), NVMe-on-stable-QEMU retest,
   MBR synthesis for BIOS captures, QEMU bundling — all as noted above.
+- **Root-cause the `.avhdx` detach hang** if Option A is ever revived. The one
+  unexplained data point is the early spike that detached cleanly (in-process
+  serve, drop-based detach, light I/O, and a different attach storage-type
+  parameter). Not on the critical path now.
 
 ## Guest access / login prep (planned feature)
 
