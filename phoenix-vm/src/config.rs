@@ -310,6 +310,18 @@ impl VmConfig {
             push("none");
         }
 
+        // Host↔guest clipboard: the GTK display speaks the SPICE agent
+        // protocol over a qemu-vdagent chardev. Inert until the guest runs
+        // the SPICE vdagent service (installed by the virtio-win guest-tools
+        // on the drivers ISO) — attached unconditionally so installing the
+        // tools is the only step.
+        push("-device");
+        push("virtio-serial-pci");
+        push("-chardev");
+        push("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on");
+        push("-device");
+        push("virtserialport,chardev=vdagent0,name=com.redhat.spice.0");
+
         // Firmware: UEFI needs a writable copy of BOTH pflash units. Attaching
         // the code flash read-only maps it as ROM, and WHPX cannot execute from
         // ROM-mapped memory — OVMF then hangs at 100% CPU before video init.
@@ -400,6 +412,15 @@ impl VmConfig {
             push("-device");
             push("ide-cd,drive=cd1,bus=ide.2");
         }
+
+        // The "SIMULACRA" helper disk (MapShare.cmd) on the next SATA port.
+        // A plain raw disk, no bootindex — the guest just opens it.
+        if let Some(img) = &spec.helper_disk {
+            push("-drive");
+            push(&format!("file={img},format=raw,if=none,id=helper0"));
+            push("-device");
+            push("ide-hd,drive=helper0,bus=ide.3");
+        }
         a
     }
 }
@@ -428,6 +449,10 @@ pub struct BootSpec {
     /// read-only CD-ROM. Never given boot priority — the guest browses it to
     /// install drivers and helpers.
     pub drivers_iso: Option<String>,
+    /// Path to the per-session "SIMULACRA" helper disk image (FAT, holds
+    /// MapShare.cmd; see `share::build_helper_disk`), attached as an extra
+    /// never-booted disk.
+    pub helper_disk: Option<String>,
 }
 
 impl BootSpec {
@@ -442,6 +467,7 @@ impl BootSpec {
             boot_iso_first: false,
             qmp_port: None,
             drivers_iso: None,
+            helper_disk: None,
         }
     }
 }
@@ -634,6 +660,34 @@ mod tests {
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(!args.contains("cdrom"));
         assert!(!args.contains("ide-cd"));
+    }
+
+    #[test]
+    fn clipboard_agent_always_attached() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(args.contains("virtio-serial-pci"));
+        assert!(args.contains("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on"));
+        assert!(args.contains("virtserialport,chardev=vdagent0,name=com.redhat.spice.0"));
+    }
+
+    #[test]
+    fn helper_disk_rides_port_three_and_never_boots() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        let spec = BootSpec {
+            helper_disk: Some(r"D:\PhoenixSimulacra\share-helper.img".to_string()),
+            ..spec_uefi_raw()
+        };
+        let args = cfg.qemu_args(&spec).join(" ");
+        assert!(args
+            .contains(r"file=D:\PhoenixSimulacra\share-helper.img,format=raw,if=none,id=helper0"));
+        assert!(args.contains("ide-hd,drive=helper0,bus=ide.3"));
+        assert!(!args.contains("helper0,bus=ide.3,bootindex"));
+        // Absent when not sharing.
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(!args.contains("helper0"));
     }
 
     #[test]

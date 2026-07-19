@@ -10,6 +10,9 @@ authors.workspace = true
 phoenix-core.workspace = true
 phoenix-mount.workspace = true
 anyhow.workspace = true
+# Building the tiny "SIMULACRA" helper disk (a real FAT image holding
+# MapShare.cmd) that gets attached to the guest alongside the SMB share.
+fatfs = "0.3"
 serde = { workspace = true }
 serde_json.workspace = true
 uuid.workspace = true

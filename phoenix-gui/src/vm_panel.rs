@@ -205,8 +205,9 @@ pub fn show(
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "To browse the folder shared next to the image, open a Command \
-                     Prompt inside the guest and run:",
+                    "To browse the folder shared next to the image: inside the guest, \
+                     open the SIMULACRA drive and run MapShare.cmd — or run this in a \
+                     Command Prompt:",
                 )
                 .small()
                 .color(palette.subtle_text),

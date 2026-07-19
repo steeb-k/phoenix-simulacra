@@ -4535,6 +4535,20 @@ impl PhoenixApp {
             None
         };
         let share_active = share_cmd.is_some();
+        // The "SIMULACRA" helper disk carries MapShare.cmd into the guest so
+        // mapping the share is a double-click, not transcription.
+        let helper_disk = share_active
+            .then(|| {
+                let p = self.vm_root(&backup).join("share-helper.img");
+                match phoenix_vm::share::build_helper_disk(&p) {
+                    Ok(()) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("helper disk build failed: {e:#}");
+                        None
+                    }
+                }
+            })
+            .flatten();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let backup_thread = backup.clone();
@@ -4548,6 +4562,7 @@ impl PhoenixApp {
                 iso.as_deref(),
                 boot_iso,
                 drivers_iso.as_deref(),
+                helper_disk.as_deref(),
                 &qemu,
                 &sessions,
                 &scratch,
@@ -4561,6 +4576,7 @@ impl PhoenixApp {
                     &iso,
                     boot_iso,
                     &drivers_iso,
+                    &helper_disk,
                     &qemu,
                     &sessions,
                     &scratch,

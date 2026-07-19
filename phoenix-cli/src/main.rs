@@ -458,14 +458,20 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                 if let Some(iso) = &drivers_iso {
                     anyhow::ensure!(iso.exists(), "drivers ISO not found: {}", iso.display());
                 }
+                let mut helper_disk = None;
                 if share {
                     let dir = phoenix_vm::share::share_dir_for_backup(&backup);
                     phoenix_vm::share::ensure_share(&dir)?;
                     println!("Sharing {} with the guest.", dir.display());
                     println!(
-                        "Inside the guest, map it with:  {}",
+                        "In the guest: open the SIMULACRA drive and run MapShare.cmd, or run:  {}",
                         phoenix_vm::share::guest_mount_command()
                     );
+                    let img = vm_root.join("share-helper.img");
+                    match phoenix_vm::share::build_helper_disk(&img) {
+                        Ok(()) => helper_disk = Some(img),
+                        Err(e) => eprintln!("warning: helper disk build failed: {e:#}"),
+                    }
                 }
                 let outcome = phoenix_vm::boot::boot(
                     &backup,
@@ -475,6 +481,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                     iso.as_deref(),
                     boot_iso,
                     drivers_iso.as_deref(),
+                    helper_disk.as_deref(),
                     &qemu,
                     &sessions,
                     &scratch,
