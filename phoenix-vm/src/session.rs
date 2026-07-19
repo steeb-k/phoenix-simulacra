@@ -53,7 +53,11 @@ pub fn serve_scratch_for_backup(backup: &Path) -> PathBuf {
 /// tree. A dirty session (its host died mid-boot) is surfaced on resume, not
 /// deleted — see [`Session::mark_booting`] / the `clean_shutdown` flag.
 pub fn sweep_serve_scratch(vm_root: &Path) {
-    phoenix_mount::cleanup_leaked_mounts(&vm_root.join("vm-serve"));
+    let serve = vm_root.join("vm-serve");
+    // Kill any serve helper orphaned by a previous run BEFORE deleting its
+    // junctions — a live helper still has its filesystem mounted there.
+    crate::serve_helper::reap_orphan_helpers(&serve);
+    phoenix_mount::cleanup_leaked_mounts(&serve);
 }
 
 /// Where guest writes go. Both keep the backing `.phnx` immutable.
@@ -419,8 +423,16 @@ mod tests {
         std::fs::create_dir_all(serve.join("serve-abc")).unwrap();
         std::fs::write(serve.join("child-abc.avhdx"), b"leaked").unwrap();
 
+        // A stale helper PID file from a dead run: the reaper must clear it
+        // (the PID is long gone) without disturbing anything else.
+        std::fs::write(serve.join("999999.helperpid"), "999999").unwrap();
+
         sweep_serve_scratch(&vm_root);
 
+        assert!(
+            !serve.join("999999.helperpid").exists(),
+            "stale helper pid file survived the sweep"
+        );
         assert!(overlay.exists(), "sweep destroyed a kept session overlay");
         assert!(!serve.join("serve-abc").exists(), "stale serve junction survived");
         assert!(!serve.join("child-abc.avhdx").exists(), "leaked child survived");
