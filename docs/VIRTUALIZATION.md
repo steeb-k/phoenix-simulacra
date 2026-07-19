@@ -591,6 +591,80 @@ corruption), WebDAV via an in-app server (the only real non-SMB option — inbox
 guest client at `http://10.0.2.2:port/`, anonymous; but a sizeable
 LOCK-compliant server build and slower; keep in the back pocket).
 
+### Black screens after reboot: it was Windows Update — SOLVED 2026-07-19
+
+Full-Windows guests went black right after the boot spinner, on every reboot
+following a guest-tools install. Firmware rendered (BCD picker, spinner), the
+guest stayed healthy (QMP `query-blockstats` showed steady I/O deltas), but
+the scanout was black and it ignored wake keys and Win+P. It survived
+resumes, so the state lived in the overlay.
+
+Two wrong diagnoses cost real time. Neither the SPICE vdagent nor the driver
+CD's own display driver is at fault: **the culprit is the display driver
+Windows Update delivers**, which it does within moments of first login on a
+connected guest — well before any in-guest script can run, so the
+`ExcludeWUDriversInQualityUpdate` policy the script sets is always too late
+to win that race. Proven by booting offline and installing the *full*
+virtio-win suite, GPU driver included: reboots fine, indefinitely.
+
+Consequences, all shipped:
+
+- **Networking defaults OFF** (`HostOptions::network`, the GUI checkbox, and
+  the CLI's `--no-network` inverted to an opt-in `--network`).
+- The helper disk is **never** gated on the share or the network — it carries
+  the driver installer, which matters most when the guest is offline. (It was
+  gated for about an hour on 2026-07-19; that is the bug that produced "the
+  FAT partition isn't showing up".)
+- `InstallGuestDrivers.cmd` runs the CD's `virtio-win-guest-tools.exe`
+  bundler in full instead of hand-picking drivers around the misdiagnosis.
+
+Note slirp cannot express "host yes, internet no": `restrict=on` is total
+isolation (drops guest→10.0.2.2, so SMB dies with it), and the `guestfwd`
+punch-through is a dead end — its chardev form is a single shared stream with
+no per-connection demux, so SMB's multiple connections would corrupt. The
+viable design is a Windows Firewall outbound rule scoped to
+`qemu-system-x86_64.exe`, since slirp turns guest→10.0.2.2 into a loopback
+connection while internet traffic is an ordinary outbound socket from the
+same process. Unbuilt; loopback's WFP exemption wants verifying first.
+
+### Clipboard needs QEMU 11.1+ — VALIDATED 2026-07-19
+
+Host↔guest clipboard works, and it needed a newer QEMU than any Windows
+installer shipped at the time.
+
+`ui/gtk-clipboard.c` sat behind the compile-time `--enable-gtk-clipboard`,
+default-off upstream and labelled "EXPERIMENTAL, MAY HANG" (clipboard
+retrieval was blocking, which hung the guest). **No Windows distributor
+enabled it** — not Weilnetz, not MSYS2, whose PKGBUILD passes no feature
+flags and so never auto-enabled a flag that defaulted to `false` rather than
+`auto`. QEMU 11.1 fixed the hang (`9a007326e83f`) and replaced the build flag
+with a runtime option (`335e32cbd0a2`): `-display gtk,clipboard=on`.
+
+Getting it needs no source build. Weilnetz publishes master snapshots in the
+same `w64/` listing as releases, so `qemu-w64-setup-20260501.exe` self-reports
+`11.0.50` — which **is** the 11.1 development tree (`VERSION` was bumped to
+11.0.50 by "Open 11.1 development tree"). Beware the numbering: the
+`20260422` build reports plain `11.0.0` because it landed exactly on the
+release tag, six days before the clipboard commit. Hence
+`Qemu::gtk_clipboard` **probes** by parse-checking the argument rather than
+comparing version strings — Windows builds are branch snapshots whose numbers
+don't track upstream tags.
+
+Both halves are required and neither works alone: `clipboard=on` on the
+display (the host-side peer) and the `qemu-vdagent` chardev the guest's agent
+talks to. No SPICE server or client is involved — `qemu-vdagent` implements
+enough of the agent protocol in-process.
+
+Guest side, the trap that made this look broken for longer than it was: the
+SPICE vdagent ships **only inside `virtio-win-guest-tools.exe`**, the
+bundler. The loose `virtio-win-gt-x64.msi` does not contain it, and that MSI
+is what the install script used — so clipboard could never have worked no
+matter what the host did. (vdagent was also absent from virtio-win entirely
+for several releases before returning in 0.1.262; want 0.1.262+.)
+
+**When bundling QEMU, ship 11.1 or newer.** Anything older silently loses
+clipboard.
+
 ### ARM64: feature hidden
 
 Windows-on-ARM QEMU has no useful acceleration for x86 guests (TCG emulation
