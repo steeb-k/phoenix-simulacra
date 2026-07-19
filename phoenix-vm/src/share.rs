@@ -166,15 +166,21 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         .write_all(cmd.as_bytes())
         .context("write MapShare.cmd")?;
 
-    // Install the CD's own guest-tools bundler, in full. Earlier revisions
-    // hand-picked drivers with pnputil to skip the display ones after
-    // black screens at WDDM handoff — but that diagnosis was wrong. The
-    // CD's display driver is fine; the black screens came from the one
-    // Windows Update delivers, which it does within moments of the guest
-    // getting a network. Hence the ordering below: block WU driver
-    // delivery FIRST, then install. Only the bundler carries the SPICE
-    // vdagent (clipboard, guest display auto-resize) — the loose
-    // virtio-win-gt-x64.msi does not, so it is deliberately not used.
+    // Launch the CD's own guest-tools bundler and otherwise stay out of the
+    // way. Only the bundler carries the SPICE vdagent (clipboard, guest
+    // display auto-resize) — the loose virtio-win-gt-x64.msi does not.
+    //
+    // Deliberately does NOT install silently, install the guest agent
+    // unconditionally, or touch the registry before the install. A `/quiet`
+    // run installs every component with defaults where an interactive one
+    // can decide per device; the bundler already ships qemu-ga, so adding a
+    // second msiexec pass put two agent installs back to back while driver
+    // staging was still settling; and setting the Windows Update policy
+    // first meant drivers were staged under a policy state a hand install
+    // never produces. A hand install works reliably and a scripted one
+    // black-screened, so the script's job is to differ from a hand install
+    // as little as possible: launch the same installer, wait, then set the
+    // policy afterwards.
     let install = "@echo off\r\n\
         title Simulacra guest tools install\r\n\
         net session >nul 2>&1\r\n\
@@ -195,13 +201,9 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         )\r\n\
         echo Found the driver CD at %VIODRV%\r\n\
         \r\n\
-        echo Blocking driver delivery via Windows Update first - it ships a\r\n\
-        echo display driver that blanks this VM on the next reboot, and it\r\n\
-        echo can win the race against this install on a connected guest.\r\n\
-        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
-        \r\n\
-        echo Installing the virtio-win guest tools (this takes a minute)...\r\n\
-        \"%VIODRV%\\virtio-win-guest-tools.exe\" /install /quiet /norestart\r\n\
+        echo Starting the virtio-win guest tools installer. Click through it\r\n\
+        echo as you would normally - this script only launches it.\r\n\
+        \"%VIODRV%\\virtio-win-guest-tools.exe\"\r\n\
         set RC=%ERRORLEVEL%\r\n\
         if not \"%RC%\"==\"0\" if not \"%RC%\"==\"3010\" (\r\n\
         echo Guest tools installer returned %RC%.\r\n\
@@ -209,10 +211,14 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         exit /b %RC%\r\n\
         )\r\n\
         \r\n\
-        if exist \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" (\r\n\
+        sc query QEMU-GA >nul 2>&1\r\n\
+        if errorlevel 1 if exist \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" (\r\n\
         echo Installing the QEMU guest agent...\r\n\
         msiexec /i \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" /qn\r\n\
         )\r\n\
+        \r\n\
+        echo Blocking driver delivery via Windows Update...\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
         \r\n\
         echo.\r\n\
         echo Done - reboot to finish. Keep the VM's network off unless you\r\n\
@@ -298,12 +304,17 @@ mod tests {
             .read_to_string(&mut inst)
             .unwrap();
         assert!(inst.contains("virtio-win-guest-tools.exe"));
-        assert!(inst.contains("/install /quiet /norestart"));
-        assert!(inst.contains("qemu-ga-x86_64.msi"));
         assert!(!inst.contains("virtio-win-gt-x64.msi"));
+        // Never silently: a /quiet run installs every component with
+        // defaults, where the interactive one decides per device.
+        assert!(!inst.contains("/quiet"));
+        // The bundler ships qemu-ga, so only install it if it is missing.
+        assert!(inst.contains("sc query QEMU-GA"));
+        // The WU policy goes on AFTER, so drivers never stage under a
+        // policy state that a hand install would not produce.
         let wu = inst.find("ExcludeWUDriversInQualityUpdate").unwrap();
-        let gt = inst.find("virtio-win-guest-tools.exe\" /install").unwrap();
-        assert!(wu < gt, "WU block must precede the guest-tools install");
+        let gt = inst.find("\\virtio-win-guest-tools.exe\"").unwrap();
+        assert!(gt < wu, "the install must precede the WU block");
         drop(fs);
         std::fs::remove_file(&img).ok();
     }
