@@ -2833,7 +2833,7 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
 }
 
 /// Best-practices guide for booting backups as VMs.
-const VM_WIKI_URL: &str = "https://github.com/steeb-k/phoenix-simulacra/wiki";
+const VM_WIKI_URL: &str = "https://github.com/steeb-k/phoenix-simulacra/wiki/Virtualization";
 
 /// The "read the guide first" card under the Virtualize header.
 ///
