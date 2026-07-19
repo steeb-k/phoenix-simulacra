@@ -293,7 +293,49 @@ growing overlay. The engine already supports this (`--vm-dir` takes any root),
 so the GUI needs a drive picker (showing free space per volume) that writes the
 chosen root into settings, with "same drive as the image" as the default choice.
 
-### Throughput: the qcow2 path is ~3× slower to boot (now critical-path)
+### Throughput: fixed (~13 min → ~3 min to lock screen)
+
+**Resolved 2026-07-19.** The read path had three pathologies, all in
+`phoenix-mount::chunkstore`, and none of them were what the shape of the
+problem first suggested:
+
+1. **Every read cloned the whole `ExtentSpan`** — including its
+   `Vec<PlacedChunk>`, where each chunk carried a heap hex `String` hash. On a
+   108 GB partition that is tens of thousands of allocations *per read*. Fixed
+   by locating the chunk under an immutable borrow and copying out only the
+   (now heap-free, `Copy`) `PlacedChunk`; hashes are stored decoded as
+   `[u8; 32]`.
+2. **Every cache hit copied the whole 4 MiB chunk** to serve a 4 KiB read.
+   Fixed by caching `Arc<Vec<u8>>` so a hit is a refcount bump.
+3. **The cache was FIFO, not LRU** — `cache_order` was never touched on a hit,
+   so hot chunks were evicted on a fixed schedule and re-decompressed (and, on
+   a spinning disk, re-*seeked*). Fixed with promote-on-hit, plus
+   sequential-detection readahead.
+
+Measured (backup on a **7200-rpm HDD**, release build):
+
+| workload | before | after |
+|---|---|---|
+| random 4 KiB, cold | 52 reads/s (19.1 ms) | **200 reads/s (5.0 ms)** |
+| random 4 KiB, warm | 136 reads/s (7.4 ms) | **517 reads/s (1.9 ms)** |
+| sequential | 131 MB/s | 132 MB/s (already streaming) |
+| **boot → lock screen** | **~13 min** | **~3 min** |
+
+Two lessons worth keeping. **The backing store matters more than the CPU
+here:** on an HDD a cache miss costs a ~10 ms seek, so the wins came from
+*avoiding I/O* (LRU, readahead), not from decoding faster — parallel chunk
+decode would have been largely wasted, and parallel I/O on a spindle would
+have made it worse. And **measure the right workload**: sequential `dd` looked
+fine (131 MB/s) because it amortizes per-read cost over a whole 4 MiB chunk;
+only a scattered 4 KiB benchmark exposed the real problem.
+
+Still available if more is needed: reads all serialize on one mutex
+(`VhdFs::read` → `self.vhd.lock()`), so there is no read concurrency. On an
+HDD that matters little; on an SSD-backed image it would be the next lever.
+Putting the `.phnx` on an SSD is also simply faster — which is another reason
+for the GUI's scratch-drive picker.
+
+### (historical) Why this was thought to be a qcow2 problem
 
 End-to-end `simulacra-cli vm boot` on the real Win11 backup (2026-07-19):
 
