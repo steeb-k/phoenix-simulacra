@@ -7,7 +7,7 @@
 //! one command to paste inside the guest:
 //!
 //! ```text
-//! net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user
+//! net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user /persistent:yes /savecred
 //! ```
 //!
 //! The guest prompts for the host account's password (a Microsoft-account PC
@@ -75,10 +75,20 @@ pub fn remove_share() {
 
 /// The command the user pastes INSIDE the guest to map the share. `10.0.2.2`
 /// is slirp's gateway — the host's loopback as seen from the guest.
+///
+/// Mapped like any ordinary drive: remembered across guest reboots, with the
+/// credential saved so the reconnect doesn't prompt. The saved credential
+/// lives in the guest's Credential Manager, i.e. inside the session overlay
+/// — discarded with the session, never written back to the backup image.
+///
+/// The single source of truth for this command: `MapShare.cmd` runs exactly
+/// this, and the Running view shows exactly this to copy.
 pub fn guest_mount_command() -> String {
     let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "HOST".into());
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    format!(r"net use S: \\10.0.2.2\{SHARE_NAME} /user:{host}\{user}")
+    format!(
+        r"net use S: \\10.0.2.2\{SHARE_NAME} /user:{host}\{user} /persistent:yes /savecred"
+    )
 }
 
 /// Build the guest helper disk: a small FAT image (regenerated every boot)
@@ -150,7 +160,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
          echo (Sign in with the account password you use on the host PC.)\r\n\
          echo.\r\n\
          net use S: /delete /y >nul 2>&1\r\n\
-         {mount} /persistent:yes\r\n\
+         {mount}\r\n\
          if errorlevel 1 (\r\n\
          echo.\r\n\
          echo Mapping failed - is the shared folder enabled on the host?\r\n\
@@ -318,9 +328,14 @@ mod tests {
         assert!(cmd.contains(r"\\10.0.2.2\SimulacraShare"));
         assert!(cmd.contains("net use S:"));
         // A normal, remembered mapping — it should come back on its own
-        // after a guest reboot rather than needing the script again.
+        // after a guest reboot, credential and all, rather than needing the
+        // script again or prompting.
         assert!(cmd.contains("/persistent:yes"));
         assert!(!cmd.contains("/persistent:no"));
+        assert!(cmd.contains("/savecred"));
+        // The script must run exactly the command the UI offers to copy, so
+        // the two can't drift apart.
+        assert!(cmd.contains(&guest_mount_command()));
 
         // The driver script installs the CD's bundler (the only source of
         // the SPICE vdagent), never the loose driver-only MSI, and blocks
