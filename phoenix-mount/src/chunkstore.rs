@@ -135,7 +135,13 @@ impl ChunkStore {
             total_size: disk_size,
             cache: HashMap::new(),
             cache_order: Vec::new(),
-            cache_cap: 64, // 64 * 4 MiB = 256 MiB ceiling
+            // Each cache miss decompresses a whole 4 MiB chunk to serve even a
+            // 4 KiB read — a booting VM guest issues scattered 4K reads across
+            // the whole OS partition, and a small cache thrashes into ~1000x
+            // read amplification (observed: winload crawling for minutes).
+            // 384 entries = 1.5 GiB ceiling, reached only under sustained
+            // scattered reads.
+            cache_cap: 384,
         })
     }
 

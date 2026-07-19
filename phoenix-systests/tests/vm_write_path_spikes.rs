@@ -444,6 +444,166 @@ fn spike_b_qcow2_overlay_over_served_vhdx() {
     let _ = std::fs::remove_file(&backup);
 }
 
+/// Boot smoke: serve a **real bootable Windows backup** and hand it to
+/// qemu-system over the qcow2 write path, auto-configuring the VM from the
+/// manifest (the seed of the `phoenix-vm` config synthesis):
+///   is_gpt        -> OVMF pflash pair (UEFI) vs SeaBIOS
+///   sector_size   -> AHCI ide-hd (512e) vs NVMe (4Kn; IDE is 512-only)
+///
+/// Interactive by design: it opens a QEMU window and blocks until the window
+/// is closed, because the serve must outlive the guest. The overlay + NVRAM
+/// session directory is kept afterwards for inspection/resume.
+///
+/// Gated on PHOENIX_VM_BOOT_PHNX=<path to .phnx> so the ordinary suite never
+/// launches a VM.
+#[test]
+#[ignore = "interactive: requires WinFsp + QEMU + PHOENIX_VM_BOOT_PHNX"]
+fn boot_smoke_windows_backup() {
+    let Ok(phnx) = std::env::var("PHOENIX_VM_BOOT_PHNX") else {
+        eprintln!("PHOENIX_VM_BOOT_PHNX not set — skipping boot smoke");
+        return;
+    };
+    let phnx = PathBuf::from(phnx);
+    assert!(phnx.exists(), "{} does not exist", phnx.display());
+    let qemu_img = qemu_tool("qemu-img.exe");
+    let qemu_sys = qemu_tool("qemu-system-x86_64.exe");
+
+    // --- manifest facts drive the whole VM config ---------------------------
+    let reader = PhnxReader::open(&phnx).expect("open backup");
+    let is_gpt = reader.manifest.disk.style.eq_ignore_ascii_case("gpt");
+    let sector_size = reader.manifest.disk.sector_size;
+    eprintln!(
+        "manifest: {} | {sector_size}-byte sectors | {} partitions:",
+        if is_gpt { "GPT (UEFI firmware)" } else { "MBR (SeaBIOS)" },
+        reader.manifest.partitions.len()
+    );
+    for p in &reader.manifest.partitions {
+        eprintln!(
+            "  p{}: {} ({}), {} MiB, bitlocker={:?}",
+            p.index,
+            p.fs,
+            p.name,
+            p.original_size / MIB,
+            p.bitlocker
+        );
+    }
+    drop(reader);
+
+    // --- serve + session (persistent qcow2 overlay, kept after exit) --------
+    let scratch = std::env::temp_dir().join("phoenix-systests").join("vmboot");
+    // serve_for_vm: boot-faithful GPT identity (original disk + partition
+    // GUIDs) — with the mount-style derived GUIDs the BCD cannot resolve its
+    // boot device and winload.efi fails with 0xc000000e.
+    let serve = WinFspServe::serve_for_vm(&phnx, &scratch).expect("WinFsp serve");
+    let parent = serve.image_path();
+    eprintln!(
+        "serving {} GiB virtual disk from {}",
+        serve.disk_size() / (1024 * MIB),
+        phnx.display()
+    );
+
+    let session = std::env::temp_dir().join("phoenix-vm-smoke");
+    std::fs::create_dir_all(&session).expect("create session dir");
+    let overlay = session.join("session.qcow2");
+    // Fresh overlay each run: the backing path embeds the per-serve directory,
+    // which changes between serves. (A real session manager will pin it.)
+    let _ = std::fs::remove_file(&overlay);
+    run_ok(
+        Command::new(&qemu_img)
+            .args(["create", "-f", "qcow2", "-F", "vhdx", "-b"])
+            .arg(&parent)
+            .arg(&overlay),
+        "qemu-img create session overlay",
+    );
+
+    // --- assemble the QEMU command line -------------------------------------
+    let mut cmd = Command::new(&qemu_sys);
+    cmd.args(["-machine", "q35"]);
+    // Accelerator (override with PHOENIX_VM_ACCEL=whpx|whpx-noirq|tcg).
+    match std::env::var("PHOENIX_VM_ACCEL").as_deref() {
+        Ok("tcg") => {
+            cmd.args(["-accel", "tcg"]);
+        }
+        Ok("whpx-noirq") => {
+            cmd.args(["-accel", "whpx,kernel-irqchip=off"])
+                .args(["-accel", "tcg"]);
+        }
+        _ => {
+            cmd.args(["-accel", "whpx"]).args(["-accel", "tcg"]);
+        }
+    }
+    cmd
+        // NOT `max`: under WHPX, `max` exposes host features the hypervisor
+        // can't virtualize (APX on new Intel hosts) and the guest spins at
+        // 100% CPU before video init. A rich named model is fast and still
+        // clears Win11's CPU floor (SSE4.2/POPCNT).
+        .args(["-cpu", "Skylake-Client-v4"])
+        .args(["-smp", "4", "-m", "6G"])
+        .args(["-rtc", "base=localtime"])
+        .args(["-nic", "user,model=e1000e"])
+        .args(["-name", "Phoenix Simulacra boot smoke"]);
+    if is_gpt {
+        let share = qemu_sys.parent().unwrap().join("share");
+        // BOTH pflash units get per-session WRITABLE copies. Attaching the
+        // code flash read-only maps it as ROM, and WHPX cannot execute from
+        // ROM-mapped memory — every fetch traps into emulation and OVMF
+        // "hangs" at 100% CPU (validated on this box: readonly=on never
+        // reached video init; a writable copy splashed in seconds).
+        let code = session.join("code.fd");
+        std::fs::copy(share.join("edk2-x86_64-code.fd"), &code).expect("copy OVMF code flash");
+        let vars = session.join("nvram-vars.fd");
+        if !vars.exists() {
+            std::fs::copy(share.join("edk2-i386-vars.fd"), &vars).expect("copy NVRAM varstore");
+        }
+        cmd.arg("-drive")
+            .arg(format!("if=pflash,format=raw,file={}", code.display()));
+        cmd.arg("-drive")
+            .arg(format!("if=pflash,format=raw,file={}", vars.display()));
+    }
+    cmd.arg("-drive")
+        .arg(format!("file={},format=qcow2,if=none,id=disk0", overlay.display()));
+    // Disk controller (override with PHOENIX_VM_DISK=ahci|nvme). NVMe is the
+    // default: a physical Windows install that booted from NVMe usually has
+    // storahci demoted via StartOverride (AHCI presentation then stalls right
+    // after winload — observed live), while stornvme is boot-start. IDE/AHCI
+    // is also 512-only, so 4Kn captures need NVMe regardless.
+    let disk_dev = std::env::var("PHOENIX_VM_DISK").unwrap_or_else(|_| "nvme".into());
+    match disk_dev.as_str() {
+        // bootindex=0 pins the OS disk first in the fw_cfg boot order —
+        // without it a fresh OVMF varstore tries PXE/HTTP for minutes and
+        // then drops to the UEFI shell before ever reaching the disk.
+        "ahci" if sector_size == 512 => {
+            cmd.args(["-device", "ide-hd,drive=disk0,bootindex=0"]);
+        }
+        _ => {
+            // Controller and namespace as separate devices: the legacy
+            // `nvme,drive=` shorthand left the controller namespace-less on
+            // this QEMU build and OVMF found no disk to boot (fell through
+            // to PXE/HTTP). The explicit nvme-ns is the documented form.
+            cmd.args(["-device", "nvme,id=nvm0,serial=PHNXVM01"]);
+            let mut ns = "nvme-ns,drive=disk0,bus=nvm0,bootindex=0".to_string();
+            if sector_size == 4096 {
+                ns.push_str(",logical_block_size=4096,physical_block_size=4096");
+            }
+            cmd.arg("-device").arg(ns);
+        }
+    }
+
+    eprintln!("launching: {cmd:?}");
+    let mut child = cmd.spawn().expect("launch qemu-system");
+    eprintln!(
+        "QEMU is up (pid {}); close the VM window to end the smoke.",
+        child.id()
+    );
+    let status = child.wait().expect("wait for qemu");
+    eprintln!("qemu exited: {status:?}");
+    drop(serve);
+    eprintln!(
+        "session kept for inspection/resume: {}",
+        session.display()
+    );
+}
+
 // --- raw device I/O helpers (sector-aligned, as QEMU's raw driver does) -----
 
 fn raw_open(path: &str) -> std::fs::File {

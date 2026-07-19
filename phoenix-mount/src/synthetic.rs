@@ -63,17 +63,31 @@ impl SyntheticVhd {
     /// container regardless of sector size (e.g. a writable-overlay parent — a
     /// fixed VHD cannot be a differencing parent).
     pub fn build(reader: PhnxReader) -> Result<Self> {
-        Self::build_inner(reader, false)
+        Self::build_inner(reader, false, false)
     }
 
     /// Like [`SyntheticVhd::build`], but always wraps the image in VHDX even for
     /// a 512e backup. Required for the writable overlay: only a VHDX can be named
     /// as the parent of a Windows differencing disk.
     pub fn build_vhdx(reader: PhnxReader) -> Result<Self> {
-        Self::build_inner(reader, true)
+        Self::build_inner(reader, true, false)
     }
 
-    fn build_inner(reader: PhnxReader, force_vhdx: bool) -> Result<Self> {
+    /// As [`SyntheticVhd::build_vhdx`], but the synthesized GPT carries the
+    /// SOURCE disk's identity — original disk GUID, original partition unique
+    /// GUIDs, original GPT attribute bits — instead of the backup-id-derived
+    /// ones. Required to *boot* the image: the Windows BCD references the OS
+    /// partition by disk GUID + PartitionId, and a regenerated identity fails
+    /// `winload.efi` with 0xc000000e (validated live on a real capture).
+    ///
+    /// Never attach a disk served with this identity to the host while the
+    /// source disk (or another mount of the same backup) is present — GPT
+    /// collisions are exactly why the mount paths derive fresh GUIDs.
+    pub fn build_vhdx_original_identity(reader: PhnxReader) -> Result<Self> {
+        Self::build_inner(reader, true, true)
+    }
+
+    fn build_inner(reader: PhnxReader, force_vhdx: bool, original_identity: bool) -> Result<Self> {
         // The synthesized disk must advertise the SOURCE disk's sector size. A
         // volume captured from a 4Kn disk records `BytesPerSector = 4096` in its
         // own boot sector, and NTFS refuses to mount when the filesystem's sector
@@ -132,7 +146,17 @@ impl SyntheticVhd {
         // in that window, and its volume never surfaces (no drive letter). A
         // different identity sidesteps the collision entirely; the mounted data
         // is unaffected (the NTFS volume's own id lives in its boot sector).
-        let disk_guid = if force_vhdx {
+        let disk_guid = if original_identity {
+            // Boot-faithful: the source disk's GUID from the manifest, falling
+            // back to the backup id for MBR sources / pre-fidelity backups.
+            reader
+                .manifest
+                .disk
+                .disk_guid
+                .as_deref()
+                .and_then(phoenix_core::disk::guid_from_string)
+                .unwrap_or_else(|| *reader.header.backup_id.as_bytes())
+        } else if force_vhdx {
             writable_overlay_guid(reader.header.backup_id.as_bytes())
         } else {
             *reader.header.backup_id.as_bytes()
@@ -148,15 +172,34 @@ impl SyntheticVhd {
                     Some(g) if g != [0u8; 16] => g,
                     _ => gpt::BASIC_DATA_TYPE_GUID,
                 };
+                // The binary index has no GPT identity; the JSON manifest does.
+                let mpart = reader
+                    .manifest
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == s.partition_index);
+                let unique_guid = if original_identity {
+                    mpart
+                        .and_then(|p| p.unique_guid.as_deref())
+                        .and_then(phoenix_core::disk::guid_from_string)
+                        .unwrap_or_else(|| derive_guid(&disk_guid, s.partition_index))
+                } else {
+                    derive_guid(&disk_guid, s.partition_index)
+                };
+                let attributes = if original_identity {
+                    mpart.and_then(|p| p.gpt_attributes).unwrap_or(0)
+                } else {
+                    0
+                };
                 GptPart {
                     type_guid,
-                    unique_guid: derive_guid(&disk_guid, s.partition_index),
+                    unique_guid,
                     // LBAs are in the DISK's sectors, so partition offsets divide
                     // by 4096 on a 4Kn disk, not 512. Partition spans are 1 MiB
                     // aligned, so both divide cleanly.
                     first_lba: s.disk_offset / sector_size,
                     last_lba: (s.disk_offset + s.size) / sector_size - 1,
-                    attributes: 0,
+                    attributes,
                     name: entry.map(|e| e.name.clone()).unwrap_or_default(),
                 }
             })
