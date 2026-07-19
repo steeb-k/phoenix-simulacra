@@ -844,6 +844,9 @@ struct PhoenixApp {
     /// A mount awaiting the "enable temporary write access" hazard dialog. Holds
     /// the Active-mounts table index (real rows first, then demo rows).
     pending_enable_write: Option<usize>,
+    /// Boot VM was clicked while saved sessions exist: the resume-or-new
+    /// hazard dialog is up. Holds every saved session's backup path.
+    vm_boot_prompt: Option<Vec<String>>,
     /// Acknowledgement-checkbox state for the enable-write dialog.
     enable_write_ack: bool,
     /// Virtualize page controls (backup, knobs, scratch drive, ISO).
@@ -999,6 +1002,7 @@ impl PhoenixApp {
             demo_mounts: demo_mount_rows_from_args(),
             pending_close: false,
             pending_enable_write: None,
+            vm_boot_prompt: None,
             enable_write_ack: false,
             vm: vm_panel::VmPageState::default(),
             vm_run: None,
@@ -1290,6 +1294,7 @@ impl PhoenixApp {
             || self.pending_close
             || self.pending_enable_write.is_some()
             || self.pending_boot_repair.is_some()
+            || self.vm_boot_prompt.is_some()
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -1990,7 +1995,7 @@ impl PhoenixApp {
                     Page::Verify => self.start_verify(),
                     Page::Clone => self.start_clone(),
                     Page::Mount => self.start_mount(),
-                    Page::Virtualize => self.start_vm(),
+                    Page::Virtualize => self.request_start_vm(),
                     Page::BootRepair => self.start_boot_repair(),
                     _ => {}
                 }
@@ -2068,6 +2073,7 @@ impl PhoenixApp {
         self.show_demo_progress_modal(ctx);
         self.show_close_dialog(ctx);
         self.show_enable_write_dialog(ctx);
+        self.show_vm_boot_dialog(ctx);
         self.show_refresh_overlay(ctx);
     }
 
@@ -2182,6 +2188,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack: None,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2196,7 +2203,7 @@ impl PhoenixApp {
                 self.status =
                     "Backup cancelled — choose a different name to keep the old one".into();
             }
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -2236,6 +2243,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2252,7 +2260,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Clone cancelled — no changes were made".into();
             }
-            ConfirmAction::None => self.pending_clone = Some(pending),
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_clone = Some(pending),
         }
     }
 
@@ -2294,6 +2302,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2310,7 +2319,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Restore cancelled — no changes were made".into();
             }
-            ConfirmAction::None => self.pending_restore = Some(pending),
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_restore = Some(pending),
         }
     }
 
@@ -2335,6 +2344,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2351,7 +2361,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Boot repair cancelled — no changes were made".into();
             }
-            ConfirmAction::None => self.pending_boot_repair = Some(pending),
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_boot_repair = Some(pending),
         }
     }
 
@@ -2393,6 +2403,7 @@ impl PhoenixApp {
             confirm_danger: false,
             hazard_tape: true,
             ack: None,
+            extra_label: None,
         };
         match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
@@ -2401,7 +2412,7 @@ impl PhoenixApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             ConfirmAction::Cancel => self.pending_close = false,
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -2425,6 +2436,7 @@ impl PhoenixApp {
             confirm_danger: true,
             hazard_tape: true,
             ack: None,
+            extra_label: None,
         };
         if confirm_dialog::show(ctx, &self.palette, &mut view) != ConfirmAction::None {
             self.demo_confirm = false;
@@ -2504,6 +2516,7 @@ impl PhoenixApp {
                 label: "I understand my changes are temporary and will be discarded on unmount",
                 checked: &mut ack_checked,
             }),
+            extra_label: None,
         };
         let result = confirm_dialog::show(ctx, &self.palette, &mut view);
         self.enable_write_ack = ack_checked;
@@ -2517,7 +2530,7 @@ impl PhoenixApp {
                 self.pending_enable_write = None;
                 self.enable_write_ack = false;
             }
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -4152,7 +4165,9 @@ impl PhoenixApp {
                         dl.progress = (downloaded, total);
                     }
                     Ok(virtio_iso::DlEvent::Done) => {
-                        self.drivers_note = "Guest tools & driver ISO is ready.".into();
+                        // No note on success — the checkbox appearing IS the
+                        // signal that the ISO is ready.
+                        self.drivers_note.clear();
                         self.drivers_dl = None;
                         break;
                     }
@@ -4269,7 +4284,7 @@ impl PhoenixApp {
             vm_panel::VmAction::Resume(path) => {
                 self.vm.backup_path = path;
                 self.load_vm_summary();
-                self.start_vm();
+                self.start_vm(false);
             }
             vm_panel::VmAction::Discard(path) => {
                 match phoenix_core::container::PhnxReader::open(std::path::Path::new(&path)) {
@@ -4326,7 +4341,115 @@ impl PhoenixApp {
         }
     }
 
-    fn start_vm(&mut self) {
+    /// Boot VM clicked: when saved sessions exist, raise the resume-or-new
+    /// hazard dialog first so a user doesn't overlook a session they meant to
+    /// continue (or blow one away by re-picking its backup). No sessions →
+    /// boot straight away.
+    fn request_start_vm(&mut self) {
+        if self.vm_run.is_some() || self.vm_boot_prompt.is_some() {
+            return;
+        }
+        let sessions: Vec<String> = phoenix_vm::SessionManager::list_all_sessions()
+            .into_iter()
+            .map(|s| s.meta().backup_path.clone())
+            .collect();
+        if sessions.is_empty() {
+            self.start_vm(false);
+        } else {
+            self.vm_boot_prompt = Some(sessions);
+        }
+    }
+
+    /// The resume-or-new dialog raised by [`Self::request_start_vm`].
+    fn show_vm_boot_dialog(&mut self, ctx: &egui::Context) {
+        let Some(session_paths) = self.vm_boot_prompt.clone() else {
+            return;
+        };
+        // Starting a new session for a backup that already has one discards
+        // that session's saved guest changes — hence the hazard framing.
+        let selected_has_session = session_paths
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(self.vm.backup_path.trim()));
+        let single = (session_paths.len() == 1).then(|| session_paths[0].clone());
+
+        let action = {
+            let (message, confirm_label, extra_label) = match &single {
+                Some(path) => {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    (
+                        format!(
+                            "You have a saved session for {name}. Resume it, or start a \
+                             new session from the selected backup?{}",
+                            if selected_has_session {
+                                "\n\nStarting new discards that session's saved changes."
+                            } else {
+                                ""
+                            }
+                        ),
+                        "Resume",
+                        Some("Start new"),
+                    )
+                }
+                None => (
+                    format!(
+                        "You have {} saved sessions. To continue one of them, choose \
+                         Resume next to it under Saved sessions. Start a new session \
+                         from the selected backup instead?{}",
+                        session_paths.len(),
+                        if selected_has_session {
+                            "\n\nThe selected backup already has a saved session — \
+                             starting new discards its saved changes."
+                        } else {
+                            ""
+                        }
+                    ),
+                    "Start new",
+                    None,
+                ),
+            };
+            let mut view = ConfirmView {
+                title: "Saved session found",
+                message: &message,
+                details: &[],
+                confirm_label,
+                cancel_label: "Cancel",
+                // "Start new" over an existing session is destructive; a plain
+                // Resume is not.
+                confirm_danger: single.is_none() && selected_has_session,
+                hazard_tape: true,
+                ack: None,
+                extra_label,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+
+        match (action, &single) {
+            // Single session: Confirm = resume it (whatever backup is picked).
+            (ConfirmAction::Confirm, Some(path)) => {
+                self.vm_boot_prompt = None;
+                self.vm.backup_path = path.clone();
+                self.load_vm_summary();
+                self.start_vm(false);
+            }
+            // Single session: Extra = start new from the selected backup.
+            (ConfirmAction::Extra, Some(_)) => {
+                self.vm_boot_prompt = None;
+                self.start_vm(selected_has_session);
+            }
+            // Multiple sessions: Confirm = start new from the selected backup.
+            (ConfirmAction::Confirm, None) => {
+                self.vm_boot_prompt = None;
+                self.start_vm(selected_has_session);
+            }
+            (ConfirmAction::Cancel, _) => self.vm_boot_prompt = None,
+            _ => {}
+        }
+    }
+
+    fn start_vm(&mut self, fresh: bool) {
         if self.vm_run.is_some() {
             return;
         }
@@ -4394,7 +4517,7 @@ impl PhoenixApp {
                 &backup_thread,
                 &host,
                 phoenix_vm::WriteLayer::Qcow2,
-                false,
+                fresh,
                 iso.as_deref(),
                 boot_iso,
                 drivers_iso.as_deref(),
@@ -4407,6 +4530,7 @@ impl PhoenixApp {
                 let _ = (
                     &backup_thread,
                     &host,
+                    fresh,
                     &iso,
                     boot_iso,
                     &drivers_iso,
@@ -4549,6 +4673,7 @@ impl PhoenixApp {
             // only record that the backup it names was ever made.
             hazard_tape: true,
             ack: None,
+            extra_label: None,
         };
         match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
@@ -4558,7 +4683,7 @@ impl PhoenixApp {
                 }
             }
             ConfirmAction::Cancel => self.pending_history_delete = None,
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
