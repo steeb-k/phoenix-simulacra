@@ -2902,12 +2902,65 @@ fn backup_path_picker(
 }
 
 fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
+    page_header_badged(ui, palette, title, subtitle, "");
+}
+
+/// [`page_header`] plus a small, low-contrast word set beside the title —
+/// for status that qualifies the whole page ("Experimental") and should read
+/// as an aside rather than as part of the title.
+fn page_header_badged(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    title: &str,
+    subtitle: &str,
+    badge: &str,
+) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
+        if !badge.is_empty() {
+            // Baseline-ish alignment: the title's cap height is far taller
+            // than the badge's, so without a nudge the small text floats.
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(badge)
+                    .font(fonts::regular(13.0))
+                    .color(palette.subtle_text),
+            );
+        }
+    });
     if !subtitle.is_empty() {
         ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
     }
     ui.add_space(14.0);
+}
+
+/// Height of the decorative hazard band at the top of the Virtualize page.
+const PAGE_HAZARD_BAND_H: f32 = 104.0;
+
+/// Hazard tape bled across the top of the page and dissolved into the panel
+/// behind it. Allocates no layout space and is painted before the page's
+/// content, so everything the page draws lands on top of it.
+///
+/// Muted hard on purpose: the confirm dialog's tape is a stop sign for one
+/// decision, while this one qualifies a whole page you're meant to keep
+/// working in. It has to register as "this is experimental" in peripheral
+/// vision and then get out of the way — full-strength tape behind body text
+/// would be unreadable and would cry wolf.
+fn paint_page_hazard_band(ui: &egui::Ui) {
+    let area = ui.max_rect();
+    let rect = egui::Rect::from_min_size(
+        area.left_top(),
+        egui::vec2(area.width(), PAGE_HAZARD_BAND_H.min(area.height())),
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    let yellow = egui::Color32::from_rgb(0xF6, 0xC4, 0x00);
+    let black = egui::Color32::from_rgb(0x16, 0x16, 0x16);
+    painter.rect_filled(rect, 0.0, black);
+    stripes::paint(&painter, rect, yellow, rect.height() * 0.7, 0.0);
+    // Wash it back most of the way at the top, then all the way by the
+    // bottom edge, so the band has no hard border to give itself away.
+    stripes::fade_into(&painter, rect, ui.visuals().panel_fill, 205);
 }
 
 impl PhoenixApp {
@@ -4250,8 +4303,12 @@ impl PhoenixApp {
         let mut vm_state = std::mem::take(&mut self.vm);
         let mut action = vm_panel::VmAction::None;
 
+        // Painted against the panel rather than inside the scroll shell, so
+        // it stays put at the top of the page instead of scrolling away.
+        paint_page_hazard_band(ui);
+
         page_scroll_shell(ui, "virtualize_page", |ui| {
-            page_header(ui, &palette, "Virtualize", "");
+            page_header_badged(ui, &palette, "Virtualize", "", "Experimental");
             let running = running_owned.as_ref().map(|(n, b, e, o, share)| {
                 vm_panel::RunningView {
                     name: n,
@@ -4623,19 +4680,20 @@ impl PhoenixApp {
         };
         let share_active = share_cmd.is_some();
         // The "SIMULACRA" helper disk carries MapShare.cmd into the guest so
-        // mapping the share is a double-click, not transcription.
-        let helper_disk = share_active
-            .then(|| {
-                let p = vm_root.join("share-helper.img");
-                match phoenix_vm::share::build_helper_disk(&p) {
-                    Ok(()) => Some(p),
-                    Err(e) => {
-                        tracing::warn!("helper disk build failed: {e:#}");
-                        None
-                    }
+        // mapping the share is a double-click, not transcription — and
+        // InstallGuestDrivers.cmd, which matters MOST with networking off,
+        // since that is exactly when the guest can't fetch anything itself.
+        // So it is never gated on the share: only MapShare.cmd needs the NAT.
+        let helper_disk = {
+            let p = vm_root.join("share-helper.img");
+            match phoenix_vm::share::build_helper_disk(&p) {
+                Ok(()) => Some(p),
+                Err(e) => {
+                    tracing::warn!("helper disk build failed: {e:#}");
+                    None
                 }
-            })
-            .flatten();
+            }
+        };
 
         let (tx, rx) = std::sync::mpsc::channel();
         let backup_thread = backup.clone();

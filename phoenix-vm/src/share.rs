@@ -230,6 +230,7 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
          MapShare.cmd           - map the host's shared folder as drive S:\r\n\
          (the folder next to the backup image, \\\\10.0.2.2\\{SHARE_NAME}).\r\n\
          Anything you copy into S: appears on the host, and vice versa.\r\n\
+         Needs the VM's networking switched on - the share rides the NAT.\r\n\
          \r\n\
          InstallGuestDrivers.cmd - install the virtio-win guest tools and\r\n\
          the QEMU guest agent from the attached driver CD, and block driver\r\n\
