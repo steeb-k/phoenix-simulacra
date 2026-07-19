@@ -226,14 +226,16 @@ pub fn boot(
             .with_context(|| format!("create {}", qemu_log_path.display()))?;
         let log_err = log_out.try_clone().context("clone qemu.log handle")?;
         let started = std::time::Instant::now();
-        let status = Command::new(&qemu.system)
+        let mut child = Command::new(&qemu.system)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(log_out)
             .stderr(log_err)
             .creation_flags(CREATE_NO_WINDOW)
-            .status()
+            .spawn()
             .with_context(|| format!("launch {}", qemu.system.display()))?;
+        maximize_window_of(child.id());
+        let status = child.wait().context("wait for QEMU")?;
 
         let log_text = std::fs::read_to_string(&qemu_log_path).unwrap_or_default();
         let guest_reset = log_text.contains("Unexpected VP exit code");
@@ -304,6 +306,61 @@ pub fn boot(
         resumed_dirty,
         qemu_log_tail,
     })
+}
+
+/// Maximize QEMU's window once it appears. QEMU has no "start maximized"
+/// switch (`full-screen=on` is borderless fullscreen — a different thing), so
+/// a watcher thread waits for the freshly-spawned process's main window and
+/// asks the OS to maximize it. Paired with `zoom-to-fit=on` in the display
+/// args so the guest picture fills the window.
+fn maximize_window_of(pid: u32) {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, GW_OWNER,
+        SW_MAXIMIZE,
+    };
+
+    struct Search {
+        pid: u32,
+        hwnd: HWND,
+    }
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        // SAFETY: `lp` is the &mut Search passed to EnumWindows below, which
+        // outlives the call.
+        let search = unsafe { &mut *(lp as *mut Search) };
+        let mut wpid = 0u32;
+        // SAFETY: hwnd is live for the duration of the callback.
+        unsafe { GetWindowThreadProcessId(hwnd, &mut wpid) };
+        // SAFETY: as above; a visible, unowned top-level window is the display.
+        if wpid == search.pid
+            && unsafe { IsWindowVisible(hwnd) } != 0
+            && unsafe { GetWindow(hwnd, GW_OWNER) }.is_null()
+        {
+            search.hwnd = hwnd;
+            return 0; // found — stop enumerating
+        }
+        1
+    }
+
+    std::thread::spawn(move || {
+        // GTK can take a moment to realize the window; give it plenty.
+        for _ in 0..150 {
+            let mut search = Search {
+                pid,
+                hwnd: std::ptr::null_mut(),
+            };
+            // SAFETY: the callback only runs during this call and only touches
+            // `search`, which outlives it.
+            unsafe { EnumWindows(Some(enum_cb), &mut search as *mut Search as LPARAM) };
+            if !search.hwnd.is_null() {
+                // SAFETY: worst case the window died since — ShowWindow then
+                // fails harmlessly.
+                unsafe { ShowWindow(search.hwnd, SW_MAXIMIZE) };
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
 }
 
 /// The last `max_bytes` of a log file as lossy UTF-8, trimmed — what gets
