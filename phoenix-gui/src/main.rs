@@ -1059,11 +1059,17 @@ impl PhoenixApp {
             app.page = Page::Mount;
             app.pending_enable_write = Some(0);
         }
-        // Restore the persisted Virtualize scratch-drive choice.
+        // Restore the persisted Virtualize knobs (scratch drive, RAM, CPUs).
         app.vm.scratch = match app.settings.vm_scratch_drive {
             Some(c) => vm_panel::ScratchChoice::Drive(c),
             None => vm_panel::ScratchChoice::SameAsImage,
         };
+        if let Some(m) = app.settings.vm_memory_mib {
+            app.vm.mem_mib = m;
+        }
+        if let Some(c) = app.settings.vm_cpus {
+            app.vm.cpus = c;
+        }
         app.init_updates();
         app
     }
@@ -4325,14 +4331,19 @@ impl PhoenixApp {
             }
         }
 
-        // Persist the scratch-drive choice the moment it changes — a fresh
-        // launch otherwise resets to the default and surprises the next boot.
+        // Persist the VM knobs the moment they change — a fresh launch
+        // otherwise resets them and surprises the next boot.
         let scratch_now = match self.vm.scratch {
             vm_panel::ScratchChoice::SameAsImage => None,
             vm_panel::ScratchChoice::Drive(c) => Some(c),
         };
-        if scratch_now != self.settings.vm_scratch_drive {
+        if scratch_now != self.settings.vm_scratch_drive
+            || self.settings.vm_memory_mib != Some(self.vm.mem_mib)
+            || self.settings.vm_cpus != Some(self.vm.cpus)
+        {
             self.settings.vm_scratch_drive = scratch_now;
+            self.settings.vm_memory_mib = Some(self.vm.mem_mib);
+            self.settings.vm_cpus = Some(self.vm.cpus);
             let _ = self.settings.save();
         }
     }

@@ -266,6 +266,10 @@ pub struct Settings {
     /// image (the default), `Some('C')` = that drive. Persisted because a
     /// fresh launch resetting it silently redirected new sessions.
     pub vm_scratch_drive: Option<char>,
+    /// The Virtualize page's memory slider (MiB). `None` = the built-in default.
+    pub vm_memory_mib: Option<u64>,
+    /// The Virtualize page's processor slider. `None` = the built-in default.
+    pub vm_cpus: Option<u32>,
 }
 
 impl Default for Settings {
@@ -280,6 +284,8 @@ impl Default for Settings {
             theme: ThemeChoice::System,
             vm_iso_history: Vec::new(),
             vm_scratch_drive: None,
+            vm_memory_mib: None,
+            vm_cpus: None,
         }
     }
 }
