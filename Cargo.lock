@@ -2264,6 +2264,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-mount",
  "phoenix-restore",
+ "phoenix-vm",
  "phoenix-vss",
  "serde",
  "toml 0.8.23",
@@ -2391,6 +2392,20 @@ dependencies = [
  "uuid",
  "windows-sys 0.59.0",
  "winfsp",
+]
+
+[[package]]
+name = "phoenix-vm"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "phoenix-core",
+ "phoenix-mount",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

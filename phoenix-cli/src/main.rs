@@ -158,6 +158,42 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         full: bool,
     },
+    /// Boot a backup as a QEMU virtual machine, or manage VM sessions. Guest
+    /// writes go to a kept, resumable overlay; the backing .phnx is immutable.
+    Vm {
+        #[command(subcommand)]
+        command: VmCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmCommands {
+    /// Boot a backup as a VM (foreground; close the VM window to end). Creates
+    /// a session on first boot and resumes it on later boots.
+    Boot {
+        backup: PathBuf,
+        /// Write overlay: `avhdx` (default; raw passthrough, needs admin,
+        /// enables boot-it-or-mount-it interop) or `qcow2` (QEMU-native, no
+        /// admin, portable fallback).
+        #[arg(long, default_value = "avhdx")]
+        write: String,
+        /// Guest RAM in MiB.
+        #[arg(long, default_value_t = 6144)]
+        mem: u64,
+        /// Guest vCPUs.
+        #[arg(long, default_value_t = 4)]
+        cpus: u32,
+        /// Disable guest networking (forensic boot of an untrusted image).
+        #[arg(long, default_value_t = false)]
+        no_network: bool,
+        /// Directory of the QEMU install (else PATH / default locations).
+        #[arg(long)]
+        qemu_dir: Option<PathBuf>,
+    },
+    /// List saved VM sessions.
+    List,
+    /// Delete a backup's VM session (overlay + firmware; the .phnx is untouched).
+    Discard { backup: PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -283,6 +319,7 @@ fn main() -> anyhow::Result<()> {
         } => cmd_boot_repair(disk, partition, apply, yes)?,
         Commands::Mount { backup, partitions } => cmd_mount(&backup, partitions.as_deref())?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
+        Commands::Vm { command } => cmd_vm(command)?,
     }
     Ok(())
 }
@@ -317,6 +354,94 @@ fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Re
     std::io::stdin().read_line(&mut line).ok();
     drop(session);
     println!("Unmounted.");
+    Ok(())
+}
+
+fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
+    use phoenix_vm::{HostOptions, Qemu, SessionManager, WriteLayer};
+
+    let sessions = SessionManager::with_default_root();
+    match command {
+        VmCommands::Boot {
+            backup,
+            write,
+            mem,
+            cpus,
+            no_network,
+            qemu_dir,
+        } => {
+            let write_layer = match write.to_ascii_lowercase().as_str() {
+                "avhdx" => WriteLayer::Avhdx,
+                "qcow2" => WriteLayer::Qcow2,
+                other => anyhow::bail!("unknown --write value {other:?} (use avhdx or qcow2)"),
+            };
+            let qemu = Qemu::discover(qemu_dir.as_deref())?;
+            println!("Using QEMU: {} ({})", qemu.system.display(), qemu.version);
+
+            let host = HostOptions {
+                memory_mib: mem,
+                smp: cpus,
+                network: !no_network,
+                ..HostOptions::default()
+            };
+            let scratch = std::env::temp_dir()
+                .join("PhoenixSimulacra")
+                .join("vm-serve");
+            phoenix_mount::cleanup_leaked_mounts(&scratch);
+
+            println!("Booting {} — close the VM window to end.", backup.display());
+            #[cfg(feature = "winfsp")]
+            {
+                let outcome =
+                    phoenix_vm::boot::boot(&backup, &host, write_layer, &qemu, &sessions, &scratch)?;
+                println!(
+                    "VM exited ({}). Session overlay holds {:.1} GB of guest writes; backup {}.",
+                    if outcome.exit_ok { "clean" } else { "non-zero" },
+                    outcome.overlay_bytes as f64 / 1e9,
+                    if outcome.backup_intact {
+                        "still verifies"
+                    } else {
+                        "FAILED verification"
+                    }
+                );
+            }
+            #[cfg(not(feature = "winfsp"))]
+            {
+                let _ = (&host, write_layer, &qemu, &sessions, &scratch);
+                anyhow::bail!(
+                    "this build lacks the `winfsp` feature required to boot a VM; \
+                     rebuild with --features winfsp"
+                );
+            }
+        }
+        VmCommands::List => {
+            let list = sessions.list();
+            if list.is_empty() {
+                println!("No VM sessions.");
+            } else {
+                for m in list {
+                    println!(
+                        "{}  {:>5}  {}  booted={}  {}",
+                        m.backup_id,
+                        match m.write_layer {
+                            WriteLayer::Avhdx => "avhdx",
+                            WriteLayer::Qcow2 => "qcow2",
+                        },
+                        m.backup_path,
+                        m.last_booted_at.as_deref().unwrap_or("never"),
+                        if m.clean_shutdown { "clean" } else { "DIRTY" },
+                    );
+                }
+            }
+        }
+        VmCommands::Discard { backup } => {
+            let reader = phoenix_core::container::PhnxReader::open(&backup)?;
+            let id = reader.header.backup_id;
+            drop(reader);
+            sessions.discard(&id)?;
+            println!("Discarded VM session for {}.", backup.display());
+        }
+    }
     Ok(())
 }
 

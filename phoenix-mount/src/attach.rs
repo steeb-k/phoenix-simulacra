@@ -214,6 +214,60 @@ impl Drop for AttachedDisk {
     }
 }
 
+/// Force `\\.\PhysicalDrive{drive_number}` OFFLINE (non-persistent). An offline
+/// disk keeps no volumes mounted, so the host filesystem stack never touches
+/// it, and Windows lifts the raw-sector write protection it applies over
+/// mounted-volume extents — the state a VM's raw-passthrough disk needs when a
+/// differencing child is attached read-write for a guest to boot from.
+///
+/// The change lasts only while the disk is attached (`Persist = 0`); when the
+/// owning [`AttachedDisk`] drops and Windows auto-detaches, it is gone.
+pub fn set_disk_offline(drive_number: u32) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Ioctl::{
+        DISK_ATTRIBUTE_OFFLINE, IOCTL_DISK_SET_DISK_ATTRIBUTES, SET_DISK_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let path = format!(r"\\.\PhysicalDrive{drive_number}");
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| PhoenixError::Disk(format!("open {path} to set it offline: {e}")))?;
+
+    // SAFETY: all-zero is valid for this POD struct; we then set the header and
+    // the offline attribute + mask. Persist=0 keeps the change attach-scoped.
+    let mut attrs: SET_DISK_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    attrs.Version = std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32;
+    attrs.Attributes = DISK_ATTRIBUTE_OFFLINE as u64;
+    attrs.AttributesMask = DISK_ATTRIBUTE_OFFLINE as u64;
+
+    let mut returned = 0u32;
+    // SAFETY: the handle is open for the call; the in-buffer outlives it; the
+    // out-buffer is unused for this IOCTL; `returned` receives the out length.
+    let ok = unsafe {
+        DeviceIoControl(
+            disk.as_raw_handle() as _,
+            IOCTL_DISK_SET_DISK_ATTRIBUTES,
+            (&attrs as *const SET_DISK_ATTRIBUTES).cast(),
+            std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(PhoenixError::Disk(format!(
+            "IOCTL_DISK_SET_DISK_ATTRIBUTES(offline) failed for {path}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 /// VIRTUAL_STORAGE_TYPE_VENDOR_UNKNOWN — the all-zero GUID, paired with
 /// DEVICE_UNKNOWN so the API detects the format from the file.
 fn vendor_unknown() -> GUID {

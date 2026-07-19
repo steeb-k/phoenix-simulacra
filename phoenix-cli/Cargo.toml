@@ -17,6 +17,7 @@ phoenix-vss.workspace = true
 phoenix-restore.workspace = true
 phoenix-clone.workspace = true
 phoenix-mount.workspace = true
+phoenix-vm.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -31,7 +32,7 @@ toml.workspace = true
 # build with --no-default-features on a machine without them (mount then uses
 # the full-size temp-VHD stopgap).
 default = ["winfsp"]
-winfsp = ["phoenix-mount/winfsp", "dep:winfsp"]
+winfsp = ["phoenix-mount/winfsp", "phoenix-vm/winfsp", "dep:winfsp"]
 
 [build-dependencies]
 winres.workspace = true
