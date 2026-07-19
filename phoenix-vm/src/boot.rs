@@ -54,6 +54,7 @@ pub fn boot(
     iso: Option<&Path>,
     boot_iso_first: bool,
     drivers_iso: Option<&Path>,
+    helper_disk: Option<&Path>,
     qemu: &Qemu,
     sessions: &SessionManager,
     scratch_dir: &Path,
@@ -217,6 +218,7 @@ pub fn boot(
             boot_iso_first: boot_iso_now,
             qmp_port,
             drivers_iso: drivers_iso.map(|p| p.display().to_string()),
+            helper_disk: helper_disk.map(|p| p.display().to_string()),
         };
         let args = cfg.qemu_args(&spec);
 

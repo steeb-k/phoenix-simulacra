@@ -538,10 +538,33 @@ net use S: \\10.0.2.2\SimulacraShare /user:HOSTNAME\user
 authenticated with the host account's password (Microsoft-account PCs: the
 Microsoft-account password). Mapping can't be automatic — the guest can't be
 reached before it boots. GUI: "Shared folder" checkbox (default on, requires
-networking); CLI: `--share`. Auto-mapping via a guest-tools script placed in
-the share is the natural follow-up. Caveats to watch on real guests: inbound
-NTLM disabled by policy, or SMB-client guest-auth hardening (authenticated
-access is fine on defaults).
+networking); CLI: `--share`. Caveats to watch on real guests: inbound NTLM
+disabled by policy, or SMB-client guest-auth hardening (authenticated access
+is fine on defaults).
+
+**De-clunking (2026-07-19), since guest clipboard doesn't exist out of the
+box:**
+
+- **The "SIMULACRA" helper disk.** Sharing also builds a small real FAT16
+  image per boot (`share::build_helper_disk`, `fatfs` crate) holding
+  `MapShare.cmd` + README, attached as an extra never-booted disk on SATA port
+  `ide.3`. In the guest: open the SIMULACRA drive, double-click
+  `MapShare.cmd` — no typing, no clipboard. A real image, NOT VVFAT: writable
+  VVFAT is corruption-prone and IDE disks can't attach read-only; guest writes
+  to this image land in a throwaway per-session file.
+- **Clipboard sharing.** Every boot attaches `virtio-serial-pci` + a
+  `qemu-vdagent` chardev (`clipboard=on`) + `virtserialport`
+  (`com.redhat.spice.0`) — the GTK display speaks the SPICE agent protocol
+  natively. Inert until the guest installs the virtio-win guest-tools (on the
+  drivers ISO we attach), which include the vdagent service; after that,
+  host↔guest clipboard just works.
+
+Alternatives considered and rejected for the simultaneous-write channel:
+virtio-fs/9p (no Windows-host daemon), writable VVFAT (experimental,
+corrupts), a dual-mounted disk image (two OSes on one filesystem = guaranteed
+corruption), WebDAV via an in-app server (the only real non-SMB option — inbox
+guest client at `http://10.0.2.2:port/`, anonymous; but a sizeable
+LOCK-compliant server build and slower; keep in the back pocket).
 
 ### ARM64: feature hidden
 
