@@ -91,6 +91,17 @@ pub struct HostOptions {
     /// zoom-to-fit scales the picture to the (maximized) window — but kept
     /// for future use as a native-mode hint.
     pub max_resolution: Option<(u32, u32)>,
+    /// Grab input whenever the pointer is over the QEMU window, so guest
+    /// hotkeys (Alt+Tab, the Windows key) reach the guest instead of the
+    /// host.
+    ///
+    /// Needed only once the SPICE agent is installed: the agent gives the
+    /// guest absolute pointer positioning, so QEMU stops grabbing input —
+    /// which is better for the mouse but sends hotkeys to the host. Off by
+    /// default, as in QEMU, because it means moving the pointer across the
+    /// window silently takes the keyboard. `Ctrl+Alt+G` toggles the same
+    /// grab by hand regardless of this setting.
+    pub grab_on_hover: bool,
     /// Dress the QEMU window's GTK chrome — menu bar, borders, the padding
     /// around the guest picture — in a dark theme, to match the app.
     ///
@@ -137,6 +148,7 @@ impl Default for HostOptions {
             accel: Accel::Whpx,
             controller_override: None,
             network: false,
+            grab_on_hover: false,
             dark_window: false,
             max_resolution: None,
             clipboard_agent: false,
@@ -243,6 +255,8 @@ pub struct VmConfig {
     pub max_resolution: Option<(u32, u32)>,
     /// See [`HostOptions::clipboard_agent`].
     pub clipboard_agent: bool,
+    /// See [`HostOptions::grab_on_hover`].
+    pub grab_on_hover: bool,
 }
 
 impl VmConfig {
@@ -296,6 +310,7 @@ impl VmConfig {
             network: host.network,
             max_resolution: host.max_resolution,
             clipboard_agent: host.clipboard_agent,
+            grab_on_hover: host.grab_on_hover,
         })
     }
 
@@ -330,12 +345,15 @@ impl VmConfig {
         // actually filled instead of letterboxed. `clipboard=on` is the
         // host-side half of clipboard sharing and only exists on QEMU 11.1+
         // — older builds reject the key outright, hence the gate.
-        push("-display");
+        let mut display = String::from("gtk,zoom-to-fit=on");
         if self.clipboard_agent {
-            push("gtk,zoom-to-fit=on,clipboard=on");
-        } else {
-            push("gtk,zoom-to-fit=on");
+            display.push_str(",clipboard=on");
         }
+        if self.grab_on_hover {
+            display.push_str(",grab-on-hover=on");
+        }
+        push("-display");
+        push(&display);
 
         // QMP control socket for graceful ACPI shutdown (system_powerdown).
         if let Some(port) = spec.qmp_port {
@@ -751,6 +769,27 @@ mod tests {
         assert!(args.contains("virtio-serial-pci"));
         assert!(args.contains("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on"));
         assert!(args.contains("virtserialport,chardev=vdagent0,name=com.redhat.spice.0"));
+    }
+
+    #[test]
+    fn grab_on_hover_is_opt_in_and_composes_with_clipboard() {
+        let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
+        assert!(!cfg
+            .qemu_args(&spec_uefi_raw())
+            .join(" ")
+            .contains("grab-on-hover"));
+
+        // Both display options are independent and must coexist on one
+        // `-display` argument, not fight over it.
+        let host = HostOptions {
+            grab_on_hover: true,
+            clipboard_agent: true,
+            ..HostOptions::default()
+        };
+        let cfg = VmConfig::from_manifest(&m, &host).unwrap();
+        let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
+        assert!(args.contains("-display gtk,zoom-to-fit=on,clipboard=on,grab-on-hover=on"));
     }
 
     #[test]

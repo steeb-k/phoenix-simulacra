@@ -1074,6 +1074,7 @@ impl PhoenixApp {
         if let Some(c) = app.settings.vm_cpus {
             app.vm.cpus = c;
         }
+        app.vm.grab_keyboard = app.settings.vm_grab_keyboard;
         app.init_updates();
         app
     }
@@ -2812,7 +2813,7 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
     let mut full_rect = ui.max_rect();
     full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
-        egui::ScrollArea::vertical()
+        let out = egui::ScrollArea::vertical()
             .id_salt(id_salt)
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2823,7 +2824,88 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
                     })
                     .show(ui, body);
             });
+        // How much content sits below the fold right now.
+        let below = out.content_size.y - (out.state.offset.y + out.inner_rect.height());
+        paint_more_below(ui, out.inner_rect, id_salt, out.state.offset.y, below);
     });
+}
+
+/// Height of the "there's more below" fade.
+const MORE_BELOW_H: f32 = 34.0;
+/// Ignore an overflow smaller than this — a stray pixel or two of rounding
+/// isn't "more to see", and an indicator that shows for it is noise.
+const MORE_BELOW_MIN: f32 = 6.0;
+/// How long the line breathes after the overflow appears or the scroll
+/// position moves. Long enough to catch the eye, short enough that the page
+/// then sits still — permanent motion in the periphery is the thing users
+/// ask to remove, and the hazard band is deliberately motionless for the
+/// same reason.
+const MORE_BELOW_ANIMATE_FOR: f64 = 3.0;
+/// One full grow-and-shrink of the line, in seconds. Slow reads as ambient;
+/// fast reads as activity, which is what a progress bar looks like.
+const MORE_BELOW_CYCLE: f64 = 1.9;
+
+/// Mark the bottom edge of a scroll area that has more content below it: the
+/// content dissolves into the page, and a short line beneath it breathes for
+/// a few seconds.
+///
+/// Deliberately short and centred rather than full-width, and in `subtle_text`
+/// rather than the accent: a full-width animated line pinned to the bottom of
+/// a pane is the visual grammar of an indeterminate progress bar, which this
+/// app uses for real elsewhere. Short, centred and muted reads as a grab
+/// handle — "there is more here" — instead.
+fn paint_more_below(ui: &egui::Ui, rect: egui::Rect, id_salt: &str, offset: f32, below: f32) {
+    let id = egui::Id::new(("more_below", id_salt));
+    let now = ui.ctx().input(|i| i.time);
+    let showing = below > MORE_BELOW_MIN;
+
+    // Restart the animation whenever the situation changes — the overflow
+    // appearing (a resize, or content growing) or the user scrolling.
+    let (last_offset, mut animate_until) = ui
+        .ctx()
+        .data(|d| d.get_temp::<(f32, f64)>(id))
+        .unwrap_or((f32::NAN, 0.0));
+    let moved = (offset - last_offset).abs() > 0.5;
+    if showing && (moved || last_offset.is_nan()) {
+        animate_until = now + MORE_BELOW_ANIMATE_FOR;
+    }
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(id, (offset, animate_until)));
+
+    if !showing {
+        return;
+    }
+
+    // The fade. Transparent at the top, the page's own colour by the bottom,
+    // so the content appears to dissolve rather than being cut off.
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - MORE_BELOW_H),
+        rect.right_bottom(),
+    );
+    stripes::fade_into(ui.painter(), band, ui.visuals().panel_fill, 0);
+
+    // The line: width oscillates about its midpoint while animating, then
+    // rests at full width so the cue survives the animation ending.
+    const MIN_W: f32 = 42.0;
+    const MAX_W: f32 = 88.0;
+    let animating = now < animate_until;
+    let half = if animating {
+        let phase = (now % MORE_BELOW_CYCLE) / MORE_BELOW_CYCLE;
+        // Smooth 0→1→0 over the cycle, so growth and shrink are symmetric.
+        let t = (1.0 - (std::f64::consts::TAU * phase).cos()) / 2.0;
+        (MIN_W + (MAX_W - MIN_W) * t as f32) / 2.0
+    } else {
+        MAX_W / 2.0
+    };
+    let y = rect.bottom() - 7.0;
+    let mid = rect.center().x;
+    ui.painter().line_segment(
+        [egui::pos2(mid - half, y), egui::pos2(mid + half, y)],
+        egui::Stroke::new(2.0, ui.visuals().weak_text_color()),
+    );
+    if animating {
+        ui.ctx().request_repaint();
+    }
 }
 
 /// Bold "label + TextEdit + Browse…" row used by the Verify, Restore, and
@@ -4584,10 +4666,12 @@ impl PhoenixApp {
         if scratch_now != self.settings.vm_scratch_drive
             || self.settings.vm_memory_mib != Some(self.vm.mem_mib)
             || self.settings.vm_cpus != Some(self.vm.cpus)
+            || self.settings.vm_grab_keyboard != self.vm.grab_keyboard
         {
             self.settings.vm_scratch_drive = scratch_now;
             self.settings.vm_memory_mib = Some(self.vm.mem_mib);
             self.settings.vm_cpus = Some(self.vm.cpus);
+            self.settings.vm_grab_keyboard = self.vm.grab_keyboard;
             let _ = self.settings.save();
         }
     }
@@ -4793,6 +4877,7 @@ impl PhoenixApp {
             clipboard_agent: self.qemu.as_ref().is_some_and(|q| q.gtk_clipboard),
             // Dress the QEMU window to match the app's theme.
             dark_window: !theme::is_light(self.settings.theme),
+            grab_on_hover: self.vm.grab_keyboard,
             ..phoenix_vm::HostOptions::default()
         };
         let iso = {
