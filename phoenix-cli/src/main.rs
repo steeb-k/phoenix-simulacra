@@ -172,10 +172,10 @@ enum VmCommands {
     /// a session on first boot and resumes it on later boots.
     Boot {
         backup: PathBuf,
-        /// Write overlay: `avhdx` (default; raw passthrough, needs admin,
-        /// enables boot-it-or-mount-it interop) or `qcow2` (QEMU-native, no
-        /// admin, portable fallback).
-        #[arg(long, default_value = "avhdx")]
+        /// Write overlay: `qcow2` (default; QEMU-native, no VHD attach) or
+        /// `avhdx` (EXPERIMENTAL raw passthrough — boots, but teardown can hang
+        /// in the storage driver; see docs/VIRTUALIZATION.md).
+        #[arg(long, default_value = "qcow2")]
         write: String,
         /// Guest RAM in MiB.
         #[arg(long, default_value_t = 6144)]
@@ -394,9 +394,17 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             fresh,
         } => {
             let write_layer = match write.to_ascii_lowercase().as_str() {
-                "avhdx" => WriteLayer::Avhdx,
+                "avhdx" => {
+                    eprintln!(
+                        "warning: --write avhdx is EXPERIMENTAL. The guest boots, but detaching \
+                         the overlay at shutdown can hang in the Windows storage driver \
+                         (leaving a stuck attach). Use the default qcow2 unless you are \
+                         specifically testing this path."
+                    );
+                    WriteLayer::Avhdx
+                }
                 "qcow2" => WriteLayer::Qcow2,
-                other => anyhow::bail!("unknown --write value {other:?} (use avhdx or qcow2)"),
+                other => anyhow::bail!("unknown --write value {other:?} (use qcow2 or avhdx)"),
             };
             let qemu = Qemu::discover(qemu_dir.as_deref())?;
             println!("Using QEMU: {} ({})", qemu.system.display(), qemu.version);

@@ -57,16 +57,26 @@ pub fn sweep_serve_scratch(vm_root: &Path) {
 }
 
 /// Where guest writes go. Both keep the backing `.phnx` immutable.
+///
+/// VMs and file-level mounts deliberately use **different differencing
+/// engines**: mounts use Windows differencing VHDX (`.avhdx`), VMs use qcow2.
+/// They no longer share an overlay — see the note on [`WriteLayer::Avhdx`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WriteLayer {
-    /// A differencing `.avhdx` child attached offline; QEMU does raw I/O
-    /// against the resulting physical device. Enables boot-it-or-mount-it
-    /// interop (the same overlay can be opened by the writable mount). Windows-
-    /// only, needs elevation. The committed default.
+    /// A differencing `.avhdx` child attached offline, with QEMU doing raw I/O
+    /// against the resulting physical device.
+    ///
+    /// **EXPERIMENTAL — not the default.** Detaching a differencing child whose
+    /// parent lives on a WinFsp filesystem hangs in the storage driver, and it
+    /// does so regardless of which process serves the parent or how the detach
+    /// is issued (measured; see `docs/VIRTUALIZATION.md`). Boots fine; it is
+    /// *teardown* that is unreliable. Kept behind a flag for experimentation.
     Avhdx,
-    /// A qcow2 overlay backing onto the served VHDX. QEMU-native, no attach,
-    /// no elevation; the portable fallback.
+    /// A qcow2 overlay backing onto the WinFsp-served VHDX — **the default**.
+    /// QEMU-native: no VHD attach anywhere in the path, so the detach deadlock
+    /// class cannot occur. Needs no elevation for the write layer itself and is
+    /// the portable (non-Windows-host) story too.
     Qcow2,
 }
 
