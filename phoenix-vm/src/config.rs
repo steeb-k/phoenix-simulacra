@@ -296,6 +296,13 @@ impl VmConfig {
         push("-name");
         push(&spec.name);
 
+        // Explicit GTK display: the Windows backend with clipboard support
+        // wired to qemu-vdagent, and zoom-to-fit scales the guest to the
+        // window so the maximized window (boot.rs maximizes it once it
+        // appears) is actually filled instead of letterboxed.
+        push("-display");
+        push("gtk,zoom-to-fit=on");
+
         // QMP control socket for graceful ACPI shutdown (system_powerdown).
         if let Some(port) = spec.qmp_port {
             push("-qmp");
@@ -670,6 +677,8 @@ mod tests {
         assert!(args.contains("virtio-serial-pci"));
         assert!(args.contains("qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on"));
         assert!(args.contains("virtserialport,chardev=vdagent0,name=com.redhat.spice.0"));
+        // The clipboard-capable display, scaled to the (maximized) window.
+        assert!(args.contains("-display gtk,zoom-to-fit=on"));
     }
 
     #[test]
