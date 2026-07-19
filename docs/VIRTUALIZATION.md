@@ -363,13 +363,21 @@ shippable. It is also the same engine work backup/restore/verify already want
   at the same deterministic path, the qcow2 keeps its own writes *and* its
   backing chain reconnects to the re-served parent (GPT still readable through
   it). Guest-free, 12s, no attach.
-- **A full stop→resume→continue with a real guest** still hasn't been run
-  end-to-end (the guest-free proof covers the mechanism, not a Windows boot
-  resuming its own prior state).
-- **Crash/orphan sweep for VM sessions.** `sweep_serve_scratch` already scopes
-  the sweep to `vm-serve` and never touches kept overlays (unit-tested). Still
-  to do: reap an **orphaned serve helper process** whose boot process died
-  (the helper self-exits on stdin EOF, so this is belt-and-braces).
+- ~~A full stop→resume→continue with a real guest.~~ **DONE 2026-07-19.**
+  boot 1 `--fresh` → lock screen → stop (teardown 2 s, no orphans); boot 2
+  reported "Resumed existing session", reused the overlay at exactly its prior
+  size (591 MB, not recreated), preserved `created_at`, and the guest booted
+  **without re-detecting hardware** — i.e. on its own previously-installed
+  device state, which is the real evidence of "continue". Overlay then grew
+  591 → 667 MB; `.phnx` still verifies.
+- ~~Crash/orphan sweep for VM sessions.~~ **DONE.** `sweep_serve_scratch` is
+  scoped to `vm-serve` and never touches kept overlays, and now reaps an
+  orphaned serve helper first (PID file per live helper; only terminates a
+  process whose image name is really ours, since PIDs get recycled).
+- **Graceful guest shutdown is missing.** Stopping a VM today means killing
+  QEMU — a power-cut from the guest's point of view. Windows recovers (proven
+  above), but the GUI's "Stop VM" needs a real ACPI shutdown: add a QMP socket
+  to the VM config and send `system_powerdown`. Worth doing with the GUI.
 - ~~Boot-it-or-mount-it interop~~ — **dropped** with the qcow2 pivot. Browsing a
   VM session's files needs a different route (`qemu-nbd`, or an offline
   `qemu-img` conversion) if we still want it.
