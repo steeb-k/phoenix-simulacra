@@ -170,17 +170,27 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
     // way. Only the bundler carries the SPICE vdagent (clipboard, guest
     // display auto-resize) — the loose virtio-win-gt-x64.msi does not.
     //
-    // Deliberately does NOT install silently, install the guest agent
-    // unconditionally, or touch the registry before the install. A `/quiet`
-    // run installs every component with defaults where an interactive one
-    // can decide per device; the bundler already ships qemu-ga, so adding a
-    // second msiexec pass put two agent installs back to back while driver
-    // staging was still settling; and setting the Windows Update policy
-    // first meant drivers were staged under a policy state a hand install
-    // never produces. A hand install works reliably and a scripted one
-    // black-screened, so the script's job is to differ from a hand install
-    // as little as possible: launch the same installer, wait, then set the
-    // policy afterwards.
+    // Deliberately does NOT install silently or install the guest agent
+    // unconditionally. A `/quiet` run installs every component with defaults
+    // where an interactive one can decide per device, and the bundler
+    // already ships qemu-ga, so a second msiexec pass put two agent installs
+    // back to back while driver staging was still settling. A hand install
+    // works reliably and a scripted one black-screened, so the script stays
+    // as close to a hand install as it can.
+    //
+    // The Windows Update lockdown DOES run first, by explicit request: on a
+    // connected guest WU delivers a screen-blanking display driver within
+    // moments of first login, so anything applied afterwards has already
+    // lost the race. `DontSearchWindowsUpdate` and `SearchOrderConfig=0` are
+    // the ones that stop a driver arriving during this very install;
+    // `ExcludeWUDriversInQualityUpdate` and the AU policy cover later
+    // updates. The services are belt-and-braces — Windows revives wuauserv
+    // on its own, which is why the policy keys matter more than `sc config`.
+    //
+    // Fast Startup goes too. It makes shutdown a kernel hibernate rather
+    // than a real shutdown, which leaves NTFS dirty in the overlay and makes
+    // the guest skip hardware re-enumeration between boots — both bad for a
+    // machine whose virtual hardware we change underneath it.
     let install = "@echo off\r\n\
         title Simulacra guest tools install\r\n\
         net session >nul 2>&1\r\n\
@@ -201,6 +211,24 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         )\r\n\
         echo Found the driver CD at %VIODRV%\r\n\
         \r\n\
+        echo Blocking driver delivery via Windows Update...\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DriverSearching\" /v DontSearchWindowsUpdate /t REG_DWORD /d 1 /f >nul\r\n\
+        reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DriverSearching\" /v SearchOrderConfig /t REG_DWORD /d 0 /f >nul\r\n\
+        reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Device Metadata\" /v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f >nul\r\n\
+        \r\n\
+        echo Disabling Windows Update...\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v NoAutoUpdate /t REG_DWORD /d 1 /f >nul\r\n\
+        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DoNotConnectToWindowsUpdateInternetLocations /t REG_DWORD /d 1 /f >nul\r\n\
+        sc stop wuauserv >nul 2>&1\r\n\
+        sc config wuauserv start= disabled >nul 2>&1\r\n\
+        sc config UsoSvc start= disabled >nul 2>&1\r\n\
+        sc config WaaSMedicSvc start= disabled >nul 2>&1\r\n\
+        \r\n\
+        echo Disabling Fast Startup...\r\n\
+        reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power\" /v HiberbootEnabled /t REG_DWORD /d 0 /f >nul\r\n\
+        powercfg /h off >nul 2>&1\r\n\
+        \r\n\
         echo Starting the virtio-win guest tools installer. Click through it\r\n\
         echo as you would normally - this script only launches it.\r\n\
         \"%VIODRV%\\virtio-win-guest-tools.exe\"\r\n\
@@ -216,9 +244,6 @@ pub fn build_helper_disk(path: &Path) -> Result<()> {
         echo Installing the QEMU guest agent...\r\n\
         msiexec /i \"%VIODRV%\\guest-agent\\qemu-ga-x86_64.msi\" /qn\r\n\
         )\r\n\
-        \r\n\
-        echo Blocking driver delivery via Windows Update...\r\n\
-        reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 1 /f >nul\r\n\
         \r\n\
         echo.\r\n\
         echo Done - reboot to finish. Keep the VM's network off unless you\r\n\
@@ -310,11 +335,29 @@ mod tests {
         assert!(!inst.contains("/quiet"));
         // The bundler ships qemu-ga, so only install it if it is missing.
         assert!(inst.contains("sc query QEMU-GA"));
-        // The WU policy goes on AFTER, so drivers never stage under a
-        // policy state that a hand install would not produce.
-        let wu = inst.find("ExcludeWUDriversInQualityUpdate").unwrap();
-        let gt = inst.find("\\virtio-win-guest-tools.exe\"").unwrap();
-        assert!(gt < wu, "the install must precede the WU block");
+        // Fast Startup off: it makes shutdown a kernel hibernate, leaving
+        // NTFS dirty in the overlay and skipping hardware re-enumeration.
+        assert!(inst.contains("HiberbootEnabled"));
+        // The driver-search blocks must land BEFORE the install — that is
+        // the whole point of them; applied afterwards, Windows Update has
+        // already won the race on a connected guest.
+        // Anchored on the LAUNCH line specifically: the drive probe names
+        // the same executable earlier, and matching that instead would make
+        // this assertion pass no matter where the keys went.
+        let gt = inst
+            .find("\"%VIODRV%\\virtio-win-guest-tools.exe\"")
+            .unwrap();
+        for key in [
+            "ExcludeWUDriversInQualityUpdate",
+            "DontSearchWindowsUpdate",
+            "SearchOrderConfig",
+            "NoAutoUpdate",
+        ] {
+            let at = inst
+                .find(key)
+                .unwrap_or_else(|| panic!("{key} missing from the script"));
+            assert!(at < gt, "{key} must be set before the guest-tools install");
+        }
         drop(fs);
         std::fs::remove_file(&img).ok();
     }

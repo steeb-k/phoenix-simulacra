@@ -424,7 +424,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // is held for the "these will be unmounted" dialog
                     // (pending_close counts as a modal, so the page goes inert);
                     // otherwise the close goes straight through.
-                    if r.app.anything_mounted() && !r.app.pending_close {
+                    if r.app.close_needs_confirm() && !r.app.pending_close {
                         r.app.pending_close = true;
                         r.window.request_redraw();
                     } else {
@@ -1952,11 +1952,15 @@ impl PhoenixApp {
         if !sidebar::page_available(self.page, self.portable) {
             self.page = Page::Backup;
         }
+        // Navigation is frozen while a VM runs, the same way a job freezes
+        // it. The Virtualize page is the only place to see or stop the VM,
+        // and wandering off it made it far too easy to close the app and
+        // pull the served disk out from under a live guest.
         let nav = sidebar::show(
             ctx,
             &mut self.page,
             &self.palette,
-            modal_open,
+            modal_open || self.vm_run.is_some(),
             &mut self.settings.theme,
             self.portable,
         );
@@ -2406,32 +2410,69 @@ impl PhoenixApp {
         if !self.pending_close {
             return;
         }
-        // Nothing left to warn about (the last mount was unmounted while the
-        // dialog was up): let the close through.
-        if !self.anything_mounted() {
+        // Nothing left to warn about (the last mount came down, or the VM
+        // stopped, while the dialog was up): let the close through.
+        if !self.close_needs_confirm() {
             self.pending_close = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        let details = self.mount_summaries();
-        let message = format!(
-            "Closing Phoenix Simulacra unmounts {} and removes {} drive letters. \
-             Any open files or Explorer windows on those drives will be disconnected.",
-            if details.len() == 1 {
+        let vm_running = self.vm_run.is_some();
+        let mut details = Vec::new();
+        if let Some(run) = &self.vm_run {
+            details.push(format!("Running VM: {}", run.name));
+        }
+        details.extend(self.mount_summaries());
+
+        // The VM warning leads when there is one: losing unsaved work inside
+        // a guest is a bigger deal than a disconnected drive letter, and the
+        // power-off is immediate rather than orderly.
+        let mounted = self.anything_mounted();
+        let mount_count = self.mount_summaries().len();
+        let mount_clause = format!(
+            "unmounts {} and removes {} drive letters, disconnecting any open \
+             files or Explorer windows on those drives",
+            if mount_count == 1 {
                 "the mounted backup".to_string()
             } else {
-                format!("all {} mounted backups", details.len())
+                format!("all {mount_count} mounted backups")
             },
-            if details.len() == 1 { "its" } else { "their" },
+            if mount_count == 1 { "its" } else { "their" },
         );
+        let message = match (vm_running, mounted) {
+            (true, true) => format!(
+                "Closing Phoenix Simulacra immediately powers off the running \
+                 virtual machine — the guest gets no chance to shut down, and \
+                 unsaved work inside it is lost. The app serves the disk the \
+                 guest is running from, so it cannot keep running without it. \
+                 Closing also {mount_clause}."
+            ),
+            (true, false) => "Closing Phoenix Simulacra immediately powers off the running \
+                 virtual machine — the guest gets no chance to shut down, and unsaved \
+                 work inside it is lost. The app serves the disk the guest is running \
+                 from, so it cannot keep running without it.\n\nTo shut the guest down \
+                 properly, cancel and use Stop VM instead."
+                .to_string(),
+            (false, _) => format!("Closing Phoenix Simulacra {mount_clause}."),
+        };
+        let title = if vm_running {
+            "A virtual machine is still running"
+        } else {
+            "Backups are still mounted"
+        };
+        let confirm_label = if vm_running {
+            "Power Off & Close"
+        } else {
+            "Unmount & Close"
+        };
         let mut view = ConfirmView {
-            title: "Backups are still mounted",
+            title,
             message: &message,
             details: &details,
-            confirm_label: "Unmount & Close",
+            confirm_label,
             cancel_label: "Keep Open",
-            confirm_danger: false,
+            confirm_danger: vm_running,
             hazard_tape: true,
             ack: None,
             extra_label: None,
@@ -2439,6 +2480,9 @@ impl PhoenixApp {
         match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
                 self.pending_close = false;
+                // Power off first: the VM's disk is served by this process,
+                // so it must stop before the mounts it rides on come down.
+                self.power_off_vm_now();
                 self.unmount_all();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -4884,6 +4928,44 @@ impl PhoenixApp {
             },
             None => self.vm_last_status = "Couldn't find the VM's control port.".into(),
         }
+    }
+
+    /// The running VM's QMP port, if there is one and we can find it.
+    ///
+    /// Same reasoning as `stop_vm`: the port file lives under the root the
+    /// boot ACTUALLY used, which `VmRun` captured — the scratch dropdown may
+    /// have moved on since.
+    fn running_vm_qmp_port(&self) -> Option<u16> {
+        let run = self.vm_run.as_ref()?;
+        let id = phoenix_core::container::PhnxReader::open(&run.backup)
+            .ok()
+            .map(|r| r.header.backup_id)?;
+        std::fs::read_to_string(
+            run.vm_root
+                .join("vm-sessions")
+                .join(id.simple().to_string())
+                .join("qmp.port"),
+        )
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+    }
+
+    /// Cut the running VM's power. Used on close, where the app is going away
+    /// and taking the VM's disk with it.
+    fn power_off_vm_now(&mut self) {
+        if let Some(port) = self.running_vm_qmp_port() {
+            let _ = phoenix_vm::qmp::quit(port);
+        }
+        self.vm_run = None;
+    }
+
+    /// A close must be held for a warning: mounts can't outlive the process,
+    /// and neither can a VM — the app serves the disk the guest is running
+    /// from.
+    fn close_needs_confirm(&self) -> bool {
+        self.anything_mounted() || self.vm_run.is_some()
     }
 
     fn ui_history(&mut self, ui: &mut egui::Ui) {
