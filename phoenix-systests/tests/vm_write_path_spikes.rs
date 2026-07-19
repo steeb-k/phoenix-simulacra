@@ -504,17 +504,55 @@ fn boot_smoke_windows_backup() {
 
     let session = std::env::temp_dir().join("phoenix-vm-smoke");
     std::fs::create_dir_all(&session).expect("create session dir");
-    let overlay = session.join("session.qcow2");
-    // Fresh overlay each run: the backing path embeds the per-serve directory,
-    // which changes between serves. (A real session manager will pin it.)
-    let _ = std::fs::remove_file(&overlay);
-    run_ok(
-        Command::new(&qemu_img)
-            .args(["create", "-f", "qcow2", "-F", "vhdx", "-b"])
-            .arg(&parent)
-            .arg(&overlay),
-        "qemu-img create session overlay",
-    );
+    // Write layer (override with PHOENIX_VM_WRITE=avhdx|qcow2). Either overlay
+    // is recreated fresh each run: the served parent lives under a per-serve
+    // directory whose path changes between serves, and both formats record
+    // the parent's location. (A real session manager will pin the serve path.)
+    let write_layer = std::env::var("PHOENIX_VM_WRITE").unwrap_or_else(|_| "avhdx".into());
+    let (_attached, disk_drive_arg): (Option<AttachedRw>, String) = match write_layer.as_str() {
+        "qcow2" => {
+            let overlay = session.join("session.qcow2");
+            let _ = std::fs::remove_file(&overlay);
+            run_ok(
+                Command::new(&qemu_img)
+                    .args(["create", "-f", "qcow2", "-F", "vhdx", "-b"])
+                    .arg(&parent)
+                    .arg(&overlay),
+                "qemu-img create session overlay",
+            );
+            (
+                None,
+                format!("file={},format=qcow2,if=none,id=disk0", overlay.display()),
+            )
+        }
+        _ => {
+            // Option A: guest writes land in the same differencing-.avhdx
+            // overlay format the writable mount uses. The child attaches
+            // read-write with no drive letters and the disk forced OFFLINE
+            // (the host's filesystem stack never touches it, and offline
+            // lifts the raw-sector write protection), then QEMU does raw
+            // I/O against \\.\PhysicalDriveN. Requires elevation.
+            require_admin();
+            let child = session.join("session.avhdx");
+            let _ = std::fs::remove_file(&child);
+            create_differencing_vhdx(&child, &parent)
+                .expect("differencing session child over served parent");
+            let attached = AttachedRw::attach_no_letters(&child)
+                .expect("attach session child RW, no letters");
+            let drive = attached
+                .physical_drive_number()
+                .expect("physical drive number of session child");
+            set_disk_offline(drive).expect("force session child offline");
+            eprintln!(
+                "session child {} attached as PhysicalDrive{drive} (offline, no letters)",
+                child.display()
+            );
+            (
+                Some(attached),
+                format!(r"file=\\.\PhysicalDrive{drive},format=raw,if=none,id=disk0"),
+            )
+        }
+    };
 
     // --- assemble the QEMU command line -------------------------------------
     let mut cmd = Command::new(&qemu_sys);
@@ -560,8 +598,7 @@ fn boot_smoke_windows_backup() {
         cmd.arg("-drive")
             .arg(format!("if=pflash,format=raw,file={}", vars.display()));
     }
-    cmd.arg("-drive")
-        .arg(format!("file={},format=qcow2,if=none,id=disk0", overlay.display()));
+    cmd.arg("-drive").arg(&disk_drive_arg);
     // Disk controller (override with PHOENIX_VM_DISK=ahci|nvme). NVMe is the
     // default: a physical Windows install that booted from NVMe usually has
     // storahci demoted via StartOverride (AHCI presentation then stalls right
@@ -597,7 +634,15 @@ fn boot_smoke_windows_backup() {
     );
     let status = child.wait().expect("wait for qemu");
     eprintln!("qemu exited: {status:?}");
+    // Detach the .avhdx child (if any) before stopping the served parent.
+    drop(_attached);
+    std::thread::sleep(std::time::Duration::from_secs(1));
     drop(serve);
+    for name in ["session.avhdx", "session.qcow2"] {
+        if let Ok(m) = std::fs::metadata(session.join(name)) {
+            eprintln!("session overlay {name}: {} MiB of guest writes", m.len() / MIB);
+        }
+    }
     eprintln!(
         "session kept for inspection/resume: {}",
         session.display()
