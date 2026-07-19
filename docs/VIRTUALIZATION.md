@@ -246,6 +246,17 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
   Boot-to-login was ~4 minutes on this rig, wall-clock dominated by that.
 - **TPM caveat confirmed as predicted**: Windows Hello PIN unavailable in the
   guest (TPM-sealed); password sign-in works.
+- **Capping the guest resolution: only VRAM size works (2026-07-19).** The
+  Windows boot loader takes the LARGEST mode the firmware GOP offers and
+  ignores EDID outright — measured with headless PE boots + QMP `screendump`:
+  with `VGA,edid=on,xres=1592,yres=832` PE picked 1920x1080 (virtio-vga's GOP
+  ceiling), and again at 1024x640. OVMF's QemuVideoDxe filters a fixed mode
+  table by what fits in VRAM, so `VGA,vgamem_mb={4,8,16,32}` is the reliable
+  cap (4 MB → 1360x768 confirmed exactly). `vgamem_mb_for` maps the host's
+  usable screen (work area minus QEMU window chrome) to the largest safe tier.
+- **The ISO CD needs its own SATA port** (`ide-cd,...,bus=ide.1`): q35 AHCI
+  ports are single-unit, and QEMU auto-places an unbussed CD as unit 1 of the
+  port the OS disk owns, refusing to start.
 - **Known gap:** MBR/BIOS captures — the synthesis currently always presents
   GPT, so a BIOS-mode guest can't boot its MBR layout yet. Needs MBR
   synthesis before SeaBIOS boots are real.

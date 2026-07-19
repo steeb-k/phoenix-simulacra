@@ -100,6 +100,24 @@ impl Default for HostOptions {
     }
 }
 
+/// The largest power-of-two VGA VRAM (MB) whose largest offered video mode
+/// still fits in `w`×`h`. The guest takes the biggest mode the firmware
+/// offers, and the firmware offers everything from its fixed table that fits
+/// in VRAM — the tallest/widest modes per tier (edk2 QemuVideoDxe's bochs
+/// table): 32 MB → 3840x2160 + 3200x2400, 16 MB → 2560x1600 + 2048x2048,
+/// 8 MB → 1920x1080 + 1600x1200, 4 MB → 1360x768 + 1280x800.
+fn vgamem_mb_for(w: u32, h: u32) -> u32 {
+    if w >= 3840 && h >= 2400 {
+        32
+    } else if w >= 2560 && h >= 2048 {
+        16
+    } else if w >= 1920 && h >= 1200 {
+        8
+    } else {
+        4
+    }
+}
+
 /// The largest guest resolution whose QEMU window still fits on the host's
 /// primary display: the work area (screen minus taskbar) less the window's own
 /// chrome (title bar, resize frame, and QEMU's menu bar). `None` if the query
@@ -279,14 +297,17 @@ impl VmConfig {
             push("none");
         }
 
-        // Video: explicit std VGA whose EDID prefers (at most) the host's
-        // screen size — OVMF's GOP and the guest take the EDID preferred mode,
-        // so PE no longer opens a display far larger than the monitor.
+        // Video: std VGA with VRAM sized so no offered mode exceeds the host's
+        // usable screen. The Windows boot loader takes the LARGEST mode the
+        // firmware GOP offers and ignores EDID outright (measured: PE picked
+        // 1920x1080 with an EDID preferring 1592x832, and again at 1024x640).
+        // OVMF's QemuVideoDxe builds its mode list from a fixed table filtered
+        // by what fits in VRAM — so VRAM size is the one reliable cap.
         if let Some((w, h)) = self.max_resolution {
             push("-vga");
             push("none");
             push("-device");
-            push(&format!("VGA,edid=on,xres={w},yres={h}"));
+            push(&format!("VGA,vgamem_mb={}", vgamem_mb_for(w, h)));
         }
 
         // Firmware: UEFI needs a writable copy of BOTH pflash units. Attaching
@@ -584,21 +605,28 @@ mod tests {
     }
 
     #[test]
-    fn max_resolution_caps_the_vga_edid() {
+    fn max_resolution_caps_vga_vram() {
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
+        // A 1080p-ish usable area: 8 MB would still offer 1920x1080 (too tall
+        // once chrome is gone) so the tier drops to 4 MB → 1360x768 max.
         let host = HostOptions {
-            max_resolution: Some((1920, 1080)),
+            max_resolution: Some((1904, 968)),
             ..HostOptions::default()
         };
         let cfg = VmConfig::from_manifest(&m, &host).unwrap();
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
         assert!(args.contains("-vga none"));
-        assert!(args.contains("VGA,edid=on,xres=1920,yres=1080"));
+        assert!(args.contains("VGA,vgamem_mb=4"));
+
+        // Roomier hosts get the larger tiers.
+        assert_eq!(vgamem_mb_for(2560, 1300), 8);
+        assert_eq!(vgamem_mb_for(2560, 2100), 16);
+        assert_eq!(vgamem_mb_for(3840, 2400), 32);
 
         // Without a cap the default VGA is left alone.
         let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
         let args = cfg.qemu_args(&spec_uefi_raw()).join(" ");
-        assert!(!args.contains("edid"));
+        assert!(!args.contains("vgamem"));
         assert!(!args.contains("-vga"));
     }
 
