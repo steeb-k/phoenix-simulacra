@@ -7,7 +7,7 @@
 
 use egui::Ui;
 use phoenix_vm::drives::{list_drives, DriveInfo};
-use phoenix_vm::session::SessionMeta;
+use phoenix_vm::session::Session;
 
 use crate::fonts;
 use crate::theme::Palette;
@@ -93,7 +93,7 @@ pub fn show(
     qemu: Option<&str>,
     history: &phoenix_core::appdata::History,
     iso_history: &[String],
-    sessions: &[SessionMeta],
+    sessions: &[Session],
     running: Option<RunningView<'_>>,
     last_status: &str,
 ) -> VmAction {
@@ -137,6 +137,7 @@ pub fn show(
         ui.separator();
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Saved sessions").font(fonts::bold(14.0)));
+    ui.add_space(8.0);
         show_sessions(ui, palette, sessions, running.as_ref(), &mut action);
         return action;
     }
@@ -170,7 +171,13 @@ pub fn show(
 
     // --- knobs --------------------------------------------------------------
     let (host_mem_mib, host_cpus) = host_caps_cached();
-    let mem_max = host_mem_mib.max(2048);
+    // Floor the ceiling to a 512 MB boundary — the OS reports an odd total
+    // (RAM minus reserved), and without this the slider's top stop lands on a
+    // random-looking number.
+    let mem_max = {
+        let m = host_mem_mib.max(2048);
+        m - m % 512
+    };
     let cpu_max = host_cpus.max(1);
     egui::Grid::new("vm_knobs")
         .num_columns(2)
@@ -181,9 +188,10 @@ pub fn show(
 
             ui.label("Memory");
             state.mem_mib = state.mem_mib.clamp(1024, mem_max);
+            state.mem_mib -= state.mem_mib % 512;
             ui.add(
                 egui::Slider::new(&mut state.mem_mib, 1024..=mem_max)
-                    .step_by(256.0)
+                    .step_by(512.0)
                     .suffix(" MB"),
             );
             ui.end_row();
@@ -229,6 +237,7 @@ pub fn show(
     ui.separator();
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Saved sessions").font(fonts::bold(14.0)));
+    ui.add_space(8.0);
     show_sessions(ui, palette, sessions, None, &mut action);
 
     if !last_status.is_empty() {
@@ -348,50 +357,104 @@ fn scratch_dropdown(ui: &mut Ui, state: &mut VmPageState) {
         });
 }
 
+/// The saved-sessions table, in a card of its own (contrasting fill) so it
+/// reads as existing state rather than more knobs for the next boot.
 fn show_sessions(
     ui: &mut Ui,
     palette: &Palette,
-    sessions: &[SessionMeta],
+    sessions: &[Session],
     running: Option<&RunningView<'_>>,
     action: &mut VmAction,
 ) {
-    if sessions.is_empty() {
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("No saved sessions yet — boot a backup to create one.")
-                .color(palette.subtle_text),
-        );
-        return;
-    }
-    for s in sessions {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let name = std::path::Path::new(&s.backup_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| s.backup_path.clone());
-            ui.label(egui::RichText::new(name).font(fonts::bold(13.0)));
-            let state_txt = if !s.clean_shutdown {
-                egui::RichText::new("dirty").color(palette.warning)
-            } else {
-                egui::RichText::new(s.last_booted_at.as_deref().unwrap_or("never"))
-                    .color(palette.subtle_text)
-            };
-            ui.label(state_txt);
-
-            // Actions on the right.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let is_running = running.is_some();
-                ui.add_enabled_ui(!is_running, |ui| {
-                    if ui.button("Discard").clicked() {
-                        *action = VmAction::Discard(s.backup_path.clone());
+    let is_running = running.is_some();
+    egui::Frame::none()
+        .fill(palette.content_card_bg)
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if sessions.is_empty() {
+                ui.label(
+                    egui::RichText::new("No saved sessions yet — boot a backup to create one.")
+                        .color(palette.subtle_text),
+                );
+                return;
+            }
+            egui::Grid::new("vm_sessions_table")
+                .num_columns(4)
+                .spacing([28.0, 10.0])
+                .show(ui, |ui| {
+                    for h in ["Backup", "Last booted", "Guest writes", ""] {
+                        ui.label(
+                            egui::RichText::new(h)
+                                .small()
+                                .strong()
+                                .color(palette.subtle_text),
+                        );
                     }
-                    if ui.button("Resume").clicked() {
-                        *action = VmAction::Resume(s.backup_path.clone());
+                    ui.end_row();
+
+                    for s in sessions {
+                        let meta = s.meta();
+                        let name = std::path::Path::new(&meta.backup_path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| meta.backup_path.clone());
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(name).font(fonts::bold(13.0)));
+                            ui.label(
+                                egui::RichText::new(&meta.backup_path)
+                                    .small()
+                                    .color(palette.subtle_text),
+                            );
+                        });
+
+                        if !meta.clean_shutdown {
+                            ui.label(
+                                egui::RichText::new("interrupted").color(palette.warning),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(short_time(meta.last_booted_at.as_deref()))
+                                    .color(palette.subtle_text),
+                            );
+                        }
+
+                        let overlay_bytes = std::fs::metadata(s.overlay_path())
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.1} GB",
+                                overlay_bytes as f64 / 1e9
+                            ))
+                            .color(palette.subtle_text),
+                        );
+
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!is_running, |ui| {
+                                if ui.button("Resume").clicked() {
+                                    *action = VmAction::Resume(meta.backup_path.clone());
+                                }
+                                if ui.button("Discard").clicked() {
+                                    *action = VmAction::Discard(meta.backup_path.clone());
+                                }
+                            });
+                        });
+                        ui.end_row();
                     }
                 });
-            });
         });
+}
+
+/// RFC 3339 ("2026-07-19T04:12:33Z") → "2026-07-19 04:12", or "never".
+fn short_time(ts: Option<&str>) -> String {
+    match ts {
+        Some(t) => match (t.get(..10), t.get(11..16)) {
+            (Some(d), Some(hm)) => format!("{d} {hm}"),
+            _ => t.to_string(),
+        },
+        None => "never".into(),
     }
 }
 

@@ -473,6 +473,11 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                         "FAILED verification"
                     }
                 );
+                // QEMU's output goes to the session's qemu.log now (not the
+                // console) — quote it when the exit was an error.
+                if let Some(tail) = outcome.qemu_log_tail.as_deref().filter(|t| !t.is_empty()) {
+                    eprintln!("QEMU output:\n{tail}");
+                }
             }
             #[cfg(not(feature = "winfsp"))]
             {
