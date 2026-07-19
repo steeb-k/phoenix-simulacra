@@ -250,6 +250,17 @@ A real Windows 11 backup (106 GiB GPT system disk, BitLocker-unlocked capture)
    config synthesis + session create/resume/discard, no QEMU). Live boot stays
    an env-gated systest + manual checklist (needs QEMU + elevation on the box).
 
+### Storage location
+
+Everything a session creates — the write overlay, the per-session firmware,
+and the on-demand serve junctions — lives on the **same volume as the `.phnx`**,
+under `<image-drive>:\PhoenixSimulacra\{vm-sessions,vm-serve}`. Never the host
+OS drive: a backup on `D:` must not fill `C:`. `simulacra-cli vm boot --vm-dir`
+overrides the root; `vm list` scans every fixed volume (sessions follow their
+image's drive, so there is no single root to look in). Only the growing overlay
+consumes real space — the served `backup.vhdx` is a WinFsp file synthesized on
+demand, not materialized.
+
 ### Still open before this is shippable
 
 - **Serve-path resume proof.** The serve path is deterministic

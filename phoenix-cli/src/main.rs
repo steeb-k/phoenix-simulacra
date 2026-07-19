@@ -189,6 +189,11 @@ enum VmCommands {
         /// Directory of the QEMU install (else PATH / default locations).
         #[arg(long)]
         qemu_dir: Option<PathBuf>,
+        /// Working root for the VM's overlay + serve scratch. Default: a
+        /// `PhoenixSimulacra` folder on the SAME drive as the backup, so
+        /// nothing lands on the host OS drive.
+        #[arg(long)]
+        vm_dir: Option<PathBuf>,
     },
     /// List saved VM sessions.
     List,
@@ -360,7 +365,6 @@ fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Re
 fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
     use phoenix_vm::{HostOptions, Qemu, SessionManager, WriteLayer};
 
-    let sessions = SessionManager::with_default_root();
     match command {
         VmCommands::Boot {
             backup,
@@ -369,6 +373,7 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             cpus,
             no_network,
             qemu_dir,
+            vm_dir,
         } => {
             let write_layer = match write.to_ascii_lowercase().as_str() {
                 "avhdx" => WriteLayer::Avhdx,
@@ -384,9 +389,12 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
                 network: !no_network,
                 ..HostOptions::default()
             };
-            let scratch = std::env::temp_dir()
-                .join("PhoenixSimulacra")
-                .join("vm-serve");
+            // Everything (session overlay + serve scratch) stays on the image's
+            // drive by default, so a backup on D: never fills the OS drive.
+            let vm_root = vm_dir.unwrap_or_else(|| phoenix_vm::vm_root_for_backup(&backup));
+            let sessions = SessionManager::new(vm_root.join("vm-sessions"));
+            let scratch = vm_root.join("vm-serve");
+            println!("VM working dir: {}", vm_root.display());
             phoenix_mount::cleanup_leaked_mounts(&scratch);
 
             println!("Booting {} — close the VM window to end.", backup.display());
@@ -415,7 +423,8 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             }
         }
         VmCommands::List => {
-            let list = sessions.list();
+            // Sessions live on their image's drive, so scan every volume.
+            let list = SessionManager::list_all();
             if list.is_empty() {
                 println!("No VM sessions.");
             } else {
@@ -438,7 +447,8 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             let reader = phoenix_core::container::PhnxReader::open(&backup)?;
             let id = reader.header.backup_id;
             drop(reader);
-            sessions.discard(&id)?;
+            // The session lives on the backup's own drive.
+            SessionManager::for_backup(&backup).discard(&id)?;
             println!("Discarded VM session for {}.", backup.display());
         }
     }
