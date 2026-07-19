@@ -414,12 +414,11 @@ shippable. It is also the same engine work backup/restore/verify already want
   boot/stop; the scratch choice should only govern NEW sessions. Workaround
   until then: set the dropdown back to the drive the session is on before
   clicking Resume.
-- **QEMU window should open maximized** (user request 2026-07-19). QEMU's GTK
-  display has no "maximized" CLI option (`full-screen=on` is true fullscreen,
-  not this). Likely shape: `-display gtk,zoom-to-fit=on` so the guest scales
-  to the window, plus a host-side nudge from `boot()` — poll `FindWindowW` for
-  the freshly-spawned QEMU window (we set `-name`) and `ShowWindow(SW_MAXIMIZE)`
-  it. Needs a live check that zoom-to-fit doesn't blur small guest modes.
+- ~~QEMU window should open maximized~~ **DONE 2026-07-19**: `boot()` spawns a
+  watcher that finds the QEMU process's main window (EnumWindows by pid) and
+  maximizes it, and `-display gtk,zoom-to-fit=on` is pinned so the guest
+  scales to fill the window (GTK is also the clipboard-capable backend).
+  Watch for zoom-to-fit blur on small guest modes.
 - **Root-cause the `.avhdx` detach hang** if Option A is ever revived. The one
   unexplained data point is the early spike that detached cleanly (in-process
   serve, drop-based detach, light I/O, and a different attach storage-type
