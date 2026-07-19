@@ -8,11 +8,40 @@
 //! creation and attach (which need the served parent and admin) live in
 //! `boot.rs`; this module owns the layout, the metadata, and the lifecycle.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// The volume root of `path` (`D:\` for `D:\dir\file`). Everything the VM
+/// creates is anchored here so it stays on the **image's** drive, never the
+/// host OS drive. Falls back to the path's own ancestor root for oddball paths
+/// (UNC, relative).
+pub fn volume_root(path: &Path) -> PathBuf {
+    if let Some(Component::Prefix(prefix)) = path.components().next() {
+        let mut root = PathBuf::from(prefix.as_os_str());
+        root.push(std::path::MAIN_SEPARATOR.to_string());
+        return root;
+    }
+    path.ancestors()
+        .last()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The Phoenix VM working root on the same volume as `backup`: the parent of
+/// both the session store (`vm-sessions`) and the serve scratch (`vm-serve`).
+/// This is the default location — chosen so a backup on `D:` never spills VM
+/// overlays onto a full `C:`.
+pub fn vm_root_for_backup(backup: &Path) -> PathBuf {
+    volume_root(backup).join("PhoenixSimulacra")
+}
+
+/// The on-demand serve scratch (WinFsp junctions) on the image's volume.
+pub fn serve_scratch_for_backup(backup: &Path) -> PathBuf {
+    vm_root_for_backup(backup).join("vm-serve")
+}
 
 /// Where guest writes go. Both keep the backing `.phnx` immutable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,17 +175,31 @@ impl SessionManager {
         SessionManager { root }
     }
 
-    /// Default sessions root: `%LOCALAPPDATA%\PhoenixSimulacra\vm-sessions`,
-    /// falling back to the temp dir if LOCALAPPDATA is unset.
-    pub fn default_root() -> PathBuf {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        base.join("PhoenixSimulacra").join("vm-sessions")
+    /// Sessions root on the **image's** volume: `<drive>\PhoenixSimulacra\
+    /// vm-sessions`. This is the default — VM overlays stay with the backup,
+    /// never on the host OS drive. Pair with [`serve_scratch_for_backup`] for
+    /// the on-demand serve junctions (same volume).
+    pub fn for_backup(backup: &Path) -> Self {
+        Self::new(vm_root_for_backup(backup).join("vm-sessions"))
     }
 
-    pub fn with_default_root() -> Self {
-        Self::new(Self::default_root())
+    /// Every session across all fixed volumes' `\PhoenixSimulacra\vm-sessions`
+    /// dirs — because sessions live on their image's drive, `list` has to look
+    /// on every drive, not one fixed root.
+    pub fn list_all() -> Vec<SessionMeta> {
+        let mut out = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let root = PathBuf::from(format!("{}:\\", letter as char))
+                .join("PhoenixSimulacra")
+                .join("vm-sessions");
+            out.extend(SessionManager::new(root).list());
+        }
+        out
+    }
+
+    /// The sessions root this manager writes to.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn session_dir(&self, backup_id: &Uuid) -> PathBuf {
@@ -317,6 +360,27 @@ mod tests {
             .unwrap();
         assert!(reloaded2.meta().clean_shutdown);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn volume_root_and_vm_root_track_the_image_drive() {
+        // A backup on D: puts the VM working dir on D:, never C:.
+        let backup = Path::new(r"D:\backups\VM_Backup_Tester.phnx");
+        assert_eq!(volume_root(backup), PathBuf::from(r"D:\"));
+        let root = vm_root_for_backup(backup);
+        assert!(root.starts_with(r"D:\"));
+        assert!(root.ends_with("PhoenixSimulacra"));
+        assert!(serve_scratch_for_backup(backup).starts_with(r"D:\"));
+
+        // A backup on E: follows E:.
+        assert_eq!(volume_root(Path::new(r"E:\x.phnx")), PathBuf::from(r"E:\"));
+    }
+
+    #[test]
+    fn for_backup_roots_sessions_on_image_drive() {
+        let mgr = SessionManager::for_backup(Path::new(r"D:\x\y.phnx"));
+        assert!(mgr.root().starts_with(r"D:\"));
+        assert!(mgr.root().ends_with("vm-sessions"));
     }
 
     #[test]
