@@ -77,6 +77,29 @@ fn make_ntfs_vhd(letter: char, label: &str) -> TestVhd {
     make_vhd(letter, label, TestFs::Ntfs)
 }
 
+/// Write `mib` MiB of incompressible-enough filler onto `letter`, so a capture
+/// of the volume takes a measurable amount of time.
+///
+/// Only the lock-duration test needs this: every other test here cares about
+/// what the capture *produced*, not how long it took, and the standard fixture
+/// is deliberately small so those run fast.
+fn write_bulk_payload(letter: char, mib: usize) {
+    use std::io::Write;
+    let path = format!(r"{letter}:\phoenix-bulk.bin");
+    let mut f = std::fs::File::create(&path).expect("create bulk payload");
+    // Vary the block so the capture cannot collapse it to almost nothing —
+    // a fully-zero file compresses away and the window shrinks again.
+    let mut block = vec![0u8; 1024 * 1024];
+    for (i, b) in block.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    for i in 0..mib {
+        block[0] = (i % 256) as u8;
+        f.write_all(&block).expect("write bulk payload");
+    }
+    f.sync_all().expect("flush bulk payload");
+}
+
 fn backup_disk(disk_index: u32) -> phoenix_core::error::Result<std::path::PathBuf> {
     let disks = phoenix_core::disk::enumerate_disks().unwrap();
     let disk = disks.iter().find(|d| d.index == disk_index).unwrap();
@@ -365,6 +388,13 @@ fn locked_backup_blocks_writers_for_duration() {
 
     let source = make_ntfs_vhd('X', "LOCKDUR");
     let digest = fill_fixture('X', 0x8888).expect("fill fixture");
+    // The capture has to last long enough to be observable. The fixture alone
+    // is ~15 MB, which captures (and verifies) in well under the head start
+    // below — the probe loop then never iterates even once, and the test fails
+    // having proven nothing about locking. Bulk data makes the window real:
+    // ~512 MiB is a second or two of capture plus verify-after, against a
+    // 300 ms head start and 25 ms probes.
+    write_bulk_payload('X', 512);
     let disk_index = source.disk_index();
 
     // Let Defender / the indexer finish scanning the just-written fixture and
@@ -401,10 +431,21 @@ fn locked_backup_blocks_writers_for_duration() {
         "[vss] during backup: {refused} write attempts refused, {allowed} allowed \
          (pre-lock window only)"
     );
+    // Two very different failures, kept apart so a red run says which it is.
+    // Conflating them cost real time once: a capture that finished inside the
+    // head start reported "the engine did not hold the lock", which was not
+    // what had happened at all.
+    assert!(
+        refused + allowed > 0,
+        "the backup finished before the probe loop ran even once, so this proved nothing \
+         about locking — the capture window was shorter than the 300 ms head start. \
+         Grow the payload; do not read this as a pass."
+    );
     assert!(
         refused > 0,
-        "no write attempt was ever refused during a locked backup — the engine did not \
-         hold FSCTL_LOCK_VOLUME for the capture window"
+        "every one of the {allowed} write attempts during a locked backup SUCCEEDED — the \
+         engine did not hold FSCTL_LOCK_VOLUME for the capture window (or wrongly \
+         escalated an idle volume to a shadow copy, which leaves it writable)"
     );
 
     // Lock released after completion; volume writable again.

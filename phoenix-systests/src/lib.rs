@@ -797,6 +797,21 @@ pub fn powershell(script: &str) -> Result<String> {
             "-Command",
             script,
         ])
+        // Windows PowerShell must not inherit PowerShell 7's module path.
+        //
+        // Launch the suite from `pwsh` — as the staged runner does — and this
+        // child inherits a PSModulePath whose PS7 directories come FIRST. 5.1
+        // then finds two copies of a shipped module, tries to load 7's, and
+        // fails on conflicting type data ("The member AuditToString is already
+        // present"). Every cmdlet in that module then reports itself as "found
+        // ... but the module could not be loaded" — which is how the BitLocker
+        // tests failed, with an error naming ConvertTo-SecureString and
+        // nothing to do with BitLocker.
+        //
+        // Set the canonical 5.1 pair rather than filtering what we inherited,
+        // so the child gets the same module path however the suite was
+        // started.
+        .env("PSModulePath", windows_powershell_module_path())
         .output()
         .context("spawning powershell")?;
     if !out.status.success() {
@@ -806,6 +821,20 @@ pub fn powershell(script: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Windows PowerShell 5.1's own module path: the system modules that ship with
+/// it, plus the all-users directory for anything installed for it.
+///
+/// Note `WindowsPowerShell` throughout — `Program Files\PowerShell\Modules`
+/// (no "Windows") is PowerShell 7's, and is exactly what must not be here.
+fn windows_powershell_module_path() -> String {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    format!(
+        r"{system_root}\system32\WindowsPowerShell\v1.0\Modules;{program_files}\WindowsPowerShell\Modules"
+    )
 }
 
 /// Scratch directory for VHDs and scripts (under the system temp dir).
