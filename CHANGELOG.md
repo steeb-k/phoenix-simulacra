@@ -2,6 +2,14 @@
 
 Notable changes per release. Releases are published on the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases).
 
+## Unreleased
+
+- **Shrinking is reliable.** Restoring or cloning a fragmented NTFS volume into a smaller partition could fail with "relocated run list grew to N bytes, past the N-1 byte attribute budget" — and it failed *after* the data had been copied, leaving the target holding data its metadata no longer described. Three changes fix it: relocated run lists now grow into the MFT record's free space instead of being limited to the handful of spare bytes inside their own attribute; relocated clusters are packed to keep each piece contiguous rather than splitting it across free runs; and every shrink is now checked against the source's MFT *before* anything is written, re-planning the relocation where a record would not fit.
+- **A shrink that genuinely cannot work is refused up front**, with the smallest target size that would work, instead of aborting partway through with the target already overwritten. On the clone path this check moved into the prepare phase, so it happens before the target's partition table is touched.
+- Large shrinks are substantially faster: translating relocated clusters was a linear scan per cluster, which made the metadata rewrite quadratic in the size of the move.
+- **Boot repair works on UEFI again.** It passed `bcdboot` an option that made it fail outright, so the EFI path never completed. Note the tradeoff: that option was what kept this PC's firmware boot entries out of it, so repairing a drive on a UEFI machine may now also add that drive to this machine's boot entries. Boot files are still written only to the target disk.
+- **Boot repair rebuilds the boot configuration instead of merging into it.** `bcdboot` adds to an existing BCD rather than replacing it, so repairing a disk with a stale store kept the very entries that made it unbootable. The old store is now set aside (kept as `.bak`) before the rebuild.
+
 ## 0.6.0 — 2026-07-20
 
 - **Boot a backup as a virtual machine** (experimental): a new Virtualize page runs a `.phnx` as a QEMU VM without modifying the backup or materializing it to disk. The guest's disk is served on demand through WinFsp and every write lands in a copy-on-write overlay, so sessions are resumable — stop the VM, come back, continue. Validated by booting real Windows 11 (GPT/UEFI) and Windows 10 (BIOS/MBR) captures to a desktop.

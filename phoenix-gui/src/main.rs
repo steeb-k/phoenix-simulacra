@@ -601,6 +601,80 @@ struct PendingClone {
     ack: bool,
 }
 
+/// Check a restore plan against its backup, off the UI thread.
+///
+/// Returns the ready-to-confirm restore, or the message to show the user.
+/// The plan is validated in the same order `run_restore` will validate it, so
+/// anything that would abort the job is caught here instead — including the
+/// NTFS shrink pre-flight, which is the slow part and the reason this runs on
+/// a thread at all.
+#[allow(clippy::too_many_arguments)]
+fn validate_restore_plan(
+    backup_path: std::path::PathBuf,
+    plan: phoenix_restore::plan::RestorePlan,
+    subject: JobSubject,
+    mut details: Vec<String>,
+    repair_boot: bool,
+    target_sector_size: u32,
+    progress: &ProgressHandle,
+) -> std::result::Result<Box<PendingRestore>, String> {
+    let mut convert = false;
+    // A backup we can't even open is left to the job itself to report, which
+    // matches the behaviour before validation moved off the UI thread.
+    if let Ok(mut reader) = PhnxReader::open(&backup_path) {
+        plan.validate_against_backup(&reader.manifest)
+            .map_err(|e| format!("Plan invalid: {e}"))?;
+        plan.validate_extents_fit(&mut reader, Some(progress))
+            .map_err(|e| format!("Plan invalid: {e}"))?;
+        // Cross-sector-size pre-flight, computed here so the confirm dialog
+        // can describe (and, for a conversion, gate on an acknowledgement of)
+        // what will happen. `opt_in = true` because the hazard-dialog checkbox
+        // — not a flag — is the opt-in gate here; an unsupported mismatch or a
+        // converted-partition shrink still errors and blocks the job.
+        match phoenix_restore::restore::plan_sector_conversion(
+            &reader.manifest,
+            &plan,
+            target_sector_size,
+            true,
+        ) {
+            Ok(None) => {}
+            Ok(Some(report)) => {
+                convert = true;
+                details.extend(conversion_detail_lines(&report));
+            }
+            Err(e) => return Err(format!("Cannot restore onto this disk: {e}")),
+        }
+    }
+    Ok(Box::new(PendingRestore {
+        subject,
+        opts: RestoreOptions {
+            backup_path,
+            plan,
+            // Read-back verification is CLI-only; the image's chunk hashes
+            // were already checked while decompressing.
+            verify_on_restore: false,
+            convert_sector_size: convert,
+            repair_boot,
+            progress: Some(ProgressHandle::new()),
+        },
+        details,
+        convert,
+        ack: false,
+    }))
+}
+
+/// A restore plan being checked on a worker thread.
+///
+/// Validating a shrink is no longer instant: the NTFS pre-flight reads the
+/// source MFT out of the backup to prove the metadata rewrite will fit, which
+/// on a large volume takes long enough to freeze the window if it ran inline.
+/// The work happens on a thread and reports into `progress`; the UI polls it
+/// each frame and parks the confirmation dialog once it succeeds.
+struct RestoreValidation {
+    rx: std::sync::mpsc::Receiver<std::result::Result<Box<PendingRestore>, String>>,
+    progress: ProgressHandle,
+}
+
 /// A validated, ready-to-run restore parked while its confirmation dialog
 /// is up. Same final wrong-disk check as [`PendingClone`].
 struct PendingRestore {
@@ -752,8 +826,10 @@ fn source_looks_bootable(source: &DiskInfo) -> bool {
 const REPAIR_BOOT_HOVER: &str =
     "After the data is written, detect a Windows installation on the target disk and rebuild \
      its boot files with Windows' own bcdboot (plus bootsect and the active flag on legacy MBR \
-     disks). Only the target disk is modified — this PC's firmware boot entries are never \
-     touched. Skipped automatically if the target turns out to hold no Windows installation.";
+     disks). The target's existing boot configuration is cleared first — kept as a .bak — so \
+     the rebuild replaces it rather than merging into it. Files are written only to the target \
+     disk, but on a UEFI PC bcdboot may also add the drive to this PC's firmware boot entries. \
+     Skipped automatically if the target turns out to hold no Windows installation.";
 
 fn disk_confirm_details(disk: &DiskInfo) -> Vec<String> {
     vec![
@@ -796,6 +872,7 @@ struct PhoenixApp {
     pending_clone: Option<PendingClone>,
     /// Restore waiting on its confirm-the-target dialog.
     pending_restore: Option<PendingRestore>,
+    restore_validation: Option<RestoreValidation>,
     /// `--demo-confirm`: show a fake wipe-confirmation dialog for styling work.
     demo_confirm: bool,
     /// `--demo-progress`: show the status modal mid-job, its bar sweeping on a
@@ -1008,6 +1085,7 @@ impl PhoenixApp {
             pending_overwrite: None,
             pending_clone: None,
             pending_restore: None,
+            restore_validation: None,
             demo_confirm: demo_confirm_from_args(),
             demo_progress: demo_progress_from_args(),
             total_backups: 0,
@@ -1333,7 +1411,11 @@ impl PhoenixApp {
     }
 
     fn busy(&self) -> bool {
-        self.job.as_ref().is_some_and(|j| j.is_running()) || !self.pending_backups.is_empty()
+        self.job.as_ref().is_some_and(|j| j.is_running())
+            || !self.pending_backups.is_empty()
+            // A shrink pre-flight is reading the backup; the form that
+            // produced the plan must not change underneath it.
+            || self.restore_validation.is_some()
     }
 
     /// True while the blocking status modal is on screen (running job or
@@ -1935,6 +2017,7 @@ impl PhoenixApp {
     /// background fill in `Renderer::paint`.)
     fn draw(&mut self, ctx: &egui::Context) {
         self.poll_job(ctx);
+        self.poll_restore_validation(ctx);
         self.poll_updater(ctx);
         self.maybe_refresh_theme(ctx);
         // Runs the refresh a click armed LAST frame — that frame already
@@ -3608,65 +3691,70 @@ impl PhoenixApp {
             return;
         };
         let plan = layout.to_restore_plan(target);
-        // Cross-sector-size pre-flight, computed here so the confirm dialog can
-        // describe (and, for a conversion, gate on an acknowledgement of) what
-        // will happen. `opt_in = true` because the hazard-dialog checkbox — not
-        // a flag — is the opt-in gate here; an unsupported mismatch or a
-        // converted-partition shrink still errors and blocks the job.
-        let mut convert = false;
-        let mut convert_lines: Vec<String> = Vec::new();
-        if let Ok(mut reader) = PhnxReader::open(&backup_path) {
-            if let Err(e) = plan.validate_against_backup(&reader.manifest) {
-                self.status = format!("Plan invalid: {e}");
-                return;
-            }
-            if let Err(e) = plan.validate_extents_fit(&mut reader) {
-                self.status = format!("Plan invalid: {e}");
-                return;
-            }
-            match phoenix_restore::restore::plan_sector_conversion(
-                &reader.manifest,
-                &plan,
-                target.sector_size,
-                true,
-            ) {
-                Ok(None) => {}
-                Ok(Some(report)) => {
-                    convert = true;
-                    convert_lines = conversion_detail_lines(&report);
-                }
-                Err(e) => {
-                    self.status = format!("Cannot restore onto this disk: {e}");
-                    return;
-                }
-            }
-        }
-        // Park the validated restore behind the same final confirm-the-target
-        // dialog the Clone page uses, so a wrong-disk pick gets caught before
-        // the worker writes anything.
+        // Everything the worker needs is captured here, on the UI thread,
+        // because it reaches into `self` and the disk list.
         let subject = JobSubject {
             source: backup_path.display().to_string(),
             target: self.disk_label(target.index),
             image_path: Some(backup_path.clone()),
         };
-        let mut details = disk_confirm_details(target);
-        details.extend(convert_lines);
-        self.pending_restore = Some(PendingRestore {
-            subject,
-            opts: RestoreOptions {
+        let base_details = disk_confirm_details(target);
+        let repair_boot = self.restore_repair_boot;
+        let target_sector_size = target.sector_size;
+
+        // Validation runs off the UI thread: an NTFS shrink pre-flight reads
+        // the source MFT out of the backup, which is slow enough on a large
+        // volume to hang the window if it ran inline.
+        let progress = ProgressHandle::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_progress = progress.clone();
+        std::thread::spawn(move || {
+            let result = validate_restore_plan(
                 backup_path,
                 plan,
-                // Read-back verification is CLI-only; the image's chunk hashes
-                // were already checked while decompressing.
-                verify_on_restore: false,
-                convert_sector_size: convert,
-                repair_boot: self.restore_repair_boot,
-                progress: Some(ProgressHandle::new()),
-            },
-            details,
-            convert,
-            ack: false,
+                subject,
+                base_details,
+                repair_boot,
+                target_sector_size,
+                &worker_progress,
+            );
+            let _ = tx.send(result);
         });
+        self.status = "Checking the restore plan…".into();
+        self.restore_validation = Some(RestoreValidation { rx, progress });
+    }
+
+    /// Pick up a finished plan check and park its confirmation dialog.
+    fn poll_restore_validation(&mut self, ctx: &egui::Context) {
+        let Some(validation) = self.restore_validation.as_ref() else {
+            return;
+        };
+        match validation.rx.try_recv() {
+            Ok(Ok(pending)) => {
+                self.restore_validation = None;
+                self.status.clear();
+                self.pending_restore = Some(*pending);
+            }
+            Ok(Err(message)) => {
+                self.restore_validation = None;
+                self.status = message;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Surface whatever the pre-flight is up to; on a big MFT this
+                // is the only sign the app is doing anything.
+                let detail = validation.progress.snapshot().detail;
+                self.status = if detail.is_empty() {
+                    "Checking the restore plan…".into()
+                } else {
+                    detail
+                };
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.restore_validation = None;
+                self.status = "Plan check ended unexpectedly — please try again".into();
+            }
+        }
     }
 
     fn ui_verify(&mut self, ui: &mut egui::Ui, busy: bool) {

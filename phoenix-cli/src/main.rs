@@ -73,8 +73,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         convert_sector_size: bool,
         /// After the restore, detect a Windows installation on the target disk
-        /// and rebuild its boot environment (bcdboot/bootsect; drive-local,
-        /// never touches this machine's firmware boot entries).
+        /// and rebuild its boot environment (bcdboot/bootsect). The target's
+        /// existing BCD is cleared first (kept as .bak) so the rebuild
+        /// replaces it. On UEFI, bcdboot may also add the drive to this
+        /// machine's firmware boot entries.
         #[arg(long, default_value_t = false)]
         repair_boot: bool,
     },
@@ -110,16 +112,19 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         convert_sector_size: bool,
         /// After the clone, detect a Windows installation on the target disk
-        /// and rebuild its boot environment (bcdboot/bootsect; drive-local,
-        /// never touches this machine's firmware boot entries).
+        /// and rebuild its boot environment (bcdboot/bootsect). The target's
+        /// existing BCD is cleared first (kept as .bak) so the rebuild
+        /// replaces it. On UEFI, bcdboot may also add the drive to this
+        /// machine's firmware boot entries.
         #[arg(long, default_value_t = false)]
         repair_boot: bool,
     },
     /// Detect Windows installations and repair a disk's boot environment
     /// (rebuild BCD/boot files with bcdboot, plus MBR boot code + active
-    /// flag on legacy disks). Drive-local: this machine's firmware (NVRAM)
-    /// boot entries are never modified. Without --disk, lists what was
-    /// detected; without --apply, shows the plan without changing anything.
+    /// flag on legacy disks). The target's existing BCD is cleared first,
+    /// kept as .bak, so the rebuild replaces it rather than merging into it.
+    /// Without --disk, lists what was detected; without --apply, shows the
+    /// plan without changing anything.
     BootRepair {
         /// Disk index carrying the Windows installation (see the no-argument
         /// listing or `list-disks`)
