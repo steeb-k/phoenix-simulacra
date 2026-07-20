@@ -116,7 +116,10 @@ impl RecordOverflowReport {
 /// LCNs here are **source** LCNs: this reads the volume as it is now,
 /// before any relocation, which is what makes it usable at plan time
 /// against a backup that has not been restored yet.
-pub fn scan_mft(src: &mut dyn VolumeRead, progress: Option<&ProgressHandle>) -> Result<MftSnapshot> {
+pub fn scan_mft(
+    src: &mut dyn VolumeRead,
+    progress: Option<&ProgressHandle>,
+) -> Result<MftSnapshot> {
     let mut sector = vec![0u8; 512];
     src.read_exact_at(0, &mut sector)?;
     let boot: NtfsBoot = parse_ntfs_boot(&sector)?;
@@ -281,20 +284,19 @@ fn unnamed_data_runs(record: &[u8]) -> Result<Vec<DataRun>> {
     // every volume Windows produces; `parse_record_model` keeps them in
     // record order, and $DATA (0x80) sorts after $STANDARD_INFORMATION
     // and $FILE_NAME, which are resident.
-    model
-        .attrs
-        .first()
-        .map(|a| a.runs.clone())
-        .ok_or_else(|| {
-            PhoenixError::Other(
-                "$MFT record 0 has no non-resident attribute; cannot locate the MFT".into(),
-            )
-        })
+    model.attrs.first().map(|a| a.runs.clone()).ok_or_else(|| {
+        PhoenixError::Other(
+            "$MFT record 0 has no non-resident attribute; cannot locate the MFT".into(),
+        )
+    })
 }
 
 /// Translate the snapshot's MFT location into source-space byte extents,
 /// so callers can re-read individual records (for names).
-pub fn source_mft_extents(src: &mut dyn VolumeRead, snapshot: &MftSnapshot) -> Result<Vec<(u64, u64)>> {
+pub fn source_mft_extents(
+    src: &mut dyn VolumeRead,
+    snapshot: &MftSnapshot,
+) -> Result<Vec<(u64, u64)>> {
     let mut record0 = vec![0u8; snapshot.bytes_per_record as usize];
     src.read_exact_at(snapshot.mft_lcn * snapshot.cluster_size, &mut record0)?;
     apply_fixups_for_read(&mut record0)?;
@@ -302,8 +304,12 @@ pub fn source_mft_extents(src: &mut dyn VolumeRead, snapshot: &MftSnapshot) -> R
     Ok(runs
         .iter()
         .filter_map(|r| {
-            r.lcn
-                .map(|lcn| (lcn * snapshot.cluster_size, r.length * snapshot.cluster_size))
+            r.lcn.map(|lcn| {
+                (
+                    lcn * snapshot.cluster_size,
+                    r.length * snapshot.cluster_size,
+                )
+            })
         })
         .collect())
 }

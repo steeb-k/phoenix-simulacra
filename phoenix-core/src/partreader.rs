@@ -23,8 +23,9 @@
 
 use std::collections::VecDeque;
 
-use crate::container::{paired_chunks, ChunkIndex, PartitionIndexEntry, PhnxReader,
-    EXTENT_LBA_BYTES};
+use crate::container::{
+    paired_chunks, ChunkIndex, PartitionIndexEntry, PhnxReader, EXTENT_LBA_BYTES,
+};
 use crate::error::{PhoenixError, Result};
 
 /// How many decompressed chunks to keep. The pre-flight walks the MFT
@@ -96,9 +97,7 @@ impl<'a> PartitionByteReader<'a> {
             .find(|p| p.index == partition_index)
             .map(|p| p.chunks.clone())
             .ok_or_else(|| {
-                PhoenixError::Manifest(format!(
-                    "partition {partition_index} has no manifest entry"
-                ))
+                PhoenixError::Manifest(format!("partition {partition_index} has no manifest entry"))
             })?;
 
         // Pair each stream chunk with its manifest record POSITIONALLY. The

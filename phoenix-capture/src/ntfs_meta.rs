@@ -522,8 +522,7 @@ pub(crate) fn parse_record_model(record: &[u8]) -> Result<RecordModel> {
             // offset 32 and must point inside this attribute.
             if attr_len < 34 {
                 return Err(PhoenixError::InvalidFormat(
-                    "MFT record: non-resident attribute too short to hold a run-list offset"
-                        .into(),
+                    "MFT record: non-resident attribute too short to hold a run-list offset".into(),
                 ));
             }
             let run_list_offset = le_u16(record, pos + 32)? as usize;
@@ -705,7 +704,12 @@ pub(crate) fn resident_file_name(record: &[u8]) -> Option<String> {
                 let namespace = record[value + 65];
                 if value + 66 + chars * 2 <= pos + attr_len {
                     let units: Vec<u16> = (0..chars)
-                        .map(|i| u16::from_le_bytes([record[value + 66 + i * 2], record[value + 67 + i * 2]]))
+                        .map(|i| {
+                            u16::from_le_bytes([
+                                record[value + 66 + i * 2],
+                                record[value + 67 + i * 2],
+                            ])
+                        })
                         .collect();
                     if let Ok(name) = String::from_utf16(&units) {
                         // 1 = Win32, 3 = Win32+DOS, 0 = POSIX, 2 = DOS alias.
@@ -749,8 +753,7 @@ pub(crate) fn rewrite_record_runs(
     record_idx: u64,
 ) -> Result<bool> {
     let model = parse_record_model(record)?;
-    let plan =
-        plan_record_fit(&model, map).map_err(|o| overflow_error(record, record_idx, &o))?;
+    let plan = plan_record_fit(&model, map).map_err(|o| overflow_error(record, record_idx, &o))?;
     if plan.attrs.is_empty() {
         return Ok(false);
     }
@@ -1319,12 +1322,12 @@ mod tests {
         // Learn the growth from a roomy record, then build one whose slack is
         // exactly that — the boundary case between fitting and overflowing.
         let attr = nonres_attr(ATTR_DATA, &split_runs(), 0);
-        let probe = build_record(&[attr.clone()]);
+        let probe = build_record(std::slice::from_ref(&attr));
         let growth = growth_under(&probe, &map);
         assert!(growth > 0);
         // Size the record so its slack is exactly the growth needed.
         let exact = used_size_of(&probe) + growth;
-        let mut rec = try_build_record(&[attr], exact).unwrap();
+        let mut rec = try_build_record(std::slice::from_ref(&attr), exact).unwrap();
 
         assert!(rewrite_record_runs(&mut rec, &map, 3).unwrap());
         assert_eq!(used_size_of(&rec), exact);
@@ -1334,11 +1337,11 @@ mod tests {
     fn overflow_past_the_record_end_is_refused() {
         let map = splitting_map();
         let attr = nonres_attr(ATTR_DATA, &split_runs(), 0);
-        let probe = build_record(&[attr.clone()]);
+        let probe = build_record(std::slice::from_ref(&attr));
         let growth = growth_under(&probe, &map);
         // One 8-byte step short of what the rewrite needs.
         let tight = used_size_of(&probe) + growth - 8;
-        let mut rec = try_build_record(&[attr], tight).unwrap();
+        let mut rec = try_build_record(std::slice::from_ref(&attr), tight).unwrap();
         let err = rewrite_record_runs(&mut rec, &map, 194).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("194"), "{msg}");
@@ -1406,7 +1409,11 @@ mod tests {
                 let actual = rewrite_record_runs(&mut rec, &map, 0);
                 match (predicted, actual) {
                     (Ok(plan), Ok(changed)) => {
-                        assert_eq!(plan.attrs.is_empty(), !changed, "pad={pad} fill={filler_len}");
+                        assert_eq!(
+                            plan.attrs.is_empty(),
+                            !changed,
+                            "pad={pad} fill={filler_len}"
+                        );
                         if changed {
                             assert_eq!(
                                 used_size_of(&rec),

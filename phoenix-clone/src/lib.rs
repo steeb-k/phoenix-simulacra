@@ -29,7 +29,6 @@ use phoenix_restore::partition_table::{
     notify_disk_updated, update_partition_layout_existing_bytes, write_mbr_partition_layout,
     write_partition_layout, GptEntry, MbrEntry,
 };
-use phoenix_restore::relocation::build_relocation_map;
 
 pub mod plan;
 pub use plan::{CloneEntry, ClonePlan, CloneTableMode};
@@ -458,9 +457,11 @@ struct PreparedPartition {
     reader: PartitionReader,
     entry: CloneEntry,
     extents: Vec<Extent>,
-    bytes_per_cluster: u32,
     capture_mode: CaptureMode,
     fs_kind: FilesystemKind,
+    /// Shrink plan for this partition, proved against the source MFT during
+    /// the prepare phase. `None` when the partition is not an NTFS shrink.
+    relocation: Option<RelocationMap>,
 }
 
 /// Freeze and plan one source partition. Writes nothing.
@@ -588,13 +589,53 @@ fn prepare_partition(
         }
     }
 
+    // ReFS cannot be shrunk: no offline shrink exists, we don't rewrite its
+    // allocators, and its backup superblocks live at the end of the volume —
+    // even a shrink whose used extents all fit would clone a volume whose
+    // tail metadata is gone. Refuse outright (the planner never offers ReFS
+    // resize; this guards hand-built plans).
+    if fs_kind == FilesystemKind::Refs && entry.target_size_bytes < part.size_bytes {
+        return Err(PhoenixError::Other(format!(
+            "partition {} is ReFS and cannot be shrunk (target {} bytes < source {} bytes); \
+             clone it at its original size or larger",
+            part.index, entry.target_size_bytes, part.size_bytes
+        )));
+    }
+
+    // Plan (and prove) an NTFS shrink here, in the prepare phase, for the same
+    // reason the freeze happens here: the target's partition table is wiped
+    // after this loop, so a shrink that cannot work must be discovered before
+    // then. The pre-flight reads the source MFT through the frozen reader, so
+    // it sees exactly the bytes the streaming pass will copy.
+    let relocation = if fs_kind == FilesystemKind::Ntfs && entry.target_size_bytes < part.size_bytes
+    {
+        let plan = phoenix_restore::relocation::plan_shrink(
+            &extents,
+            EXTENT_LBA_BYTES as u64,
+            bytes_per_cluster as u64,
+            entry.target_size_bytes,
+            part.size_bytes,
+            &mut reader,
+            opts.progress.as_ref(),
+        )?;
+        info!(
+            partition = part.index,
+            entries = plan.map.entries.len(),
+            replanned_records = plan.replanned_records,
+            "planned NTFS shrink relocation for clone"
+        );
+        Some(plan.map)
+    } else {
+        None
+    };
+
     Ok(PreparedPartition {
         reader,
         entry: entry.clone(),
         extents,
-        bytes_per_cluster,
         capture_mode,
         fs_kind,
+        relocation,
     })
 }
 
@@ -615,35 +656,13 @@ fn stream_one_partition(
     // Take the extents (the reader stays borrowed in place — `stream_extents` needs
     // it by &mut, and the rest are Copy).
     let extents = std::mem::take(&mut prep.extents);
-    let bytes_per_cluster = prep.bytes_per_cluster;
     let capture_mode = prep.capture_mode;
     let fs_kind = prep.fs_kind;
 
-    // ReFS cannot be shrunk: no offline shrink exists, we don't rewrite its
-    // allocators, and its backup superblocks live at the end of the volume —
-    // even a shrink whose used extents all fit would clone a volume whose
-    // tail metadata is gone. Refuse outright (the planner never offers ReFS
-    // resize; this guards hand-built plans).
-    if fs_kind == FilesystemKind::Refs && entry.target_size_bytes < part.size_bytes {
-        return Err(PhoenixError::Other(format!(
-            "partition {} is ReFS and cannot be shrunk (target {} bytes < source {} bytes); \
-             clone it at its original size or larger",
-            part.index, entry.target_size_bytes, part.size_bytes
-        )));
-    }
-
-    // --- Shrink relocation (NTFS only) ---
-    let relocation: Option<RelocationMap> =
-        if fs_kind == FilesystemKind::Ntfs && entry.target_size_bytes < part.size_bytes {
-            build_relocation_map(
-                &extents,
-                EXTENT_LBA_BYTES as u64,
-                bytes_per_cluster as u64,
-                entry.target_size_bytes,
-            )?
-        } else {
-            None
-        };
+    // The shrink relocation was planned — and proved against the source MFT —
+    // back in the prepare phase, before the target's table was touched. The
+    // ReFS shrink refusal lives there too, for the same reason.
+    let relocation: Option<RelocationMap> = prep.relocation.take();
 
     // --- Open the target writer and stream ---
     let mut writer =
