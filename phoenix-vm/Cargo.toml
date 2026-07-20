@@ -32,6 +32,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     # DwmSetWindowAttribute — the only way to darken a native title bar.
     "Win32_Graphics_Dwm",
+    # LoadLibrary/GetProcAddress, to ask WHPX whether a hypervisor is present
+    # without link-time dependence on an optional Windows feature's DLL.
+    "Win32_System_LibraryLoader",
 ] }
 
 [features]
