@@ -6,6 +6,7 @@
 
 mod about_panel;
 mod action_bar;
+mod qemu_payload;
 mod virtio_iso;
 mod vm_panel;
 mod vm_sessions_table;
@@ -658,6 +659,11 @@ struct DriversDl {
     progress: (u64, u64),
 }
 
+/// An in-flight download of the bundled QEMU, offered when none was found.
+struct QemuDl {
+    rx: std::sync::mpsc::Receiver<qemu_payload::DlEvent>,
+}
+
 /// The two ends of the running job, named the way a person would name them
 /// ("Samsung SSD 990 PRO (Disk 1)", `D:\Backups\work.phnx`).
 ///
@@ -871,6 +877,13 @@ struct PhoenixApp {
     drivers_dl: Option<DriversDl>,
     /// One-line outcome of the last drivers download / update check.
     drivers_note: String,
+    /// An in-flight download of the bundled QEMU, if any.
+    qemu_dl: Option<QemuDl>,
+    /// Last progress seen from that worker (`try_recv` drains, so without this
+    /// the bar flickers empty between events).
+    qemu_dl_last: Option<(u64, u64)>,
+    /// Why the last QEMU download failed, if it did.
+    qemu_dl_note: String,
     /// Discovered QEMU install, or `None` when it isn't found — the page then
     /// shows an install notice (mirrors `mount_available`).
     qemu: Option<phoenix_vm::Qemu>,
@@ -1021,6 +1034,9 @@ impl PhoenixApp {
             vm_last_status: String::new(),
             drivers_dl: None,
             drivers_note: String::new(),
+            qemu_dl: None,
+            qemu_dl_last: None,
+            qemu_dl_note: String::new(),
             // Probe for QEMU once at startup; the page shows an install notice
             // when it's missing. A saved directory wins over autodetection so
             // a side-by-side build can be used without touching the system one.
@@ -4553,6 +4569,9 @@ impl PhoenixApp {
             )
         });
         let last = self.vm_last_status.clone();
+        // Drain the QEMU download worker before rendering, so the progress bar
+        // and the "QEMU found" state both reflect this frame.
+        let qemu_dl = self.poll_qemu_download();
         let drivers = vm_panel::DriversView {
             present: virtio_iso::installed().is_some(),
             downloading: self.drivers_dl.as_ref().map(|d| d.progress),
@@ -4600,6 +4619,7 @@ impl PhoenixApp {
                 &sessions,
                 running,
                 &last,
+                &qemu_dl,
             );
         });
         self.vm = vm_state;
@@ -4654,6 +4674,15 @@ impl PhoenixApp {
                     None => {
                         self.vm_last_status = "Couldn't find the VM's control port.".into()
                     }
+                }
+            }
+            vm_panel::VmAction::DownloadQemu => {
+                if self.qemu_dl.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    qemu_payload::spawn_download(tx);
+                    self.qemu_dl_note.clear();
+                    self.qemu_dl_last = None;
+                    self.qemu_dl = Some(QemuDl { rx });
                 }
             }
             vm_panel::VmAction::BrowseQemuDir => {
@@ -5089,6 +5118,68 @@ impl PhoenixApp {
             },
             None => self.vm_last_status = "Couldn't find the VM's control port.".into(),
         }
+    }
+
+    /// Drain the QEMU download worker's channel into a view for this frame.
+    ///
+    /// On success it re-runs discovery, so the page swaps from "QEMU is
+    /// required" to the real thing without a restart — the whole point of
+    /// offering the download in-app.
+    fn poll_qemu_download(&mut self) -> vm_panel::QemuDownloadView {
+        let mut view = vm_panel::QemuDownloadView {
+            note: std::mem::take(&mut self.qemu_dl_note),
+            ..Default::default()
+        };
+        let Some(dl) = self.qemu_dl.as_ref() else {
+            return view;
+        };
+        let mut finished = false;
+        while let Ok(ev) = dl.rx.try_recv() {
+            match ev {
+                qemu_payload::DlEvent::Progress { downloaded, total } => {
+                    view.progress = Some((downloaded, total));
+                }
+                qemu_payload::DlEvent::Extracting => {
+                    view.progress = None;
+                    view.extracting = true;
+                }
+                qemu_payload::DlEvent::Done => {
+                    finished = true;
+                    view.note.clear();
+                    self.qemu = phoenix_vm::Qemu::discover(
+                        self.settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
+                    )
+                    .ok();
+                    self.vm_last_status = match self.qemu.as_ref() {
+                        Some(q) => format!("QEMU ready — {}", q.version),
+                        None => "QEMU downloaded but could not be started.".into(),
+                    };
+                }
+                qemu_payload::DlEvent::Failed(m) => {
+                    finished = true;
+                    view.note = m;
+                }
+            }
+        }
+        // Carry state forward: try_recv drains, so the last-seen values have to
+        // be remembered or the bar flickers empty between events.
+        if finished {
+            self.qemu_dl = None;
+            view.progress = None;
+            view.extracting = false;
+            self.qemu_dl_note = view.note.clone();
+        } else {
+            if let Some(p) = view.progress {
+                self.qemu_dl_last = Some(p);
+            } else if !view.extracting {
+                view.progress = self.qemu_dl_last;
+            }
+            if view.extracting {
+                self.qemu_dl_last = None;
+            }
+            self.qemu_dl_note = view.note.clone();
+        }
+        view
     }
 
     /// The running VM's QMP port, if there is one and we can find it.
