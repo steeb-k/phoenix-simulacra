@@ -75,8 +75,7 @@ enum Commands {
         /// After the restore, detect a Windows installation on the target disk
         /// and rebuild its boot environment (bcdboot/bootsect). The target's
         /// existing BCD is cleared first (kept as .bak) so the rebuild
-        /// replaces it. On UEFI, bcdboot may also add the drive to this
-        /// machine's firmware boot entries.
+        /// replaces it rather than merging into it.
         #[arg(long, default_value_t = false)]
         repair_boot: bool,
     },
@@ -114,8 +113,7 @@ enum Commands {
         /// After the clone, detect a Windows installation on the target disk
         /// and rebuild its boot environment (bcdboot/bootsect). The target's
         /// existing BCD is cleared first (kept as .bak) so the rebuild
-        /// replaces it. On UEFI, bcdboot may also add the drive to this
-        /// machine's firmware boot entries.
+        /// replaces it rather than merging into it.
         #[arg(long, default_value_t = false)]
         repair_boot: bool,
     },

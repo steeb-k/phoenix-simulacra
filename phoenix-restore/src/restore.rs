@@ -33,7 +33,7 @@ pub struct RestoreOptions {
     pub convert_sector_size: bool,
     /// After the restore completes and the disk is online, detect a Windows
     /// installation on the target and rebuild its boot environment
-    /// (`bcdboot`/`bootsect`, drive-local only — see [`crate::bootrepair`]).
+    /// (`bcdboot`/`bootsect` — see [`crate::bootrepair`]).
     /// Best-effort: a repair failure is recorded in the summary, never
     /// propagated, because the restored data is already valid.
     pub repair_boot: bool,
