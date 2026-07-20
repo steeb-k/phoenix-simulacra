@@ -33,7 +33,7 @@ const LATEST_RELEASE_URL: &str =
 
 /// GitHub rejects API requests without a `User-Agent`. Identify ourselves with
 /// the running version so the request log is legible.
-const USER_AGENT: &str = concat!("PhoenixSimulacra/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("PhoenixSimulacra/", env!("CARGO_PKG_VERSION"));
 
 /// How the check was started, so the UI can decide how loud to be about the
 /// outcome (auto checks stay silent on failure; manual ones report it).
@@ -234,7 +234,7 @@ fn classify(e: ureq::Error) -> FetchErr {
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30));

@@ -85,7 +85,9 @@ pub struct Extent {
     pub sector_count: u64,
 }
 
-#[derive(Debug, Clone)]
+// All fields are plain integers, so `Copy` lets hot read paths pass one around
+// without touching the heap (see `phoenix-mount::chunkstore`).
+#[derive(Debug, Clone, Copy)]
 pub struct ChunkIndex {
     pub file_offset: u64,
     pub compressed_len: u32,
@@ -1309,6 +1311,8 @@ mod tests {
             disk: DiskManifest {
                 style: "gpt".into(),
                 disk_guid: None,
+                disk_signature: None,
+                mbr_boot_code: None,
                 sector_size: 512,
             },
             partitions: vec![PartitionManifest {
@@ -1322,6 +1326,8 @@ mod tests {
                 bitlocker: None,
                 unique_guid: None,
                 gpt_attributes: None,
+                mbr_type: None,
+                mbr_bootable: None,
                 chunks,
                 bitmap_hash: None,
             }],

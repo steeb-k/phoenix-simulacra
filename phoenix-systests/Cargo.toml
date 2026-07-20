@@ -17,6 +17,7 @@ phoenix-capture = { workspace = true }
 phoenix-restore = { workspace = true }
 phoenix-clone = { workspace = true }
 phoenix-mount = { workspace = true }
+phoenix-vm = { workspace = true }
 phoenix-vss = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
@@ -31,6 +32,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_Vhd",
     "Win32_System_IO",
+    "Win32_System_Ioctl",
 ] }
 
 [features]

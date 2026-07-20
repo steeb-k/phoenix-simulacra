@@ -6,6 +6,10 @@
 
 mod about_panel;
 mod action_bar;
+mod qemu_payload;
+mod virtio_iso;
+mod vm_panel;
+mod vm_sessions_table;
 mod bootrepair_table;
 mod clone_panel;
 mod confirm_dialog;
@@ -107,6 +111,20 @@ const STATUS_BAR_HEIGHT_ESTIMATE: f32 = 40.0;
 const MIN_WINDOW_WIDTH: f32 = 640.0;
 
 fn main() {
+    // Serve-helper re-exec: booting a VM re-execs THIS exe with a sentinel
+    // argv[1] to become the out-of-process WinFsp serve for the backup (see
+    // `phoenix_vm::serve_helper`). Route it before anything else — without
+    // this, the child comes up as a second GUI, the single-instance guard
+    // swallows it, and the boot times out waiting for its READY handshake.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(res) = phoenix_vm::serve_helper::maybe_run(&args) {
+        if let Err(e) = res {
+            eprintln!("serve helper failed: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--debug` re-enables the console this GUI-subsystem build normally
     // suppresses. Attach it BEFORE logging init so the stderr layer binds to a
     // live console handle (Rust resolves the std handles lazily per write, and
@@ -407,7 +425,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // is held for the "these will be unmounted" dialog
                     // (pending_close counts as a modal, so the page goes inert);
                     // otherwise the close goes straight through.
-                    if r.app.anything_mounted() && !r.app.pending_close {
+                    if r.app.close_needs_confirm() && !r.app.pending_close {
                         r.app.pending_close = true;
                         r.window.request_redraw();
                     } else {
@@ -505,7 +523,7 @@ fn init_logging(debug: bool) -> Option<tracing_appender::non_blocking::WorkerGua
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         "phoenix_core=info,phoenix_gui=info,phoenix_capture=info,\
              phoenix_restore=info,phoenix_vss=info,phoenix_build=info,\
-             phoenix_mount=info,phoenix_clone=info,warn"
+             phoenix_mount=info,phoenix_clone=info,phoenix_vm=info,warn"
             .into()
     });
 
@@ -607,6 +625,43 @@ struct PendingBootRepair {
     /// True when the target is the live system disk.
     system_disk: bool,
     ack: bool,
+}
+
+/// A VM booted on a background thread. `boot()` blocks for the whole guest
+/// session, so it can't run on the UI thread; the outcome comes back over
+/// `result` and the page polls it each frame.
+struct VmRun {
+    /// The backup this VM is running — used to locate its session (for the QMP
+    /// stop port) and to label the page.
+    backup: std::path::PathBuf,
+    name: String,
+    started: Instant,
+    /// Path to the session overlay, polled to show how much the guest has written.
+    overlay_path: std::path::PathBuf,
+    /// The `net use` command mapping this run's shared folder in the guest,
+    /// when the share is active.
+    share_cmd: Option<String>,
+    /// The VM working root this run actually uses (session, serve scratch,
+    /// QMP port file) — captured at boot so Stop can't be misdirected by a
+    /// later scratch-dropdown change.
+    vm_root: std::path::PathBuf,
+    /// Whether the guest's virtual network cable is plugged in. Every VM
+    /// boots unplugged; the running view grants it.
+    network_connected: bool,
+    result: std::sync::mpsc::Receiver<anyhow::Result<phoenix_vm::boot::BootOutcome>>,
+}
+
+/// A guest-tools ISO download (or update check) running on a worker thread;
+/// the Virtualize page polls `rx` and shows `progress` as a bar.
+struct DriversDl {
+    rx: std::sync::mpsc::Receiver<virtio_iso::DlEvent>,
+    /// (bytes downloaded, total or 0) — updated from `Progress` events.
+    progress: (u64, u64),
+}
+
+/// An in-flight download of the bundled QEMU, offered when none was found.
+struct QemuDl {
+    rx: std::sync::mpsc::Receiver<qemu_payload::DlEvent>,
 }
 
 /// The two ends of the running job, named the way a person would name them
@@ -806,8 +861,39 @@ struct PhoenixApp {
     /// A mount awaiting the "enable temporary write access" hazard dialog. Holds
     /// the Active-mounts table index (real rows first, then demo rows).
     pending_enable_write: Option<usize>,
+    /// Boot VM was clicked while saved sessions exist: the resume-or-new
+    /// hazard dialog is up. Holds every saved session's (backup path, its own
+    /// VM working root) — resume must go where the session lives.
+    vm_boot_prompt: Option<Vec<(String, std::path::PathBuf)>>,
     /// Acknowledgement-checkbox state for the enable-write dialog.
     enable_write_ack: bool,
+    /// Virtualize page controls (backup, knobs, scratch drive, ISO).
+    vm: vm_panel::VmPageState,
+    /// A VM running on a background thread, if any (one at a time for now).
+    vm_run: Option<VmRun>,
+    /// Last VM outcome/status shown on the Virtualize page.
+    vm_last_status: String,
+    /// An in-flight guest-tools ISO download/update-check, if any.
+    drivers_dl: Option<DriversDl>,
+    /// One-line outcome of the last drivers download / update check.
+    drivers_note: String,
+    /// An in-flight download of the bundled QEMU, if any.
+    qemu_dl: Option<QemuDl>,
+    /// Last progress seen from that worker (`try_recv` drains, so without this
+    /// the bar flickers empty between events).
+    qemu_dl_last: Option<(u64, u64)>,
+    /// Why the last QEMU download failed, if it did.
+    qemu_dl_note: String,
+    /// Host acceleration, probed at startup and re-probed after a fix.
+    accel: phoenix_vm::accel::AccelStatus,
+    /// An in-flight acceleration fix (DISM is slow), and its outcome.
+    accel_fix: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    accel_fix_note: String,
+    /// A fix succeeded; the change needs a restart to take effect.
+    accel_restart_needed: bool,
+    /// Discovered QEMU install, or `None` when it isn't found — the page then
+    /// shows an install notice (mirrors `mount_available`).
+    qemu: Option<phoenix_vm::Qemu>,
     /// Boot Repair page: Windows installations detected on the current disk
     /// list. `None` means "scan on next page render" — cleared whenever the
     /// disk list reloads so the page never shows installs from a stale world.
@@ -948,7 +1034,27 @@ impl PhoenixApp {
             demo_mounts: demo_mount_rows_from_args(),
             pending_close: false,
             pending_enable_write: None,
+            vm_boot_prompt: None,
             enable_write_ack: false,
+            vm: vm_panel::VmPageState::default(),
+            vm_run: None,
+            vm_last_status: String::new(),
+            drivers_dl: None,
+            drivers_note: String::new(),
+            qemu_dl: None,
+            qemu_dl_last: None,
+            qemu_dl_note: String::new(),
+            accel: demo_accel_from_args().unwrap_or_else(phoenix_vm::accel::probe),
+            accel_fix: None,
+            accel_fix_note: String::new(),
+            accel_restart_needed: false,
+            // Probe for QEMU once at startup; the page shows an install notice
+            // when it's missing. A saved directory wins over autodetection so
+            // a side-by-side build can be used without touching the system one.
+            qemu: phoenix_vm::Qemu::discover(
+                settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
+            )
+            .ok(),
             bootrepair_installs: None,
             bootrepair_selected: None,
             bootrepair_plan: None,
@@ -986,6 +1092,17 @@ impl PhoenixApp {
         if demo_enable_write_from_args() && !app.demo_mounts.is_empty() {
             app.page = Page::Mount;
             app.pending_enable_write = Some(0);
+        }
+        // Restore the persisted Virtualize knobs (scratch drive, RAM, CPUs).
+        app.vm.scratch = match app.settings.vm_scratch_drive {
+            Some(c) => vm_panel::ScratchChoice::Drive(c),
+            None => vm_panel::ScratchChoice::SameAsImage,
+        };
+        if let Some(m) = app.settings.vm_memory_mib {
+            app.vm.mem_mib = m;
+        }
+        if let Some(c) = app.settings.vm_cpus {
+            app.vm.cpus = c;
         }
         app.init_updates();
         app
@@ -1161,7 +1278,7 @@ impl PhoenixApp {
             Page::BootRepair => {
                 self.bootrepair_selected = None;
             }
-            Page::Verify | Page::Mount | Page::About => {}
+            Page::Verify | Page::Mount | Page::Virtualize | Page::About => {}
         }
     }
 
@@ -1231,6 +1348,7 @@ impl PhoenixApp {
             || self.pending_close
             || self.pending_enable_write.is_some()
             || self.pending_boot_repair.is_some()
+            || self.vm_boot_prompt.is_some()
     }
 
     fn clear_restore_ui_state(&mut self) {
@@ -1765,6 +1883,26 @@ impl PhoenixApp {
                     }),
                 }
             }
+            Page::Virtualize => {
+                // No QEMU or a VM already running → withhold the bar (the page
+                // shows an install notice / the running-VM controls instead).
+                if self.qemu.is_none() || self.vm_run.is_some() {
+                    return None;
+                }
+                let ready = self.vm.summary.as_ref().is_some_and(|s| s.blocker.is_none());
+                StartAction {
+                    label: "Boot VM",
+                    icon: Some(egui_phosphor::fill::PLAY),
+                    enabled: !busy && ready,
+                    disabled_hint: Some(if busy {
+                        "A job is already running"
+                    } else if self.vm.summary.is_none() {
+                        "Choose a backup file first"
+                    } else {
+                        "This backup can't boot — see the note above"
+                    }),
+                }
+            }
             Page::BootRepair => {
                 let plan_ok = self
                     .bootrepair_plan
@@ -1838,12 +1976,23 @@ impl PhoenixApp {
         // to `titlebar::show` along with the floating corner pill. That pill
         // hosts the app's one Refresh button — live only when the window is
         // otherwise idle (no job, no modal, no refresh already in flight).
+        // Belt and braces: the sidebar hides unavailable pages, but nothing
+        // stops `self.page` holding one that arrived by another route. Fall
+        // back rather than render a page this build cannot support.
+        if !sidebar::page_available(self.page, self.portable) {
+            self.page = Page::Backup;
+        }
+        // Navigation is frozen while a VM runs, the same way a job freezes
+        // it. The Virtualize page is the only place to see or stop the VM,
+        // and wandering off it made it far too easy to close the app and
+        // pull the served disk out from under a live guest.
         let nav = sidebar::show(
             ctx,
             &mut self.page,
             &self.palette,
-            modal_open,
+            modal_open || self.vm_run.is_some(),
             &mut self.settings.theme,
+            self.portable,
         );
         let brand_rect = nav.brand_rect;
         if nav.theme_changed {
@@ -1911,6 +2060,7 @@ impl PhoenixApp {
                     Page::Verify => self.start_verify(),
                     Page::Clone => self.start_clone(),
                     Page::Mount => self.start_mount(),
+                    Page::Virtualize => self.request_start_vm(),
                     Page::BootRepair => self.start_boot_repair(),
                     _ => {}
                 }
@@ -1945,6 +2095,10 @@ impl PhoenixApp {
                     Page::Restore => self.ui_restore(ui, busy),
                     Page::Verify => self.ui_verify(ui, busy),
                     Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
+                    // Not gated on `busy`: a running VM lives on a background
+                    // thread, not a modal job, so the page stays interactive
+                    // (Stop button, sessions). `modal_open` still disables it.
+                    Page::Virtualize => self.ui_virtualize(ui),
                     Page::BootRepair => disabled_when(ui, busy, |ui| self.ui_bootrepair(ui)),
                     Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
                     Page::About => disabled_when(ui, busy, |ui| self.ui_about(ui)),
@@ -1984,6 +2138,7 @@ impl PhoenixApp {
         self.show_demo_progress_modal(ctx);
         self.show_close_dialog(ctx);
         self.show_enable_write_dialog(ctx);
+        self.show_vm_boot_dialog(ctx);
         self.show_refresh_overlay(ctx);
     }
 
@@ -2098,6 +2253,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack: None,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2112,7 +2268,7 @@ impl PhoenixApp {
                 self.status =
                     "Backup cancelled — choose a different name to keep the old one".into();
             }
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -2152,6 +2308,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2168,7 +2325,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Clone cancelled — no changes were made".into();
             }
-            ConfirmAction::None => self.pending_clone = Some(pending),
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_clone = Some(pending),
         }
     }
 
@@ -2210,6 +2367,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2226,7 +2384,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Restore cancelled — no changes were made".into();
             }
-            ConfirmAction::None => self.pending_restore = Some(pending),
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_restore = Some(pending),
         }
     }
 
@@ -2251,6 +2409,7 @@ impl PhoenixApp {
                 confirm_danger: true,
                 hazard_tape: true,
                 ack,
+                extra_label: None,
             };
             confirm_dialog::show(ctx, &self.palette, &mut view)
         };
@@ -2267,7 +2426,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Boot repair cancelled — no changes were made".into();
             }
-            ConfirmAction::None => self.pending_boot_repair = Some(pending),
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_boot_repair = Some(pending),
         }
     }
 
@@ -2281,43 +2440,84 @@ impl PhoenixApp {
         if !self.pending_close {
             return;
         }
-        // Nothing left to warn about (the last mount was unmounted while the
-        // dialog was up): let the close through.
-        if !self.anything_mounted() {
+        // Nothing left to warn about (the last mount came down, or the VM
+        // stopped, while the dialog was up): let the close through.
+        if !self.close_needs_confirm() {
             self.pending_close = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        let details = self.mount_summaries();
-        let message = format!(
-            "Closing Phoenix Simulacra unmounts {} and removes {} drive letters. \
-             Any open files or Explorer windows on those drives will be disconnected.",
-            if details.len() == 1 {
+        let vm_running = self.vm_run.is_some();
+        let mut details = Vec::new();
+        if let Some(run) = &self.vm_run {
+            details.push(format!("Running VM: {}", run.name));
+        }
+        details.extend(self.mount_summaries());
+
+        // The VM warning leads when there is one: losing unsaved work inside
+        // a guest is a bigger deal than a disconnected drive letter, and the
+        // power-off is immediate rather than orderly.
+        let mounted = self.anything_mounted();
+        let mount_count = self.mount_summaries().len();
+        let mount_clause = format!(
+            "unmounts {} and removes {} drive letters, disconnecting any open \
+             files or Explorer windows on those drives",
+            if mount_count == 1 {
                 "the mounted backup".to_string()
             } else {
-                format!("all {} mounted backups", details.len())
+                format!("all {mount_count} mounted backups")
             },
-            if details.len() == 1 { "its" } else { "their" },
+            if mount_count == 1 { "its" } else { "their" },
         );
+        let message = match (vm_running, mounted) {
+            (true, true) => format!(
+                "Closing Phoenix Simulacra immediately powers off the running \
+                 virtual machine — the guest gets no chance to shut down, and \
+                 unsaved work inside it is lost. The app serves the disk the \
+                 guest is running from, so it cannot keep running without it. \
+                 Closing also {mount_clause}."
+            ),
+            (true, false) => "Closing Phoenix Simulacra immediately powers off the running \
+                 virtual machine — the guest gets no chance to shut down, and unsaved \
+                 work inside it is lost. The app serves the disk the guest is running \
+                 from, so it cannot keep running without it.\n\nTo shut the guest down \
+                 properly, cancel and use Stop VM instead."
+                .to_string(),
+            (false, _) => format!("Closing Phoenix Simulacra {mount_clause}."),
+        };
+        let title = if vm_running {
+            "A virtual machine is still running"
+        } else {
+            "Backups are still mounted"
+        };
+        let confirm_label = if vm_running {
+            "Power Off & Close"
+        } else {
+            "Unmount & Close"
+        };
         let mut view = ConfirmView {
-            title: "Backups are still mounted",
+            title,
             message: &message,
             details: &details,
-            confirm_label: "Unmount & Close",
+            confirm_label,
             cancel_label: "Keep Open",
-            confirm_danger: false,
+            confirm_danger: vm_running,
             hazard_tape: true,
             ack: None,
+            extra_label: None,
         };
         match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
                 self.pending_close = false;
+                // Power off first: the VM's disk is served by this process,
+                // so it must stop before the mounts it rides on come down.
+                self.power_off_vm_now();
                 self.unmount_all();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             ConfirmAction::Cancel => self.pending_close = false,
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -2341,6 +2541,7 @@ impl PhoenixApp {
             confirm_danger: true,
             hazard_tape: true,
             ack: None,
+            extra_label: None,
         };
         if confirm_dialog::show(ctx, &self.palette, &mut view) != ConfirmAction::None {
             self.demo_confirm = false;
@@ -2420,6 +2621,7 @@ impl PhoenixApp {
                 label: "I understand my changes are temporary and will be discarded on unmount",
                 checked: &mut ack_checked,
             }),
+            extra_label: None,
         };
         let result = confirm_dialog::show(ctx, &self.palette, &mut view);
         self.enable_write_ack = ack_checked;
@@ -2433,7 +2635,7 @@ impl PhoenixApp {
                 self.pending_enable_write = None;
                 self.enable_write_ack = false;
             }
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -2640,7 +2842,7 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
     let mut full_rect = ui.max_rect();
     full_rect.max.x += CENTRAL_PANEL_MARGIN_X;
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
-        egui::ScrollArea::vertical()
+        let out = egui::ScrollArea::vertical()
             .id_salt(id_salt)
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2651,7 +2853,128 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
                     })
                     .show(ui, body);
             });
+        // How much content sits below the fold right now.
+        let below = out.content_size.y - (out.state.offset.y + out.inner_rect.height());
+        paint_more_below(ui, out.inner_rect, below);
     });
+}
+
+/// Best-practices guide for booting backups as VMs.
+const VM_WIKI_URL: &str = "https://github.com/steeb-k/phoenix-simulacra/wiki/Virtualization";
+
+/// The "read the guide first" card under the Virtualize header.
+///
+/// Booting a backup has more sharp edges than the rest of the app — guest
+/// tools, when to connect the network, what a session actually keeps — and
+/// most of them are cheaper to read about than to discover. Styled as a card
+/// rather than a plain line so it reads as part of the page furniture and
+/// survives being scrolled past, but deliberately not hazard tape: the page
+/// header already carries that, and a second alarm devalues the first.
+fn vm_wiki_notice(ui: &mut egui::Ui, palette: &Palette) {
+    egui::Frame::none()
+        .fill(palette.content_card_bg)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            // Two columns: the icon owns the left one at a size that reads as
+            // a mark rather than punctuation, and the prose wraps in the
+            // right one without flowing back under it.
+            //
+            // The icon is PAINTED rather than laid out, after the text, so it
+            // can be centred against the text block's real height. A
+            // `horizontal` layout positions each item as it is added, before
+            // the row's final height is known, so adding the icon first pins
+            // it to the top no matter what the layout's cross-alignment says.
+            const ICON_W: f32 = 30.0;
+            const ICON_GAP: f32 = 14.0;
+            ui.horizontal(|ui| {
+                let icon_x = ui.cursor().left();
+                ui.add_space(ICON_W + ICON_GAP);
+                let column = ui.vertical(|ui| {
+                    // Prose and link on separate lines, NOT one wrapped
+                    // sentence with the link inline. A wrapped layout lays
+                    // each item out as a unit, so when the link's own text
+                    // straddled a line break its widget became two lines
+                    // tall and inflated that row — a visible extra gap at
+                    // exactly the widths where the link happened to wrap.
+                    ui.label(
+                        egui::RichText::new(
+                            "You are strongly encouraged to read the best-practices \
+                             guide before booting a backup — it covers guest tools, \
+                             networking, and how sessions keep your changes.",
+                        )
+                        .color(palette.subtle_text),
+                    );
+                    ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        egui::RichText::new("Open the Virtualization guide  →")
+                            .color(palette.accent),
+                        VM_WIKI_URL,
+                    );
+                });
+                let mid = column.response.rect.center().y;
+                ui.painter().text(
+                    egui::pos2(icon_x, mid),
+                    egui::Align2::LEFT_CENTER,
+                    egui_phosphor::regular::BOOK_OPEN,
+                    fonts::icon(ICON_W),
+                    palette.accent,
+                );
+            });
+        });
+    ui.add_space(12.0);
+}
+
+/// Ignore an overflow smaller than this — a stray pixel or two of rounding
+/// isn't "more to see", and an indicator that shows for it is noise.
+const MORE_BELOW_MIN: f32 = 6.0;
+/// One full grow-and-shrink of the line, in seconds. Slow reads as ambient;
+/// fast reads as activity, which is what a progress bar looks like.
+const MORE_BELOW_CYCLE: f64 = 3.4;
+
+/// Mark the bottom edge of a scroll area that has more content below it: a
+/// short line that breathes — widening and brightening together, then
+/// narrowing and dimming — for as long as there is more to see.
+///
+/// Deliberately short and centred rather than full-width, and drawn between
+/// the weak and strong text colours rather than in the accent: a full-width
+/// animated line pinned to the bottom of a pane is the visual grammar of an
+/// indeterminate progress bar, which this app uses for real elsewhere.
+/// Short, centred and muted reads as a grab handle — "there is more here" —
+/// instead. Width and brightness move on one phase so it reads as a single
+/// breath rather than two effects.
+fn paint_more_below(ui: &egui::Ui, rect: egui::Rect, below: f32) {
+    if below <= MORE_BELOW_MIN {
+        return;
+    }
+    const MIN_W: f32 = 42.0;
+    const MAX_W: f32 = 88.0;
+
+    let now = ui.ctx().input(|i| i.time);
+    let phase = (now % MORE_BELOW_CYCLE) / MORE_BELOW_CYCLE;
+    // Smooth 0→1→0 across the cycle, so growing and shrinking are symmetric
+    // and neither end has a visible corner.
+    let t = ((1.0 - (std::f64::consts::TAU * phase).cos()) / 2.0) as f32;
+
+    let half = (MIN_W + (MAX_W - MIN_W) * t) / 2.0;
+    // Between the theme's weak and strong text colours, so "brighter" means
+    // more prominent in light mode as well as dark.
+    let dim = ui.visuals().weak_text_color();
+    let bright = ui.visuals().strong_text_color();
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    let color = egui::Color32::from_rgb(
+        mix(dim.r(), bright.r()),
+        mix(dim.g(), bright.g()),
+        mix(dim.b(), bright.b()),
+    );
+
+    let y = rect.bottom() - 7.0;
+    let mid = rect.center().x;
+    ui.painter().line_segment(
+        [egui::pos2(mid - half, y), egui::pos2(mid + half, y)],
+        egui::Stroke::new(2.0, color),
+    );
+    ui.ctx().request_repaint();
 }
 
 /// Bold "label + TextEdit + Browse…" row used by the Verify, Restore, and
@@ -2665,24 +2988,54 @@ fn page_scroll_shell(ui: &mut egui::Ui, id_salt: &str, body: impl FnOnce(&mut eg
 /// loses focus with a changed value, and immediately after Browse picks a file.
 /// Returns `true` if Browse selected a new file.
 /// Every `.phnx` the job history has ever named — backups created, files
-/// verified or restored from — deduplicated case-insensitively, newest
-/// mention first, and filtered to files that still exist so the dropdown
-/// never offers a dead path. Called from inside the combo's popup closure,
-/// so the `is_file` stats only run while the list is actually open.
-fn history_backup_choices(history: &phoenix_core::appdata::History) -> Vec<String> {
+/// verified or restored from — plus every one reached via Browse…,
+/// deduplicated case-insensitively, newest mention first, and filtered to
+/// files that still exist so the dropdown never offers a dead path. Called
+/// from inside the combo's popup closure, so the `is_file` stats only run
+/// while the list is actually open.
+///
+/// Browsed paths come first: they were chosen by hand just now, which is a
+/// stronger signal of intent than a job run months ago.
+fn history_backup_choices(
+    history: &phoenix_core::appdata::History,
+    browsed: &[String],
+) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut push = |cand: &String, out: &mut Vec<String>| {
+        if !cand.to_ascii_lowercase().ends_with(".phnx") {
+            return;
+        }
+        if seen.insert(cand.to_ascii_lowercase()) && Path::new(cand).is_file() {
+            out.push(cand.clone());
+        }
+    };
+    for cand in browsed {
+        push(cand, &mut out);
+    }
     for rec in history.records.iter().rev() {
         for cand in [&rec.target, &rec.source] {
-            if !cand.to_ascii_lowercase().ends_with(".phnx") {
-                continue;
-            }
-            if seen.insert(cand.to_ascii_lowercase()) && Path::new(cand).is_file() {
-                out.push(cand.clone());
-            }
+            push(cand, &mut out);
         }
     }
     out
+}
+
+/// How many hand-browsed backups to remember. Enough to cover working with
+/// a handful of external drives, short enough that the dropdown stays a
+/// list rather than an archive.
+const BROWSED_BACKUPS_MAX: usize = 12;
+
+/// Record a hand-picked backup as the newest entry, dropping any duplicate
+/// and any path that has since disappeared.
+fn remember_browsed_backup(browsed: &mut Vec<String>, picked: &str) {
+    let picked = picked.trim();
+    if picked.is_empty() {
+        return;
+    }
+    browsed.retain(|p| !p.eq_ignore_ascii_case(picked) && Path::new(p).is_file());
+    browsed.insert(0, picked.to_string());
+    browsed.truncate(BROWSED_BACKUPS_MAX);
 }
 
 /// The backup chooser shared by the Restore, Verify, and Mount pages: a
@@ -2698,6 +3051,9 @@ fn backup_path_picker(
     hint: &str,
     path: &mut String,
     history: &phoenix_core::appdata::History,
+    // Hand-browsed backups, newest first. Browse… appends to this, so a
+    // backup the job history has never seen still shows up in the list.
+    browsed: &mut Vec<String>,
     mut on_path_changed: Option<&mut dyn FnMut()>,
 ) -> bool {
     ui.horizontal(|ui| {
@@ -2722,7 +3078,7 @@ fn backup_path_picker(
                 .width(combo_w)
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
-                    let choices = history_backup_choices(history);
+                    let choices = history_backup_choices(history, browsed);
                     if choices.is_empty() {
                         ui.label(
                             egui::RichText::new(
@@ -2769,6 +3125,7 @@ fn backup_path_picker(
         {
             if let Some(picked) = pick_backup_open_path(path) {
                 *path = picked.display().to_string();
+                remember_browsed_backup(browsed, path);
                 chosen = true;
                 if let Some(cb) = on_path_changed {
                     cb();
@@ -2781,15 +3138,108 @@ fn backup_path_picker(
 }
 
 fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
+    page_header_badged(ui, palette, title, subtitle, "");
+}
+
+/// [`page_header`] plus a small, low-contrast word set beside the title —
+/// for status that qualifies the whole page ("Experimental") and should read
+/// as an aside rather than as part of the title.
+fn page_header_badged(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    title: &str,
+    subtitle: &str,
+    badge: &str,
+) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(title).font(fonts::bold(22.0)));
+    let title_font = fonts::bold(22.0);
+    let title = ui.label(egui::RichText::new(title).font(title_font));
+    if !badge.is_empty() {
+        // To the right of the title, bottom-aligned to it so the two sit on
+        // a common baseline. Painted rather than laid out: a bottom-aligned
+        // *layout* fills whatever height it is handed, which once pushed
+        // the whole page off the bottom of the screen, and painting also
+        // guarantees the badge displaces nothing. Above the title it fell
+        // under the window's drag-area reservation and got clipped; below
+        // it simply looked wrong.
+        ui.painter().text(
+            egui::pos2(title.rect.right() + 8.0, title.rect.bottom()),
+            egui::Align2::LEFT_BOTTOM,
+            badge,
+            fonts::regular(13.0),
+            palette.subtle_text,
+        );
+    }
     if !subtitle.is_empty() {
         ui.label(egui::RichText::new(subtitle).color(palette.subtle_text));
     }
     ui.add_space(14.0);
 }
 
+/// Height of the decorative hazard band at the top of the Virtualize page.
+const PAGE_HAZARD_BAND_H: f32 = 54.0;
+
+/// Stripe width for that band. Fixed, NOT derived from the band's height:
+/// the confirm dialog's tape is only a stripe or two tall so height works
+/// there, but at this size it yields 70px slabs that read as blocks rather
+/// than tape, and the diagonal edges then cross the fade so slowly that the
+/// gradient looks stepped.
+const PAGE_HAZARD_STRIPE_W: f32 = 22.0;
+
+/// Hazard tape bled across the top of the page and dissolved into the panel
+/// behind it. Allocates no layout space and is painted before the page's
+/// content, so everything the page draws lands on top of it.
+///
+/// Muted hard on purpose: the confirm dialog's tape is a stop sign for one
+/// decision, while this one qualifies a whole page you're meant to keep
+/// working in. It has to register as "this is experimental" in peripheral
+/// vision and then get out of the way — full-strength tape behind body text
+/// would be unreadable and would cry wolf.
+fn paint_page_hazard_band(ui: &egui::Ui) {
+    // `clip_rect`, not `max_rect`: the latter is inset by the panel frame's
+    // margin, which leaves the band stopping short of both edges instead of
+    // bleeding off them. Intersected with the screen so an unbounded clip
+    // rect can't turn into an absurd mesh.
+    let area = ui.clip_rect().intersect(ui.ctx().screen_rect());
+    if !area.is_positive() {
+        return;
+    }
+    let rect = egui::Rect::from_min_size(
+        area.left_top(),
+        egui::vec2(area.width(), PAGE_HAZARD_BAND_H.min(area.height())),
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    let yellow = egui::Color32::from_rgb(0xF6, 0xC4, 0x00);
+    let black = egui::Color32::from_rgb(0x16, 0x16, 0x16);
+    painter.rect_filled(rect, 0.0, black);
+    stripes::paint(&painter, rect, yellow, PAGE_HAZARD_STRIPE_W, 0.0);
+    // Wash it back most of the way at the top, then all the way by the
+    // bottom edge, so the band has no hard border to give itself away.
+    //
+    // Lighter wash in light mode: the tape is dark-on-yellow, so a pale
+    // panel colour laid over it flattens the contrast far faster than a
+    // dark one does, and the same alpha that reads as "muted" on dark
+    // reads as "invisible" on light.
+    let wash = if ui.visuals().dark_mode { 205 } else { 165 };
+    stripes::fade_into(&painter, rect, ui.visuals().panel_fill, wash);
+}
+
 impl PhoenixApp {
+    /// Record a backup as recently used, so every page's dropdown offers it.
+    ///
+    /// Browsing is not the only way a backup gets chosen — Resume fills the
+    /// path in from a saved session, and the job history only learns about a
+    /// file once a *job* completes, which a VM boot or a mount never
+    /// produces. Actually using a backup is the strongest signal that it
+    /// belongs in the list, so every entry point records here.
+    fn remember_backup_in_use(&mut self, path: &str) {
+        let before = self.settings.browsed_backups.clone();
+        remember_browsed_backup(&mut self.settings.browsed_backups, path);
+        if self.settings.browsed_backups != before {
+            let _ = self.settings.save();
+        }
+    }
+
     fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
         // Whole-page scroll: when the window is too short, the entire backup
         // page (header, fields, drive list, options) scrolls as a unit above
@@ -3096,10 +3546,12 @@ impl PhoenixApp {
             "Select or browse for a .phnx backup",
             &mut self.restore_backup_path,
             &self.history,
+            &mut self.settings.browsed_backups,
             None,
         );
         if chosen {
             self.restore_backup_load_now = true;
+            let _ = self.settings.save();
         }
     }
 
@@ -3143,6 +3595,7 @@ impl PhoenixApp {
             return;
         };
         self.restore_backup_path = backup_path.display().to_string();
+        self.remember_backup_in_use(&self.restore_backup_path.clone());
         let Some(layout) = self.restore_layout.as_ref() else {
             self.status = "No restore layout — load a backup first".into();
             return;
@@ -3253,6 +3706,7 @@ impl PhoenixApp {
             return;
         };
         self.restore_backup_path = path.display().to_string();
+        self.remember_backup_in_use(&self.restore_backup_path.clone());
         self.completed = None;
         self.status = "Verify in progress…".into();
         self.job_subject = JobSubject {
@@ -3516,9 +3970,13 @@ impl PhoenixApp {
                     "Select or browse for a .phnx backup",
                     &mut self.mount_backup_path,
                     &self.history,
+                    &mut self.settings.browsed_backups,
                     None,
                 );
             });
+            if chosen {
+                let _ = self.settings.save();
+            }
             let path_changed = chosen && self.mount_backup_path != path_before;
             if path_changed
                 || (self.mount_source.is_none()
@@ -3985,6 +4443,7 @@ impl PhoenixApp {
             return;
         }
         let path = std::path::PathBuf::from(self.mount_backup_path.trim());
+        self.remember_backup_in_use(&self.mount_backup_path.clone());
         let scratch = phoenix_mount::mount_scratch_dir();
         let selected: Vec<u32> = self.mount_selection.iter().map(|&(_, part)| part).collect();
         self.status = if phoenix_mount::ActiveMount::space_efficient() {
@@ -4017,6 +4476,817 @@ impl PhoenixApp {
                 self.status = format!("Mount failed: {e}");
             }
         }
+    }
+
+    fn ui_virtualize(&mut self, ui: &mut egui::Ui) {
+        // Poll the background VM thread for completion.
+        if let Some(run) = &self.vm_run {
+            match run.result.try_recv() {
+                Ok(Ok(outcome)) => {
+                    self.vm_last_status = if outcome.exit_ok {
+                        format!(
+                            "VM exited cleanly. Session overlay holds {:.1} GB of guest writes; backup {}.",
+                            outcome.overlay_bytes as f64 / 1e9,
+                            if outcome.backup_intact { "still verifies" } else { "FAILED verification" },
+                        )
+                    } else {
+                        // The launch died — quote QEMU's own words, they name
+                        // the actual problem (bad option, missing WHPX, …).
+                        let why = outcome
+                            .qemu_log_tail
+                            .as_deref()
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or("(no output captured — see the session's qemu.log)");
+                        tracing::warn!("QEMU exited non-zero: {why}");
+                        format!("QEMU exited with an error: {why}")
+                    };
+                    self.vm_run = None;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("VM boot failed: {e:#}");
+                    self.vm_last_status = format!("VM failed: {e:#}");
+                    self.vm_run = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.vm_last_status = "VM thread ended unexpectedly.".into();
+                    self.vm_run = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // Keep the elapsed timer / poll ticking while a VM runs.
+        if self.vm_run.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
+        // Poll the guest-tools ISO worker (download or update check).
+        if let Some(dl) = &mut self.drivers_dl {
+            loop {
+                match dl.rx.try_recv() {
+                    Ok(virtio_iso::DlEvent::Progress { downloaded, total }) => {
+                        dl.progress = (downloaded, total);
+                    }
+                    Ok(virtio_iso::DlEvent::Done) => {
+                        // No note on success — the checkbox appearing IS the
+                        // signal that the ISO is ready.
+                        self.drivers_note.clear();
+                        self.drivers_dl = None;
+                        break;
+                    }
+                    Ok(virtio_iso::DlEvent::UpToDate) => {
+                        self.drivers_note = "The driver ISO is up to date.".into();
+                        self.drivers_dl = None;
+                        break;
+                    }
+                    Ok(virtio_iso::DlEvent::Failed(m)) => {
+                        tracing::warn!("drivers ISO: {m}");
+                        self.drivers_note = m;
+                        self.drivers_dl = None;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.drivers_note = "Download worker ended unexpectedly.".into();
+                        self.drivers_dl = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if self.drivers_dl.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+
+        // Pull everything the page needs out of `self` into owned locals so the
+        // scroll-shell closure doesn't borrow `self` (which would conflict: it
+        // needs `&mut self.vm` while a running view borrows `self.vm_run`).
+        let qemu_info = self
+            .qemu
+            .as_ref()
+            .map(|q| (q.version.clone(), q.gtk_clipboard));
+        let qemu_dir = self.settings.vm_qemu_dir.clone();
+        let sessions = phoenix_vm::SessionManager::list_all_sessions();
+        let running_owned = self.vm_run.as_ref().map(|r| {
+            let overlay_mib = std::fs::metadata(&r.overlay_path)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0);
+            (
+                r.name.clone(),
+                r.backup.display().to_string(),
+                r.started.elapsed().as_secs(),
+                overlay_mib,
+                r.share_cmd.clone(),
+                r.network_connected,
+            )
+        });
+        let last = self.vm_last_status.clone();
+        // Drain the QEMU download worker before rendering, so the progress bar
+        // and the "QEMU found" state both reflect this frame.
+        let qemu_dl = self.poll_qemu_download();
+        let accel_view = self.poll_accel_fix();
+        let drivers = vm_panel::DriversView {
+            present: virtio_iso::installed().is_some(),
+            downloading: self.drivers_dl.as_ref().map(|d| d.progress),
+            note: self.drivers_note.clone(),
+        };
+        let palette = self.palette;
+        let mut vm_state = std::mem::take(&mut self.vm);
+        // Taken out and put back like `vm_state`: the page needs it mutably
+        // while other `self.settings` fields are borrowed alongside it.
+        let mut browsed = std::mem::take(&mut self.settings.browsed_backups);
+        let browsed_before = browsed.len();
+        let mut action = vm_panel::VmAction::None;
+
+        // Painted against the panel rather than inside the scroll shell, so
+        // it stays put at the top of the page instead of scrolling away.
+        paint_page_hazard_band(ui);
+
+        page_scroll_shell(ui, "virtualize_page", |ui| {
+            page_header_badged(ui, &palette, "Virtualize", "", "Experimental");
+            vm_wiki_notice(ui, &palette);
+            let running =
+                running_owned
+                    .as_ref()
+                    .map(|(n, b, e, o, share, net)| vm_panel::RunningView {
+                        name: n,
+                        backup_path: b,
+                        elapsed_secs: *e,
+                        overlay_mib: *o,
+                        share_cmd: share.as_deref(),
+                        network_connected: *net,
+                    });
+            action = vm_panel::show(
+                ui,
+                &mut vm_state,
+                &palette,
+                qemu_info.as_ref().map(|(v, c)| vm_panel::QemuView {
+                    version: v,
+                    clipboard: *c,
+                    dir: qemu_dir.as_deref(),
+                }),
+                &self.history,
+                &mut browsed,
+                &self.settings.vm_iso_history,
+                &drivers,
+                &sessions,
+                running,
+                &last,
+                &qemu_dl,
+                &accel_view,
+            );
+        });
+        self.vm = vm_state;
+        let browsed_changed = browsed.len() != browsed_before;
+        self.settings.browsed_backups = browsed;
+        if browsed_changed {
+            let _ = self.settings.save();
+        }
+
+        match action {
+            vm_panel::VmAction::None => {}
+            vm_panel::VmAction::BrowseIso => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Disc image", &["iso"])
+                    .set_title("Choose a rescue / PE ISO")
+                    .pick_file()
+                {
+                    let picked = p.display().to_string();
+                    self.vm.iso_path = picked.clone();
+                    // Remember it for the dropdown: newest first, deduped,
+                    // capped so the popup stays a list rather than a history.
+                    let hist = &mut self.settings.vm_iso_history;
+                    hist.retain(|h| !h.eq_ignore_ascii_case(&picked));
+                    hist.insert(0, picked);
+                    hist.truncate(8);
+                    let _ = self.settings.save();
+                }
+            }
+            vm_panel::VmAction::SetNetwork(up) => {
+                match self.running_vm_qmp_port() {
+                    Some(port) => {
+                        match phoenix_vm::qmp::set_link(
+                            port,
+                            phoenix_vm::config::NET_DEVICE_ID,
+                            up,
+                        ) {
+                            Ok(()) => {
+                                if let Some(run) = self.vm_run.as_mut() {
+                                    run.network_connected = up;
+                                }
+                                self.vm_last_status = if up {
+                                    "Network connected — the guest is online.".into()
+                                } else {
+                                    "Network disconnected.".into()
+                                };
+                            }
+                            Err(e) => {
+                                self.vm_last_status = format!("Couldn't change the network: {e}")
+                            }
+                        }
+                    }
+                    None => {
+                        self.vm_last_status = "Couldn't find the VM's control port.".into()
+                    }
+                }
+            }
+            vm_panel::VmAction::FixAcceleration(blocker) => {
+                if self.accel_fix.is_none() {
+                    // Off the UI thread: DISM routinely takes tens of seconds
+                    // and would otherwise freeze the window solid.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(blocker.apply_fix());
+                    });
+                    self.accel_fix_note.clear();
+                    self.accel_fix = Some(rx);
+                }
+            }
+            vm_panel::VmAction::DownloadQemu => {
+                if self.qemu_dl.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    qemu_payload::spawn_download(tx);
+                    self.qemu_dl_note.clear();
+                    self.qemu_dl_last = None;
+                    self.qemu_dl = Some(QemuDl { rx });
+                }
+            }
+            vm_panel::VmAction::BrowseQemuDir => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("Choose the folder containing qemu-system-x86_64.exe")
+                    .pick_folder()
+                {
+                    // Re-probe immediately: a folder without the binaries (or
+                    // without the OVMF firmware) must not silently become the
+                    // saved choice, so only a successful discover sticks.
+                    match phoenix_vm::Qemu::discover(Some(&p)) {
+                        Ok(q) => {
+                            self.vm_last_status = format!("Using {}", q.version);
+                            self.qemu = Some(q);
+                            self.settings.vm_qemu_dir = Some(p.display().to_string());
+                            let _ = self.settings.save();
+                        }
+                        Err(e) => {
+                            self.vm_last_status =
+                                format!("That folder isn't a usable QEMU install: {e}");
+                        }
+                    }
+                }
+            }
+            vm_panel::VmAction::ClearQemuDir => {
+                self.settings.vm_qemu_dir = None;
+                let _ = self.settings.save();
+                self.qemu = phoenix_vm::Qemu::discover(None).ok();
+                self.vm_last_status = match self.qemu.as_ref() {
+                    Some(q) => format!("Autodetected {}", q.version),
+                    None => "QEMU not found".to_string(),
+                };
+            }
+            vm_panel::VmAction::DownloadDrivers => {
+                if self.drivers_dl.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    virtio_iso::spawn_download(tx);
+                    self.drivers_note.clear();
+                    self.drivers_dl = Some(DriversDl { rx, progress: (0, 0) });
+                }
+            }
+            vm_panel::VmAction::CheckDriversUpdate => {
+                if self.drivers_dl.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    virtio_iso::spawn_update_check(tx);
+                    self.drivers_note = "Checking for a newer driver ISO…".into();
+                    self.drivers_dl = Some(DriversDl { rx, progress: (0, 0) });
+                }
+            }
+            vm_panel::VmAction::LoadSummary => self.load_vm_summary(),
+            vm_panel::VmAction::Stop => self.stop_vm(),
+            vm_panel::VmAction::Resume { backup_path, vm_root } => {
+                self.vm.backup_path = backup_path;
+                self.load_vm_summary();
+                // Resume where the session lives — never where the scratch
+                // dropdown currently points.
+                self.start_vm(false, Some(vm_root));
+            }
+            vm_panel::VmAction::Discard { backup_path, vm_root } => {
+                match phoenix_core::container::PhnxReader::open(std::path::Path::new(&backup_path))
+                {
+                    Ok(reader) => {
+                        let id = reader.header.backup_id;
+                        drop(reader);
+                        // Discard at the session's own root, same reasoning.
+                        match phoenix_vm::SessionManager::new(vm_root.join("vm-sessions"))
+                            .discard(&id)
+                        {
+                            Ok(()) => self.vm_last_status = "Session discarded.".into(),
+                            Err(e) => self.vm_last_status = format!("Discard failed: {e}"),
+                        }
+                    }
+                    Err(e) => self.vm_last_status = format!("Can't open backup: {e}"),
+                }
+            }
+        }
+
+        // Persist the VM knobs the moment they change — a fresh launch
+        // otherwise resets them and surprises the next boot.
+        let scratch_now = match self.vm.scratch {
+            vm_panel::ScratchChoice::SameAsImage => None,
+            vm_panel::ScratchChoice::Drive(c) => Some(c),
+        };
+        if scratch_now != self.settings.vm_scratch_drive
+            || self.settings.vm_memory_mib != Some(self.vm.mem_mib)
+            || self.settings.vm_cpus != Some(self.vm.cpus)
+        {
+            self.settings.vm_scratch_drive = scratch_now;
+            self.settings.vm_memory_mib = Some(self.vm.mem_mib);
+            self.settings.vm_cpus = Some(self.vm.cpus);
+            let _ = self.settings.save();
+        }
+    }
+
+    /// Parse the picked backup's manifest — the VM's display name plus any
+    /// boot blocker (a locked-BitLocker OS volume is refused up front). A
+    /// clean parse is also what arms the Boot VM action.
+    fn load_vm_summary(&mut self) {
+        let path = self.vm.backup_path.trim().to_string();
+        self.vm.loaded_path = path.clone();
+        self.vm.summary = None;
+        if path.is_empty() {
+            return;
+        }
+        match phoenix_core::container::PhnxReader::open(std::path::Path::new(&path)) {
+            Ok(reader) => {
+                let m = &reader.manifest;
+                let blocker = m
+                    .partitions
+                    .iter()
+                    .find(|p| p.bitlocker.as_deref() == Some("locked"))
+                    .map(|p| format!("partition {} is a locked BitLocker volume — can't boot", p.index));
+                self.vm.summary = Some(vm_panel::BackupSummary {
+                    hostname: m.hostname.clone(),
+                    blocker,
+                });
+            }
+            Err(e) => self.vm_last_status = format!("Can't read backup: {e}"),
+        }
+    }
+
+    /// Compute the VM working root from the scratch-drive choice.
+    fn vm_root(&self, backup: &std::path::Path) -> std::path::PathBuf {
+        match self.vm.scratch {
+            vm_panel::ScratchChoice::SameAsImage => phoenix_vm::vm_root_for_backup(backup),
+            vm_panel::ScratchChoice::Drive(c) => {
+                std::path::PathBuf::from(format!("{c}:\\")).join("PhoenixSimulacra")
+            }
+        }
+    }
+
+    /// Boot VM clicked: when saved sessions exist, raise the resume-or-new
+    /// hazard dialog first so a user doesn't overlook a session they meant to
+    /// continue (or blow one away by re-picking its backup). No sessions →
+    /// boot straight away.
+    fn request_start_vm(&mut self) {
+        if self.vm_run.is_some() || self.vm_boot_prompt.is_some() {
+            return;
+        }
+        let sessions: Vec<(String, std::path::PathBuf)> =
+            phoenix_vm::SessionManager::list_all_sessions()
+                .into_iter()
+                .map(|s| (s.meta().backup_path.clone(), s.vm_root()))
+                .collect();
+        if sessions.is_empty() {
+            self.start_vm(false, None);
+        } else {
+            self.vm_boot_prompt = Some(sessions);
+        }
+    }
+
+    /// The resume-or-new dialog raised by [`Self::request_start_vm`].
+    fn show_vm_boot_dialog(&mut self, ctx: &egui::Context) {
+        let Some(session_paths) = self.vm_boot_prompt.clone() else {
+            return;
+        };
+        // Starting a new session for a backup that already has one discards
+        // that session's saved guest changes — hence the hazard framing.
+        let selected_has_session = session_paths
+            .iter()
+            .any(|(p, _)| p.eq_ignore_ascii_case(self.vm.backup_path.trim()));
+        let single = (session_paths.len() == 1).then(|| session_paths[0].clone());
+
+        let action = {
+            let (message, confirm_label, extra_label) = match &single {
+                Some((path, _root)) => {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    (
+                        format!(
+                            "You have a saved session for {name}. Resume it, or start a \
+                             new session from the selected backup?{}",
+                            if selected_has_session {
+                                "\n\nStarting new discards that session's saved changes."
+                            } else {
+                                ""
+                            }
+                        ),
+                        "Resume",
+                        Some("Start new"),
+                    )
+                }
+                None => (
+                    format!(
+                        "You have {} saved sessions. To continue one of them, choose \
+                         Resume next to it under Saved sessions. Start a new session \
+                         from the selected backup instead?{}",
+                        session_paths.len(),
+                        if selected_has_session {
+                            "\n\nThe selected backup already has a saved session — \
+                             starting new discards its saved changes."
+                        } else {
+                            ""
+                        }
+                    ),
+                    "Start new",
+                    None,
+                ),
+            };
+            let mut view = ConfirmView {
+                title: "Saved session found",
+                message: &message,
+                details: &[],
+                confirm_label,
+                cancel_label: "Cancel",
+                // "Start new" over an existing session is destructive; a plain
+                // Resume is not.
+                confirm_danger: single.is_none() && selected_has_session,
+                hazard_tape: true,
+                ack: None,
+                extra_label,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+
+        match (action, &single) {
+            // Single session: Confirm = resume it (whatever backup is picked),
+            // at the root it actually lives under.
+            (ConfirmAction::Confirm, Some((path, root))) => {
+                self.vm_boot_prompt = None;
+                self.vm.backup_path = path.clone();
+                self.load_vm_summary();
+                self.start_vm(false, Some(root.clone()));
+            }
+            // Single session: Extra = start new from the selected backup
+            // (the scratch choice governs where NEW sessions go).
+            (ConfirmAction::Extra, Some(_)) => {
+                self.vm_boot_prompt = None;
+                self.start_vm(selected_has_session, None);
+            }
+            // Multiple sessions: Confirm = start new from the selected backup.
+            (ConfirmAction::Confirm, None) => {
+                self.vm_boot_prompt = None;
+                self.start_vm(selected_has_session, None);
+            }
+            (ConfirmAction::Cancel, _) => self.vm_boot_prompt = None,
+            _ => {}
+        }
+    }
+
+    /// `vm_root_override` is the session's own root when resuming; `None`
+    /// derives the root from the scratch-drive choice (new sessions).
+    fn start_vm(&mut self, fresh: bool, vm_root_override: Option<std::path::PathBuf>) {
+        if self.vm_run.is_some() {
+            return;
+        }
+        let backup = std::path::PathBuf::from(self.vm.backup_path.trim());
+        self.remember_backup_in_use(&self.vm.backup_path.clone());
+        if !backup.exists() {
+            self.vm_last_status = "Pick a backup file first.".into();
+            return;
+        }
+        let Some(qemu) = self.qemu.clone() else {
+            self.vm_last_status = "QEMU isn't installed.".into();
+            return;
+        };
+        // Session identity (for the overlay path we poll for progress).
+        let id = match phoenix_core::container::PhnxReader::open(&backup) {
+            Ok(r) => {
+                let id = r.header.backup_id;
+                drop(r);
+                id
+            }
+            Err(e) => {
+                self.vm_last_status = format!("Can't open backup: {e}");
+                return;
+            }
+        };
+        let name = self.vm.summary.as_ref().map(|s| s.hostname.clone()).unwrap_or_else(|| {
+            backup.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+        });
+
+        let vm_root = vm_root_override.unwrap_or_else(|| self.vm_root(&backup));
+        let sessions = phoenix_vm::SessionManager::new(vm_root.join("vm-sessions"));
+        let scratch = vm_root.join("vm-serve");
+        let overlay_path = vm_root
+            .join("vm-sessions")
+            .join(id.simple().to_string())
+            .join("session.qcow2");
+        phoenix_vm::sweep_serve_scratch(&vm_root);
+
+        let host = phoenix_vm::HostOptions {
+            memory_mib: self.vm.mem_mib,
+            smp: self.vm.cpus,
+            // Always boot unplugged; the running view grants it on demand.
+            network: false,
+            // Cap the guest display so the QEMU window (chrome included)
+            // fits the monitor — PE otherwise picks a huge video mode.
+            max_resolution: phoenix_vm::usable_guest_resolution(),
+            // Clipboard sharing only where the QEMU we found supports it
+            // (11.1+); asking an older build for it fails the launch.
+            clipboard_agent: self.qemu.as_ref().is_some_and(|q| q.gtk_clipboard),
+            // Dress the QEMU window to match the app's theme.
+            dark_window: !theme::is_light(self.settings.theme),
+            // Ask for what actually works, so qemu.log isn't muddied with a
+            // WHPX failure on every launch of a machine that can't use it.
+            accel: if self.accel.is_accelerated() {
+                phoenix_vm::Accel::Whpx
+            } else {
+                phoenix_vm::Accel::Tcg
+            },
+            ..phoenix_vm::HostOptions::default()
+        };
+        let iso = {
+            let t = self.vm.iso_path.trim();
+            if t.is_empty() { None } else { Some(std::path::PathBuf::from(t)) }
+        };
+        let boot_iso = self.vm.boot_iso;
+        // The guest-tools / driver ISO rides along when present and the
+        // checkbox (default on) says so.
+        let drivers_iso = if self.vm.attach_drivers_on() {
+            virtio_iso::installed()
+        } else {
+            None
+        };
+
+        // Shared folder: create/point the Windows share before boot so the
+        // Running view can show the guest-side command immediately. A failure
+        // is surfaced but never blocks the boot.
+        // Always set up: there is no longer a checkbox for it. The share
+        // costs nothing while the guest's cable is unplugged, and having it
+        // ready means connecting the network is the only step between a
+        // running guest and the shared folder.
+        let mut share_warning = None;
+        let share_cmd = {
+            let dir = phoenix_vm::share::share_dir_for_backup(&backup);
+            match phoenix_vm::share::ensure_share(&dir) {
+                Ok(()) => Some(phoenix_vm::share::guest_mount_command()),
+                Err(e) => {
+                    tracing::warn!("shared folder setup failed: {e:#}");
+                    share_warning = Some(format!("Shared folder unavailable: {e}"));
+                    None
+                }
+            }
+        };
+        let share_active = share_cmd.is_some();
+        // The "VMSCRIPTS" helper disk carries MapShare.cmd into the guest so
+        // mapping the share is a double-click, not transcription — and
+        // InstallGuestDrivers.cmd, which matters MOST with networking off,
+        // since that is exactly when the guest can't fetch anything itself.
+        // So it is never gated on the share: only MapShare.cmd needs the NAT.
+        let helper_disk = {
+            let p = vm_root.join("share-helper.img");
+            match phoenix_vm::share::build_helper_disk(&p) {
+                Ok(()) => Some(p),
+                Err(e) => {
+                    tracing::warn!("helper disk build failed: {e:#}");
+                    None
+                }
+            }
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let backup_thread = backup.clone();
+        std::thread::spawn(move || {
+            #[cfg(feature = "winfsp")]
+            let res = phoenix_vm::boot::boot(
+                &backup_thread,
+                &host,
+                phoenix_vm::WriteLayer::Qcow2,
+                fresh,
+                iso.as_deref(),
+                boot_iso,
+                drivers_iso.as_deref(),
+                helper_disk.as_deref(),
+                &qemu,
+                &sessions,
+                &scratch,
+            );
+            #[cfg(not(feature = "winfsp"))]
+            let res: anyhow::Result<phoenix_vm::boot::BootOutcome> = {
+                let _ = (
+                    &backup_thread,
+                    &host,
+                    fresh,
+                    &iso,
+                    boot_iso,
+                    &drivers_iso,
+                    &helper_disk,
+                    &qemu,
+                    &sessions,
+                    &scratch,
+                );
+                Err(anyhow::anyhow!("this build lacks the winfsp feature required to boot a VM"))
+            };
+            // The share exists for the guest; the guest is gone. (The folder
+            // and its contents stay.)
+            if share_active {
+                phoenix_vm::share::remove_share();
+            }
+            let _ = tx.send(res);
+        });
+
+        self.vm_last_status = share_warning.unwrap_or_default();
+        self.vm_run = Some(VmRun {
+            backup,
+            name,
+            started: Instant::now(),
+            overlay_path,
+            share_cmd,
+            vm_root,
+            // Boot unplugs the cable as soon as QMP answers.
+            network_connected: false,
+            result: rx,
+        });
+    }
+
+    fn stop_vm(&mut self) {
+        let Some(run) = &self.vm_run else { return };
+        let backup = run.backup.clone();
+        let vm_root = run.vm_root.clone();
+        let id = match phoenix_core::container::PhnxReader::open(&backup) {
+            Ok(r) => {
+                let id = r.header.backup_id;
+                drop(r);
+                id
+            }
+            Err(e) => {
+                self.vm_last_status = format!("Can't open backup: {e}");
+                return;
+            }
+        };
+        // The QMP port file lives in the session dir under the root the boot
+        // ACTUALLY used (captured in VmRun — the dropdown may have moved on).
+        let port_file = vm_root
+            .join("vm-sessions")
+            .join(id.simple().to_string())
+            .join("qmp.port");
+        let port = std::fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+        match port {
+            Some(p) => match phoenix_vm::qmp::system_powerdown(p) {
+                Ok(()) => {
+                    self.vm_last_status = "Sent graceful shutdown; the guest is powering off…".into()
+                }
+                Err(e) => self.vm_last_status = format!("Graceful stop failed: {e}"),
+            },
+            None => self.vm_last_status = "Couldn't find the VM's control port.".into(),
+        }
+    }
+
+    /// Drain the QEMU download worker's channel into a view for this frame.
+    ///
+    /// On success it re-runs discovery, so the page swaps from "QEMU is
+    /// required" to the real thing without a restart — the whole point of
+    /// offering the download in-app.
+    fn poll_qemu_download(&mut self) -> vm_panel::QemuDownloadView {
+        let mut view = vm_panel::QemuDownloadView {
+            note: std::mem::take(&mut self.qemu_dl_note),
+            ..Default::default()
+        };
+        let Some(dl) = self.qemu_dl.as_ref() else {
+            return view;
+        };
+        let mut finished = false;
+        while let Ok(ev) = dl.rx.try_recv() {
+            match ev {
+                qemu_payload::DlEvent::Progress { downloaded, total } => {
+                    view.progress = Some((downloaded, total));
+                }
+                qemu_payload::DlEvent::Extracting => {
+                    view.progress = None;
+                    view.extracting = true;
+                }
+                qemu_payload::DlEvent::Done => {
+                    finished = true;
+                    view.note.clear();
+                    self.qemu = phoenix_vm::Qemu::discover(
+                        self.settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
+                    )
+                    .ok();
+                    // Only the failure is worth saying. On success the page
+                    // itself is the confirmation — it only renders because
+                    // QEMU was found, and the footer already names the
+                    // version, so a "QEMU is ready" line states twice over
+                    // what the user can already see.
+                    self.vm_last_status = match self.qemu.as_ref() {
+                        Some(_) => String::new(),
+                        None => "QEMU downloaded but could not be started.".into(),
+                    };
+                }
+                qemu_payload::DlEvent::Failed(m) => {
+                    finished = true;
+                    view.note = m;
+                }
+            }
+        }
+        // Carry state forward: try_recv drains, so the last-seen values have to
+        // be remembered or the bar flickers empty between events.
+        if finished {
+            self.qemu_dl = None;
+            view.progress = None;
+            view.extracting = false;
+            self.qemu_dl_note = view.note.clone();
+        } else {
+            if let Some(p) = view.progress {
+                self.qemu_dl_last = Some(p);
+            } else if !view.extracting {
+                view.progress = self.qemu_dl_last;
+            }
+            if view.extracting {
+                self.qemu_dl_last = None;
+            }
+            self.qemu_dl_note = view.note.clone();
+        }
+        view
+    }
+
+    /// Drain the acceleration-fix worker and build this frame's view.
+    ///
+    /// A successful fix does NOT re-probe: both DISM and bcdedit only take
+    /// effect after a restart, so re-probing would still say "unavailable" and
+    /// make a working fix look like a failed one.
+    fn poll_accel_fix(&mut self) -> vm_panel::AccelView {
+        if let Some(rx) = self.accel_fix.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.accel_fix = None;
+                    self.accel_restart_needed = true;
+                    self.accel_fix_note.clear();
+                }
+                Ok(Err(e)) => {
+                    self.accel_fix = None;
+                    self.accel_fix_note = e;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.accel_fix = None;
+                    self.accel_fix_note = "the fix did not report a result".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        vm_panel::AccelView {
+            status: self.accel,
+            applying: self.accel_fix.is_some(),
+            note: self.accel_fix_note.clone(),
+            restart_needed: self.accel_restart_needed,
+        }
+    }
+
+    /// The running VM's QMP port, if there is one and we can find it.
+    ///
+    /// Same reasoning as `stop_vm`: the port file lives under the root the
+    /// boot ACTUALLY used, which `VmRun` captured — the scratch dropdown may
+    /// have moved on since.
+    fn running_vm_qmp_port(&self) -> Option<u16> {
+        let run = self.vm_run.as_ref()?;
+        let id = phoenix_core::container::PhnxReader::open(&run.backup)
+            .ok()
+            .map(|r| r.header.backup_id)?;
+        std::fs::read_to_string(
+            run.vm_root
+                .join("vm-sessions")
+                .join(id.simple().to_string())
+                .join("qmp.port"),
+        )
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+    }
+
+    /// Cut the running VM's power. Used on close, where the app is going away
+    /// and taking the VM's disk with it.
+    fn power_off_vm_now(&mut self) {
+        if let Some(port) = self.running_vm_qmp_port() {
+            let _ = phoenix_vm::qmp::quit(port);
+        }
+        self.vm_run = None;
+    }
+
+    /// A close must be held for a warning: mounts can't outlive the process,
+    /// and neither can a VM — the app serves the disk the guest is running
+    /// from.
+    fn close_needs_confirm(&self) -> bool {
+        self.anything_mounted() || self.vm_run.is_some()
     }
 
     fn ui_history(&mut self, ui: &mut egui::Ui) {
@@ -4104,6 +5374,7 @@ impl PhoenixApp {
             // only record that the backup it names was ever made.
             hazard_tape: true,
             ack: None,
+            extra_label: None,
         };
         match confirm_dialog::show(ctx, &self.palette, &mut view) {
             ConfirmAction::Confirm => {
@@ -4113,7 +5384,7 @@ impl PhoenixApp {
                 }
             }
             ConfirmAction::Cancel => self.pending_history_delete = None,
-            ConfirmAction::None => {}
+            ConfirmAction::None | ConfirmAction::Extra => {}
         }
     }
 
@@ -4284,6 +5555,23 @@ fn demo_enable_write_from_args() -> bool {
     std::env::args().skip(1).any(|a| a == "--demo-enable-write")
 }
 
+/// `--demo-accel=firmware|platform|hypervisor` forces the acceleration warning
+/// so its three states can be seen on a machine where WHPX works fine — which
+/// is every development machine, and therefore the reason this exists.
+fn demo_accel_from_args() -> Option<phoenix_vm::accel::AccelStatus> {
+    use phoenix_vm::accel::{AccelBlocker, AccelStatus};
+    let arg = std::env::args()
+        .skip(1)
+        .find_map(|a| a.strip_prefix("--demo-accel=").map(str::to_string))?;
+    let blocker = match arg.as_str() {
+        "firmware" => AccelBlocker::FirmwareDisabled,
+        "platform" => AccelBlocker::PlatformFeatureMissing,
+        "hypervisor" => AccelBlocker::HypervisorNotRunning,
+        _ => return None,
+    };
+    Some(AccelStatus::SoftwareOnly(blocker))
+}
+
 fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
     if !std::env::args().skip(1).any(|a| a == "--demo-mounts") {
         return Vec::new();
@@ -4397,6 +5685,8 @@ fn start_page_from_args() -> Option<Page> {
                 "restore" => Some(Page::Restore),
                 "verify" => Some(Page::Verify),
                 "mount" => Some(Page::Mount),
+                "virtualize" | "vm" => Some(Page::Virtualize)
+                    .filter(|p| sidebar::page_available(*p, updater::is_portable())),
                 "bootrepair" | "boot-repair" => Some(Page::BootRepair),
                 "history" => Some(Page::History),
                 "about" => Some(Page::About),

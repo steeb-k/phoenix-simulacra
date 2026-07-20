@@ -146,6 +146,18 @@ pub struct PartitionInfo {
     /// regenerated PartitionId is the classic "cloned disk drops into
     /// Startup Repair" failure). All-zero for MBR partitions.
     pub unique_guid: [u8; 16],
+    /// MBR partition **type byte** (0x07 NTFS/exFAT, 0x0C FAT32-LBA, 0x27
+    /// recovery…) — the MBR analogue of `type_guid`, and the only record of
+    /// what a partition claims to be on a BIOS disk. Zero for GPT sources.
+    ///
+    /// Captured because it cannot be reliably recovered later: inferring it
+    /// from the filesystem loses the distinction between, say, a plain NTFS
+    /// data partition and a hidden recovery one that happens to hold NTFS.
+    pub mbr_type: u8,
+    /// The MBR active/boot flag. On a BIOS disk the MBR boot code chains into
+    /// whichever primary partition carries this, so a synthesized or restored
+    /// disk that loses it does not boot. False for GPT sources.
+    pub mbr_bootable: bool,
     pub offset_bytes: u64,
     pub size_bytes: u64,
     pub fs_kind: FilesystemKind,
@@ -719,6 +731,9 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         name: e.name,
                         type_guid: e.type_guid,
                         unique_guid: e.unique_guid,
+                        // GPT source: no MBR identity to carry.
+                        mbr_type: 0,
+                        mbr_bootable: false,
                         gpt_attributes: e.attributes,
                         offset_bytes: e.starting_offset,
                         size_bytes: e.length,
@@ -753,6 +768,8 @@ fn read_disk_info(index: u32, path: &str, handle: HANDLE) -> Result<DiskInfo> {
                         name: format!("Partition{i}"),
                         type_guid: [0u8; 16],
                         unique_guid: [0u8; 16],
+                        mbr_type: e.partition_type,
+                        mbr_bootable: e.bootable,
                         gpt_attributes: 0,
                         offset_bytes: e.starting_offset,
                         size_bytes: e.length,
@@ -1175,6 +1192,12 @@ struct GptEntry {
 struct MbrEntry {
     starting_offset: u64,
     length: u64,
+    /// MBR partition type byte (0x07 NTFS/exFAT, 0x0C FAT32-LBA, 0x27
+    /// recovery…). The MBR analogue of a GPT type GUID.
+    partition_type: u8,
+    /// The active/boot flag. On a BIOS disk this is what the MBR boot code
+    /// looks for to decide which partition to chain into.
+    bootable: bool,
 }
 
 enum LayoutInfo {
@@ -1316,9 +1339,14 @@ fn get_drive_layout(handle: HANDLE) -> Result<LayoutInfo> {
             if part.PartitionLength == 0 {
                 continue;
             }
+            // SAFETY: the union's Mbr arm is the live one — this branch runs
+            // only when the layout reported PARTITION_STYLE_MBR.
+            let mbr = unsafe { &part.Anonymous.Mbr };
             entries.push(MbrEntry {
                 starting_offset: part.StartingOffset as u64,
                 length: part.PartitionLength as u64,
+                partition_type: mbr.PartitionType,
+                bootable: mbr.BootIndicator != 0,
             });
         }
         let signature = unsafe { layout.Anonymous.Mbr }.Signature;
@@ -2127,6 +2155,8 @@ mod tests {
             name: "test".into(),
             type_guid: [0u8; 16],
             unique_guid: [0u8; 16],
+            mbr_type: 0,
+            mbr_bootable: false,
             gpt_attributes: 0,
             offset_bytes: 1024 * 1024,
             size_bytes: 64 * 1024 * 1024,

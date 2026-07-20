@@ -10,7 +10,7 @@ What's planned, what's deliberately deferred, and what's out of scope. The engin
 - Device-aware parallel reads (multiple readers over disjoint extents on NVMe; strictly sequential on spinning/USB media)
 - An optional sampled verify-after tier for speed-sensitive runs (full verification stays the default)
 
-**Boot backups in a VM.** Writable copy-on-write overlay mounts shipped in 0.3.0; the follow-on is booting a mounted backup directly in QEMU. Exploratory plan: [QEMU-BOOT.md](QEMU-BOOT.md).
+**Re-pin QEMU to 11.1 final.** The bundled payload is a development snapshot of the 11.1 tree (reported as `11.0.50`) — currently the only Windows build with clipboard support. Validated end to end, so there is no urgency, but swap it for the tagged release once 11.1 ships: re-run `scripts/build-qemu-payload.ps1`, publish a new payload, bump the two pins. See [VIRTUALIZATION.md](VIRTUALIZATION.md).
 
 **ARM64 validation.** Backup, mount, and the full T2 virtual-disk suite (restore, clone, resize, 4Kn) are proven on real ARM64 hardware; the destructive real-disk (T3) tiers haven't run there yet, and BitLocker has no ARM64 test coverage (Pro-SKU test fixture). See [ARM64.md](ARM64.md).
 

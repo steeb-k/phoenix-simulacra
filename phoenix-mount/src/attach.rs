@@ -19,6 +19,10 @@ use windows_sys::Win32::Storage::Vhd::{
     VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
 };
 
+/// ERROR_SHARING_VIOLATION — the overlay file is still open (usually attached
+/// from a previous run that didn't exit cleanly).
+const ERROR_SHARING_VIOLATION: u32 = 32;
+
 // VIRTUAL_STORAGE_TYPE_DEVICE_UNKNOWN = 0 — let the API detect VHD vs VHDX
 // from the file contents rather than asserting a device type ourselves.
 const STORAGE_TYPE_DEVICE_UNKNOWN: u32 = 0;
@@ -145,6 +149,13 @@ impl AttachedDisk {
             )
         };
         if rc != 0 {
+            if rc == ERROR_SHARING_VIOLATION {
+                return Err(PhoenixError::Disk(format!(
+                    "the overlay {vhd_path} is still in use — it is most likely attached from a \
+                     previous VM run that didn't exit cleanly. Close any running VM for this \
+                     backup (or reboot) and try again."
+                )));
+            }
             return Err(PhoenixError::Disk(format!(
                 "OpenVirtualDisk (read-write) failed for {vhd_path} (Win32 error {})",
                 describe_vhd_error(rc)
@@ -204,14 +215,106 @@ impl AttachedDisk {
     }
 }
 
+/// Wait until `\\.\PhysicalDrive{drive_number}` can no longer be opened — i.e.
+/// the virtual disk has finished detaching — up to `timeout`. Returns `true` if
+/// the device went away.
+///
+/// **Detach via `drop` (CloseHandle), then call this.** Do NOT call
+/// `DetachVirtualDisk` explicitly on a disk whose parent lives on a WinFsp
+/// filesystem: that synchronous call deadlocks in the storage driver, and it
+/// does so whether the serve runs in this process or another one (measured —
+/// see `vm_overlay_lifecycle`). The `Drop`/CloseHandle path performs the same
+/// detach asynchronously and does not wedge; this poll replaces the fixed sleep
+/// that used to race it, so callers can know the device is really gone before
+/// stopping the serve that backs it.
+#[must_use]
+pub fn wait_for_device_gone(drive_number: u32, timeout: std::time::Duration) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let path = format!(r"\\.\PhysicalDrive{drive_number}");
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(&path);
+        match opened {
+            Ok(f) => {
+                drop(f);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // The device is gone (or no longer openable): detach completed.
+            Err(_) => return true,
+        }
+    }
+    tracing::warn!("{path} still present after {timeout:?}; detach may be incomplete");
+    false
+}
+
 impl Drop for AttachedDisk {
     fn drop(&mut self) {
         // Closing the handle detaches the disk (no PERMANENT_LIFETIME flag was
-        // requested), so no explicit DetachVirtualDisk is needed.
+        // requested). Callers that back the disk with an in-process WinFsp serve
+        // must call `detach_wait` FIRST so the detach completes before the serve
+        // stops; this is the fallback for the read-only / no-serve cases.
         if self.handle != INVALID_HANDLE_VALUE {
             unsafe { CloseHandle(self.handle) };
         }
     }
+}
+
+/// Force `\\.\PhysicalDrive{drive_number}` OFFLINE (non-persistent). An offline
+/// disk keeps no volumes mounted, so the host filesystem stack never touches
+/// it, and Windows lifts the raw-sector write protection it applies over
+/// mounted-volume extents — the state a VM's raw-passthrough disk needs when a
+/// differencing child is attached read-write for a guest to boot from.
+///
+/// The change lasts only while the disk is attached (`Persist = 0`); when the
+/// owning [`AttachedDisk`] drops and Windows auto-detaches, it is gone.
+pub fn set_disk_offline(drive_number: u32) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Ioctl::{
+        DISK_ATTRIBUTE_OFFLINE, IOCTL_DISK_SET_DISK_ATTRIBUTES, SET_DISK_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let path = format!(r"\\.\PhysicalDrive{drive_number}");
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| PhoenixError::Disk(format!("open {path} to set it offline: {e}")))?;
+
+    // SAFETY: all-zero is valid for this POD struct; we then set the header and
+    // the offline attribute + mask. Persist=0 keeps the change attach-scoped.
+    let mut attrs: SET_DISK_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    attrs.Version = std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32;
+    attrs.Attributes = DISK_ATTRIBUTE_OFFLINE as u64;
+    attrs.AttributesMask = DISK_ATTRIBUTE_OFFLINE as u64;
+
+    let mut returned = 0u32;
+    // SAFETY: the handle is open for the call; the in-buffer outlives it; the
+    // out-buffer is unused for this IOCTL; `returned` receives the out length.
+    let ok = unsafe {
+        DeviceIoControl(
+            disk.as_raw_handle() as _,
+            IOCTL_DISK_SET_DISK_ATTRIBUTES,
+            (&attrs as *const SET_DISK_ATTRIBUTES).cast(),
+            std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(PhoenixError::Disk(format!(
+            "IOCTL_DISK_SET_DISK_ATTRIBUTES(offline) failed for {path}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 /// VIRTUAL_STORAGE_TYPE_VENDOR_UNKNOWN — the all-zero GUID, paired with

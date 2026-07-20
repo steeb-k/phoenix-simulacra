@@ -1,0 +1,46 @@
+[package]
+name = "phoenix-vm"
+description = "Boot Phoenix Simulacra backups as QEMU virtual machines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-core.workspace = true
+phoenix-mount.workspace = true
+anyhow.workspace = true
+# Building the tiny "SIMULACRA" helper disk (a real FAT image holding
+# MapShare.cmd) that gets attached to the guest alongside the SMB share.
+# fscommon provides StreamSlice so the FAT volume can live inside an MBR
+# partition (a fixed disk without one won't mount in Windows).
+fatfs = "0.3"
+fscommon = "0.1"
+serde = { workspace = true }
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+# Reaping an orphaned serve helper: open the recorded PID, confirm the image
+# name is really ours (PIDs get reused), then terminate it. SystemInformation
+# is for GlobalMemoryStatusEx (host RAM ceiling for the GUI's memory slider).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging",
+    # DwmSetWindowAttribute — the only way to darken a native title bar.
+    "Win32_Graphics_Dwm",
+    # LoadLibrary/GetProcAddress, to ask WHPX whether a hypervisor is present
+    # without link-time dependence on an optional Windows feature's DLL.
+    "Win32_System_LibraryLoader",
+] }
+
+[features]
+# The live boot path serves the backup on demand through WinFsp, so the
+# orchestration in `boot.rs` needs the same feature (and libclang + WinFsp)
+# the mount crate does. Config synthesis, QEMU discovery, and the session
+# store build and test WITHOUT it — the high-value, deterministic parts.
+default = []
+winfsp = ["phoenix-mount/winfsp"]

@@ -141,13 +141,22 @@ if ($LASTEXITCODE -ne 0) {
 
 # --- 5. Create or update the release ------------------------------------------
 # Every release asset, in one list, so create and re-upload stay in sync.
+# What changed, for someone deciding whether to download. Pinned to the tag
+# rather than to a branch so the link keeps showing THIS release's changelog
+# after later versions are added to the file.
+$SourceRepo = "steeb-k/phoenix-simulacra"
+$changelogUrl = "https://github.com/$SourceRepo/blob/$tag/CHANGELOG.md"
+$changelogLine = "What's new in $version`: $changelogUrl"
+
 if ($ZipOnly) {
     $notes = "Portable ZIP-only release of Phoenix Simulacra $version " +
              "(unsigned; no installer).`n`n" +
+             "$changelogLine`n`n" +
              "SHA-256 ($zipName): $zipHash"
     $assets = @($zip, $zipShaPath)
 } else {
     $notes = "Automated release of Phoenix Simulacra $version.`n`n" +
+             "$changelogLine`n`n" +
              "SHA-256 ($setupName): $hash`n" +
              "SHA-256 ($zipName): $zipHash"
     $assets = @($setup, $shaPath, $zip, $zipShaPath)
@@ -183,7 +192,6 @@ if ($exists) {
 # releases (-ZipOnly / -PreRelease) stay binaries-only; -Draft mirrors as a
 # draft. The tag lands on the current HEAD — publish from the version-bump
 # commit.
-$SourceRepo = "steeb-k/phoenix-simulacra"
 $binariesUrl = "https://github.com/$Target/releases/tag/$tag"
 if ($ZipOnly -or $PreRelease) {
     Write-Host "== Skipping source release on $SourceRepo (ZipOnly/PreRelease is a stopgap, binaries-only)" -ForegroundColor DarkGray
@@ -200,6 +208,7 @@ if ($ZipOnly -or $PreRelease) {
         & git push origin $tag
         if ($LASTEXITCODE -ne 0) { throw "git push origin $tag failed" }
         $srcNotes = "Source code for Phoenix Simulacra $version.`n`n" +
+                    "$changelogLine`n`n" +
                     "Installer and portable bundle: $binariesUrl"
         $srcArgs = @(
             "release", "create", $tag,

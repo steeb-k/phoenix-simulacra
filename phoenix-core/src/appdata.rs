@@ -259,6 +259,28 @@ pub struct Settings {
     pub default_verify_quick: bool,
     pub clone_readback_verify: bool,
     pub theme: ThemeChoice,
+    /// Rescue/PE ISOs the Virtualize page has attached before, newest first,
+    /// so the ISO picker can offer them as a dropdown. Capped by the GUI.
+    pub vm_iso_history: Vec<String>,
+    /// The Virtualize page's scratch-drive choice: `None` = same drive as the
+    /// image (the default), `Some('C')` = that drive. Persisted because a
+    /// fresh launch resetting it silently redirected new sessions.
+    pub vm_scratch_drive: Option<char>,
+    /// The Virtualize page's memory slider (MiB). `None` = the built-in default.
+    pub vm_memory_mib: Option<u64>,
+    /// The Virtualize page's processor slider. `None` = the built-in default.
+    pub vm_cpus: Option<u32>,
+    /// Backups reached via Browse…, newest first. The dropdowns are built
+    /// from the job history, which only knows about backups this machine
+    /// created, verified or restored — so one browsed from elsewhere used to
+    /// vanish from the list the moment you navigated away. Entries whose
+    /// file no longer exists are dropped, same as history-derived ones.
+    pub browsed_backups: Vec<String>,
+    /// Directory holding `qemu-system-x86_64.exe`. `None` = autodetect
+    /// (`PATH`, then the stock installer locations). Set this to run a
+    /// side-by-side QEMU without disturbing the system-wide install — e.g.
+    /// an 11.1+ build, which is what clipboard sharing needs.
+    pub vm_qemu_dir: Option<String>,
 }
 
 impl Default for Settings {
@@ -271,6 +293,12 @@ impl Default for Settings {
             default_verify_quick: true,
             clone_readback_verify: true,
             theme: ThemeChoice::System,
+            vm_iso_history: Vec::new(),
+            vm_scratch_drive: None,
+            vm_memory_mib: None,
+            vm_cpus: None,
+            browsed_backups: Vec::new(),
+            vm_qemu_dir: None,
         }
     }
 }

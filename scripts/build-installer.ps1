@@ -34,6 +34,11 @@ $signScript = Join-Path $PSScriptRoot "sign-artifacts.ps1"
 $WinFspUrl    = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
 $WinFspSha256 = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A"
 
+# The curated QEMU payload is NOT staged here: the installer downloads it at
+# install time (pin + SHA-256 live in simulacra.iss), so it never bloats the
+# setup exe the auto-updater ships. See scripts/build-qemu-payload.ps1 for how
+# the payload is produced, and installer/README.md for why.
+
 # --- 1. Build the bundle -------------------------------------------------------
 Write-Host "== Building release bundle (dist/simulacra) ..." -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot "build-release.ps1")

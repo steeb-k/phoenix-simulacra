@@ -495,6 +495,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             } else {
                 None
             },
+            // The MBR identity, recorded only for MBR sources — it is what
+            // lets the disk be synthesized or restored faithfully enough to
+            // boot, and it cannot be reconstructed afterwards.
+            mbr_type: (!disk.is_gpt).then_some(part.mbr_type),
+            mbr_bootable: (!disk.is_gpt).then_some(part.mbr_bootable),
             chunks,
             bitmap_hash,
         });
@@ -513,6 +518,15 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 "mbr".into()
             },
             disk_guid: disk.disk_guid.map(|g| guid_to_string(&g)),
+            // The BCD on a BIOS install names the boot disk by this, so it
+            // has to survive the round trip or the restored/booted disk
+            // fails the way a regenerated GPT disk GUID does.
+            disk_signature: (!disk.is_gpt).then_some(disk.disk_signature as u32),
+            mbr_boot_code: if disk.is_gpt {
+                None
+            } else {
+                read_mbr_boot_code(&disk.path)
+            },
             sector_size: disk.sector_size,
         },
         partitions: partition_manifests,
@@ -686,6 +700,43 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
 /// `CHUNK_SIZE` alignment, because capture advances by the actual bytes read
 /// and raw volume reads can be short (which shifts later chunks). Reads fill the
 /// exact recorded length so a short device read doesn't cause a false mismatch.
+/// Read an MBR disk's boot code — bytes 0..440 of LBA 0.
+///
+/// This is the one part of a bootable MBR disk that lives outside every
+/// partition, so nothing else in the backup contains it, and a synthesized or
+/// restored disk without it does not boot however correct its partition table
+/// is. Cheap to keep: 440 bytes.
+///
+/// Best-effort. A disk that refuses the read, or whose boot code is all zeros
+/// (a data disk that was never made bootable), records nothing rather than
+/// failing the backup — neither case has anything worth reproducing.
+fn read_mbr_boot_code(disk_path: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    // Share the device: the disk is live, and other readers must not be
+    // locked out by a 512-byte read.
+    const FILE_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .open(disk_path)
+        .map_err(|e| warn!("cannot open {disk_path} to read MBR boot code: {e}"))
+        .ok()?;
+    // Raw device reads must be whole sectors, so take 512 and keep 440.
+    let mut sector = [0u8; 512];
+    f.read_exact(&mut sector)
+        .map_err(|e| warn!("cannot read MBR boot code from {disk_path}: {e}"))
+        .ok()?;
+
+    let code = &sector[..440];
+    if code.iter().all(|&b| b == 0) {
+        info!("MBR boot code is empty; the source disk was not bootable");
+        return None;
+    }
+    Some(hash::hex_encode(code))
+}
+
 fn verify_partition_against_source(
     reader: &mut impl BlockSource,
     extents: &[Extent],

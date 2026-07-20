@@ -19,6 +19,7 @@
 
 pub mod chunkstore;
 pub mod gpt;
+pub mod mbr;
 pub mod image;
 pub mod synthetic;
 pub mod vhd;
@@ -37,6 +38,9 @@ pub mod winfsp_mount;
 
 #[cfg(windows)]
 pub use active::ActiveMount;
+pub use attach::{
+    create_differencing_vhdx, set_disk_offline, wait_for_device_gone, AttachedDisk,
+};
 pub use chunkstore::{plan_layout, ChunkStore, PartitionSpan};
 #[cfg(windows)]
 pub use letters::MountedVolume;
