@@ -19,6 +19,7 @@
 
 pub mod chunkstore;
 pub mod gpt;
+pub mod mbr;
 pub mod image;
 pub mod synthetic;
 pub mod vhd;

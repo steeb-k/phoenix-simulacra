@@ -240,6 +240,8 @@ mod tests {
             index,
             name: format!("P{index}"),
             type_guid: [0; 16],
+            mbr_type: 0,
+            mbr_bootable: false,
             gpt_attributes: 0,
             offset_bytes: offset,
             size_bytes: size,

@@ -575,6 +575,8 @@ mod tests {
             bitlocker: bitlocker.map(|s| s.to_string()),
             unique_guid: None,
             gpt_attributes: None,
+            mbr_type: None,
+            mbr_bootable: None,
             chunks: vec![],
             bitmap_hash: None,
         }
@@ -589,6 +591,7 @@ mod tests {
             disk: DiskManifest {
                 style: style.to_string(),
                 disk_guid: None,
+                disk_signature: None,
                 sector_size: sector,
             },
             partitions: parts,

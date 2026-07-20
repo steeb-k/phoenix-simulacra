@@ -71,6 +71,7 @@ fn phnx_write_read_manifest() {
         disk: DiskManifest {
             style: "gpt".into(),
             disk_guid: None,
+            disk_signature: None,
             sector_size: 512,
         },
         partitions: vec![PartitionManifest {
@@ -84,6 +85,8 @@ fn phnx_write_read_manifest() {
             bitlocker: None,
             unique_guid: None,
             gpt_attributes: None,
+            mbr_type: None,
+            mbr_bootable: None,
             chunks: vec![ChunkRecord {
                 chunk_index: 0,
                 extent_index: 0,
