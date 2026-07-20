@@ -9,7 +9,7 @@
 # updates" flow looks. Kept separate from the build so a build never publishes
 # as a side effect. A full release carries four assets:
 #   - Simulacra-Setup-<ver>.exe        the installer (what auto-update fetches)
-#   - Simulacra-Bundle-<ver>.zip       portable bundle: the 5 exes + WinFsp MSI
+#   - Simulacra-Portable-<ver>.zip     portable bundle: the 5 exes + WinFsp MSI
 #                                      + portable.marker (disables auto-update)
 #   - a .sha256 sidecar for each of the two above
 #
@@ -88,7 +88,7 @@ if ($exes.Count -ne 5) {
     throw "expected 5 bundle exes in $bundleDir, found $($exes.Count). Re-run scripts/build-release.ps1."
 }
 
-$zipName = "Simulacra-Bundle-$version.zip"
+$zipName = "Simulacra-Portable-$version.zip"
 $zip = Join-Path $repo "dist\$zipName"
 # Stage under a versioned folder so the archive extracts into one tidy directory.
 $stageRoot = Join-Path $repo "dist\zip-stage"
