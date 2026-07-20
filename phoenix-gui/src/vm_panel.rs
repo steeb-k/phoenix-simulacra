@@ -581,7 +581,19 @@ pub fn show(
     // no Windows build shipped the GTK clipboard code at all — so the state
     // is worth surfacing rather than leaving the user guessing why copy and
     // paste does nothing.
-    ui.add_space(16.0);
+    ui.add_space(18.0);
+    ui.label(
+        egui::RichText::new("QEMU Version Information")
+            .font(fonts::bold(13.0))
+            .color(palette.subtle_text),
+    );
+    ui.add_space(2.0);
+    // Hairline under the heading, the same device the tables use to separate a
+    // header from its rows.
+    let sep = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(sep, 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, palette.panel_border);
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!("Using {}", qemu.version))
