@@ -174,6 +174,31 @@ impl TestVhd {
         diskpart_layout(self.disk_index, true, parts)
     }
 
+    /// Lay out the disk as **MBR** instead of GPT.
+    ///
+    /// diskpart stamps a fresh NT disk signature and sets the active flag on
+    /// the first primary, so the resulting disk carries real MBR identity —
+    /// which is exactly what an MBR capture has to preserve.
+    pub fn init_mbr_with(&self, parts: &[PartSpec]) -> Result<()> {
+        diskpart_layout(self.disk_index, false, parts)
+    }
+
+    /// Mark a primary partition **active** (1-based, as diskpart numbers
+    /// them).
+    ///
+    /// Separate from [`TestVhd::init_mbr_with`] because diskpart does not set
+    /// the flag when it creates partitions — a freshly laid out MBR disk has
+    /// nothing active, and would not boot. A real Windows BIOS install sets it
+    /// on System Reserved, so a fixture that means to model one has to say so.
+    pub fn set_mbr_active(&self, partition_number: u32) -> Result<()> {
+        run_diskpart(&format!(
+            "select disk {}\nselect partition {partition_number}\nactive\n",
+            self.disk_index
+        ))
+        .context("diskpart set active")?;
+        Ok(())
+    }
+
     /// As [`TestVhd::init_gpt_with`], but formats with an explicit
     /// allocation-unit size (e.g. 65536 for 64K clusters) instead of the
     /// filesystem default.
