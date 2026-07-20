@@ -36,6 +36,15 @@ impl Qemu {
         if let Some(d) = explicit_dir {
             candidates.push(d.to_path_buf());
         }
+        // The bundled copy, in a private subfolder beside the app, BEFORE
+        // anything on the system. It is the build this app was validated
+        // against; a system QEMU may be older and silently lose features
+        // (clipboard needs 11.1+, and Windows build numbers don't track
+        // upstream tags, so "newer-looking" isn't newer). A user who wants
+        // their own install can still say so — an explicit directory wins.
+        if let Some(d) = bundled_dir() {
+            candidates.push(d);
+        }
         if let Some(d) = which_dir("qemu-system-x86_64") {
             candidates.push(d);
         }
@@ -135,6 +144,16 @@ fn probe_gtk_clipboard(system: &Path) -> bool {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// `<install dir>\qemu` — where the installer puts the bundled build.
+///
+/// Deliberately private to the app rather than `C:\Program Files\qemu`: a QEMU
+/// the user installed themselves must never be overwritten or version-clashed
+/// with. `None` when the executable's own directory can't be determined.
+fn bundled_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("qemu"))
 }
 
 /// Directory containing `name(.exe)` on `PATH`, if any. A tiny `which` so we
