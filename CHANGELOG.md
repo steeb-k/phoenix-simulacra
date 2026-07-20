@@ -2,7 +2,7 @@
 
 Notable changes per release. Releases are published on the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases).
 
-## Unreleased
+## 0.6.1 — 2026-07-20
 
 - **Shrinking is reliable.** Restoring or cloning a fragmented NTFS volume into a smaller partition could fail with "relocated run list grew to N bytes, past the N-1 byte attribute budget" — and it failed *after* the data had been copied, leaving the target holding data its metadata no longer described. Three changes fix it: relocated run lists now grow into the MFT record's free space instead of being limited to the handful of spare bytes inside their own attribute; relocated clusters are packed to keep each piece contiguous rather than splitting it across free runs; and every shrink is now checked against the source's MFT *before* anything is written, re-planning the relocation where a record would not fit.
 - **A shrink that genuinely cannot work is refused up front**, with the smallest target size that would work, instead of aborting partway through with the target already overwritten. On the clone path this check moved into the prepare phase, so it happens before the target's partition table is touched.
