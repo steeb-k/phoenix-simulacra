@@ -1,0 +1,4 @@
+===== T2 staged run 2026-07-19T20:52:50.6272281-07:00 =====
+tests: bitlocker  workers: default  winfsp: False
+START bitlocker 2026-07-19T20:52:50.6442628-07:00
+END   bitlocker exit=101 2026-07-19T20:53:01.8441784-07:00

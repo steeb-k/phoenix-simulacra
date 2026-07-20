@@ -1,0 +1,32 @@
+===== T2 staged run 2026-07-18T11:20:45.1212185-07:00 =====
+tests: refs_family  workers: default  winfsp: False
+START refs_family 2026-07-18T11:20:45.1397686-07:00
+END   refs_family exit=0 2026-07-18T11:21:10.8233023-07:00
+===== T2 staged run 2026-07-18T13:43:19.9704680-07:00 =====
+tests: resize_roundtrip,sector_4kn,backup_restore_roundtrip,clone,fat_family,refs_family,gpt_identity,partial_mbr,partial_clone,mount,vhdx_container,vss,bitlocker  workers: default  winfsp: False
+START resize_roundtrip 2026-07-18T13:43:19.9704680-07:00
+END   resize_roundtrip exit=0 2026-07-18T13:43:59.9080617-07:00
+START sector_4kn 2026-07-18T13:44:04.9238655-07:00
+END   sector_4kn exit=0 2026-07-18T13:44:49.3597738-07:00
+START backup_restore_roundtrip 2026-07-18T13:44:54.3692314-07:00
+END   backup_restore_roundtrip exit=0 2026-07-18T13:45:07.1323694-07:00
+START clone 2026-07-18T13:45:12.1455908-07:00
+END   clone exit=0 2026-07-18T13:45:30.5049536-07:00
+START fat_family 2026-07-18T13:45:35.5078063-07:00
+END   fat_family exit=0 2026-07-18T13:45:52.5237807-07:00
+START refs_family 2026-07-18T13:45:57.5257508-07:00
+END   refs_family exit=0 2026-07-18T13:46:20.9928825-07:00
+START gpt_identity 2026-07-18T13:46:26.0019873-07:00
+END   gpt_identity exit=0 2026-07-18T13:46:38.6270026-07:00
+START partial_mbr 2026-07-18T13:46:43.6384197-07:00
+END   partial_mbr exit=0 2026-07-18T13:47:27.9066842-07:00
+START partial_clone 2026-07-18T13:47:32.9188341-07:00
+END   partial_clone exit=101 2026-07-18T13:48:47.9134360-07:00
+START mount 2026-07-18T13:48:52.9168411-07:00
+END   mount exit=0 2026-07-18T13:49:03.8151488-07:00
+START vhdx_container 2026-07-18T13:49:08.8300738-07:00
+END   vhdx_container exit=0 2026-07-18T13:49:11.3694655-07:00
+START vss 2026-07-18T13:49:16.3766139-07:00
+END   vss exit=101 2026-07-18T13:50:04.3642553-07:00
+START bitlocker 2026-07-18T13:50:09.3700327-07:00
+END   bitlocker exit=0 2026-07-18T13:50:31.9039951-07:00

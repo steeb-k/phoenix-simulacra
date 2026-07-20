@@ -1,0 +1,46 @@
+
+=== bitlocker ===
+   Compiling phoenix-mount v0.5.0 (C:\Users\steeb-ai\carbon-phoenix-backup\phoenix-mount)
+   Compiling phoenix-systests v0.5.0 (C:\Users\steeb-ai\carbon-phoenix-backup\phoenix-systests)
+   Compiling phoenix-vm v0.5.0 (C:\Users\steeb-ai\carbon-phoenix-backup\phoenix-vm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.29s
+     Running tests\bitlocker.rs (target\debug\deps\bitlocker-6e473d111e606bdd.exe)
+
+running 1 test
+
+thread 'bitlocker_unlocked_then_locked_roundtrips' (2536) panicked at phoenix-systests\tests\bitlocker.rs:88:40:
+enable bitlocker: Enable-BitLocker
+
+Caused by:
+    powershell failed: ConvertTo-SecureString : The 'ConvertTo-SecureString' command was found in the module 'Microsoft.PowerShell.Security', 
+    but the module could not be loaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.
+    At line:1 char:40
+    + $ErrorActionPreference = 'Stop'; $pw = ConvertTo-SecureString 'Phoeni ...
+    +                                        ~~~~~~~~~~~~~~~~~~~~~~
+        + CategoryInfo          : ObjectNotFound: (ConvertTo-SecureString:String) [], ParentContainsErrorRecordException
+        + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule
+     
+    
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test bitlocker_unlocked_then_locked_roundtrips ... FAILED
+
+failures:
+
+failures:
+    bitlocker_unlocked_then_locked_roundtrips
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.55s
+
+error: test failed, to rerun pass `-p phoenix-systests --test bitlocker`
+bitlocker FAILED (exit 101)
+
+===== summary =====
+  bitlocker                  FAIL (101)
+
+breadcrumbs: t2-rerun.log
+
+1 binary/binaries failed. A failure is a RESULT -- capture the exact
+error text and report it. Do not relax or skip the test to make it green.
+Known exception: vss.rs :: locked_backup_blocks_writers_for_duration is
+flaky (~1-in-3, races a writer against the capture window). Re-run before
+believing it. It is the ONLY test with a standing excuse.
