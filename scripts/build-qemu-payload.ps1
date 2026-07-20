@@ -7,10 +7,14 @@
 # and QEMU's script exposes no component flags, so pruning is the only way to
 # avoid shipping a gigabyte of emulators for architectures we never launch.
 #
-# Output: dist/qemu-payload/ (the tree) + dist/<name>.zip, which is uploaded to
-# the binaries repo. build-installer.ps1 then downloads THAT zip by pinned hash
-# -- it never runs this script, so a release build never depends on the
-# upstream installer still being at its URL.
+# Output: dist/qemu-payload/ (the tree) + dist/<name>.zip, published as a
+# release asset on the phoenix-simulacra-deps repo. The installer downloads THAT
+# zip by pinned hash, so a release build never depends on the upstream installer
+# still being at its URL.
+#
+# Deps repo, not the binaries repo: an asset there would sit alongside app
+# releases and read as one, and the in-app updater reads that repo's "latest
+# release".
 #
 # Run this only when moving to a new QEMU build, and TEST the result (see
 # -Verify below) before uploading it.
@@ -185,8 +189,12 @@ Write-Host "Payload:  $work" -ForegroundColor Green
 Write-Host ("Zip:      {0} ({1:N0} MB)" -f $zip, ((Get-Item $zip).Length/1MB)) -ForegroundColor Green
 Write-Host "SHA-256:  $zipHash" -ForegroundColor Green
 Write-Host ""
-Write-Host "Next: upload the zip to the binaries repo, then update build-installer.ps1:"
-Write-Host "  `$QemuPayloadSha256 = `"$zipHash`""
+Write-Host "Next:"
+Write-Host "  1. gh release create qemu-payload-<ver> <zip> --repo steeb-k/phoenix-simulacra-deps"
+Write-Host "  2. Update the pin in BOTH places (they must agree):"
+Write-Host "       installer/simulacra.iss          #define QemuSha256"
+Write-Host "       phoenix-gui/src/qemu_payload.rs  PAYLOAD_SHA256"
+Write-Host "     SHA-256: $zipHash"
 Write-Host ""
 Write-Host "GPLv2: corresponding source for this build is QEMU commit $QemuCommit"
 Write-Host "  https://github.com/qemu/qemu/archive/$QemuCommit.tar.gz"
