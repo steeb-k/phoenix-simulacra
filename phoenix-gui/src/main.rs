@@ -5182,8 +5182,13 @@ impl PhoenixApp {
                         self.settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
                     )
                     .ok();
+                    // Only the failure is worth saying. On success the page
+                    // itself is the confirmation — it only renders because
+                    // QEMU was found, and the footer already names the
+                    // version, so a "QEMU is ready" line states twice over
+                    // what the user can already see.
                     self.vm_last_status = match self.qemu.as_ref() {
-                        Some(q) => format!("QEMU ready — {}", q.version),
+                        Some(_) => String::new(),
                         None => "QEMU downloaded but could not be started.".into(),
                     };
                 }
