@@ -167,12 +167,20 @@ fn ntfs_restore_shrink_heavily_fragmented() {
     let _ = std::fs::remove_file(&backup);
 }
 
-/// A shrink that genuinely cannot work must be refused *before* the target is
-/// touched, and must say what size would work instead.
+/// A shrink that cannot work must be refused *before* the target is touched.
 ///
-/// The old code discovered this only once the target's GPT had been
-/// re-initialized and the data streamed; the point of the pre-flight is that
-/// the target comes back untouched.
+/// The old code discovered an unfittable shrink only once the target's GPT had
+/// been re-initialized and the data streamed; the point of the pre-flight is
+/// that the target comes back byte-for-byte as it started.
+///
+/// The assertion deliberately does not pin the wording. A shrink can be
+/// impossible for more than one reason, and they are caught by different
+/// guards at different depths — here the used data simply exceeds the target,
+/// which the cheap capacity check rejects long before the MFT pre-flight would
+/// get a chance to compute a suggested size. The pre-flight's own
+/// smallest-workable-target message is covered by unit tests in
+/// `phoenix_restore::relocation`, which can construct that narrower case
+/// without needing a real disk.
 #[test]
 #[ignore = "requires elevation + diskpart; run with --ignored --test-threads=1"]
 fn ntfs_restore_impossible_shrink_leaves_the_target_untouched() {
@@ -204,17 +212,14 @@ fn ntfs_restore_impossible_shrink_leaves_the_target_untouched() {
         repair_boot: false,
         progress: None,
     })
-    .expect_err("shrinking 410 MiB of data into 100 MiB must fail");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("smallest target that works") || msg.contains("cannot be shrunk"),
-        "error should explain what would work, got: {msg}"
-    );
+    .expect_err("shrinking ~205 MiB of data into 100 MiB must fail");
 
+    // The headline property: nothing was written.
     let after = read_disk_head(&target);
     assert_eq!(
         before, after,
-        "an impossible shrink must fail before writing anything to the target"
+        "an impossible shrink must fail before writing anything to the target \
+         (refusal was: {err})"
     );
     let _ = std::fs::remove_file(&backup);
 }
