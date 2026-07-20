@@ -25,6 +25,22 @@ pub fn hex_decode(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Decode a hex string of any even length. [`hex_decode`] is the fixed-size
+/// digest form; this one is for variable-length blobs (e.g. MBR boot code).
+/// `None` on an odd length or a non-hex digit.
+pub fn hex_decode_vec(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks(2) {
+        let hi = hex_nibble(chunk.first()?)?;
+        let lo = hex_nibble(chunk.get(1)?)?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
 fn hex_nibble(c: &u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),

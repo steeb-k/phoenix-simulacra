@@ -27,9 +27,9 @@ use phoenix_systests::{
 
 const VHD_MB: u64 = 512;
 
-/// Read the MBR's four-byte NT disk signature straight off the attached disk,
-/// so the expectation comes from Windows rather than from our own code.
-fn read_disk_signature(disk_index: u32) -> u32 {
+/// Read LBA 0 straight off the attached disk, so every expectation below comes
+/// from Windows rather than from our own code.
+fn read_mbr_sector(disk_index: u32) -> [u8; 512] {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
@@ -43,7 +43,7 @@ fn read_disk_signature(disk_index: u32) -> u32 {
     let mut sector = [0u8; 512];
     f.read_exact(&mut sector).expect("read MBR");
     assert_eq!(&sector[510..512], &[0x55, 0xAA], "source disk has no MBR");
-    u32::from_le_bytes(sector[0x1B8..0x1BC].try_into().unwrap())
+    sector
 }
 
 #[test]
@@ -80,9 +80,29 @@ fn mbr_identity_survives_capture_and_synthesis() {
     fill_fixture('X', 0xB105).expect("fill system fixture");
     fill_fixture('Y', 0xB106).expect("fill data fixture");
 
+    // Give the disk real MBR boot code, as a bootable disk has and a freshly
+    // partitioned one does not. bootsect is what Windows Setup uses, and it is
+    // what our own boot-repair path shells out to.
+    let bootsect = std::process::Command::new("bootsect.exe")
+        .args(["/nt60", "X:", "/mbr"])
+        .output()
+        .expect("run bootsect");
+    assert!(
+        bootsect.status.success(),
+        "bootsect failed: {}{}",
+        String::from_utf8_lossy(&bootsect.stdout),
+        String::from_utf8_lossy(&bootsect.stderr)
+    );
+
     // What Windows says the disk is, before we touch it.
-    let expected_signature = read_disk_signature(source.disk_index());
+    let source_mbr = read_mbr_sector(source.disk_index());
+    let expected_signature = u32::from_le_bytes(source_mbr[0x1B8..0x1BC].try_into().unwrap());
+    let expected_boot_code = source_mbr[..440].to_vec();
     assert_ne!(expected_signature, 0, "diskpart left a zero disk signature");
+    assert!(
+        expected_boot_code.iter().any(|&b| b != 0),
+        "bootsect left no MBR boot code to capture"
+    );
 
     let disk = enumerate_disks()
         .unwrap()
@@ -125,6 +145,17 @@ fn mbr_identity_survives_capture_and_synthesis() {
         Some(expected_signature),
         "NT disk signature must survive capture — the BCD names the boot disk by it"
     );
+    assert_eq!(
+        reader
+            .manifest
+            .disk
+            .mbr_boot_code
+            .as_deref()
+            .and_then(phoenix_core::hash::hex_decode_vec),
+        Some(expected_boot_code.clone()),
+        "MBR boot code must survive capture — it lives outside every partition, \
+         so nothing else in the backup holds it, and without it the disk hangs"
+    );
     for (i, p) in reader.manifest.partitions.iter().enumerate() {
         assert_eq!(
             p.mbr_type,
@@ -145,6 +176,11 @@ fn mbr_identity_survives_capture_and_synthesis() {
     synth.read_at(0, &mut sector).expect("read synthesized MBR");
 
     assert_eq!(&sector[510..512], &[0x55, 0xAA], "no MBR boot signature");
+    assert_eq!(
+        &sector[..440],
+        &expected_boot_code[..],
+        "synthesized disk lost the boot code — a BIOS guest would execute zeros"
+    );
     assert_eq!(
         &sector[0x1B8..0x1BC],
         &expected_signature.to_le_bytes(),

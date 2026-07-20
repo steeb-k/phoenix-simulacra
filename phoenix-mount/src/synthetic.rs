@@ -289,7 +289,20 @@ impl SyntheticVhd {
             }
         }
 
-        let leading = mbr::synthesize(signature, &parts, sector_size as usize);
+        // The source disk's own boot code. Without it a BIOS guest executes
+        // zeros at LBA 0 and hangs, however correct the table is.
+        let boot_code = reader
+            .manifest
+            .disk
+            .mbr_boot_code
+            .as_deref()
+            .and_then(phoenix_core::hash::hex_decode_vec);
+        let leading = mbr::synthesize(
+            signature,
+            boot_code.as_deref(),
+            &parts,
+            sector_size as usize,
+        );
         let leading_end = sector_size;
         // No trailing region: `trailing_start == disk_size` makes the
         // dispatcher's trailing branch unreachable.
@@ -600,6 +613,7 @@ mod tests {
                 style: "gpt".into(),
                 disk_guid: None,
                 disk_signature: None,
+                mbr_boot_code: None,
                 sector_size: 512,
             },
             partitions: vec![PartitionManifest {
@@ -669,6 +683,7 @@ mod tests {
                 style: "mbr".into(),
                 disk_guid: None,
                 disk_signature: Some(signature),
+                mbr_boot_code: None,
                 sector_size: 512,
             },
             partitions: vec![PartitionManifest {
@@ -799,6 +814,7 @@ mod tests {
                 style: "mbr".into(),
                 disk_guid: None,
                 disk_signature: Some(1),
+                mbr_boot_code: None,
                 sector_size: 512,
             },
             partitions: manifests,

@@ -12,10 +12,12 @@
 //! per-partition type byte and active flag all come from the manifest; they are
 //! captured precisely because they cannot be reconstructed afterwards.
 //!
-//! Boot code is deliberately NOT synthesized. Bytes 0..440 stay zero: the
-//! source disk's boot code lives outside every captured partition, so we never
-//! had it. A guest that needs it gets the boot-repair path (`bootsect /nt60
-//! /mbr`), the same answer as a restored disk.
+//! Boot code is reproduced, not invented. Bytes 0..440 are the source disk's
+//! own, captured at backup time precisely because they live outside every
+//! partition and nothing else in the backup holds them — a disk without them
+//! executes zeros at LBA 0 and hangs, however correct its table is. A backup
+//! that has none (a GPT source, a non-bootable disk, or one taken before this
+//! was captured) leaves the region empty, and the guest needs boot repair.
 
 /// Offset of the first partition entry in the MBR.
 const FIRST_ENTRY: usize = 446;
@@ -48,14 +50,34 @@ pub struct MbrPart {
 /// back to Basic Data.
 pub const DEFAULT_TYPE: u8 = 0x07;
 
+/// Length of the boot-code region at the start of the MBR.
+pub const BOOT_CODE_LEN: usize = 440;
+
 /// Build the single MBR sector. Padded to `sector_size` because it occupies a
 /// whole sector, though the structure itself is 512 bytes by definition.
+///
+/// `boot_code` is the source disk's own bytes 0..440, captured because they sit
+/// outside every partition and nothing else in the backup holds them. Without
+/// them the BIOS executes zeros and the disk hangs, however correct the table
+/// is. `None` (a GPT source, a non-bootable disk, or a backup predating the
+/// capture) leaves the region empty and the guest needs boot repair.
 ///
 /// Entries beyond the fourth are dropped: MBR has room for four primaries, and
 /// a backup carrying more came from an extended/logical layout this does not
 /// attempt to reproduce.
-pub fn synthesize(disk_signature: u32, parts: &[MbrPart], sector_size: usize) -> Vec<u8> {
+pub fn synthesize(
+    disk_signature: u32,
+    boot_code: Option<&[u8]>,
+    parts: &[MbrPart],
+    sector_size: usize,
+) -> Vec<u8> {
     let mut mbr = vec![0u8; sector_size];
+    if let Some(code) = boot_code {
+        // Truncate rather than reject: the region is fixed at 440 bytes, and a
+        // longer blob would otherwise overwrite the partition table below.
+        let n = code.len().min(BOOT_CODE_LEN);
+        mbr[..n].copy_from_slice(&code[..n]);
+    }
     mbr[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 4].copy_from_slice(&disk_signature.to_le_bytes());
 
     for (i, p) in parts.iter().take(MAX_PARTITIONS).enumerate() {
@@ -102,7 +124,7 @@ mod tests {
     #[test]
     fn synthesized_mbr_has_valid_structure() {
         let parts = vec![part(2048, 1_048_576, 0x07, true), part(1_050_624, 4096, 0x27, false)];
-        let mbr = synthesize(0xDEAD_BEEF, &parts, 512);
+        let mbr = synthesize(0xDEAD_BEEF, None, &parts, 512);
 
         assert_eq!(mbr.len(), 512);
         assert_eq!(&mbr[510..512], &[0x55, 0xAA]);
@@ -125,25 +147,48 @@ mod tests {
     }
 
     #[test]
-    fn boot_code_region_is_left_empty() {
-        // We never captured the source's boot code — it lives outside every
-        // partition — so claiming to synthesize it would be a lie. Boot repair
-        // is the answer, exactly as it is for a restored disk.
-        let mbr = synthesize(1, &[part(2048, 4096, 0x07, true)], 512);
-        assert!(mbr[..440].iter().all(|&b| b == 0));
+    fn captured_boot_code_is_reproduced_verbatim() {
+        // The whole point: without these bytes the BIOS executes zeros and
+        // the disk hangs, however correct the table is.
+        let code: Vec<u8> = (0..BOOT_CODE_LEN).map(|i| (i % 251) as u8).collect();
+        let mbr = synthesize(1, Some(&code), &[part(2048, 4096, 0x07, true)], 512);
+        assert_eq!(&mbr[..BOOT_CODE_LEN], &code[..]);
+        // And it must not have run over the table or the signature.
+        assert_eq!(&mbr[0x1B8..0x1BC], &1u32.to_le_bytes());
+        assert_eq!(mbr[446 + 4], 0x07);
+        assert_eq!(&mbr[510..512], &[0x55, 0xAA]);
+    }
+
+    #[test]
+    fn missing_boot_code_leaves_the_region_empty() {
+        // A GPT source, a non-bootable disk, or a pre-capture backup. Better
+        // an honest gap that boot repair can fill than invented boot code.
+        let mbr = synthesize(1, None, &[part(2048, 4096, 0x07, true)], 512);
+        assert!(mbr[..BOOT_CODE_LEN].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn overlong_boot_code_cannot_reach_the_partition_table() {
+        // 440 bytes is the region; anything longer would otherwise overwrite
+        // the first entry.
+        let code = vec![0xAAu8; 512];
+        let mbr = synthesize(1, Some(&code), &[part(2048, 4096, 0x07, true)], 512);
+        assert!(mbr[..BOOT_CODE_LEN].iter().all(|&b| b == 0xAA));
+        assert_eq!(mbr[446], 0x80, "table survived");
+        assert_eq!(&mbr[510..512], &[0x55, 0xAA]);
     }
 
     #[test]
     fn zero_type_byte_falls_back_rather_than_marking_unused() {
         // A zero type byte means UNUSED, so a pre-fidelity backup would
         // otherwise synthesize a table the guest reads as empty.
-        let mbr = synthesize(1, &[part(2048, 4096, 0x00, true)], 512);
+        let mbr = synthesize(1, None, &[part(2048, 4096, 0x00, true)], 512);
         assert_eq!(mbr[446 + 4], DEFAULT_TYPE);
     }
 
     #[test]
     fn occupies_a_whole_sector_on_4kn() {
-        let mbr = synthesize(1, &[part(256, 4096, 0x07, true)], 4096);
+        let mbr = synthesize(1, None, &[part(256, 4096, 0x07, true)], 4096);
         assert_eq!(mbr.len(), 4096);
         // The structure stays 512 bytes wherever it sits.
         assert_eq!(&mbr[510..512], &[0x55, 0xAA]);
@@ -157,7 +202,7 @@ mod tests {
         let parts: Vec<MbrPart> = (0..5)
             .map(|i| part(2048 + i * 4096, 4096, 0x07, false))
             .collect();
-        let mbr = synthesize(1, &parts, 512);
+        let mbr = synthesize(1, None, &parts, 512);
         assert_eq!(&mbr[510..512], &[0x55, 0xAA]);
         // The fourth entry is the last one written.
         assert_eq!(&mbr[494 + 8..494 + 12], &(2048u32 + 3 * 4096).to_le_bytes());

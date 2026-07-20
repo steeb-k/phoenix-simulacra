@@ -30,6 +30,23 @@ pub struct DiskManifest {
     /// recorded (those can be restored, but a booted VM may need boot repair).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_signature: Option<u32>,
+    /// The MBR's **boot code** — bytes 0..440 of LBA 0 — as hex.
+    ///
+    /// Captured because it lives *outside every partition*, so nothing else in
+    /// the backup contains it, and a disk without it does not boot: the BIOS
+    /// loads LBA 0 and executes whatever is there. Reproducing the partition
+    /// table and signature without this yields a disk that looks perfect and
+    /// still hangs.
+    ///
+    /// Absent for GPT sources (whose protective-MBR boot code is meaningless)
+    /// and for backups taken before this was recorded.
+    ///
+    /// Known limitation: a bootloader that stages a second stage in the **MBR
+    /// gap** — the space between LBA 0 and the first partition, as GRUB does —
+    /// is still not fully captured. Windows is unaffected: it keeps `bootmgr`
+    /// in System Reserved's boot sector, which is inside a captured partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbr_boot_code: Option<String>,
     pub sector_size: u32,
 }
 
