@@ -434,8 +434,30 @@ fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
             let qemu = Qemu::discover(qemu_dir.as_deref())?;
             println!("Using QEMU: {} ({})", qemu.system.display(), qemu.version);
 
+            // Say up front when the guest will run in software emulation.
+            // QEMU falls back on its own, but silently — the user would just
+            // experience "this is unusably slow" with no idea it is fixable.
+            let accel_status = phoenix_vm::accel::probe();
+            match accel_status.blocker() {
+                None => println!("Acceleration: WHPX (hardware)"),
+                Some(b) => {
+                    println!();
+                    println!("WARNING: {} — the guest will run in software", b.headline());
+                    println!("  emulation (TCG), which is drastically slower for Windows.");
+                    println!("  {}", b.remedy());
+                    println!();
+                }
+            }
+
             let host = HostOptions {
                 memory_mib: mem,
+                // Ask for what actually works, so qemu.log isn't muddied with
+                // a WHPX failure on every launch of a machine that can't use it.
+                accel: if accel_status.is_accelerated() {
+                    phoenix_vm::Accel::Whpx
+                } else {
+                    phoenix_vm::Accel::Tcg
+                },
                 smp: cpus,
                 network,
                 // Cap the guest display so the QEMU window (chrome included)

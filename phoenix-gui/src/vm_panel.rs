@@ -131,6 +131,108 @@ pub enum VmAction {
     SetNetwork(bool),
     /// Download the bundled QEMU (offered when none was found).
     DownloadQemu,
+    /// Apply the Windows-side fix for the acceleration blocker.
+    FixAcceleration(phoenix_vm::accel::AccelBlocker),
+}
+
+/// Host acceleration state, for the warning card.
+pub struct AccelView {
+    pub status: phoenix_vm::accel::AccelStatus,
+    /// A fix is running (DISM takes tens of seconds).
+    pub applying: bool,
+    /// Outcome of the last fix attempt.
+    pub note: String,
+    /// The fix succeeded and a restart is needed for it to take effect.
+    pub restart_needed: bool,
+}
+
+/// "This will be slow, and here is why" — shown when WHPX is unavailable.
+///
+/// QEMU falls back to software emulation on its own, but silently, so without
+/// this the user just experiences an unusably slow VM and concludes the
+/// feature is broken. The two causes need completely different actions, which
+/// is why the probe distinguishes them rather than saying "enable
+/// virtualization" and leaving the user to guess where.
+fn accel_warning(ui: &mut Ui, palette: &Palette, accel: &AccelView, action: &mut VmAction) {
+    let Some(blocker) = accel.status.blocker() else {
+        return;
+    };
+    egui::Frame::none()
+        .fill(palette.content_card_bg)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(egui_phosphor::regular::WARNING)
+                        .font(fonts::icon(22.0))
+                        .color(palette.warning),
+                );
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(blocker.headline())
+                            .font(fonts::bold(14.0))
+                            .color(palette.warning),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Virtual machines will still run, but in software emulation — \
+                             far slower than normal, and slow enough that a Windows guest \
+                             may take a very long time to reach its login screen.",
+                        )
+                        .small()
+                        .color(palette.subtle_text),
+                    );
+                    ui.add_space(6.0);
+
+                    if accel.restart_needed {
+                        ui.label(
+                            egui::RichText::new(
+                                "Done — restart this PC for the change to take effect.",
+                            )
+                            .small()
+                            .color(palette.accent),
+                        );
+                    } else if accel.applying {
+                        ui.label(
+                            egui::RichText::new("Applying… this can take a minute.")
+                                .small()
+                                .color(palette.subtle_text),
+                        );
+                    } else if let Some(label) = blocker.fix_label() {
+                        // Fixable from here, because the app already runs
+                        // elevated. Firmware never is — that card only ever
+                        // shows instructions.
+                        if ui.button(egui::RichText::new(label).font(fonts::regular(13.0))).clicked()
+                        {
+                            *action = VmAction::FixAcceleration(blocker);
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(blocker.remedy())
+                                .small()
+                                .color(palette.subtle_text),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(blocker.remedy())
+                                .small()
+                                .color(palette.subtle_text),
+                        );
+                    }
+
+                    if !accel.note.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&accel.note).small().color(palette.danger),
+                        );
+                    }
+                });
+            });
+        });
+    ui.add_space(12.0);
 }
 
 /// State of an in-flight (or failed) QEMU download, for the unavailable page.
@@ -187,12 +289,15 @@ pub fn show(
     running: Option<RunningView<'_>>,
     last_status: &str,
     qemu_dl: &QemuDownloadView,
+    accel: &AccelView,
 ) -> VmAction {
     let mut action = VmAction::None;
     let Some(qemu) = qemu else {
         show_unavailable(ui, palette, qemu_dl, &mut action);
         return action;
     };
+    // Above everything: it changes what to expect from every boot on this page.
+    accel_warning(ui, palette, accel, &mut action);
 
     // A VM is running: show its status + a graceful Stop, and nothing else
     // actionable (one VM at a time in this first cut).

@@ -12,6 +12,7 @@
 //! See `docs/VIRTUALIZATION.md` for the design and the findings these defaults
 //! encode.
 
+pub mod accel;
 pub mod config;
 pub mod drives;
 pub mod qemu;

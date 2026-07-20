@@ -884,6 +884,13 @@ struct PhoenixApp {
     qemu_dl_last: Option<(u64, u64)>,
     /// Why the last QEMU download failed, if it did.
     qemu_dl_note: String,
+    /// Host acceleration, probed at startup and re-probed after a fix.
+    accel: phoenix_vm::accel::AccelStatus,
+    /// An in-flight acceleration fix (DISM is slow), and its outcome.
+    accel_fix: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    accel_fix_note: String,
+    /// A fix succeeded; the change needs a restart to take effect.
+    accel_restart_needed: bool,
     /// Discovered QEMU install, or `None` when it isn't found — the page then
     /// shows an install notice (mirrors `mount_available`).
     qemu: Option<phoenix_vm::Qemu>,
@@ -1037,6 +1044,10 @@ impl PhoenixApp {
             qemu_dl: None,
             qemu_dl_last: None,
             qemu_dl_note: String::new(),
+            accel: demo_accel_from_args().unwrap_or_else(phoenix_vm::accel::probe),
+            accel_fix: None,
+            accel_fix_note: String::new(),
+            accel_restart_needed: false,
             // Probe for QEMU once at startup; the page shows an install notice
             // when it's missing. A saved directory wins over autodetection so
             // a side-by-side build can be used without touching the system one.
@@ -4572,6 +4583,7 @@ impl PhoenixApp {
         // Drain the QEMU download worker before rendering, so the progress bar
         // and the "QEMU found" state both reflect this frame.
         let qemu_dl = self.poll_qemu_download();
+        let accel_view = self.poll_accel_fix();
         let drivers = vm_panel::DriversView {
             present: virtio_iso::installed().is_some(),
             downloading: self.drivers_dl.as_ref().map(|d| d.progress),
@@ -4620,6 +4632,7 @@ impl PhoenixApp {
                 running,
                 &last,
                 &qemu_dl,
+                &accel_view,
             );
         });
         self.vm = vm_state;
@@ -4674,6 +4687,18 @@ impl PhoenixApp {
                     None => {
                         self.vm_last_status = "Couldn't find the VM's control port.".into()
                     }
+                }
+            }
+            vm_panel::VmAction::FixAcceleration(blocker) => {
+                if self.accel_fix.is_none() {
+                    // Off the UI thread: DISM routinely takes tens of seconds
+                    // and would otherwise freeze the window solid.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(blocker.apply_fix());
+                    });
+                    self.accel_fix_note.clear();
+                    self.accel_fix = Some(rx);
                 }
             }
             vm_panel::VmAction::DownloadQemu => {
@@ -4979,6 +5004,13 @@ impl PhoenixApp {
             clipboard_agent: self.qemu.as_ref().is_some_and(|q| q.gtk_clipboard),
             // Dress the QEMU window to match the app's theme.
             dark_window: !theme::is_light(self.settings.theme),
+            // Ask for what actually works, so qemu.log isn't muddied with a
+            // WHPX failure on every launch of a machine that can't use it.
+            accel: if self.accel.is_accelerated() {
+                phoenix_vm::Accel::Whpx
+            } else {
+                phoenix_vm::Accel::Tcg
+            },
             ..phoenix_vm::HostOptions::default()
         };
         let iso = {
@@ -5180,6 +5212,38 @@ impl PhoenixApp {
             self.qemu_dl_note = view.note.clone();
         }
         view
+    }
+
+    /// Drain the acceleration-fix worker and build this frame's view.
+    ///
+    /// A successful fix does NOT re-probe: both DISM and bcdedit only take
+    /// effect after a restart, so re-probing would still say "unavailable" and
+    /// make a working fix look like a failed one.
+    fn poll_accel_fix(&mut self) -> vm_panel::AccelView {
+        if let Some(rx) = self.accel_fix.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.accel_fix = None;
+                    self.accel_restart_needed = true;
+                    self.accel_fix_note.clear();
+                }
+                Ok(Err(e)) => {
+                    self.accel_fix = None;
+                    self.accel_fix_note = e;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.accel_fix = None;
+                    self.accel_fix_note = "the fix did not report a result".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        vm_panel::AccelView {
+            status: self.accel,
+            applying: self.accel_fix.is_some(),
+            note: self.accel_fix_note.clone(),
+            restart_needed: self.accel_restart_needed,
+        }
     }
 
     /// The running VM's QMP port, if there is one and we can find it.
@@ -5484,6 +5548,23 @@ fn demo_refresh_overlay_from_args() -> Option<Instant> {
 /// demo mount, a styling aid for the dialog (pairs with `--demo-mounts`).
 fn demo_enable_write_from_args() -> bool {
     std::env::args().skip(1).any(|a| a == "--demo-enable-write")
+}
+
+/// `--demo-accel=firmware|platform|hypervisor` forces the acceleration warning
+/// so its three states can be seen on a machine where WHPX works fine — which
+/// is every development machine, and therefore the reason this exists.
+fn demo_accel_from_args() -> Option<phoenix_vm::accel::AccelStatus> {
+    use phoenix_vm::accel::{AccelBlocker, AccelStatus};
+    let arg = std::env::args()
+        .skip(1)
+        .find_map(|a| a.strip_prefix("--demo-accel=").map(str::to_string))?;
+    let blocker = match arg.as_str() {
+        "firmware" => AccelBlocker::FirmwareDisabled,
+        "platform" => AccelBlocker::PlatformFeatureMissing,
+        "hypervisor" => AccelBlocker::HypervisorNotRunning,
+        _ => return None,
+    };
+    Some(AccelStatus::SoftwareOnly(blocker))
 }
 
 fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
