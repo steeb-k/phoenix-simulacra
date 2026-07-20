@@ -34,7 +34,10 @@
 ; phoenix-gui/src/qemu_payload.rs. See docs/VIRTUALIZATION.md.
 #define QemuVersion "11.0.50"
 #define QemuZip "qemu-x86_64-11.0.50-20260501-win64.zip"
-#define QemuUrl "https://github.com/steeb-k/phoenix-simulacra-binaries/releases/download/qemu-11.0.50/qemu-x86_64-11.0.50-20260501-win64.zip"
+; Hosted in the separate deps repo, not the binaries repo: an asset there would
+; sit alongside app releases and read as one, and the in-app updater reads that
+; repo's "latest release".
+#define QemuUrl "https://github.com/steeb-k/phoenix-simulacra-deps/releases/download/qemu-payload-11.0.50/qemu-x86_64-11.0.50-20260501-win64.zip"
 #define QemuSha256 "c86f19d18e0b479922ea01f2a6eb91952de5ccc543960d318f4ddadf13590c8c"
 
 [Setup]

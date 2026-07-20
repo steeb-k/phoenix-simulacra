@@ -13,6 +13,10 @@
 //! testing, not something to drift into in the background. Bumping the pin
 //! here (and in `installer/simulacra.iss`) is how a new QEMU ships.
 //!
+//! Payloads live in the separate `phoenix-simulacra-deps` repository, not the
+//! binaries repo: release assets there would sit alongside app releases and
+//! read as one, and the in-app updater reads that repo's "latest release".
+//!
 //! Keep [`PAYLOAD_SHA256`] in step with `scripts/build-qemu-payload.ps1`.
 
 use std::io::{Read, Write};
@@ -25,7 +29,7 @@ use sha2::{Digest, Sha256};
 /// deliberately NOT a tag: Windows builds are branch snapshots, and this one
 /// (11.0.50) is the 11.1 development tree. Clipboard needs 11.1+.
 pub const PAYLOAD_VERSION: &str = "11.0.50";
-const PAYLOAD_URL: &str = "https://github.com/steeb-k/phoenix-simulacra-binaries/releases/download/qemu-11.0.50/qemu-x86_64-11.0.50-20260501-win64.zip";
+const PAYLOAD_URL: &str = "https://github.com/steeb-k/phoenix-simulacra-deps/releases/download/qemu-payload-11.0.50/qemu-x86_64-11.0.50-20260501-win64.zip";
 const PAYLOAD_SHA256: &str = "c86f19d18e0b479922ea01f2a6eb91952de5ccc543960d318f4ddadf13590c8c";
 /// Roughly, for the UI to set expectations before the first progress event.
 pub const PAYLOAD_MIB: u64 = 84;
