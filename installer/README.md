@@ -42,8 +42,8 @@ compiles `simulacra.iss`.
   Simulacra\qemu\` — a **private** copy, deliberately not `Program Files\qemu`,
   so a QEMU the user installed themselves is never touched, overwritten or
   version-clashed with. The app looks there first and the location is
-  changeable in its UI. Removed with the app on uninstall, since Inno tracks
-  the files it laid down; no registry marker is needed.
+  changeable in its UI. It is **downloaded during the wizard**, not embedded —
+  see below.
 
 A marker (`HKLM\Software\Phoenix Simulacra\InstalledWinFsp`) records whether the
 installer installed WinFsp, so the uninstaller only offers to remove it when we
@@ -59,9 +59,36 @@ selection and QEMU's script exposes no component flags, so pruning is the only
 way to avoid shipping a gigabyte of emulators that never run.
 
 That script is **not** part of a release build. It is run by hand when moving to
-a new QEMU build, and its output is uploaded to the binaries repo;
-`build-installer.ps1` then downloads that zip against a pinned SHA-256. A
-release build therefore never depends on the upstream URL still resolving.
+a new QEMU build, and its output is published as a release asset on the
+[phoenix-simulacra-deps](https://github.com/steeb-k/phoenix-simulacra-deps)
+repository — deliberately not the binaries repo, where it would sit alongside
+application releases and where GitHub's `/releases/latest` (which the in-app
+updater reads) would return it.
+
+### Downloaded, not embedded
+
+The setup executable does **not** carry the payload. It downloads it during the
+wizard, from a URL and SHA-256 pinned in `simulacra.iss`. Embedding 84 MB would
+be paid on nearly every auto-update, for a component that changes far more
+rarely than the app does; the installer stays about 13 MB instead of ~97 MB.
+
+`DownloadPage.Add` verifies the hash itself, so a truncated or substituted file
+fails there rather than producing a broken QEMU. A **failed download is not
+fatal** — an offline or firewalled machine still gets a working app, with a
+message pointing at the in-app download on the Virtualize page, which is also
+the path for anyone who unticks the task.
+
+Unpacking uses the inbox `tar.exe` rather than Inno's `extractarchive`: Inno's
+own extraction refused this payload outright (*"Cannot get class object / The
+archive format is unsupported"*) and rolled the install back. `tar` handles it
+in about a second and is what the app itself uses for the same payload, so both
+paths unpack identically. Because `tar` lays the files down rather than Inno,
+they are absent from the install log and `[UninstallDelete]` removes them — a
+plain uninstall would otherwise leave 223 MB behind.
+
+The pin appears in **two places that must agree**: `installer\simulacra.iss`
+(`QemuSha256`) and `phoenix-gui\src\qemu_payload.rs` (`PAYLOAD_SHA256`).
+`build-qemu-payload.ps1` prints both when it finishes.
 
 Because pruning is our decision rather than upstream's, the script verifies what
 it produced: the emulator reports the expected version, still accepts

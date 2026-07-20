@@ -8,9 +8,9 @@ The feature is x86_64-only and absent from portable builds — see [Availability
 
 ## Scope
 
-**In:** UEFI/GPT Windows guests booted from a single-disk capture; persistent, resumable sessions; rescue-ISO boot; host↔guest file exchange; guest tooling and clipboard; opt-in guest networking.
+**In:** UEFI/GPT and BIOS/MBR Windows guests booted from a single-disk capture; persistent, resumable sessions; rescue-ISO boot; host↔guest file exchange; guest tooling and clipboard; opt-in guest networking.
 
-**Out:** multi-disk systems (one `.phnx` is one disk — a system spanning disks would need multi-backup sessions); TPM emulation, and therefore Windows Hello PIN; Secure Boot; MBR/BIOS captures (see [Limitations](#limitations)).
+**Out:** multi-disk systems (one `.phnx` is one disk — a system spanning disks would need multi-backup sessions); TPM emulation, and therefore Windows Hello PIN; Secure Boot.
 
 Deliberately **not built:** offline password or PIN bypass. Blanking a hash cascades into losing DPAPI-protected secrets sealed to the original password, patching the verification path is bootkit-shaped and trips antivirus, and neither helps against a Microsoft account. The locked-out-of-your-own-guest case is served by rescue-ISO boot instead.
 
@@ -21,6 +21,28 @@ Deliberately **not built:** offline password or PIN bypass. Blanking a hash casc
 `WinFspServe` projects the synthesized disk image as a read-only VHDX **file** on a WinFsp filesystem — a real path any program can open. Every read is answered on demand from the `.phnx` and BLAKE3-verified. Serving does not attach the disk to Windows, so nothing surfaces on the host while the guest runs and there is no double-mount hazard.
 
 **GPT identity must be boot-faithful.** The mount paths deliberately derive fresh disk and partition GUIDs as double-attach protection, but Windows' BCD references the OS partition by disk GUID plus PartitionId — derived GUIDs fail `winload.efi` with `0xc000000e`. `SyntheticVhd::build_vhdx_original_identity` / `WinFspServe::serve_for_vm` restore the manifest's original identity and GPT attribute bits. An image served this way must never be host-attached.
+
+### Synthesizing an MBR disk
+
+A capture of a BIOS/MBR disk gets a **real** MBR rather than GPT's protective one, from `phoenix-mount/src/mbr.rs`. The shape differs, not just the bytes: one leading sector instead of 34, and no trailing region at all where GPT reserves 33 sectors for its backup copy.
+
+Three things have to be captured because nothing else in the backup contains them and none can be reconstructed afterwards:
+
+| | Why it cannot be inferred |
+|---|---|
+| **NT disk signature** (4 bytes at `0x1B8`) | The BCD names the boot disk by it — the MBR analogue of the GPT disk GUID, and just as fatal to get wrong. |
+| **Partition type byte** | The filesystem cannot distinguish a plain NTFS volume from a hidden `0x27` recovery partition; both are NTFS. |
+| **Active flag** | A table with nothing active does not boot. |
+| **Boot code** (bytes 0..440) | Lives *outside every partition*, so no captured partition holds it. Without it the BIOS executes zeros and the disk hangs however correct the table is. |
+
+Four deliberate choices in the writer, each pinned by a test:
+
+- A **zero type byte falls back to `0x07`** rather than being written through: zero means *unused*, so the guest would read an empty table — the same trap the GPT path avoids with Basic Data.
+- **Overlong boot code is truncated** to 440 bytes so it can never reach the partition table.
+- **Entries past the fourth are dropped**, not wrapped into the boot signature. An MBR holds four primaries; a backup with more came from an extended/logical layout this does not reproduce.
+- With **no captured active flag** (only possible for backups predating the capture), the first small NTFS partition is marked — the System Reserved shape. Neither position nor size alone is right: a standard BIOS install puts `bootmgr` on a small System Reserved and leaves the large Windows volume inactive, while a single-partition install has it on the Windows volume itself. Verified against a real Windows 10 install, whose 50 MB System Reserved is active and whose 40 GB `C:` is not.
+
+Validated end to end: a Windows 10 22H2 BIOS install, captured and booted from the `.phnx` to a desktop with the source detached. `phoenix-systests/tests/mbr_identity.rs` is the regression test — run it with `scripts\run-system-tests.ps1 -Test mbr_identity`.
 
 ### Write path: qcow2
 
@@ -47,7 +69,7 @@ The goal is zero-question boot: derive every setting from what the backup alread
 | Manifest fact | QEMU setting |
 |---|---|
 | `is_gpt` = true | UEFI firmware (edk2/OVMF pflash pair), machine `q35` |
-| `is_gpt` = false (MBR) | SeaBIOS; see [Limitations](#limitations) |
+| `is_gpt` = false (MBR) | SeaBIOS (QEMU's default — no pflash), machine `q35` |
 | `sector_size` = 4096 | `logical_block_size=4096,physical_block_size=4096`, NVMe controller (IDE and AHCI are 512-byte only) |
 | Partition `fs_kind` (NTFS/ReFS + ESP) | AHCI `ide-hd` on q35 — Windows' inbox `storahci` boot driver, so no virtio injection and no `0x7B` |
 | `drive_type` = SSD | `rotation_rate=1`, so the guest doesn't schedule defragmentation |
@@ -71,6 +93,26 @@ Every element below is load-bearing; the reasons are recorded because they were 
 - **A QMP socket on an ephemeral loopback port**, recorded in the session. It carries graceful shutdown (`system_powerdown`), the network link toggle (`set_link`), and the immediate power-off used when the app closes.
 
 qemu-system and qemu-img are console applications; every spawn passes `CREATE_NO_WINDOW` and redirects output to a per-launch `qemu.log` in the session directory, whose tail is surfaced in the UI when a launch fails.
+
+### When WHPX is unavailable
+
+QEMU is launched with `-accel whpx -accel tcg`, an ordered fallback list, so a machine without hardware acceleration still boots — in software emulation, which for a Windows guest is the difference between minutes and hours. Silent fallback is worse than useless on its own: the user waits, concludes the feature is broken, and never learns it is one checkbox away.
+
+So `phoenix-vm/src/accel.rs` probes up front, asking `WHvGetCapability` — the same API QEMU's own WHPX accelerator uses — rather than inferring from Windows version or registry state. The DLL is loaded dynamically, since `WinHvPlatform.dll` ships with an *optional* Windows feature and its absence is itself one of the answers.
+
+The three outcomes need completely different actions, which is the whole reason for distinguishing them:
+
+| Blocker | Remedy | Fixable in-app |
+|---|---|---|
+| Virtualization disabled in **firmware** | Reboot into BIOS/UEFI setup | No — no amount of elevation reaches it |
+| **Windows Hypervisor Platform** not enabled | A Windows Features checkbox | Yes (DISM) |
+| **Hypervisor not running** | `bcdedit /set hypervisorlaunchtype auto` | Yes |
+
+The two Windows-side fixes are applied from the app, which already runs elevated. Both need a restart, so success reports "restart to take effect" rather than re-probing — a re-probe would still say unavailable and make a working fix look like a failure. A single "enable virtualization" message would send half of these users to the wrong place.
+
+`--demo-accel=firmware|platform|hypervisor` forces each state, since a development machine never shows them.
+
+Note the buffer size when reading the capability: `WHV_CAPABILITY.HypervisorPresent` is a 4-byte `BOOL`. Passing a smaller buffer makes the call *fail*, which reads exactly like "no hypervisor" and sends the user to their BIOS for nothing.
 
 ### Guest restarts
 
@@ -154,11 +196,25 @@ This is nearly free in this model. A fresh QEMU process launches on every boot, 
 
 ## QEMU discovery and bundling
 
-Search order: an explicit setting (`Settings::vm_qemu_dir`, or `--qemu-dir`) → `PATH` → the stock install locations. A directory only becomes the saved choice if `Qemu::discover` succeeds on it, so a wrong folder cannot be silently persisted. When nothing is found, the Virtualize page shows an install call-to-action rather than failing cryptically — mirroring the Mount page's WinFsp notice.
+Search order: an explicit setting (`Settings::vm_qemu_dir`, or `--qemu-dir`) → the **bundled** copy beside the app → `PATH` → the stock install locations. The bundled copy is preferred over anything on the system because it is the build the app was validated against, and a system QEMU may be older and silently lose features — but an explicit directory still wins, so a user who chose their own install keeps it. A directory only becomes the saved choice if `Qemu::discover` succeeds on it, so a wrong folder cannot be silently persisted.
 
-Bundling QEMU in the installer, WinFsp-style, is the intended direction. Licensing is straightforward: QEMU is GPLv2 and shipping its unmodified installer alongside the app is mere aggregation. The obligation picked up is *corresponding source* — pin the exact bundled build and link or archive its matching source tarball in the release notes.
+QEMU is installed **privately**, into `<install dir>\qemu`, never `C:\Program Files\qemu`: a QEMU the user installed themselves must never be touched, overwritten or version-clashed with. The location is changeable in the UI.
 
-Two practicalities. The installer is large (a step change for ours), so detect-first must stay: bundled QEMU installs only when none is found, and the runtime path keeps honouring a user-supplied install. And **the bundled build must be 11.1 or newer**, or clipboard silently disappears.
+### The payload
+
+Upstream ships one installer carrying 55 system emulators and firmware for all of them — 1,170 MB installed. Simulacra launches exactly one target, and NSIS silent installs take default component selection with no component flags to override it, so `scripts/build-qemu-payload.ps1` extracts the upstream installer and prunes it to **223 MB** (84 MB compressed). That script is run by hand when moving QEMU versions, never as part of a release build; its output is published to the `phoenix-simulacra-deps` repository and pinned by SHA-256.
+
+Because the pruning is ours rather than upstream's, the script proves what it produced: the expected version, `-display gtk,clipboard=on` still accepted, `qemu-img` runs, and a paused machine starts with **the exact device set the app emits**. A missing option ROM or firmware blob fails the build rather than a user's first boot.
+
+The installer **downloads it at install time** rather than embedding it — 84 MB in every setup executable would be paid on nearly every auto-update, for a payload that changes far more rarely than the app. A failed download is deliberately not fatal: the Virtualize page offers the same download later, so an offline or firewalled machine still gets a working app. Both paths unpack with the inbox `tar.exe`; Inno's own archive extraction was tried and refused the payload outright.
+
+The download is **pin-driven, not latest-driven** — it fetches the exact validated version rather than asking upstream what is newest. QEMU version changes alter the boot recipe, so moving builds is an app-release decision made after testing, and bumping the pin (in `installer/simulacra.iss` and `phoenix-gui/src/qemu_payload.rs`, which must agree) is how a new one ships.
+
+**The bundled build must be QEMU 11.1 or newer**, or host↔guest clipboard silently disappears.
+
+### Licensing
+
+QEMU is **GPLv2**. It runs as a separate process driven over a command line, so it is not linked into the application and does not affect this project's licensing. Redistributing its binaries does carry the *corresponding source* obligation: each payload release links the exact upstream commit, and the licence text ships inside the payload as `COPYING` / `COPYING.LIB`.
 
 ## Throughput
 
@@ -196,10 +252,11 @@ Both are decided by `sidebar::page_available`, which also guards the `--page vir
 
 ## Limitations
 
-- **MBR/BIOS captures do not boot.** The synthesis always presents GPT, so a BIOS-mode guest cannot boot its MBR layout. Needs MBR synthesis before SeaBIOS boots are real.
+- **Bootloaders using the MBR gap are not fully captured.** The space between LBA 0 and the first partition — where GRUB stages its second stage — lies outside every partition and is not captured; only the MBR's own 440 bytes of boot code are. Windows is unaffected, keeping `bootmgr` in System Reserved's boot sector, which is inside a captured partition.
+- **Fast Startup produces a hibernated capture.** Windows enables it by default, so "Shut down" writes a kernel resume image to `hiberfil.sys` rather than shutting down. A guest booted from such a capture tries to resume and may fail — observed as a crash just after the Windows logo. Disabling Fast Startup on the source before capture avoids it; `InstallGuestDrivers.cmd` disables it inside the guest, so only the first boot of a session is exposed.
 - **No TPM emulation**, so Windows Hello PIN is unavailable in the guest; password sign-in works. Secure Boot is off. Windows may demand reactivation.
 - **NVMe is unverified on current QEMU.** It is required for 4Kn captures, since IDE and AHCI are 512-byte-sector only, but QEMU's `nvme` device was invisible to one build's OVMF even with an explicit `nvme-ns`. Retest before relying on 4Kn boot.
 - **One `.phnx` is one disk**; multi-disk systems are out of scope.
-- **Acceleration falls back to TCG** if WHPX is unavailable, which is correct but very slow for Windows guests.
+- **Acceleration falls back to TCG** if WHPX is unavailable — correct but very slow for a Windows guest. The Virtualize page says why and offers the fix; see [When WHPX is unavailable](#when-whpx-is-unavailable).
 
 The original exploratory notes for this feature are kept in [QEMU-BOOT.md](QEMU-BOOT.md).
