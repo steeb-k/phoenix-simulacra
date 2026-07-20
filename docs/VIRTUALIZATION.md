@@ -212,6 +212,8 @@ The download is **pin-driven, not latest-driven** — it fetches the exact valid
 
 **The bundled build must be QEMU 11.1 or newer**, or host↔guest clipboard silently disappears.
 
+**Re-pin to 11.1 final when it ships.** The current payload is a *development snapshot* of the 11.1 tree, not a tagged release — that is what "11.0.50" means, and today it is the only way to get a Windows build with clipboard support. It is validated end to end, so there is no urgency, but a tagged release is a better thing to ship than a snapshot: re-run `build-qemu-payload.ps1` against it, publish a new payload, and bump the two pins.
+
 ### Licensing
 
 QEMU is **GPLv2**. It runs as a separate process driven over a command line, so it is not linked into the application and does not affect this project's licensing. Redistributing its binaries does carry the *corresponding source* obligation: each payload release links the exact upstream commit, and the licence text ships inside the payload as `COPYING` / `COPYING.LIB`.
