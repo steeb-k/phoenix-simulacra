@@ -282,13 +282,10 @@ impl SyntheticVhd {
             .collect();
 
         // A table with nothing active does not boot, and a backup predating
-        // the captured flag has none. Fall back to the first partition: on a
-        // Windows BIOS layout that is System Reserved, which is exactly the
-        // one that should be active. A wrong guess is no worse than the
-        // certain failure of leaving every entry inactive.
+        // the captured flag has none.
         if !parts.iter().any(|p| p.bootable) {
-            if let Some(first) = parts.first_mut() {
-                first.bootable = true;
+            if let Some(i) = guess_active_partition(&reader, &spans) {
+                parts[i].bootable = true;
             }
         }
 
@@ -462,6 +459,57 @@ fn read_disk_image(
         done += run;
     }
     Ok(())
+}
+
+/// Largest a "System Reserved" partition is expected to be. Windows has used
+/// 100 MB (7), 350 MB (8) and 500–579 MB (10/11); 1 GiB covers all of them
+/// with room to spare while staying far below any real Windows volume.
+const SYSTEM_RESERVED_MAX: u64 = 1024 * 1024 * 1024;
+
+/// Which partition to mark active when the backup didn't record it.
+///
+/// Only reachable for backups captured before the active flag was recorded —
+/// every MBR capture since carries the real one. It exists so such a backup
+/// boots rather than presenting a table with nothing active, which cannot.
+///
+/// Neither position nor size alone is the answer. The active flag says which
+/// partition's boot record the MBR code loads, so it has to be the one holding
+/// the boot manager:
+///
+/// - A standard BIOS install puts `bootmgr` in a small NTFS **System
+///   Reserved** partition and leaves the large Windows volume inactive — so
+///   "the biggest partition" is wrong on the most common layout.
+/// - A single-partition install has no System Reserved, and `bootmgr` lives on
+///   the Windows volume itself — so "the small one" is wrong there.
+/// - A disk with an OEM diagnostic or another OS ahead of Windows breaks
+///   "the first partition".
+///
+/// So look for the System-Reserved shape first, and fall back to the largest
+/// NTFS volume. Guessing wrong costs a boot repair from rescue media; not
+/// guessing costs a disk that certainly won't boot.
+fn guess_active_partition(reader: &PhnxReader, spans: &[PartitionSpan]) -> Option<usize> {
+    let is_ntfs = |i: usize| -> bool {
+        spans.get(i).is_some_and(|s| {
+            reader
+                .manifest
+                .partitions
+                .iter()
+                .find(|p| p.index == s.partition_index)
+                .is_some_and(|p| p.fs.eq_ignore_ascii_case("ntfs"))
+        })
+    };
+
+    // System Reserved: the first small NTFS partition on the disk.
+    if let Some(i) = (0..spans.len())
+        .find(|&i| is_ntfs(i) && spans[i].size > 0 && spans[i].size <= SYSTEM_RESERVED_MAX)
+    {
+        return Some(i);
+    }
+    // Otherwise the Windows volume itself, on a single-partition install.
+    (0..spans.len())
+        .filter(|&i| is_ntfs(i))
+        .max_by_key(|&i| spans[i].size)
+        .or(if spans.is_empty() { None } else { Some(0) })
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -676,9 +724,9 @@ mod tests {
 
     #[test]
     fn mbr_without_a_captured_active_flag_still_boots_something() {
-        // Pre-fidelity backups have no flag recorded. A table with nothing
-        // active cannot boot, so the first partition is marked instead —
-        // System Reserved on a Windows BIOS layout.
+        // Pre-fidelity backups have no flag recorded, and a table with
+        // nothing active cannot boot. One NTFS partition — the single-install
+        // case — so it is the one marked.
         let path = build_mbr_backup(1, 0x07, false);
         let reader = PhnxReader::open(&path).unwrap();
         let mut vhd = SyntheticVhd::build(reader).unwrap();
@@ -686,6 +734,121 @@ mod tests {
         vhd.read_at(0, &mut sector).unwrap();
         assert_eq!(sector[446], 0x80);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Spans + manifest for a hypothetical layout, to exercise the
+    /// active-partition guess without building a whole backup per case.
+    fn guess_for(parts: &[(&str, u64)]) -> Option<usize> {
+        let path = std::env::temp_dir().join(format!("synth_guess_{}.phnx", Uuid::new_v4()));
+        let backup_id = Uuid::new_v4();
+        let header = Header {
+            version: FORMAT_VERSION,
+            flags: 0,
+            timestamp: 1,
+            backup_id,
+            disk_signature: 1,
+            partition_count: parts.len() as u32,
+        };
+        let mut w = PhnxWriter::create(&path, header).unwrap();
+        let mut manifests = Vec::new();
+        for (i, (fs, _size)) in parts.iter().enumerate() {
+            let ext_bytes = 64 * 1024u64;
+            let extents = vec![Extent {
+                start_sector: 0,
+                sector_count: ext_bytes / LBA as u64,
+            }];
+            let mut s = w
+                .begin_partition_stream(PartitionStreamSpec {
+                    index: i as u32,
+                    type_guid: [0u8; 16],
+                    name: format!("P{i}"),
+                    original_size: ext_bytes,
+                    fs_kind: FilesystemKind::Ntfs,
+                    capture_mode: CaptureMode::UsedBlocks,
+                    sector_size: LBA,
+                    used_bytes: 0,
+                    extents: &extents,
+                    bytes_per_cluster: 4096,
+                })
+                .unwrap();
+            s.write_chunk(&vec![0u8; ext_bytes as usize]).unwrap();
+            let (chunks, _) = s.finish().unwrap();
+            manifests.push(PartitionManifest {
+                index: i as u32,
+                name: format!("P{i}"),
+                type_guid: None,
+                fs: (*fs).into(),
+                capture_mode: "used-blocks".into(),
+                original_size: ext_bytes,
+                used_bytes: ext_bytes,
+                bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
+                mbr_type: Some(0x07),
+                mbr_bootable: Some(false),
+                chunks,
+                bitmap_hash: None,
+            });
+        }
+        w.finalize(&BackupManifest {
+            format_version: 1,
+            backup_id,
+            parent_backup_id: None,
+            hostname: "T".into(),
+            disk: DiskManifest {
+                style: "mbr".into(),
+                disk_guid: None,
+                disk_signature: Some(1),
+                sector_size: 512,
+            },
+            partitions: manifests,
+        })
+        .unwrap();
+
+        let reader = PhnxReader::open(&path).unwrap();
+        // Spans carry the sizes the guess reasons about; synthesize them at
+        // the requested sizes rather than the tiny on-disk payloads.
+        let spans: Vec<PartitionSpan> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, (_fs, size))| PartitionSpan {
+                partition_index: i as u32,
+                disk_offset: ALIGN + i as u64 * ALIGN,
+                size: *size,
+                ..plan_layout(&reader, ALIGN).0[i].clone()
+            })
+            .collect();
+        let out = guess_active_partition(&reader, &spans);
+        drop(reader);
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    #[test]
+    fn active_guess_prefers_system_reserved_over_the_windows_volume() {
+        // The most common BIOS layout. "Largest partition" would pick C: and
+        // be wrong — bootmgr lives on System Reserved, and that is what the
+        // MBR boot code has to chain into.
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(guess_for(&[("ntfs", 500 * MB), ("ntfs", 200_000 * MB)]), Some(0));
+    }
+
+    #[test]
+    fn active_guess_falls_back_to_the_windows_volume_when_alone() {
+        // Single-partition install: no System Reserved, bootmgr sits on C:.
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(guess_for(&[("ntfs", 200_000 * MB)]), Some(0));
+    }
+
+    #[test]
+    fn active_guess_skips_a_leading_non_ntfs_partition() {
+        // An OEM diagnostic or other-OS partition ahead of Windows is what
+        // breaks a naive "first partition" rule.
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(
+            guess_for(&[("fat32", 500 * MB), ("ntfs", 500 * MB), ("ntfs", 200_000 * MB)]),
+            Some(1)
+        );
     }
 
     #[test]
