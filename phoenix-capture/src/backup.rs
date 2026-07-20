@@ -495,6 +495,11 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
             } else {
                 None
             },
+            // The MBR identity, recorded only for MBR sources — it is what
+            // lets the disk be synthesized or restored faithfully enough to
+            // boot, and it cannot be reconstructed afterwards.
+            mbr_type: (!disk.is_gpt).then_some(part.mbr_type),
+            mbr_bootable: (!disk.is_gpt).then_some(part.mbr_bootable),
             chunks,
             bitmap_hash,
         });
@@ -513,6 +518,10 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
                 "mbr".into()
             },
             disk_guid: disk.disk_guid.map(|g| guid_to_string(&g)),
+            // The BCD on a BIOS install names the boot disk by this, so it
+            // has to survive the round trip or the restored/booted disk
+            // fails the way a regenerated GPT disk GUID does.
+            disk_signature: (!disk.is_gpt).then_some(disk.disk_signature as u32),
             sector_size: disk.sector_size,
         },
         partitions: partition_manifests,

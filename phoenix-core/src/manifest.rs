@@ -21,6 +21,15 @@ pub struct DiskManifest {
     pub style: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_guid: Option<String>,
+    /// MBR **NT disk signature** — the 4 bytes at offset 0x1B8 of the MBR.
+    ///
+    /// The MBR counterpart of `disk_guid`, and load-bearing for the same
+    /// reason: on a BIOS/MBR install the BCD identifies the boot disk by this
+    /// signature, so a disk synthesized or restored with a different one does
+    /// not boot. Absent for GPT sources and for backups taken before this was
+    /// recorded (those can be restored, but a booted VM may need boot repair).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_signature: Option<u32>,
     pub sector_size: u32,
 }
 
@@ -56,6 +65,19 @@ pub struct PartitionManifest {
     /// Absent for MBR sources and pre-fidelity backups (restored as 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpt_attributes: Option<u64>,
+    /// MBR partition **type byte** (0x07 NTFS/exFAT, 0x0C FAT32-LBA, 0x27
+    /// recovery…) — the MBR analogue of `type_guid`. Absent for GPT sources.
+    ///
+    /// Recorded rather than inferred from the filesystem: the filesystem
+    /// cannot distinguish a plain NTFS data partition from a hidden recovery
+    /// one, and that distinction decides whether Windows auto-mounts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbr_type: Option<u8>,
+    /// The MBR active/boot flag. The MBR boot code chains into whichever
+    /// primary partition carries it, so a disk that loses it does not boot.
+    /// Absent for GPT sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbr_bootable: Option<bool>,
     pub chunks: Vec<ChunkRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitmap_hash: Option<String>,

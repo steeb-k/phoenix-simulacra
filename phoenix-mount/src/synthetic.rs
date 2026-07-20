@@ -14,6 +14,7 @@ use phoenix_core::error::{PhoenixError, Result};
 
 use crate::chunkstore::{plan_layout, ChunkStore, PartitionSpan};
 use crate::gpt::{self, GptPart};
+use crate::mbr;
 use crate::vhd::{self, VHD_MAX_BYTES};
 use crate::vhdx::Vhdx;
 
@@ -104,8 +105,17 @@ impl SyntheticVhd {
             }
         };
 
+        // An MBR disk is one sector at the front and nothing at the back, so it
+        // reserves no trailing region at all — unlike GPT's 33-sector backup
+        // copy. Decided here because it changes the disk size below.
+        let is_mbr = reader.manifest.disk.style.eq_ignore_ascii_case("mbr");
+
         let (spans, raw_disk_size) = plan_layout(&reader, ALIGN);
-        let trail_bytes = gpt::trailing_sectors(sector_size) * sector_size;
+        let trail_bytes = if is_mbr {
+            0
+        } else {
+            gpt::trailing_sectors(sector_size) * sector_size
+        };
         // Round up to a sector multiple and leave room for the trailing GPT past
         // the last partition.
         let disk_size = align_up(raw_disk_size + trail_bytes + ALIGN, sector_size);
@@ -161,6 +171,10 @@ impl SyntheticVhd {
         } else {
             *reader.header.backup_id.as_bytes()
         };
+        if is_mbr {
+            return Self::finish_mbr(reader, spans, disk_size, sector_size, container);
+        }
+
         let parts: Vec<GptPart> = spans
             .iter()
             .map(|s| {
@@ -221,6 +235,79 @@ impl SyntheticVhd {
             container,
             gpt_leading: gpt_img.leading,
             gpt_trailing: gpt_img.trailing,
+            disk_size,
+            spans,
+        })
+    }
+
+    /// Finish building a disk whose source was MBR-partitioned.
+    ///
+    /// Split out because the shape genuinely differs rather than just the
+    /// bytes: one leading sector, no trailing region, and identity that comes
+    /// from a 4-byte signature instead of GUIDs. A BIOS guest boots this, so
+    /// the signature and the active flag are load-bearing — the BCD names the
+    /// boot disk by the former and the MBR boot code chains on the latter.
+    fn finish_mbr(
+        reader: PhnxReader,
+        spans: Vec<PartitionSpan>,
+        disk_size: u64,
+        sector_size: u64,
+        container: Container,
+    ) -> Result<Self> {
+        // Prefer the captured signature. The fallback keeps pre-fidelity
+        // backups (taken before this was recorded) mountable with a stable,
+        // non-zero signature — they just may need boot repair to boot, which
+        // is the same answer a restored disk gets.
+        let signature = reader.manifest.disk.disk_signature.unwrap_or_else(|| {
+            u32::from_le_bytes(reader.header.backup_id.as_bytes()[..4].try_into().unwrap())
+        });
+
+        let mut parts: Vec<mbr::MbrPart> = spans
+            .iter()
+            .map(|s| {
+                let mpart = reader
+                    .manifest
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == s.partition_index);
+                mbr::MbrPart {
+                    // LBAs are in the DISK's sectors, so a 4Kn disk divides by
+                    // 4096. Spans are 1 MiB aligned, so both divide cleanly.
+                    first_lba: s.disk_offset / sector_size,
+                    sectors: s.size / sector_size,
+                    partition_type: mpart.and_then(|p| p.mbr_type).unwrap_or(0),
+                    bootable: mpart.and_then(|p| p.mbr_bootable).unwrap_or(false),
+                }
+            })
+            .collect();
+
+        // A table with nothing active does not boot, and a backup predating
+        // the captured flag has none. Fall back to the first partition: on a
+        // Windows BIOS layout that is System Reserved, which is exactly the
+        // one that should be active. A wrong guess is no worse than the
+        // certain failure of leaving every entry inactive.
+        if !parts.iter().any(|p| p.bootable) {
+            if let Some(first) = parts.first_mut() {
+                first.bootable = true;
+            }
+        }
+
+        let leading = mbr::synthesize(signature, &parts, sector_size as usize);
+        let leading_end = sector_size;
+        // No trailing region: `trailing_start == disk_size` makes the
+        // dispatcher's trailing branch unreachable.
+        let trailing_start = disk_size;
+        debug_assert_eq!(leading.len() as u64, leading_end);
+
+        let store = ChunkStore::new(reader, spans.clone(), disk_size)?;
+        Ok(Self {
+            store,
+            sector_size,
+            leading_end,
+            trailing_start,
+            container,
+            gpt_leading: leading,
+            gpt_trailing: Vec::new(),
             disk_size,
             spans,
         })
@@ -464,6 +551,7 @@ mod tests {
             disk: DiskManifest {
                 style: "gpt".into(),
                 disk_guid: None,
+                disk_signature: None,
                 sector_size: 512,
             },
             partitions: vec![PartitionManifest {
@@ -477,12 +565,140 @@ mod tests {
                 bitlocker: None,
                 unique_guid: None,
                 gpt_attributes: None,
+                mbr_type: None,
+                mbr_bootable: None,
                 chunks,
                 bitmap_hash: None,
             }],
         };
         w.finalize(&manifest).unwrap();
         path
+    }
+
+    /// Same shape as `build_backup`, but the manifest describes an MBR disk
+    /// carrying real MBR identity — a signature, a type byte and an active
+    /// flag — as a capture of a BIOS disk now records.
+    fn build_mbr_backup(signature: u32, mbr_type: u8, bootable: bool) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("synth_mbr_{}.phnx", Uuid::new_v4()));
+        let backup_id = Uuid::new_v4();
+        let header = Header {
+            version: FORMAT_VERSION,
+            // flags bit 0 is the GPT flag; clear for an MBR source.
+            flags: 0,
+            timestamp: 1,
+            backup_id,
+            disk_signature: signature as u64,
+            partition_count: 1,
+        };
+        let ext_bytes = 64 * 1024u64;
+        let extents = vec![Extent {
+            start_sector: 0,
+            sector_count: ext_bytes / LBA as u64,
+        }];
+        let mut w = PhnxWriter::create(&path, header).unwrap();
+        let mut s = w
+            .begin_partition_stream(PartitionStreamSpec {
+                index: 0,
+                type_guid: [0u8; 16],
+                name: "Vol".into(),
+                original_size: ext_bytes,
+                fs_kind: FilesystemKind::Ntfs,
+                capture_mode: CaptureMode::UsedBlocks,
+                sector_size: LBA,
+                used_bytes: 0,
+                extents: &extents,
+                bytes_per_cluster: 4096,
+            })
+            .unwrap();
+        s.write_chunk(&vec![0x5Au8; ext_bytes as usize]).unwrap();
+        let (chunks, _) = s.finish().unwrap();
+        let manifest = BackupManifest {
+            format_version: 1,
+            backup_id,
+            parent_backup_id: None,
+            hostname: "T".into(),
+            disk: DiskManifest {
+                style: "mbr".into(),
+                disk_guid: None,
+                disk_signature: Some(signature),
+                sector_size: 512,
+            },
+            partitions: vec![PartitionManifest {
+                index: 0,
+                name: "Vol".into(),
+                type_guid: None,
+                fs: "ntfs".into(),
+                capture_mode: "used-blocks".into(),
+                original_size: ext_bytes,
+                used_bytes: ext_bytes,
+                bitlocker: None,
+                unique_guid: None,
+                gpt_attributes: None,
+                mbr_type: Some(mbr_type),
+                mbr_bootable: Some(bootable),
+                chunks,
+                bitmap_hash: None,
+            }],
+        };
+        w.finalize(&manifest).unwrap();
+        path
+    }
+
+    #[test]
+    fn mbr_source_synthesizes_a_real_mbr_not_a_gpt() {
+        let path = build_mbr_backup(0xCAFE_F00D, 0x07, true);
+        let reader = PhnxReader::open(&path).unwrap();
+        let mut vhd = SyntheticVhd::build(reader).unwrap();
+
+        let mut sector = vec![0u8; 512];
+        vhd.read_at(0, &mut sector).unwrap();
+
+        assert_eq!(&sector[510..512], &[0x55, 0xAA]);
+        // The identity the BCD names the boot disk by, carried from capture.
+        assert_eq!(&sector[0x1B8..0x1BC], &0xCAFE_F00Du32.to_le_bytes());
+        // A REAL entry, not GPT's 0xEE protective one — that is the whole
+        // point: a protective MBR tells a BIOS guest the disk is empty.
+        assert_eq!(sector[446 + 4], 0x07);
+        assert_ne!(sector[446 + 4], 0xEE);
+        assert_eq!(sector[446], 0x80, "active flag must survive capture");
+
+        // The partition starts where the layout put it, in disk sectors.
+        let first_lba = u32::from_le_bytes(sector[454..458].try_into().unwrap()) as u64;
+        assert_eq!(first_lba * 512, ALIGN, "first partition at the 1 MiB align");
+
+        // And no GPT anywhere: no signature at LBA 1, and nothing reserved at
+        // the end of the disk.
+        let mut lba1 = vec![0u8; 512];
+        vhd.read_at(512, &mut lba1).unwrap();
+        assert_ne!(&lba1[0..8], b"EFI PART");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mbr_without_a_captured_active_flag_still_boots_something() {
+        // Pre-fidelity backups have no flag recorded. A table with nothing
+        // active cannot boot, so the first partition is marked instead —
+        // System Reserved on a Windows BIOS layout.
+        let path = build_mbr_backup(1, 0x07, false);
+        let reader = PhnxReader::open(&path).unwrap();
+        let mut vhd = SyntheticVhd::build(reader).unwrap();
+        let mut sector = vec![0u8; 512];
+        vhd.read_at(0, &mut sector).unwrap();
+        assert_eq!(sector[446], 0x80);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mbr_partition_data_is_served_after_the_single_leading_sector() {
+        // GPT reserves 34 sectors up front; MBR reserves one. The data must
+        // still land at the 1 MiB alignment either way.
+        let path = build_mbr_backup(1, 0x07, true);
+        let reader = PhnxReader::open(&path).unwrap();
+        let mut vhd = SyntheticVhd::build(reader).unwrap();
+        let mut buf = vec![0u8; 16];
+        vhd.read_at(ALIGN, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x5A), "partition payload");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

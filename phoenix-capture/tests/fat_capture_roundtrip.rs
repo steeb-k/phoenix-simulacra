@@ -152,6 +152,7 @@ fn fat16_capture_reproduces_used_clusters() {
         disk: DiskManifest {
             style: "mbr".into(),
             disk_guid: None,
+            disk_signature: None,
             sector_size: 512,
         },
         partitions: vec![PartitionManifest {
@@ -165,6 +166,8 @@ fn fat16_capture_reproduces_used_clusters() {
             bitlocker: None,
             unique_guid: None,
             gpt_attributes: None,
+            mbr_type: None,
+            mbr_bootable: None,
             chunks,
             bitmap_hash,
         }],
