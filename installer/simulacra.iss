@@ -57,9 +57,10 @@ OutputDir=..\dist
 OutputBaseFilename=Simulacra-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
-; Required by the `extractarchive` flag on the downloaded QEMU zip. Costs about
-; a megabyte of installer for the extraction support.
-ArchiveExtraction=enhanced
+; NOTE: deliberately NOT ArchiveExtraction=enhanced. Inno's own extraction
+; refused this payload outright ("Cannot get class object / The archive format
+; is unsupported") and rolled the install back. The zip is unpacked with the
+; inbox tar.exe instead -- see the [Run] entry.
 MinVersion=10.0
 ; The bundle ships only x64 + ARM64 binaries. x64compatible admits x64 and ARM64
 ; (ARM64 runs the x64/x86 setup under emulation) and excludes pure x86 machines.
@@ -102,15 +103,12 @@ Name: "desktopicon"; Description: "Create a &desktop icon"
 Source: "..\dist\simulacra\*.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Staged WinFsp MSI, extracted only when we're actually going to install it.
 Source: "build\winfsp.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: ShouldInstallWinFsp
-; QEMU goes in a PRIVATE subfolder, never Program Files\qemu: a QEMU the user
-; installs themselves must not be touched, overwritten or version-clashed with.
-; The app looks here first and the location is user-changeable in its UI.
-;
-; `external` because the zip is downloaded to {tmp} during the wizard rather
-; than compiled in; `extractarchive` unpacks it in place. Guarded by
-; ShouldExtractQemu so a failed or skipped download is simply absent rather
-; than a broken install.
-Source: "{tmp}\{#QemuZip}"; DestDir: "{app}\qemu"; Flags: external extractarchive recursesubdirs ignoreversion; Check: ShouldExtractQemu
+; The QEMU zip is downloaded to {tmp} during the wizard and unpacked by the
+; [Run] entry below; it needs no [Files] line of its own.
+
+[Dirs]
+; tar needs its destination to exist. Created before [Run] executes.
+Name: "{app}\qemu"; Check: ShouldExtractQemu
 
 [Icons]
 ; Two Start Menu entries side by side: normal + debug (console). Both target the
@@ -123,8 +121,19 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#LauncherExe}"; Tasks: deskt
 [Run]
 ; Silent WinFsp install (installer is already elevated).
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\winfsp.msi"" /qn /norestart"; StatusMsg: "Installing WinFsp..."; Flags: waituntilterminated; Check: ShouldInstallWinFsp
+; Unpack QEMU with the inbox tar.exe (bsdtar, shipped since Windows 10 1803 --
+; MinVersion=10.0 already requires newer). Inno's own archive extraction was
+; tried first and refused this zip outright, and tar is what the app itself
+; uses for the same payload, so both paths now unpack it identically.
+Filename: "{sys}\tar.exe"; Parameters: "-xf ""{tmp}\{#QemuZip}"" -C ""{app}\qemu"""; StatusMsg: "Installing QEMU..."; Flags: waituntilterminated runhidden; Check: ShouldExtractQemu
 ; Offer to launch after a normal (non-silent) install.
 Filename: "{app}\{#LauncherExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; tar lays these down, so Inno never logged them and would otherwise leave 223
+; MB behind on uninstall. Scoped to our own private qemu folder, which only
+; ever contains what we put there.
+Type: filesandordirs; Name: "{app}\qemu"
 
 [Registry]
 ; Marker so the uninstaller only offers "Remove WinFsp" when WE installed it
