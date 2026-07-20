@@ -161,10 +161,25 @@ impl RestorePlan {
         Ok(())
     }
 
+    /// Check every shrinking partition can actually be restored, and return
+    /// the shrink plans that proved it.
+    ///
+    /// For NTFS this runs the full pre-flight: it reads the source MFT out of
+    /// the backup and simulates the metadata rewrite, adjusting the
+    /// relocation plan where a record's run list would not fit. That work is
+    /// not thrown away — the returned [`ShrinkPlans`] is what
+    /// [`crate::restore::run_restore`] streams with, so the plan that was
+    /// validated is exactly the plan that runs.
+    ///
+    /// It is the slow part of planning a shrink (an MFT can be hundreds of
+    /// megabytes), so `progress` gets a running commentary. Callers on a UI
+    /// thread should run it off that thread.
     pub fn validate_extents_fit(
         &self,
         reader: &mut phoenix_core::container::PhnxReader,
-    ) -> Result<()> {
+        progress: Option<&phoenix_core::progress::ProgressHandle>,
+    ) -> Result<ShrinkPlans> {
+        let mut plans = ShrinkPlans::default();
         for entry in &self.entries {
             if !entry.restore {
                 continue;
@@ -193,20 +208,35 @@ impl RestorePlan {
 
             if matches!(idx_entry.fs_kind, FilesystemKind::Ntfs) {
                 let cluster_size = stream.bytes_per_cluster as u64;
-                match crate::relocation::build_relocation_map(
-                    &stream.extents,
+                let extents = stream.extents.clone();
+                let target = entry.target_size_bytes;
+                let original = idx_entry.original_size;
+                if let Some(p) = progress {
+                    p.set_detail(format!(
+                        "Checking partition {src} can shrink to {target} bytes"
+                    ));
+                }
+                // The pre-flight reads the source volume out of the backup,
+                // so it needs byte addressing over this partition's stream.
+                let mut source = PreflightSource(
+                    phoenix_core::partreader::PartitionByteReader::new(reader, &idx_entry)?,
+                );
+                let plan = crate::relocation::plan_shrink(
+                    &extents,
                     sector_size,
                     cluster_size,
-                    entry.target_size_bytes,
-                ) {
-                    Ok(_) => continue,
-                    Err(e) => {
-                        return Err(PhoenixError::Plan(format!(
-                            "NTFS partition {src} cannot be shrunk to {} bytes: {e}",
-                            entry.target_size_bytes
-                        )));
-                    }
-                }
+                    target,
+                    original,
+                    &mut source,
+                    progress,
+                )
+                .map_err(|e| {
+                    PhoenixError::Plan(format!(
+                        "NTFS partition {src} cannot be shrunk to {target} bytes: {e}"
+                    ))
+                })?;
+                plans.0.insert(src, plan);
+                continue;
             }
 
             let max_sector = entry.target_size_bytes / sector_size;
@@ -235,7 +265,37 @@ impl RestorePlan {
                 )));
             }
         }
-        Ok(())
+        Ok(plans)
+    }
+}
+
+/// The verified shrink plan for each source partition that shrinks, keyed by
+/// source partition index.
+///
+/// Restore builds these once during validation and streams with them, rather
+/// than rebuilding a map later: the pre-flight may have *adjusted* the
+/// relocation to make the MFT rewrite fit, and a rebuilt map would throw
+/// that adjustment away.
+#[derive(Debug, Default)]
+pub struct ShrinkPlans(pub std::collections::HashMap<u32, crate::relocation::ShrinkPlan>);
+
+impl ShrinkPlans {
+    /// Take the plan for `source_partition`, if it shrinks.
+    pub fn take(&mut self, source_partition: u32) -> Option<crate::relocation::ShrinkPlan> {
+        self.0.remove(&source_partition)
+    }
+}
+
+/// Adapts a `.phnx` partition reader to the pre-flight's read contract.
+///
+/// The pre-flight is written against volume bytes so the same code serves a
+/// clone (reading a live disk) and a restore (reading a backup); this is the
+/// restore side of that.
+struct PreflightSource<'a>(phoenix_core::partreader::PartitionByteReader<'a>);
+
+impl phoenix_capture::ntfs_preflight::VolumeRead for PreflightSource<'_> {
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.0.read_at(offset, buf)
     }
 }
 
