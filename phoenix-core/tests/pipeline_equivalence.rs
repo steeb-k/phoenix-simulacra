@@ -75,6 +75,8 @@ fn manifest_for(backup_id: Uuid, parts: Vec<PartitionManifest>) -> BackupManifes
         disk: DiskManifest {
             style: "gpt".into(),
             disk_guid: None,
+            disk_signature: None,
+            mbr_boot_code: None,
             sector_size: 512,
         },
         partitions: parts,
@@ -93,6 +95,8 @@ fn part_manifest(index: u32, chunks: Vec<ChunkRecord>, size: u64) -> PartitionMa
         bitlocker: None,
         unique_guid: None,
         gpt_attributes: None,
+        mbr_type: None,
+        mbr_bootable: None,
         chunks,
         bitmap_hash: None,
     }

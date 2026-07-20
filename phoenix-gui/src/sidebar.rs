@@ -13,6 +13,7 @@ pub enum Page {
     Restore,
     Verify,
     Mount,
+    Virtualize,
     BootRepair,
     History,
     About,
@@ -68,6 +69,13 @@ const TOP_ITEMS: &[NavItem] = &[
         accel: 'M',
     },
     NavItem {
+        page: Page::Virtualize,
+        label: "Virtualize",
+        icon: egui_phosphor::regular::MONITOR,
+        key: Key::Z,
+        accel: 'z',
+    },
+    NavItem {
         page: Page::BootRepair,
         label: "Boot Repair",
         icon: egui_phosphor::regular::WRENCH,
@@ -75,6 +83,25 @@ const TOP_ITEMS: &[NavItem] = &[
         accel: 'o',
     },
 ];
+
+/// Whether a page exists in this build. Virtualization is hidden twice over.
+///
+/// It is x86_64-only: Windows-on-ARM QEMU has no useful acceleration for the
+/// x86 guests our backups mostly are (TCG emulation only), and ARM-Windows
+/// machines vary too much in guest-visible hardware for a booted backup to be
+/// a good bet — so ARM builds hide the page rather than ship a trap.
+///
+/// It is also absent from portable builds. Booting a backup needs an
+/// installed WinFsp to serve the disk and an installed QEMU to run it;
+/// neither is something a portable copy can assume or provide, and the whole
+/// point of the portable build is that it installs nothing. A page that
+/// could only ever report missing prerequisites is worse than no page.
+pub fn page_available(page: Page, portable: bool) -> bool {
+    match page {
+        Page::Virtualize => cfg!(target_arch = "x86_64") && !portable,
+        _ => true,
+    }
+}
 
 const BOTTOM_ITEMS: &[NavItem] = &[
     NavItem {
@@ -93,12 +120,15 @@ const BOTTOM_ITEMS: &[NavItem] = &[
     },
 ];
 
-const SIDEBAR_WIDTH: f32 = 220.0;
+// Sized so the full sidebar (brand + 7 nav rows + pinned bottom block) fits
+// the default 720px window without the middle section scrolling — the brand
+// is deliberately compact-but-prominent rather than poster-sized.
+const SIDEBAR_WIDTH: f32 = 190.0;
 const ROW_HEIGHT: f32 = 40.0;
 /// Display width of the sidebar phoenix image. Source `phoenix-sidebar.png` is
 /// 1024×976, so the height follows via [`LOGO_ASPECT`] rather than forcing a
 /// square (which would squash the art).
-const LOGO_WIDTH: f32 = 192.0;
+const LOGO_WIDTH: f32 = 136.0;
 /// height / width of `phoenix-sidebar.png` (1024×976).
 const LOGO_ASPECT: f32 = 976.0 / 1024.0;
 /// Gap between the phoenix image and the "Simulacra" wordmark below it.
@@ -107,10 +137,10 @@ const BRAND_WORDMARK_GAP: f32 = 6.0;
 /// to size the OS window's minimum height (see [`min_content_height`]); the
 /// brand panel itself sizes to the real glyph height, so this only needs to be
 /// close.
-const WORDMARK_HEIGHT_EST: f32 = 48.0;
+const WORDMARK_HEIGHT_EST: f32 = 40.0;
 const SIDEBAR_H_PAD: f32 = 12.0;
-const BRAND_TOP_PAD: f32 = 18.0;
-const BRAND_BOTTOM_PAD: f32 = 18.0;
+const BRAND_TOP_PAD: f32 = 14.0;
+const BRAND_BOTTOM_PAD: f32 = 12.0;
 /// Trailing space inside `draw_brand` between the wordmark and the panel edge.
 const BRAND_IMAGE_TRAILER: f32 = 6.0;
 const BOTTOM_NAV_TOP_PAD: f32 = 8.0;
@@ -175,6 +205,8 @@ pub fn show(
     palette: &Palette,
     busy: bool,
     theme: &mut ThemeChoice,
+    // See [`page_available`] — hides pages this build cannot offer.
+    portable: bool,
 ) -> SidebarOutput {
     // Alt+<first letter> jumps straight to a page. Consumed here (before any
     // widget sees the key) but only while navigation is allowed, mirroring
@@ -182,6 +214,9 @@ pub fn show(
     // modifier held, so Ctrl+Alt combos (e.g. AltGr input) pass through.
     if !busy {
         for item in TOP_ITEMS.iter().chain(BOTTOM_ITEMS) {
+            if !page_available(item.page, portable) {
+                continue;
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, item.key)) {
                 *current = item.page;
             }
@@ -248,6 +283,9 @@ pub fn show(
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for item in TOP_ITEMS {
+                                    if !page_available(item.page, portable) {
+                                        continue;
+                                    }
                                     nav_row(ui, item, current, palette);
                                 }
                             });

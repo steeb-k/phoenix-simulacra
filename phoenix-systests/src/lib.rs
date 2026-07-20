@@ -174,6 +174,31 @@ impl TestVhd {
         diskpart_layout(self.disk_index, true, parts)
     }
 
+    /// Lay out the disk as **MBR** instead of GPT.
+    ///
+    /// diskpart stamps a fresh NT disk signature and sets the active flag on
+    /// the first primary, so the resulting disk carries real MBR identity —
+    /// which is exactly what an MBR capture has to preserve.
+    pub fn init_mbr_with(&self, parts: &[PartSpec]) -> Result<()> {
+        diskpart_layout(self.disk_index, false, parts)
+    }
+
+    /// Mark a primary partition **active** (1-based, as diskpart numbers
+    /// them).
+    ///
+    /// Separate from [`TestVhd::init_mbr_with`] because diskpart does not set
+    /// the flag when it creates partitions — a freshly laid out MBR disk has
+    /// nothing active, and would not boot. A real Windows BIOS install sets it
+    /// on System Reserved, so a fixture that means to model one has to say so.
+    pub fn set_mbr_active(&self, partition_number: u32) -> Result<()> {
+        run_diskpart(&format!(
+            "select disk {}\nselect partition {partition_number}\nactive\n",
+            self.disk_index
+        ))
+        .context("diskpart set active")?;
+        Ok(())
+    }
+
     /// As [`TestVhd::init_gpt_with`], but formats with an explicit
     /// allocation-unit size (e.g. 65536 for 64K clusters) instead of the
     /// filesystem default.
@@ -772,6 +797,21 @@ pub fn powershell(script: &str) -> Result<String> {
             "-Command",
             script,
         ])
+        // Windows PowerShell must not inherit PowerShell 7's module path.
+        //
+        // Launch the suite from `pwsh` — as the staged runner does — and this
+        // child inherits a PSModulePath whose PS7 directories come FIRST. 5.1
+        // then finds two copies of a shipped module, tries to load 7's, and
+        // fails on conflicting type data ("The member AuditToString is already
+        // present"). Every cmdlet in that module then reports itself as "found
+        // ... but the module could not be loaded" — which is how the BitLocker
+        // tests failed, with an error naming ConvertTo-SecureString and
+        // nothing to do with BitLocker.
+        //
+        // Set the canonical 5.1 pair rather than filtering what we inherited,
+        // so the child gets the same module path however the suite was
+        // started.
+        .env("PSModulePath", windows_powershell_module_path())
         .output()
         .context("spawning powershell")?;
     if !out.status.success() {
@@ -781,6 +821,20 @@ pub fn powershell(script: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Windows PowerShell 5.1's own module path: the system modules that ship with
+/// it, plus the all-users directory for anything installed for it.
+///
+/// Note `WindowsPowerShell` throughout — `Program Files\PowerShell\Modules`
+/// (no "Windows") is PowerShell 7's, and is exactly what must not be here.
+fn windows_powershell_module_path() -> String {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    format!(
+        r"{system_root}\system32\WindowsPowerShell\v1.0\Modules;{program_files}\WindowsPowerShell\Modules"
+    )
 }
 
 /// Scratch directory for VHDs and scripts (under the system temp dir).
@@ -975,15 +1029,28 @@ impl AttachedRw {
     /// a differencing chain (the child) writable and any parent(s) read-only —
     /// exactly the copy-on-write guarantee.
     pub fn attach(vhdx_path: &Path) -> Result<Self> {
+        Self::attach_with_letters(vhdx_path, true)
+    }
+
+    /// As [`AttachedRw::attach`], but with `ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER`:
+    /// the disk attaches read-write but the mount manager assigns no letters.
+    /// The VM write-path spike uses this so the host never surfaces the guest's
+    /// volumes (pair it with [`set_disk_offline`] before touching the raw device).
+    pub fn attach_no_letters(vhdx_path: &Path) -> Result<Self> {
+        Self::attach_with_letters(vhdx_path, false)
+    }
+
+    fn attach_with_letters(vhdx_path: &Path, letters: bool) -> Result<Self> {
         use std::os::windows::ffi::OsStrExt;
 
         use windows_sys::core::GUID;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::Vhd::{
             AttachVirtualDisk, OpenVirtualDisk, ATTACH_VIRTUAL_DISK_FLAG_NONE,
-            ATTACH_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_FLAG_NONE,
-            OPEN_VIRTUAL_DISK_PARAMETERS, VIRTUAL_DISK_ACCESS_ATTACH_RW,
-            VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, ATTACH_VIRTUAL_DISK_PARAMETERS,
+            OPEN_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_PARAMETERS,
+            VIRTUAL_DISK_ACCESS_ATTACH_RW, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_STORAGE_TYPE,
+            VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
         };
 
         const VENDOR_MICROSOFT: GUID = GUID {
@@ -1020,8 +1087,12 @@ impl AttachedRw {
             );
         }
 
-        // Read-WRITE attach (no READ_ONLY flag), auto drive letters (no
-        // NO_DRIVE_LETTER flag).
+        // Read-WRITE attach (no READ_ONLY flag); drive letters per `letters`.
+        let flags = if letters {
+            ATTACH_VIRTUAL_DISK_FLAG_NONE
+        } else {
+            ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER
+        };
         let attach = ATTACH_VIRTUAL_DISK_PARAMETERS {
             Version: 1, // ATTACH_VIRTUAL_DISK_VERSION_1
             Anonymous: unsafe { std::mem::zeroed() },
@@ -1030,7 +1101,7 @@ impl AttachedRw {
             AttachVirtualDisk(
                 handle,
                 std::ptr::null_mut(),
-                ATTACH_VIRTUAL_DISK_FLAG_NONE,
+                flags,
                 0,
                 &attach,
                 std::ptr::null_mut(),
@@ -1074,6 +1145,59 @@ impl Drop for AttachedRw {
             unsafe { CloseHandle(self.handle) };
         }
     }
+}
+
+/// Force `\\.\PhysicalDrive{drive_number}` OFFLINE (non-persistent). An offline
+/// disk has no mounted volumes, which both keeps the host's filesystem stack off
+/// the guest's disk and lifts the raw-sector write protection Windows applies
+/// over mounted-volume extents — the state a VM's raw passthrough needs.
+pub fn set_disk_offline(drive_number: u32) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Ioctl::{
+        DISK_ATTRIBUTE_OFFLINE, IOCTL_DISK_SET_DISK_ATTRIBUTES, SET_DISK_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let path = format!(r"\\.\PhysicalDrive{drive_number}");
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+        .open(&path)
+        .with_context(|| format!("open {path} to set it offline"))?;
+
+    // SAFETY: all-zero is valid for this POD struct; we then set the header and
+    // the offline attribute + mask. Persist=0 keeps the change attach-scoped.
+    let mut attrs: SET_DISK_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    attrs.Version = std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32;
+    attrs.Attributes = DISK_ATTRIBUTE_OFFLINE as u64;
+    attrs.AttributesMask = DISK_ATTRIBUTE_OFFLINE as u64;
+
+    let mut returned = 0u32;
+    // SAFETY: the handle is open, the in-buffer outlives the call, out-buffer is
+    // unused for this IOCTL, and `returned` receives the (zero) out length.
+    let ok = unsafe {
+        DeviceIoControl(
+            disk.as_raw_handle() as _,
+            IOCTL_DISK_SET_DISK_ATTRIBUTES,
+            (&attrs as *const SET_DISK_ATTRIBUTES).cast(),
+            std::mem::size_of::<SET_DISK_ATTRIBUTES>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        bail!(
+            "IOCTL_DISK_SET_DISK_ATTRIBUTES(offline) failed for {path} \
+             (os error {})",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }
 
 /// Clean up any leaked VHDs from a previous crashed run: detach every attached

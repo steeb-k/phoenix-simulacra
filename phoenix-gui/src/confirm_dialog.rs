@@ -20,6 +20,8 @@ pub enum ConfirmAction {
     None,
     Confirm,
     Cancel,
+    /// The optional third button (`extra_label`) was clicked.
+    Extra,
 }
 
 /// An optional acknowledgement checkbox rendered above the buttons. When
@@ -54,6 +56,10 @@ pub struct ConfirmView<'a> {
     pub hazard_tape: bool,
     /// Optional acknowledgement checkbox gating the Confirm button.
     pub ack: Option<ConfirmAck<'a>>,
+    /// Optional third button, rendered at the left edge of the button row
+    /// (plain styling — the primary choice stays `confirm_label`). Yields
+    /// [`ConfirmAction::Extra`]. Escape still maps to Cancel only.
+    pub extra_label: Option<&'a str>,
 }
 
 const DIALOG_WIDTH: f32 = 460.0;
@@ -162,9 +168,22 @@ pub fn show(ctx: &egui::Context, palette: &Palette, view: &mut ConfirmView<'_>) 
         ui.horizontal(|ui| {
             // Right-align the button pair: Cancel then Confirm, so the
             // destructive action sits at the far (default-reach) edge but
-            // still needs a deliberate click.
+            // still needs a deliberate click. The optional Extra button sits
+            // at the left edge, visually apart from the pair.
             let button = egui::vec2(150.0, 38.0);
             let spacing = ui.spacing().item_spacing.x;
+
+            if let Some(label) = view.extra_label {
+                let extra = ui.add_sized(
+                    [130.0, button.y],
+                    egui::Button::new(RichText::new(label).color(palette.icon_color))
+                        .fill(ui.visuals().widgets.inactive.bg_fill),
+                );
+                if extra.clicked() {
+                    *action = ConfirmAction::Extra;
+                }
+            }
+
             let pair_width = button.x * 2.0 + spacing;
             let pad = (ui.available_width() - pair_width).max(0.0);
             ui.add_space(pad);

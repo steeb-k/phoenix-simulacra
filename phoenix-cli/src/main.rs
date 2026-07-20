@@ -158,9 +158,88 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         full: bool,
     },
+    /// Boot a backup as a QEMU virtual machine, or manage VM sessions. Guest
+    /// writes go to a kept, resumable overlay; the backing .phnx is immutable.
+    Vm {
+        #[command(subcommand)]
+        command: VmCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmCommands {
+    /// Boot a backup as a VM (foreground; close the VM window to end). Creates
+    /// a session on first boot and resumes it on later boots.
+    Boot {
+        backup: PathBuf,
+        /// Write overlay: `qcow2` (default; QEMU-native, no VHD attach) or
+        /// `avhdx` (EXPERIMENTAL raw passthrough — boots, but teardown can hang
+        /// in the storage driver; see docs/VIRTUALIZATION.md).
+        #[arg(long, default_value = "qcow2")]
+        write: String,
+        /// Guest RAM in MiB.
+        #[arg(long, default_value_t = 6144)]
+        mem: u64,
+        /// Guest vCPUs.
+        #[arg(long, default_value_t = 4)]
+        cpus: u32,
+        /// Boot with the guest's network cable plugged in. Off by default: a
+        /// connected Windows guest gets a display driver pushed by Windows
+        /// Update that blanks the screen on the next reboot. The NIC is
+        /// always present either way — this is link state, and the GUI can
+        /// plug it in later without a reboot.
+        #[arg(long, default_value_t = false)]
+        network: bool,
+        /// Directory of the QEMU install (else PATH / default locations).
+        #[arg(long)]
+        qemu_dir: Option<PathBuf>,
+        /// Working root for the VM's overlay + serve scratch. Default: a
+        /// `PhoenixSimulacra` folder on the SAME drive as the backup, so
+        /// nothing lands on the host OS drive.
+        #[arg(long)]
+        vm_dir: Option<PathBuf>,
+        /// Discard the kept overlay and start from a clean first boot (recover
+        /// a session that won't boot). Keeps the session identity.
+        #[arg(long, default_value_t = false)]
+        fresh: bool,
+        /// Attach an ISO as a CD-ROM (e.g. a WinPE / rescue environment).
+        #[arg(long)]
+        iso: Option<PathBuf>,
+        /// Attach a guest-tools / driver ISO (e.g. virtio-win) as a second,
+        /// never-booted CD-ROM.
+        #[arg(long)]
+        drivers_iso: Option<PathBuf>,
+        /// Share a folder next to the image with the guest over the host's SMB
+        /// server (prints the `net use` command to run inside the guest).
+        #[arg(long, default_value_t = false)]
+        share: bool,
+        /// Boot from the `--iso` this launch instead of the disk (one-shot: the
+        /// next boot without this flag boots the disk normally).
+        #[arg(long, default_value_t = false)]
+        boot_iso: bool,
+    },
+    /// Gracefully power down a running VM (ACPI), instead of killing it.
+    Stop { backup: PathBuf },
+    /// List saved VM sessions.
+    List,
+    /// Delete a backup's VM session (overlay + firmware; the .phnx is untouched).
+    Discard { backup: PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
+    // If we were re-exec'd as an out-of-process WinFsp serve helper for a VM
+    // boot, run that and exit — before any argument parsing, so the sentinel
+    // isn't rejected by clap. (VM detach deadlocks against an in-process serve;
+    // see phoenix_vm::serve_helper.)
+    let raw_args: Vec<String> = std::env::args().collect();
+    if let Some(res) = phoenix_vm::serve_helper::maybe_run(&raw_args) {
+        if let Err(e) = res {
+            eprintln!("vm serve helper failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Match the GUI's default filter so a user running the CLI also sees
     // capture/restore progress events without having to set `RUST_LOG`.
     // The catch-all `warn` keeps third-party libs quiet.
@@ -283,6 +362,7 @@ fn main() -> anyhow::Result<()> {
         } => cmd_boot_repair(disk, partition, apply, yes)?,
         Commands::Mount { backup, partitions } => cmd_mount(&backup, partitions.as_deref())?,
         Commands::Inspect { backup, full } => cmd_inspect(&backup, full)?,
+        Commands::Vm { command } => cmd_vm(command)?,
     }
     Ok(())
 }
@@ -317,6 +397,231 @@ fn cmd_mount(backup: &std::path::Path, partitions: Option<&[u32]>) -> anyhow::Re
     std::io::stdin().read_line(&mut line).ok();
     drop(session);
     println!("Unmounted.");
+    Ok(())
+}
+
+fn cmd_vm(command: VmCommands) -> anyhow::Result<()> {
+    use phoenix_vm::{HostOptions, Qemu, SessionManager, WriteLayer};
+
+    match command {
+        VmCommands::Boot {
+            backup,
+            write,
+            mem,
+            cpus,
+            network,
+            qemu_dir,
+            vm_dir,
+            fresh,
+            iso,
+            boot_iso,
+            drivers_iso,
+            share,
+        } => {
+            let write_layer = match write.to_ascii_lowercase().as_str() {
+                "avhdx" => {
+                    eprintln!(
+                        "warning: --write avhdx is EXPERIMENTAL. The guest boots, but detaching \
+                         the overlay at shutdown can hang in the Windows storage driver \
+                         (leaving a stuck attach). Use the default qcow2 unless you are \
+                         specifically testing this path."
+                    );
+                    WriteLayer::Avhdx
+                }
+                "qcow2" => WriteLayer::Qcow2,
+                other => anyhow::bail!("unknown --write value {other:?} (use qcow2 or avhdx)"),
+            };
+            let qemu = Qemu::discover(qemu_dir.as_deref())?;
+            println!("Using QEMU: {} ({})", qemu.system.display(), qemu.version);
+
+            // Say up front when the guest will run in software emulation.
+            // QEMU falls back on its own, but silently — the user would just
+            // experience "this is unusably slow" with no idea it is fixable.
+            let accel_status = phoenix_vm::accel::probe();
+            match accel_status.blocker() {
+                None => println!("Acceleration: WHPX (hardware)"),
+                Some(b) => {
+                    println!();
+                    println!("WARNING: {} — the guest will run in software", b.headline());
+                    println!("  emulation (TCG), which is drastically slower for Windows.");
+                    println!("  {}", b.remedy());
+                    println!();
+                }
+            }
+
+            let host = HostOptions {
+                memory_mib: mem,
+                // Ask for what actually works, so qemu.log isn't muddied with
+                // a WHPX failure on every launch of a machine that can't use it.
+                accel: if accel_status.is_accelerated() {
+                    phoenix_vm::Accel::Whpx
+                } else {
+                    phoenix_vm::Accel::Tcg
+                },
+                smp: cpus,
+                network,
+                // Cap the guest display so the QEMU window (chrome included)
+                // fits the monitor — PE otherwise picks a huge video mode.
+                max_resolution: phoenix_vm::usable_guest_resolution(),
+                // Clipboard sharing only where this build supports it (11.1+).
+                clipboard_agent: qemu.gtk_clipboard,
+                ..HostOptions::default()
+            };
+            // Everything (session overlay + serve scratch) stays on the image's
+            // drive by default, so a backup on D: never fills the OS drive.
+            let vm_root = vm_dir.unwrap_or_else(|| phoenix_vm::vm_root_for_backup(&backup));
+            let sessions = SessionManager::new(vm_root.join("vm-sessions"));
+            let scratch = vm_root.join("vm-serve");
+            println!("VM working dir: {}", vm_root.display());
+            // Session-aware sweep: reclaims stale serve junctions under
+            // vm-serve, never touches kept overlays under vm-sessions.
+            phoenix_vm::sweep_serve_scratch(&vm_root);
+
+            println!("Booting {} — close the VM window to end.", backup.display());
+            #[cfg(feature = "winfsp")]
+            {
+                if let Some(iso) = &iso {
+                    anyhow::ensure!(iso.exists(), "ISO not found: {}", iso.display());
+                }
+                if let Some(iso) = &drivers_iso {
+                    anyhow::ensure!(iso.exists(), "drivers ISO not found: {}", iso.display());
+                }
+                // The helper disk rides along on every boot, share or not: it
+                // also carries InstallGuestDrivers.cmd, which matters most
+                // when the guest has no network to fetch anything with.
+                let img = vm_root.join("share-helper.img");
+                let mut helper_disk = None;
+                match phoenix_vm::share::build_helper_disk(&img) {
+                    Ok(()) => helper_disk = Some(img),
+                    Err(e) => eprintln!("warning: helper disk build failed: {e:#}"),
+                }
+                if share {
+                    let dir = phoenix_vm::share::share_dir_for_backup(&backup);
+                    phoenix_vm::share::ensure_share(&dir)?;
+                    println!("Sharing {} with the guest.", dir.display());
+                    println!(
+                        "In the guest: open the VMSCRIPTS drive and run MapShare.cmd, or run:  {}",
+                        phoenix_vm::share::guest_mount_command()
+                    );
+                }
+                let outcome = phoenix_vm::boot::boot(
+                    &backup,
+                    &host,
+                    write_layer,
+                    fresh,
+                    iso.as_deref(),
+                    boot_iso,
+                    drivers_iso.as_deref(),
+                    helper_disk.as_deref(),
+                    &qemu,
+                    &sessions,
+                    &scratch,
+                );
+                // The share exists for the guest; drop it even when the boot
+                // errored (the folder and its contents stay).
+                if share {
+                    phoenix_vm::share::remove_share();
+                }
+                let outcome = outcome?;
+                if outcome.resumed {
+                    println!(
+                        "Resumed existing session{}.",
+                        if outcome.resumed_dirty {
+                            " (was left DIRTY by a prior crash — use --fresh if it won't boot)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                println!(
+                    "VM exited ({}). Session overlay holds {:.1} GB of guest writes; backup {}.",
+                    if outcome.exit_ok { "clean" } else { "non-zero" },
+                    outcome.overlay_bytes as f64 / 1e9,
+                    if outcome.backup_intact {
+                        "still verifies"
+                    } else {
+                        "FAILED verification"
+                    }
+                );
+                // QEMU's output goes to the session's qemu.log now (not the
+                // console) — quote it when the exit was an error.
+                if let Some(tail) = outcome.qemu_log_tail.as_deref().filter(|t| !t.is_empty()) {
+                    eprintln!("QEMU output:\n{tail}");
+                }
+            }
+            #[cfg(not(feature = "winfsp"))]
+            {
+                let _ = (
+                    &host,
+                    write_layer,
+                    fresh,
+                    &iso,
+                    boot_iso,
+                    &drivers_iso,
+                    share,
+                    &qemu,
+                    &sessions,
+                    &scratch,
+                );
+                anyhow::bail!(
+                    "this build lacks the `winfsp` feature required to boot a VM; \
+                     rebuild with --features winfsp"
+                );
+            }
+        }
+        VmCommands::Stop { backup } => {
+            let reader = phoenix_core::container::PhnxReader::open(&backup)?;
+            let id = reader.header.backup_id;
+            drop(reader);
+            let session = SessionManager::for_backup(&backup).open_or_create(
+                id,
+                &backup,
+                WriteLayer::Qcow2,
+                phoenix_vm::now_rfc3339(),
+            )?;
+            let port_file = session.qmp_port_file();
+            let port: u16 = std::fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no running VM for {} (no QMP port recorded)",
+                        backup.display()
+                    )
+                })?;
+            phoenix_vm::qmp::system_powerdown(port)?;
+            println!("Sent ACPI power-down to the VM; it will shut down gracefully.");
+        }
+        VmCommands::List => {
+            // Sessions live on their image's drive, so scan every volume.
+            let list = SessionManager::list_all();
+            if list.is_empty() {
+                println!("No VM sessions.");
+            } else {
+                for m in list {
+                    println!(
+                        "{}  {:>5}  {}  booted={}  {}",
+                        m.backup_id,
+                        match m.write_layer {
+                            WriteLayer::Avhdx => "avhdx",
+                            WriteLayer::Qcow2 => "qcow2",
+                        },
+                        m.backup_path,
+                        m.last_booted_at.as_deref().unwrap_or("never"),
+                        if m.clean_shutdown { "clean" } else { "DIRTY" },
+                    );
+                }
+            }
+        }
+        VmCommands::Discard { backup } => {
+            let reader = phoenix_core::container::PhnxReader::open(&backup)?;
+            let id = reader.header.backup_id;
+            drop(reader);
+            // The session lives on the backup's own drive.
+            SessionManager::for_backup(&backup).discard(&id)?;
+            println!("Discarded VM session for {}.", backup.display());
+        }
+    }
     Ok(())
 }
 

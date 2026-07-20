@@ -21,6 +21,25 @@
 ; Used by the uninstaller's opt-in "Remove WinFsp".
 #define WinFspProductCode "{C79D9B29-3AF0-45B3-9DB9-226F3C2D2204}"
 
+; Curated QEMU payload (see scripts/build-qemu-payload.ps1). DOWNLOADED at
+; install time rather than embedded: it is 84 MB, most installs are updates
+; delivered by the auto-updater, and QEMU changes far more rarely than the app
+; does -- so carrying it in every installer would spend that on nearly every
+; update for a payload that almost never changed. Skipping it is not fatal: the
+; app's Virtualize page offers the same download later.
+;
+; The version must be QEMU 11.1+ or host<->guest clipboard silently disappears,
+; and Windows build numbers do not track upstream tags -- this build reports
+; 11.0.50 and IS the 11.1 development tree. Keep in step with the pin in
+; phoenix-gui/src/qemu_payload.rs. See docs/VIRTUALIZATION.md.
+#define QemuVersion "11.0.50"
+#define QemuZip "qemu-x86_64-11.0.50-20260501-win64.zip"
+; Hosted in the separate deps repo, not the binaries repo: an asset there would
+; sit alongside app releases and read as one, and the in-app updater reads that
+; repo's "latest release".
+#define QemuUrl "https://github.com/steeb-k/phoenix-simulacra-deps/releases/download/qemu-payload-11.0.50/qemu-x86_64-11.0.50-20260501-win64.zip"
+#define QemuSha256 "c86f19d18e0b479922ea01f2a6eb91952de5ccc543960d318f4ddadf13590c8c"
+
 [Setup]
 ; A stable AppId is what ties upgrades and uninstall together across releases;
 ; never change it once shipped.
@@ -38,6 +57,10 @@ OutputDir=..\dist
 OutputBaseFilename=Simulacra-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
+; NOTE: deliberately NOT ArchiveExtraction=enhanced. Inno's own extraction
+; refused this payload outright ("Cannot get class object / The archive format
+; is unsupported") and rolled the install back. The zip is unpacked with the
+; inbox tar.exe instead -- see the [Run] entry.
 MinVersion=10.0
 ; The bundle ships only x64 + ARM64 binaries. x64compatible admits x64 and ARM64
 ; (ARM64 runs the x64/x86 setup under emulation) and excludes pure x86 machines.
@@ -69,15 +92,23 @@ WizardSmallImageFileDynamicDark=..\assets\phoenix-appicon-128px.png
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-; Both default-checked (no "unchecked" flag). The WinFsp task only appears when
-; WinFsp isn't already installed.
+; All default-checked (no "unchecked" flag). The WinFsp task only appears when
+; WinFsp isn't already installed; the QEMU task is always offered because it
+; installs privately and so never conflicts with a QEMU the user already has.
 Name: "winfsp"; Description: "Install WinFsp (*RECOMMENDED* - Required for mounting backups)"; Check: IsWinFspMissing
+Name: "qemu"; Description: "Download and install QEMU (*RECOMMENDED* - Required for booting backups as VMs, 84 MB download)"; Check: IsQemuSupported
 Name: "desktopicon"; Description: "Create a &desktop icon"
 
 [Files]
 Source: "..\dist\simulacra\*.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Staged WinFsp MSI, extracted only when we're actually going to install it.
 Source: "build\winfsp.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: ShouldInstallWinFsp
+; The QEMU zip is downloaded to {tmp} during the wizard and unpacked by the
+; [Run] entry below; it needs no [Files] line of its own.
+
+[Dirs]
+; tar needs its destination to exist. Created before [Run] executes.
+Name: "{app}\qemu"; Check: ShouldExtractQemu
 
 [Icons]
 ; Two Start Menu entries side by side: normal + debug (console). Both target the
@@ -90,8 +121,19 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#LauncherExe}"; Tasks: deskt
 [Run]
 ; Silent WinFsp install (installer is already elevated).
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\winfsp.msi"" /qn /norestart"; StatusMsg: "Installing WinFsp..."; Flags: waituntilterminated; Check: ShouldInstallWinFsp
+; Unpack QEMU with the inbox tar.exe (bsdtar, shipped since Windows 10 1803 --
+; MinVersion=10.0 already requires newer). Inno's own archive extraction was
+; tried first and refused this zip outright, and tar is what the app itself
+; uses for the same payload, so both paths now unpack it identically.
+Filename: "{sys}\tar.exe"; Parameters: "-xf ""{tmp}\{#QemuZip}"" -C ""{app}\qemu"""; StatusMsg: "Installing QEMU..."; Flags: waituntilterminated runhidden; Check: ShouldExtractQemu
 ; Offer to launch after a normal (non-silent) install.
 Filename: "{app}\{#LauncherExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; tar lays these down, so Inno never logged them and would otherwise leave 223
+; MB behind on uninstall. Scoped to our own private qemu folder, which only
+; ever contains what we put there.
+Type: filesandordirs; Name: "{app}\qemu"
 
 [Registry]
 ; Marker so the uninstaller only offers "Remove WinFsp" when WE installed it
@@ -103,6 +145,10 @@ Root: HKLM; Subkey: "Software\Phoenix Simulacra"; ValueType: dword; ValueName: "
 var
   GRemoveSettings: Boolean;
   GRemoveWinFsp: Boolean;
+  { The QEMU zip actually landed in the temp folder and matched its hash.
+    Only then is there anything to extract. }
+  GQemuDownloaded: Boolean;
+  QemuDownloadPage: TDownloadWizardPage;
 
 { True when neither the ARM64-style key (HKLM64 SOFTWARE\WinFsp) nor the
   x64-style key (HKLM32 SOFTWARE\WinFsp == HKLM SOFTWARE\WOW6432Node\WinFsp)
@@ -114,6 +160,72 @@ begin
   Result := not (
     RegQueryStringValue(HKLM64, 'SOFTWARE\WinFsp', 'InstallDir', S) or
     RegQueryStringValue(HKLM32, 'SOFTWARE\WinFsp', 'InstallDir', S));
+end;
+
+{ The VM feature is x86_64-only -- ARM64 QEMU has no useful acceleration for
+  x86 guests, so the app hides the Virtualize page there entirely. Offering a
+  download that could never be used would be worse than not offering it. }
+function IsQemuSupported(): Boolean;
+begin
+  Result := not IsArm64;
+end;
+
+{ The user asked for QEMU and this machine can use it. }
+function ShouldDownloadQemu(): Boolean;
+begin
+  Result := IsQemuSupported() and WizardIsTaskSelected('qemu');
+end;
+
+{ ...and the download actually succeeded. Kept separate so a failed download
+  skips the extraction instead of failing the whole install. }
+function ShouldExtractQemu(): Boolean;
+begin
+  Result := GQemuDownloaded;
+end;
+
+procedure InitializeWizard();
+begin
+  QemuDownloadPage := CreateDownloadPage(
+    'Downloading QEMU',
+    'Simulacra is fetching QEMU, needed to boot backups as virtual machines.',
+    nil);
+  QemuDownloadPage.ShowBaseNameInsteadOfUrl := True;
+end;
+
+{ Fetch the payload between the Ready page and the install. DownloadPage.Add
+  verifies the SHA-256 itself, so a truncated or substituted file fails here
+  rather than producing a broken QEMU.
+
+  A failure is deliberately NOT fatal. An offline or firewalled machine should
+  still get the app; the Virtualize page offers the same download later, which
+  is also the path for anyone who unticks the task. }
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = wpReady) and ShouldDownloadQemu() then begin
+    QemuDownloadPage.Clear;
+    QemuDownloadPage.Add('{#QemuUrl}', '{#QemuZip}', '{#QemuSha256}');
+    QemuDownloadPage.Show;
+    try
+      try
+        QemuDownloadPage.Download;
+        GQemuDownloaded := True;
+      except
+        GQemuDownloaded := False;
+        if QemuDownloadPage.AbortedByUser then
+          Log('QEMU download aborted by user; the app can fetch it later.')
+        else
+          SuppressibleMsgBox(
+            'QEMU could not be downloaded:' + #13#10#13#10 +
+            AddPeriod(GetExceptionMessage) + #13#10#13#10 +
+            'Setup will continue without it. You can download QEMU later from ' +
+            'the Virtualize page in Phoenix Simulacra.',
+            mbInformation, MB_OK, IDOK);
+      end;
+    finally
+      QemuDownloadPage.Hide;
+    end;
+  end;
 end;
 
 { Install WinFsp only if the user kept the task AND it isn't already present. }

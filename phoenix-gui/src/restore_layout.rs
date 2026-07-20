@@ -117,6 +117,22 @@ pub fn backup_to_disk_info(reader: &PhnxReader) -> DiskInfo {
             name: e.name.clone(),
             type_guid: e.type_guid,
             gpt_attributes: 0,
+            // Carried through from the manifest so the layout editor shows
+            // an MBR backup's real partition types rather than zeroes.
+            mbr_type: reader
+                .manifest
+                .partitions
+                .iter()
+                .find(|p| p.index == e.index)
+                .and_then(|p| p.mbr_type)
+                .unwrap_or(0),
+            mbr_bootable: reader
+                .manifest
+                .partitions
+                .iter()
+                .find(|p| p.index == e.index)
+                .and_then(|p| p.mbr_bootable)
+                .unwrap_or(false),
             offset_bytes: offset,
             size_bytes: e.original_size,
             fs_kind: fs_kind_for_entry(reader, e),

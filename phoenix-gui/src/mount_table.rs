@@ -280,6 +280,7 @@ fn card(
             egui_phosphor::regular::FOLDER_OPEN,
             "Explore",
             palette.accent,
+            true,
             palette,
         ) {
             action = Some(MountAction::Explore(letter));
@@ -310,6 +311,7 @@ fn card(
         egui_phosphor::regular::EJECT,
         "Unmount",
         palette.danger,
+        true,
         palette,
     ) {
         action = Some(MountAction::Unmount(index));
@@ -331,6 +333,7 @@ fn card(
         egui_phosphor::regular::PENCIL_SIMPLE,
         "Enable Write",
         palette.warning,
+        true,
         palette,
     ) {
         action = Some(MountAction::EnableWrite(index));
@@ -369,49 +372,59 @@ fn writable_chip(ui: &mut Ui, rect: Rect, index: usize, palette: &Palette) {
 /// A card-local button: a raised chip against the card fill that tints toward
 /// `hover_tint` on hover (accent for Explore, danger for Unmount). Painted by
 /// hand so it can live at an arbitrary rect inside the card without disturbing
-/// the layout cursor.
-fn table_button(
+/// the layout cursor. With `enabled` false it paints faded and inert (the
+/// sessions table greys its buttons while a VM runs). Shared with the
+/// Virtualize page's saved-sessions table so both tables speak one language.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn table_button(
     ui: &mut Ui,
     rect: Rect,
     id: egui::Id,
     icon: &str,
     label: &str,
     hover_tint: Color32,
+    enabled: bool,
     palette: &Palette,
 ) -> bool {
-    let response = ui.interact(rect, id, Sense::click());
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
     let raised = if palette.light_mode {
         blend(palette.content_card_bg, Color32::WHITE, 0.55)
     } else {
         blend(palette.content_card_bg, Color32::WHITE, 0.10)
     };
-    let fill = if response.is_pointer_button_down_on() {
+    let fill = if enabled && response.is_pointer_button_down_on() {
         blend(raised, hover_tint, 0.45)
-    } else if response.hovered() {
+    } else if enabled && response.hovered() {
         blend(raised, hover_tint, 0.25)
     } else {
         raised
     };
-    let border = if response.hovered() {
+    let border = if enabled && response.hovered() {
         hover_tint
     } else {
-        with_alpha(palette.subtle_text, 90)
+        with_alpha(palette.subtle_text, if enabled { 90 } else { 55 })
     };
 
+    let text_color = if enabled {
+        palette.icon_color
+    } else {
+        with_alpha(palette.icon_color, 110)
+    };
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(BTN_ROUNDING), fill);
     painter.rect_stroke(rect, Rounding::same(BTN_ROUNDING), Stroke::new(1.0, border));
-    let job = icon_label(
-        icon,
-        fonts::icon(15.0),
-        label,
-        fonts::regular(13.0),
-        palette.icon_color,
-    );
+    let job = icon_label(icon, fonts::icon(15.0), label, fonts::regular(13.0), text_color);
     let galley = ui.fonts(|f| f.layout_job(job));
     let pos = rect.center() - galley.size() * 0.5;
-    ui.painter().galley(pos, galley, palette.icon_color);
+    ui.painter().galley(pos, galley, text_color);
 
+    if !enabled {
+        return false;
+    }
     draw_focus_outline(ui, &response, palette);
     if response.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -423,8 +436,8 @@ fn table_button(
 
 /// Lay out `text` on a single line, ellipsizing anything past `max_width` —
 /// long backup names shrink into the name column instead of running under the
-/// size column.
-fn elided(
+/// size column. Shared with the Virtualize page's saved-sessions table.
+pub(crate) fn elided(
     ui: &Ui,
     text: &str,
     font: FontId,
