@@ -280,9 +280,9 @@ fn apply_fixups_for_write(record: &mut [u8]) -> Result<()> {
 /// One run of contiguous clusters in a non-resident attribute's
 /// run list. A `lcn` of `None` indicates a sparse run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DataRun {
-    pub(crate) length: u64,
-    pub(crate) lcn: Option<u64>,
+pub struct DataRun {
+    pub length: u64,
+    pub lcn: Option<u64>,
 }
 
 /// Parse a run list starting at `bytes[0]` until the 0x00 terminator.
@@ -406,34 +406,44 @@ fn bytes_for_signed(v: i64) -> u8 {
 /// Apply the relocation map to every LCN in `runs`. Splits a run if
 /// the relocation breaks it into non-contiguous destination ranges.
 pub(crate) fn relocate_runs(runs: &[DataRun], map: &RelocationMap) -> Vec<DataRun> {
-    let mut out = Vec::new();
+    let mut out: Vec<DataRun> = Vec::new();
     for run in runs {
-        let lcn = match run.lcn {
-            None => {
-                out.push(*run);
-                continue;
-            }
-            Some(l) => l,
+        let Some(lcn) = run.lcn else {
+            out.push(*run);
+            continue;
         };
-        let mut cur_src = lcn;
-        let end_src = lcn + run.length;
-        while cur_src < end_src {
-            let dst = map.translate_cluster(cur_src).unwrap_or(cur_src);
-            let mut span = 1u64;
-            while cur_src + span < end_src {
-                let next_dst = map
-                    .translate_cluster(cur_src + span)
-                    .unwrap_or(cur_src + span);
-                if next_dst != dst + span {
-                    break;
+        let mut cur = lcn;
+        let end = lcn + run.length;
+        // Spans coming out of one source run may be merged back together when
+        // they happen to land adjacently, but never across source runs — that
+        // would shorten a run list the relocation did not actually change,
+        // and rewrite records that should have been left alone.
+        let mut first = true;
+        while cur < end {
+            let (dst, span) = map.translate_span(cur, end - cur);
+            debug_assert!(span > 0, "translate_span must make progress");
+            let merged = if first {
+                false
+            } else {
+                match out.last_mut() {
+                    Some(prev) => match prev.lcn {
+                        Some(prev_lcn) if prev_lcn + prev.length == dst => {
+                            prev.length += span;
+                            true
+                        }
+                        _ => false,
+                    },
+                    None => false,
                 }
-                span += 1;
+            };
+            if !merged {
+                out.push(DataRun {
+                    length: span,
+                    lcn: Some(dst),
+                });
             }
-            out.push(DataRun {
-                length: span,
-                lcn: Some(dst),
-            });
-            cur_src += span;
+            first = false;
+            cur += span;
         }
     }
     out
@@ -443,36 +453,28 @@ pub(crate) fn relocate_runs(runs: &[DataRun], map: &RelocationMap) -> Vec<DataRu
 /// Resident attributes hold no run list, so a relocation can never change
 /// their size; they are not modelled, only stepped over.
 #[derive(Debug, Clone)]
-pub(crate) struct AttrModel {
+pub struct AttrModel {
     /// Offset of the attribute header within the record, as parsed.
-    pub(crate) attr_offset: usize,
+    pub attr_offset: usize,
     /// Current on-disk length of the attribute, including its 8-byte
     /// alignment padding.
-    pub(crate) attr_len: usize,
+    pub attr_len: usize,
     /// Attribute-relative offset of the run list. Any attribute *name*
     /// sits before this, so growing the run list never disturbs it.
-    pub(crate) run_list_offset: usize,
-    pub(crate) runs: Vec<DataRun>,
+    pub run_list_offset: usize,
+    pub runs: Vec<DataRun>,
 }
 
 /// The parts of an MFT record a relocation can disturb, parsed once so
 /// the rewriter and the pre-flight simulator work from identical inputs.
 #[derive(Debug, Clone)]
-pub(crate) struct RecordModel {
+pub struct RecordModel {
     /// Bytes in use, reconciled against where the attribute chain
     /// actually ends (some records under-report).
-    pub(crate) used_size: usize,
+    pub used_size: usize,
     /// Total bytes the record may occupy — its allocated size.
-    pub(crate) alloc_size: usize,
-    pub(crate) attrs: Vec<AttrModel>,
-}
-
-impl RecordModel {
-    /// Bytes of unused space inside the record: the headroom a growing
-    /// run list can expand into.
-    pub(crate) fn slack(&self) -> usize {
-        self.alloc_size.saturating_sub(self.used_size)
-    }
+    pub alloc_size: usize,
+    pub attrs: Vec<AttrModel>,
 }
 
 /// Parse the non-resident attributes of one (fixed-up) MFT record.
