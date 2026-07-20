@@ -133,6 +133,7 @@ mod tests {
                 style: "gpt".into(),
                 disk_guid: None,
                 disk_signature: None,
+                mbr_boot_code: None,
                 sector_size: 512,
             },
             partitions: vec![PartitionManifest {

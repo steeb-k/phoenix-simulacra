@@ -118,6 +118,7 @@ fn restore_raw_parallel_roundtrips_and_stays_in_bounds() {
             style: "gpt".into(),
             disk_guid: None,
             disk_signature: None,
+            mbr_boot_code: None,
             sector_size: 512,
         },
         partitions: vec![PartitionManifest {

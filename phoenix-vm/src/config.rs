@@ -592,6 +592,7 @@ mod tests {
                 style: style.to_string(),
                 disk_guid: None,
                 disk_signature: None,
+                mbr_boot_code: None,
                 sector_size: sector,
             },
             partitions: parts,
