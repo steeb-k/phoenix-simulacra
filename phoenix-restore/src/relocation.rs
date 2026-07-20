@@ -501,7 +501,9 @@ fn attempt_plan(
 
 fn worst_of(mut overflows: Vec<RecordOverflowReport>) -> RecordOverflowReport {
     overflows.sort_by_key(|o| (o.needed_bytes.saturating_sub(o.available), o.record_index));
-    overflows.pop().expect("caller checked the list is non-empty")
+    overflows
+        .pop()
+        .expect("caller checked the list is non-empty")
 }
 
 /// Give one record's above-boundary clusters a contiguous home.
@@ -982,9 +984,9 @@ mod tests {
     /// that fits three of them.
     fn three_free_runs_and(above: Extent) -> Vec<Extent> {
         vec![
-            ext(5 * 8, 5 * 8),    // used 5..10   -> free 0..5
-            ext(30 * 8, 5 * 8),   // used 30..35  -> free 10..30
-            ext(45 * 8, 55 * 8),  // used 45..100 -> free 35..45
+            ext(5 * 8, 5 * 8),   // used 5..10   -> free 0..5
+            ext(30 * 8, 5 * 8),  // used 30..35  -> free 10..30
+            ext(45 * 8, 55 * 8), // used 45..100 -> free 35..45
             above,
         ]
     }
@@ -1012,9 +1014,9 @@ mod tests {
         // run first costs two fragments, where first-fit's 5 + 6 + 10 costs
         // three.
         let extents = vec![
-            ext(5 * 8, 5 * 8),    // used 5..10   -> free 0..5
-            ext(16 * 8, 19 * 8),  // used 16..35  -> free 10..16
-            ext(55 * 8, 45 * 8),  // used 55..100 -> free 35..55
+            ext(5 * 8, 5 * 8),   // used 5..10   -> free 0..5
+            ext(16 * 8, 19 * 8), // used 16..35  -> free 10..16
+            ext(55 * 8, 45 * 8), // used 55..100 -> free 35..55
             ext(200 * 8, 21 * 8),
         ];
         let map = build_relocation_map(&extents, SECTOR, CLUSTER, 100 * CLUSTER)
@@ -1099,10 +1101,7 @@ mod tests {
 
         let mft = MFT_LCN as usize * cluster;
         // Record 0: $MFT's own $DATA, describing the two clusters above.
-        let rec0 = file_record(
-            &[(2u64, MFT_LCN)],
-            0,
-        );
+        let rec0 = file_record(&[(2u64, MFT_LCN)], 0);
         image[mft..mft + REC].copy_from_slice(&rec0);
         for (i, rec) in records.iter().enumerate() {
             let at = mft + (i + 1) * REC;
@@ -1188,7 +1187,7 @@ mod tests {
         (1..=8u8)
             .find(|n| {
                 let bits = *n as u32 * 8;
-                v >= -(1i64 << (bits - 1)) && v <= (1i64 << (bits - 1)) - 1
+                v >= -(1i64 << (bits - 1)) && v < (1i64 << (bits - 1))
             })
             .unwrap_or(8)
     }
@@ -1252,8 +1251,8 @@ mod tests {
         // With pre-flight, the record's clusters get a contiguous home and
         // the rewrite fits.
         let mut src = Image(image);
-        let plan = plan_shrink(&extents, SECTOR, CLUSTER, TARGET, ORIGINAL, &mut src, None)
-            .unwrap();
+        let plan =
+            plan_shrink(&extents, SECTOR, CLUSTER, TARGET, ORIGINAL, &mut src, None).unwrap();
         assert!(
             plan.replanned_records > 0,
             "the plan should have been adjusted"
