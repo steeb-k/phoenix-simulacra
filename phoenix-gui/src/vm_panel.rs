@@ -952,19 +952,26 @@ fn show_unavailable(
                     .text(egui::RichText::new("Unpacking QEMU…").small()),
             );
         } else {
+            // The version is dropped on purpose: it means nothing to a user
+            // deciding whether to click, and it is already shown in the
+            // footer once QEMU is present. The size is kept — that IS
+            // decision-relevant on a metered or slow connection.
             let label = crate::icon_label(
                 egui_phosphor::regular::DOWNLOAD_SIMPLE,
                 fonts::icon(16.0),
-                &format!(
-                    "Download QEMU {} ({} MB)",
-                    crate::qemu_payload::PAYLOAD_VERSION,
-                    crate::qemu_payload::PAYLOAD_MIB
-                ),
+                &format!("Download QEMU ({} MB)", crate::qemu_payload::PAYLOAD_MIB),
                 fonts::regular(14.0),
                 ui.visuals().widgets.inactive.fg_stroke.color,
             );
+            // `wrap_mode(Extend)` keeps it on one line; the button is then
+            // sized to that width rather than a guessed constant, so it can
+            // never wrap however the label changes.
             if ui
-                .add_sized([260.0, crate::ACTION_BUTTON_HEIGHT], egui::Button::new(label))
+                .add(
+                    egui::Button::new(label)
+                        .wrap_mode(egui::TextWrapMode::Extend)
+                        .min_size(egui::vec2(0.0, crate::ACTION_BUTTON_HEIGHT)),
+                )
                 .clicked()
             {
                 *action = VmAction::DownloadQemu;
