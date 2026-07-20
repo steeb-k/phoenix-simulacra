@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-capture"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-clone"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "phoenix-capture",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "byteorder",
@@ -2329,7 +2329,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-gui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-launcher"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "windows-sys 0.59.0",
  "winres",
@@ -2374,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-mount"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "phoenix-core",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-restore"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "phoenix-capture",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-systests"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-vm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-vss"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "phoenix-core",
  "thiserror 2.0.18",
