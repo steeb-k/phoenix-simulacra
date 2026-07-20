@@ -96,7 +96,11 @@ fn run(tx: &Sender<DlEvent>) -> Result<(), String> {
     if !installed() {
         return Err("unpacked QEMU is missing qemu-system-x86_64.exe".into());
     }
-    tracing::info!(dir = %dir.display(), "bundled QEMU installed");
+    tracing::info!(
+        dir = %dir.display(),
+        version = PAYLOAD_VERSION,
+        "bundled QEMU installed"
+    );
     Ok(())
 }
 
