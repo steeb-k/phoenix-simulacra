@@ -69,15 +69,22 @@ WizardSmallImageFileDynamicDark=..\assets\phoenix-appicon-128px.png
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-; Both default-checked (no "unchecked" flag). The WinFsp task only appears when
-; WinFsp isn't already installed.
+; All default-checked (no "unchecked" flag). The WinFsp task only appears when
+; WinFsp isn't already installed; the QEMU task is always offered because it
+; installs privately and so never conflicts with a QEMU the user already has.
 Name: "winfsp"; Description: "Install WinFsp (*RECOMMENDED* - Required for mounting backups)"; Check: IsWinFspMissing
+Name: "qemu"; Description: "Install QEMU (*RECOMMENDED* - Required for booting backups as VMs, ~220 MB)"; Check: IsQemuSupported
 Name: "desktopicon"; Description: "Create a &desktop icon"
 
 [Files]
 Source: "..\dist\simulacra\*.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Staged WinFsp MSI, extracted only when we're actually going to install it.
 Source: "build\winfsp.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: ShouldInstallWinFsp
+; QEMU goes in a PRIVATE subfolder, never Program Files\qemu: a QEMU the user
+; installs themselves must not be touched, overwritten or version-clashed with.
+; The app looks here first and the location is user-changeable in its UI.
+; x86_64 only, so nothing is staged on ARM64 (where the feature is hidden).
+Source: "build\qemu\*"; DestDir: "{app}\qemu"; Flags: ignoreversion recursesubdirs createallsubdirs; Tasks: qemu; Check: IsQemuSupported
 
 [Icons]
 ; Two Start Menu entries side by side: normal + debug (console). Both target the
@@ -114,6 +121,14 @@ begin
   Result := not (
     RegQueryStringValue(HKLM64, 'SOFTWARE\WinFsp', 'InstallDir', S) or
     RegQueryStringValue(HKLM32, 'SOFTWARE\WinFsp', 'InstallDir', S));
+end;
+
+{ The VM feature is x86_64-only -- ARM64 QEMU has no useful acceleration for
+  x86 guests, so the app hides the Virtualize page there entirely. Offering a
+  220 MB payload that could never be used would be worse than not offering it. }
+function IsQemuSupported(): Boolean;
+begin
+  Result := not IsArm64;
 end;
 
 { Install WinFsp only if the user kept the task AND it isn't already present. }
