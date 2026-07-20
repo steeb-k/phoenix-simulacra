@@ -827,9 +827,8 @@ const REPAIR_BOOT_HOVER: &str =
     "After the data is written, detect a Windows installation on the target disk and rebuild \
      its boot files with Windows' own bcdboot (plus bootsect and the active flag on legacy MBR \
      disks). The target's existing boot configuration is cleared first — kept as a .bak — so \
-     the rebuild replaces it rather than merging into it. Files are written only to the target \
-     disk, but on a UEFI PC bcdboot may also add the drive to this PC's firmware boot entries. \
-     Skipped automatically if the target turns out to hold no Windows installation.";
+     the rebuild replaces it rather than merging into it. Skipped automatically if the target \
+     turns out to hold no Windows installation.";
 
 fn disk_confirm_details(disk: &DiskInfo) -> Vec<String> {
     vec![

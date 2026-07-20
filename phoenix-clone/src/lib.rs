@@ -58,7 +58,7 @@ pub struct CloneOptions {
     pub convert_sector_size: bool,
     /// After the clone completes and the target is online, detect a Windows
     /// installation on it and rebuild its boot environment (`bcdboot`/
-    /// `bootsect`, drive-local only — see `phoenix_restore::bootrepair`).
+    /// `bootsect` — see `phoenix_restore::bootrepair`).
     /// Best-effort: a repair failure is recorded in the summary, never
     /// propagated, because the cloned data is already valid.
     pub repair_boot: bool,

@@ -6,18 +6,9 @@
 //! repair its disk), and as an opt-in post-pass after a clone/restore whose
 //! target carries a Windows installation ([`repair_target_disk`]).
 //!
-//! The intent is to stay **drive-local**: the boot files and BCD written are
-//! those on the target disk, reached with `bcdboot /s <target ESP>`, and a
-//! repaired drive is expected to boot on another machine through the standard
-//! on-disk path (`\EFI\Microsoft\Boot\bootmgfw.efi`) rather than through an
-//! NVRAM entry this machine happens to hold.
-//!
-//! This used to also pass `/nofirmwaresync` to make that guarantee explicit.
-//! That option made `bcdboot` fail outright on the UEFI path, so it is gone —
-//! which means firmware-entry behaviour is now whatever `bcdboot` does by
-//! default for the `/s` target. Repairing a secondary drive on a UEFI machine
-//! may therefore touch this machine's NVRAM boot entries. If that needs to be
-//! prevented again it has to be done another way, not with that flag.
+//! The boot files and BCD written are those on the target disk, reached with
+//! `bcdboot /s <target ESP>`, so a repaired drive boots through the standard
+//! on-disk path (`\EFI\Microsoft\Boot\bootmgfw.efi`) on any machine.
 //!
 //! GPT disks get the UEFI treatment (rebuild BCD + boot files on the EFI
 //! System Partition); MBR disks get the legacy one (Windows boot code in the
@@ -187,8 +178,7 @@ pub fn plan_boot_repair(disk: &DiskInfo, install: &WindowsInstall) -> Result<Boo
         ));
         actions.push(
             "Write the boot files to the target disk's own EFI System Partition, so the drive \
-             boots via the standard \\EFI\\Microsoft path on any machine. On a UEFI PC, bcdboot \
-             may also add this drive to this PC's firmware boot entries"
+             boots via the standard \\EFI\\Microsoft path on any machine"
                 .into(),
         );
         BootScheme::UefiGpt {
@@ -511,9 +501,6 @@ fn ensure_letter(
     )))
 }
 
-/// Run a System32 tool, hidden-console, and fold its outcome into the
-/// report. The absolute path avoids PATH lookups; both tools ship with
-/// Windows (and with WinPE) on every supported version.
 /// Move an existing BCD store aside so `bcdboot` builds a fresh one.
 ///
 /// `bcdboot` *merges* into a store that is already there rather than replacing
@@ -534,8 +521,7 @@ fn ensure_letter(
 /// Doing this by moving files, rather than by asking `bcdboot` for a clean
 /// store, is deliberate — `bcdboot`'s option set varies across Windows
 /// versions, and an option the local `bcdboot` doesn't recognise fails the
-/// whole repair (which is exactly how `/nofirmwaresync` broke the UEFI path).
-/// Renaming a file behaves the same everywhere.
+/// whole repair. Renaming a file behaves the same everywhere.
 fn clear_existing_bcd(boot_dir: &Path, report: &mut BootRepairReport) -> Result<()> {
     let mut moved = Vec::new();
     for name in ["BCD", "BCD.LOG", "BCD.LOG1", "BCD.LOG2"] {
@@ -577,6 +563,9 @@ fn clear_existing_bcd(boot_dir: &Path, report: &mut BootRepairReport) -> Result<
     Ok(())
 }
 
+/// Run a System32 tool, hidden-console, and fold its outcome into the
+/// report. The absolute path avoids PATH lookups; both tools ship with
+/// Windows (and with WinPE) on every supported version.
 fn run_tool(tool: &str, args: &[&str], report: &mut BootRepairReport) -> Result<()> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let exe = format!("{system_root}\\System32\\{tool}.exe");
