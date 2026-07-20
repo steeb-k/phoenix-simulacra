@@ -4,6 +4,7 @@ pub mod backup;
 pub mod fat;
 pub mod ntfs;
 pub mod ntfs_meta;
+pub mod ntfs_preflight;
 pub mod raw;
 pub mod reader;
 pub mod refs;
