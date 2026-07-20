@@ -129,6 +129,19 @@ pub enum VmAction {
     ClearQemuDir,
     /// Plug or unplug the running guest's network cable.
     SetNetwork(bool),
+    /// Download the bundled QEMU (offered when none was found).
+    DownloadQemu,
+}
+
+/// State of an in-flight (or failed) QEMU download, for the unavailable page.
+#[derive(Default)]
+pub struct QemuDownloadView {
+    /// (bytes so far, total bytes or 0) while downloading.
+    pub progress: Option<(u64, u64)>,
+    /// Unpacking, after the bytes are in.
+    pub extracting: bool,
+    /// Why the last attempt failed, if it did.
+    pub note: String,
 }
 
 /// A running VM, for the header status line.
@@ -173,13 +186,13 @@ pub fn show(
     sessions: &[Session],
     running: Option<RunningView<'_>>,
     last_status: &str,
+    qemu_dl: &QemuDownloadView,
 ) -> VmAction {
-    let Some(qemu) = qemu else {
-        show_unavailable(ui, palette);
-        return VmAction::None;
-    };
-
     let mut action = VmAction::None;
+    let Some(qemu) = qemu else {
+        show_unavailable(ui, palette, qemu_dl, &mut action);
+        return action;
+    };
 
     // A VM is running: show its status + a graceful Stop, and nothing else
     // actionable (one VM at a time in this first cut).
@@ -767,9 +780,17 @@ fn short_time(ts: Option<&str>) -> String {
     }
 }
 
-/// Shown when QEMU isn't found — mirrors the Mount page's WinFsp notice.
-fn show_unavailable(ui: &mut Ui, palette: &Palette) {
-    const NOTICE_HEIGHT: f32 = 230.0;
+/// Shown when QEMU isn't found — mirrors the Mount page's WinFsp notice, but
+/// with a way out: the installer's QEMU download is skippable (offline install,
+/// or the task unticked), so the same download is offered here rather than
+/// sending the user off to install QEMU by hand.
+fn show_unavailable(
+    ui: &mut Ui,
+    palette: &Palette,
+    download: &QemuDownloadView,
+    action: &mut VmAction,
+) {
+    const NOTICE_HEIGHT: f32 = 260.0;
     const NOTICE_WIDTH: f32 = 470.0;
     let leftover = (ui.available_height() - NOTICE_HEIGHT).max(0.0);
     ui.add_space(leftover * 0.5);
@@ -786,13 +807,61 @@ fn show_unavailable(ui: &mut Ui, palette: &Palette) {
         ui.label(
             egui::RichText::new(
                 "Booting a backup runs it as a virtual machine with QEMU, which isn't \
-                 installed on this machine (or couldn't be found). Install QEMU and \
-                 restart Simulacra to boot backups.",
+                 installed on this machine (or couldn't be found). Simulacra can \
+                 download the version it was tested with and keep it to itself, \
+                 leaving any QEMU you install yourself alone.",
             )
             .font(fonts::regular(14.0))
             .color(palette.subtle_text),
         );
         ui.add_space(16.0);
+
+        if let Some((got, total)) = download.progress {
+            let frac = if total > 0 { got as f32 / total as f32 } else { 0.0 };
+            let text = if total > 0 {
+                format!("Downloading QEMU… {} / {} MB", got / 1_000_000, total / 1_000_000)
+            } else {
+                format!("Downloading QEMU… {} MB", got / 1_000_000)
+            };
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(NOTICE_WIDTH - 40.0)
+                    .text(egui::RichText::new(text).small()),
+            );
+        } else if download.extracting {
+            ui.add(
+                egui::ProgressBar::new(1.0)
+                    .desired_width(NOTICE_WIDTH - 40.0)
+                    .text(egui::RichText::new("Unpacking QEMU…").small()),
+            );
+        } else {
+            let label = crate::icon_label(
+                egui_phosphor::regular::DOWNLOAD_SIMPLE,
+                fonts::icon(16.0),
+                &format!(
+                    "Download QEMU {} ({} MB)",
+                    crate::qemu_payload::PAYLOAD_VERSION,
+                    crate::qemu_payload::PAYLOAD_MIB
+                ),
+                fonts::regular(14.0),
+                ui.visuals().widgets.inactive.fg_stroke.color,
+            );
+            if ui
+                .add_sized([260.0, crate::ACTION_BUTTON_HEIGHT], egui::Button::new(label))
+                .clicked()
+            {
+                *action = VmAction::DownloadQemu;
+            }
+            if !download.note.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&download.note)
+                        .small()
+                        .color(palette.danger),
+                );
+            }
+        }
+        ui.add_space(14.0);
         let mut link = egui::text::LayoutJob::default();
         link.append(
             egui_phosphor::regular::LINK,
@@ -805,7 +874,7 @@ fn show_unavailable(ui: &mut Ui, palette: &Palette) {
             },
         );
         link.append(
-            "  Get QEMU — qemu.org/download",
+            "  Or install QEMU yourself — qemu.org/download",
             0.0,
             egui::TextFormat {
                 font_id: fonts::bold(14.0),

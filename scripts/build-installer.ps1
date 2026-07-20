@@ -34,16 +34,10 @@ $signScript = Join-Path $PSScriptRoot "sign-artifacts.ps1"
 $WinFspUrl    = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
 $WinFspSha256 = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A"
 
-# --- Pinned QEMU payload (curated x86_64-only tree; see build-qemu-payload.ps1)
-# Mirrored on our own binaries repo rather than fetched from upstream: this is a
-# master SNAPSHOT rather than a tagged release, so its upstream URL is not a
-# guarantee, and a release build must not depend on someone else's file staying
-# put. Clipboard needs QEMU 11.1+ and this build (reporting 11.0.50) IS the 11.1
-# development tree -- do not "upgrade" the pin to a lower-numbered stable
-# release. See docs/VIRTUALIZATION.md.
-$QemuVersion      = "11.0.50"
-$QemuPayloadUrl   = "https://github.com/steeb-k/phoenix-simulacra-binaries/releases/download/qemu-$QemuVersion/qemu-x86_64-$QemuVersion-20260501-win64.zip"
-$QemuPayloadSha256 = "C86F19D18E0B479922EA01F2A6EB91952DE5CCC543960D318F4DDADF13590C8C"
+# The curated QEMU payload is NOT staged here: the installer downloads it at
+# install time (pin + SHA-256 live in simulacra.iss), so it never bloats the
+# setup exe the auto-updater ships. See scripts/build-qemu-payload.ps1 for how
+# the payload is produced, and installer/README.md for why.
 
 # --- 1. Build the bundle -------------------------------------------------------
 Write-Host "== Building release bundle (dist/simulacra) ..." -ForegroundColor Cyan
@@ -78,39 +72,6 @@ if (Test-Msi) {
         throw "WinFsp MSI SHA-256 mismatch!`n  expected $WinFspSha256`n  got      $got"
     }
     Write-Host "== WinFsp MSI downloaded and verified."
-}
-
-# --- 3c. Ensure the pinned QEMU payload ---------------------------------------
-# Staged as an extracted tree (installer/build/qemu/) rather than a zip, so Inno
-# embeds the files directly and installs them without an extract step at
-# install time.
-$qemuDir = Join-Path $buildDir "qemu"
-$qemuZip = Join-Path $buildDir "qemu-payload.zip"
-$qemuStamp = Join-Path $qemuDir ".sha256"
-
-function Test-QemuPayload {
-    if (-not (Test-Path (Join-Path $qemuDir "qemu-system-x86_64.exe"))) { return $false }
-    if (-not (Test-Path $qemuStamp)) { return $false }
-    return ((Get-Content $qemuStamp -Raw).Trim() -eq $QemuPayloadSha256)
-}
-
-if (Test-QemuPayload) {
-    Write-Host "== QEMU payload present and verified (SHA-256 match)."
-} else {
-    if (-not (Test-Path $qemuZip) -or
-        (Get-FileHash -Algorithm SHA256 $qemuZip).Hash -ne $QemuPayloadSha256) {
-        Write-Host "== Downloading QEMU payload (84 MB): $QemuPayloadUrl"
-        Invoke-WebRequest -Uri $QemuPayloadUrl -OutFile $qemuZip -UseBasicParsing
-    }
-    $got = (Get-FileHash -Algorithm SHA256 $qemuZip).Hash
-    if ($got -ne $QemuPayloadSha256) {
-        Remove-Item $qemuZip -Force
-        throw "QEMU payload SHA-256 mismatch!`n  expected $QemuPayloadSha256`n  got      $got"
-    }
-    if (Test-Path $qemuDir) { Remove-Item $qemuDir -Recurse -Force }
-    Expand-Archive -Path $qemuZip -DestinationPath $qemuDir -Force
-    Set-Content -Path $qemuStamp -Value $QemuPayloadSha256 -NoNewline
-    Write-Host "== QEMU payload downloaded, verified and staged."
 }
 
 # --- 3b. Sign the bundle exes (before ISCC embeds them) -----------------------
