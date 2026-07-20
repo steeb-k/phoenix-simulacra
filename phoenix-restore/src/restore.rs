@@ -80,7 +80,15 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     // This has to come before `init_target_disk_as_gpt` — a half-
     // initialized GPT plus an aborted restore would leave the user's
     // disk in worse shape than not starting at all.
-    opts.plan.validate_extents_fit(&mut reader)?;
+    //
+    // For NTFS this also proves the metadata rewrite will fit, adjusting the
+    // relocation where it otherwise wouldn't. The resulting plans are what
+    // the streaming loop below uses: rebuilding a map there would discard
+    // any adjustment made here and re-introduce the failure this pre-flight
+    // exists to prevent.
+    let mut shrink_plans = opts
+        .plan
+        .validate_extents_fit(&mut reader, opts.progress.as_ref())?;
 
     let disks = enumerate_disks()?;
     let disk = disks
@@ -452,32 +460,31 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
             src_index, idx_entry.name, entry.target_offset_bytes
         );
 
-        // For NTFS shrink restores we build a relocation map up front
-        // and pass it through `restore_ntfs` -> `restore_raw` -> the
-        // metadata rewriter. The map's `None` case is identical to the
-        // pre-relocation behavior, so non-shrink and non-NTFS paths see
-        // no functional change.
+        // For NTFS shrink restores the relocation map comes from the
+        // pre-flight above, which already proved the metadata rewrite fits
+        // (and re-planned it where it didn't). It threads through
+        // `restore_ntfs` -> `restore_raw` -> the metadata rewriter. `None`
+        // is identical to the pre-relocation behavior, so non-shrink and
+        // non-NTFS paths see no functional change.
         let relocation = match fs {
             FilesystemKind::Ntfs if entry.target_size_bytes < idx_entry.original_size => {
-                let stream = reader.read_stream_header(&idx_entry)?;
-                let cluster_size = stream.bytes_per_cluster as u64;
-                crate::relocation::build_relocation_map(
-                    &stream.extents,
-                    idx_entry.sector_size as u64,
-                    cluster_size,
-                    entry.target_size_bytes,
-                )?
+                let plan = shrink_plans.take(src_index).ok_or_else(|| {
+                    phoenix_core::error::PhoenixError::Other(format!(
+                        "internal error: partition {src_index} shrinks but the pre-flight \
+                         produced no plan for it"
+                    ))
+                })?;
+                info!(
+                    partition = src_index,
+                    entries = plan.map.entries.len(),
+                    new_total_clusters = plan.map.new_total_clusters,
+                    replanned_records = plan.replanned_records,
+                    "using the pre-flighted NTFS relocation map for shrink"
+                );
+                Some(plan.map)
             }
             _ => None,
         };
-        if let Some(ref m) = relocation {
-            info!(
-                partition = src_index,
-                entries = m.entries.len(),
-                new_total_clusters = m.new_total_clusters,
-                "built NTFS relocation map for shrink"
-            );
-        }
 
         let restore_opts = RestoreOpts {
             verify: opts.verify_on_restore,
