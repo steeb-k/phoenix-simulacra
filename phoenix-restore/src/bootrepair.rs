@@ -6,13 +6,18 @@
 //! repair its disk), and as an opt-in post-pass after a clone/restore whose
 //! target carries a Windows installation ([`repair_target_disk`]).
 //!
-//! Everything here is **drive-local**: only partitions and files on the
-//! target disk are modified. `bcdboot` always runs with `/nofirmwaresync` so
-//! this machine's UEFI NVRAM boot entries are never created, reordered, or
-//! replaced — a repaired drive has to boot when moved to a different machine,
-//! and repairing a secondary drive must never disturb the boot menu of the
-//! machine doing the repairing. Firmware finds the repaired drive through the
-//! standard on-disk paths (`\EFI\Microsoft\Boot\bootmgfw.efi`).
+//! The intent is to stay **drive-local**: the boot files and BCD written are
+//! those on the target disk, reached with `bcdboot /s <target ESP>`, and a
+//! repaired drive is expected to boot on another machine through the standard
+//! on-disk path (`\EFI\Microsoft\Boot\bootmgfw.efi`) rather than through an
+//! NVRAM entry this machine happens to hold.
+//!
+//! This used to also pass `/nofirmwaresync` to make that guarantee explicit.
+//! That option made `bcdboot` fail outright on the UEFI path, so it is gone —
+//! which means firmware-entry behaviour is now whatever `bcdboot` does by
+//! default for the `/s` target. Repairing a secondary drive on a UEFI machine
+//! may therefore touch this machine's NVRAM boot entries. If that needs to be
+//! prevented again it has to be done another way, not with that flag.
 //!
 //! GPT disks get the UEFI treatment (rebuild BCD + boot files on the EFI
 //! System Partition); MBR disks get the legacy one (Windows boot code in the
@@ -174,14 +179,16 @@ pub fn plan_boot_repair(disk: &DiskInfo, install: &WindowsInstall) -> Result<Boo
                 ))
             })?;
         actions.push(format!(
-            "Rebuild the UEFI boot files and BCD on partition {} (EFI System Partition) with \
-             bcdboot, pointing at {}",
+            "Clear the existing boot configuration on partition {} (EFI System Partition), \
+             keeping a .bak copy, then rebuild the UEFI boot files and BCD with bcdboot, \
+             pointing at {}",
             esp.index,
             install.display()
         ));
         actions.push(
-            "Leave this PC's firmware (NVRAM) boot entries untouched — the drive boots via the \
-             standard \\EFI\\Microsoft path on any machine"
+            "Write the boot files to the target disk's own EFI System Partition, so the drive \
+             boots via the standard \\EFI\\Microsoft path on any machine. On a UEFI PC, bcdboot \
+             may also add this drive to this PC's firmware boot entries"
                 .into(),
         );
         BootScheme::UefiGpt {
@@ -234,7 +241,8 @@ pub fn plan_boot_repair(disk: &DiskInfo, install: &WindowsInstall) -> Result<Boo
             system.index
         ));
         actions.push(format!(
-            "Rebuild the BCD on partition {} with bcdboot /f BIOS, pointing at {}",
+            "Clear the existing boot configuration on partition {}, keeping a .bak copy, then \
+             rebuild the BCD with bcdboot /f BIOS, pointing at {}",
             system.index,
             install.display()
         ));
@@ -272,19 +280,15 @@ pub fn execute_boot_repair(disk: &DiskInfo, plan: &BootRepairPlan) -> Result<Boo
                 .find(|p| p.index == *esp_partition)
                 .ok_or_else(|| PhoenixError::Disk("ESP not found on disk".into()))?;
             let (esp_letter, _esp_guard) = ensure_letter(esp, &mut report)?;
-            run_tool(
-                "bcdboot",
-                &[
-                    &source,
-                    "/s",
-                    &format!("{esp_letter}:"),
-                    "/f",
-                    "UEFI",
-                    "/nofirmwaresync",
-                ],
+            clear_existing_bcd(
+                &PathBuf::from(format!("{esp_letter}:\\EFI\\Microsoft\\Boot")),
                 &mut report,
             )?;
-            report.push("Firmware (NVRAM) boot entries were not modified");
+            run_tool(
+                "bcdboot",
+                &[&source, "/s", &format!("{esp_letter}:"), "/f", "UEFI"],
+                &mut report,
+            )?;
         }
         BootScheme::BiosMbr {
             system_partition,
@@ -311,6 +315,7 @@ pub fn execute_boot_repair(disk: &DiskInfo, plan: &BootRepairPlan) -> Result<Boo
                 &["/nt60", &format!("{sys_letter}:"), "/mbr"],
                 &mut report,
             )?;
+            clear_existing_bcd(&PathBuf::from(format!("{sys_letter}:\\Boot")), &mut report)?;
             run_tool(
                 "bcdboot",
                 &[&source, "/s", &format!("{sys_letter}:"), "/f", "BIOS"],
@@ -509,6 +514,69 @@ fn ensure_letter(
 /// Run a System32 tool, hidden-console, and fold its outcome into the
 /// report. The absolute path avoids PATH lookups; both tools ship with
 /// Windows (and with WinPE) on every supported version.
+/// Move an existing BCD store aside so `bcdboot` builds a fresh one.
+///
+/// `bcdboot` *merges* into a store that is already there rather than replacing
+/// it, so a repair run against a disk carrying a stale or broken BCD inherits
+/// exactly the entries that made it unbootable — the classic symptom being a
+/// boot menu still listing an installation that no longer exists, or pointing
+/// at a partition that moved. Clearing the store first is what makes the
+/// repair a rebuild rather than a top-up.
+///
+/// The hive's log files go too. They are the registry transaction logs for the
+/// store, and leaving them next to a fresh BCD lets the loader replay the old
+/// contents back over it.
+///
+/// Renamed rather than deleted: a `.bak` alongside costs nothing and leaves a
+/// way back if a repair makes things worse. Any previous `.bak` is replaced,
+/// so repeated repairs don't accumulate.
+///
+/// Doing this by moving files, rather than by asking `bcdboot` for a clean
+/// store, is deliberate — `bcdboot`'s option set varies across Windows
+/// versions, and an option the local `bcdboot` doesn't recognise fails the
+/// whole repair (which is exactly how `/nofirmwaresync` broke the UEFI path).
+/// Renaming a file behaves the same everywhere.
+fn clear_existing_bcd(boot_dir: &Path, report: &mut BootRepairReport) -> Result<()> {
+    let mut moved = Vec::new();
+    for name in ["BCD", "BCD.LOG", "BCD.LOG1", "BCD.LOG2"] {
+        let store = boot_dir.join(name);
+        if !store.exists() {
+            continue;
+        }
+        // The store is often read-only, which blocks the replace below.
+        if let Ok(meta) = std::fs::metadata(&store) {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&store, perms);
+            }
+        }
+        let backup = boot_dir.join(format!("{name}.bak"));
+        let _ = std::fs::remove_file(&backup);
+        std::fs::rename(&store, &backup).map_err(|e| {
+            PhoenixError::Disk(format!(
+                "could not move the existing boot configuration {} aside: {e}",
+                store.display()
+            ))
+        })?;
+        moved.push(name);
+    }
+    if moved.is_empty() {
+        report.push(format!(
+            "No existing boot configuration in {} — bcdboot will create one",
+            boot_dir.display()
+        ));
+    } else {
+        report.push(format!(
+            "Cleared the existing boot configuration in {} ({} kept as .bak)",
+            boot_dir.display(),
+            moved.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn run_tool(tool: &str, args: &[&str], report: &mut BootRepairReport) -> Result<()> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let exe = format!("{system_root}\\System32\\{tool}.exe");

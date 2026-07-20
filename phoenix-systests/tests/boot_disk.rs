@@ -539,7 +539,7 @@ fn boot_c_restore_shrink() {
             orig
         }
     });
-    plan.validate_extents_fit(&mut reader)
+    plan.validate_extents_fit(&mut reader, None)
         .expect("shrink target too small for the relocation map");
     if skip_restore() {
         eprintln!("[T3B] PHOENIX_BOOT_SKIP_RESTORE=1 — validating the EXISTING (shrunk) layout");

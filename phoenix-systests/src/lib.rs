@@ -1222,7 +1222,7 @@ pub fn cleanup_leaked_vhds() -> Result<()> {
 }
 
 pub mod fixture;
-pub use fixture::{fill_fixture, verify_fixture, FixtureDigest};
+pub use fixture::{fill_fixture, fill_fixture_fragmented, verify_fixture, FixtureDigest};
 
 /// Console progress reporter for long-running engine operations in tests:
 /// hand `handle()` to `BackupOptions`/`RestoreOptions` and a background

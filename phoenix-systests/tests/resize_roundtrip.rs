@@ -21,14 +21,21 @@ use phoenix_core::disk::enumerate_disks;
 use phoenix_restore::plan::default_plan_from_backup;
 use phoenix_restore::restore::{run_restore, RestoreOptions};
 use phoenix_systests::{
-    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
-    wait_for_letter, wait_for_restored_letter, FixtureDigest, PartSpec, TestFs, TestVhd,
+    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, fill_fixture_fragmented, require_admin,
+    verify_fixture, wait_for_letter, wait_for_restored_letter, FixtureDigest, PartSpec, TestFs,
+    TestVhd,
 };
 
 const MIB: u64 = 1024 * 1024;
 
 /// Create an NTFS source VHD, fill it, and back up ALL its partitions.
 fn backup_disk(source_mb: u64, seed: u64) -> (PathBuf, FixtureDigest) {
+    backup_disk_with(source_mb, seed, false)
+}
+
+/// As [`backup_disk`], but `fragmented` swaps in the heavy-fragmentation
+/// fixture whose one large file spans the whole volume.
+fn backup_disk_with(source_mb: u64, seed: u64, fragmented: bool) -> (PathBuf, FixtureDigest) {
     let source = TestVhd::create(source_mb).expect("create source vhd");
     source
         .init_gpt_with(&[PartSpec {
@@ -39,7 +46,11 @@ fn backup_disk(source_mb: u64, seed: u64) -> (PathBuf, FixtureDigest) {
         }])
         .expect("init source");
     assert!(wait_for_letter('X', 15_000), "source volume never mounted");
-    let digest = fill_fixture('X', seed).expect("fill fixture");
+    let digest = if fragmented {
+        fill_fixture_fragmented('X', seed, source_mb).expect("fill fragmented fixture")
+    } else {
+        fill_fixture('X', seed).expect("fill fixture")
+    };
 
     let disks = enumerate_disks().unwrap();
     let disk = disks
@@ -132,6 +143,95 @@ fn ntfs_restore_shrink() {
     let target = TestVhd::create(300).expect("create target");
     restore_full_disk_and_verify(&backup, &target, 300 * MIB, &digest);
     let _ = std::fs::remove_file(&backup);
+}
+
+/// Shrink a volume whose data is fragmented badly enough to overflow an MFT
+/// record — the case that used to fail *after* streaming the whole partition.
+///
+/// The fixture leaves one large file spread over the entire 512 MiB volume in
+/// hundreds of pieces, with everything else deleted. Shrinking to 300 MiB
+/// therefore has to relocate roughly half of that file while its run lists are
+/// already long enough to fill their records. Before the shrink pre-flight and
+/// in-record attribute growth, this died with "relocated run list grew to N
+/// bytes, past the N-1 byte attribute budget"; it must now come back
+/// chkdsk-clean and byte-identical.
+#[test]
+#[ignore = "requires elevation + diskpart; run with --ignored --test-threads=1"]
+fn ntfs_restore_shrink_heavily_fragmented() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    let (backup, digest) = backup_disk_with(512, 0x3333, true);
+    let target = TestVhd::create(300).expect("create target");
+    restore_full_disk_and_verify(&backup, &target, 300 * MIB, &digest);
+    let _ = std::fs::remove_file(&backup);
+}
+
+/// A shrink that cannot work must be refused *before* the target is touched.
+///
+/// The old code discovered an unfittable shrink only once the target's GPT had
+/// been re-initialized and the data streamed; the point of the pre-flight is
+/// that the target comes back byte-for-byte as it started.
+///
+/// The assertion deliberately does not pin the wording. A shrink can be
+/// impossible for more than one reason, and they are caught by different
+/// guards at different depths — here the used data simply exceeds the target,
+/// which the cheap capacity check rejects long before the MFT pre-flight would
+/// get a chance to compute a suggested size. The pre-flight's own
+/// smallest-workable-target message is covered by unit tests in
+/// `phoenix_restore::relocation`, which can construct that narrower case
+/// without needing a real disk.
+#[test]
+#[ignore = "requires elevation + diskpart; run with --ignored --test-threads=1"]
+fn ntfs_restore_impossible_shrink_leaves_the_target_untouched() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    // The fragmented fixture leaves ~205 MiB of live data (80% of the volume
+    // written as pairs, half of it deleted), which cannot fit a 100 MiB
+    // partition under any layout.
+    let (backup, _digest) = backup_disk_with(512, 0x4444, true);
+    let target = TestVhd::create(100).expect("create target");
+
+    let before = read_disk_head(&target);
+
+    let reader = PhnxReader::open(&backup).unwrap();
+    let plan = default_plan_from_backup(
+        backup.to_str().unwrap(),
+        &reader,
+        target.disk_index(),
+        100 * MIB,
+    );
+    drop(reader);
+
+    let err = run_restore(RestoreOptions {
+        backup_path: backup.clone(),
+        plan,
+        verify_on_restore: false,
+        convert_sector_size: false,
+        repair_boot: false,
+        progress: None,
+    })
+    .expect_err("shrinking ~205 MiB of data into 100 MiB must fail");
+
+    // The headline property: nothing was written.
+    let after = read_disk_head(&target);
+    assert_eq!(
+        before, after,
+        "an impossible shrink must fail before writing anything to the target \
+         (refusal was: {err})"
+    );
+    let _ = std::fs::remove_file(&backup);
+}
+
+/// First MiB of a target disk, for proving a failed restore wrote nothing.
+fn read_disk_head(target: &TestVhd) -> Vec<u8> {
+    use std::io::Read;
+    let path = format!("\\\\.\\PhysicalDrive{}", target.disk_index());
+    let mut f = std::fs::File::open(path).expect("open target disk for read-back");
+    let mut buf = vec![0u8; MIB as usize];
+    f.read_exact(&mut buf).expect("read target head");
+    buf
 }
 
 /// Shrink an NTFS volume formatted with **64K clusters**.

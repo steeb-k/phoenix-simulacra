@@ -40,8 +40,8 @@
 use phoenix_clone::{run_clone, CloneEntry, CloneOptions, ClonePlan, CloneTableMode, CloneVerify};
 use phoenix_core::disk::{enumerate_disks, refine_partition_fs, DiskInfo};
 use phoenix_systests::{
-    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, require_admin, verify_fixture,
-    wait_for_letter, wait_for_letter_at_offset, PartSpec, TestFs, TestVhd,
+    chkdsk_clean, cleanup_leaked_vhds, fill_fixture, fill_fixture_fragmented, require_admin,
+    verify_fixture, wait_for_letter, wait_for_letter_at_offset, PartSpec, TestFs, TestVhd,
 };
 
 /// Re-enumerate with filesystem refinement, the way every engine entry point does.
@@ -406,6 +406,106 @@ fn partial_clone_shrinks_ntfs_into_a_smaller_slot() {
         "the preserved partition lost its drive letter"
     );
     verify_fixture('Z', &keep_digest).expect("preserved partition survived the shrink");
+}
+
+/// Clone-shrink a volume fragmented badly enough to overflow an MFT record.
+///
+/// This is the exact shape of the reported failure: a clone, onto real slots,
+/// where relocating a heavily fragmented file made a run list outgrow its
+/// record. On the clone path that used to abort *mid-stream* — the target's
+/// slot already partly overwritten — because the relocation was planned inside
+/// the streaming loop rather than in the prepare phase.
+#[test]
+#[ignore = "requires elevation + diskpart"]
+fn partial_clone_shrinks_a_heavily_fragmented_ntfs_volume() {
+    require_admin();
+    let _ = cleanup_leaked_vhds();
+
+    // Source: 512 MiB NTFS holding one file smeared over the whole volume.
+    let source = TestVhd::create(512).expect("create source");
+    source
+        .init_gpt_with(&[PartSpec {
+            size_mb: 0,
+            fs: TestFs::Ntfs,
+            letter: 'X',
+            label: "FRAGSRC".into(),
+        }])
+        .expect("init source");
+    assert!(wait_for_letter('X', 15_000), "source never mounted");
+    let src_digest =
+        fill_fixture_fragmented('X', 0xC10E_0005, 512).expect("fill fragmented source");
+
+    // Target: a 300 MiB slot — big enough for the ~205 MiB of live data, but
+    // only after everything above the boundary has been relocated.
+    let target = TestVhd::create(640).expect("create target");
+    target
+        .init_gpt_with(&[
+            PartSpec {
+                size_mb: 300,
+                fs: TestFs::Ntfs,
+                letter: 'Y',
+                label: "FRAGSLOT".into(),
+            },
+            PartSpec {
+                size_mb: 0,
+                fs: TestFs::Ntfs,
+                letter: 'Z',
+                label: "FRAGKEEP".into(),
+            },
+        ])
+        .expect("init target");
+    assert!(wait_for_letter('Y', 15_000), "target slot never mounted");
+    assert!(wait_for_letter('Z', 15_000), "target keep never mounted");
+
+    let src_disk = disk_by_index(source.disk_index());
+    let tgt_disk = disk_by_index(target.disk_index());
+    let src_part = src_disk
+        .partitions
+        .iter()
+        .find(|p| p.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .expect("source NTFS partition");
+    let tgt_ntfs: Vec<_> = tgt_disk
+        .partitions
+        .iter()
+        .filter(|p| p.fs_kind == phoenix_core::disk::FilesystemKind::Ntfs)
+        .collect();
+    let slot = tgt_ntfs[0];
+    assert!(
+        slot.size_bytes < src_part.size_bytes,
+        "fixture is wrong: the target slot must be SMALLER than the source for this to shrink"
+    );
+
+    let preserved: Vec<u32> = tgt_disk
+        .partitions
+        .iter()
+        .filter(|p| p.index != slot.index)
+        .map(|p| p.index)
+        .collect();
+
+    run_clone(CloneOptions {
+        source_disk_index: source.disk_index(),
+        target_disk_index: target.disk_index(),
+        plan: ClonePlan {
+            entries: vec![CloneEntry {
+                source_partition_index: src_part.index,
+                target_offset_bytes: slot.offset_bytes,
+                target_size_bytes: slot.size_bytes,
+            }],
+            table_mode: CloneTableMode::UpdateExisting {
+                preserved_target_indices: preserved,
+            },
+        },
+        verify: CloneVerify::ReadBack,
+        convert_sector_size: false,
+        repair_boot: false,
+        progress: None,
+    })
+    .expect("clone-shrink of a heavily fragmented volume");
+
+    let slot_letter = wait_for_letter_at_offset(target.disk_index(), slot.offset_bytes, 60_000)
+        .expect("shrunk slot never got a drive letter");
+    chkdsk_clean(slot_letter).expect("shrunk slot is chkdsk-clean");
+    verify_fixture(slot_letter, &src_digest).expect("shrunk slot holds the source fixture");
 }
 
 /// A partial clone that does NOT preserve a live target partition must remove it
