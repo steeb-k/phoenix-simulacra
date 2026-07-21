@@ -6,10 +6,6 @@
 
 mod about_panel;
 mod action_bar;
-mod qemu_payload;
-mod virtio_iso;
-mod vm_panel;
-mod vm_sessions_table;
 mod bootrepair_table;
 mod clone_panel;
 mod confirm_dialog;
@@ -20,6 +16,7 @@ mod fonts;
 mod history_table;
 mod job;
 mod mount_table;
+mod qemu_payload;
 mod raster;
 mod restore_layout;
 mod restore_panel;
@@ -35,6 +32,9 @@ mod updater;
 mod util;
 mod utilities;
 mod version;
+mod virtio_iso;
+mod vm_panel;
+mod vm_sessions_table;
 
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU32;
@@ -322,14 +322,15 @@ impl Renderer {
                             .egui_ctx
                             .input(|i| i.pointer.latest_pos())
                             .unwrap_or(egui::Pos2::ZERO);
-                        self.egui_state.egui_input_mut().events.push(
-                            egui::Event::PointerButton {
+                        self.egui_state
+                            .egui_input_mut()
+                            .events
+                            .push(egui::Event::PointerButton {
                                 pos,
                                 button: egui::PointerButton::Primary,
                                 pressed: false,
                                 modifiers: egui::Modifiers::default(),
-                            },
-                        );
+                            });
                     }
                     egui::ViewportCommand::Minimized(v) => self.window.set_minimized(*v),
                     egui::ViewportCommand::Maximized(v) => self.window.set_maximized(*v),
@@ -457,16 +458,12 @@ impl ApplicationHandler<UserEvent> for App {
                     // START of the frame that asked for it, not to now —
                     // otherwise rasterization time adds to the interval and
                     // a 10 ms frame yields 26 ms ticks, not 16 ms ones.
-                    let anchor = self
-                        .renderer
-                        .as_ref()
-                        .map_or(now, |r| r.last_paint_start);
+                    let anchor = self.renderer.as_ref().map_or(now, |r| r.last_paint_start);
                     (anchor + REPAINT_FRAME_CAP).max(now)
                 } else {
                     now + after
                 };
-                self.next_repaint =
-                    Some(self.next_repaint.map_or(deadline, |d| d.min(deadline)));
+                self.next_repaint = Some(self.next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
         }
     }
@@ -885,9 +882,10 @@ fn source_looks_bootable(source: &DiskInfo) -> bool {
         .partitions
         .iter()
         .any(|p| matches!(p.fs_kind, F::Ntfs | F::Bitlocker));
-    let has_esp = source.partitions.iter().any(|p| {
-        p.fs_kind == F::Efi || phoenix_core::disk::is_efi_system_partition(&p.type_guid)
-    });
+    let has_esp = source
+        .partitions
+        .iter()
+        .any(|p| p.fs_kind == F::Efi || phoenix_core::disk::is_efi_system_partition(&p.type_guid));
     has_windows_capable && (has_esp || !source.is_gpt)
 }
 
@@ -1391,11 +1389,12 @@ impl PhoenixApp {
             }
             updater::UpdateEvent::Ready(staged) => {
                 self.update_state.staged_version = Some(staged.version.clone());
-                self.update_state.staged_installer =
-                    Some(staged.installer.display().to_string());
+                self.update_state.staged_installer = Some(staged.installer.display().to_string());
                 let _ = self.update_state.save();
-                let banner =
-                    format!("Update {} will install when you close the app.", staged.version);
+                let banner = format!(
+                    "Update {} will install when you close the app.",
+                    staged.version
+                );
                 self.update_banner = Some(banner.clone());
                 self.status = banner;
                 self.update_check = None;
@@ -1647,17 +1646,35 @@ impl PhoenixApp {
         }
     }
 
-    /// Whether `path` has a successful Verify record in the job history — the
-    /// green-shield state. Covers both an explicit Verify and the verify pass
-    /// that runs after a backup (both append a `Verify` record whose `source`
-    /// is the `.phnx` path), which is exactly the "explicit + auto" rule.
-    fn backup_is_verified(&self, path: &str) -> bool {
+    /// The shield state for `path`, derived from its Verify records in the job
+    /// history. Both an explicit Verify and the verify pass that runs after a
+    /// backup append a `Verify` record whose `source` is the `.phnx` path, so
+    /// this covers the "explicit + auto" rule.
+    ///
+    /// A `Failed` verify (mismatch/error) is the loud red state and takes
+    /// precedence — the most recent *definitive* outcome (Success or Failed,
+    /// ignoring the non-result `Cancelled`) decides between green and red. With
+    /// no definitive outcome on record the shield is yellow: never verified, or
+    /// only ever cancelled (integrity unknown — click to verify).
+    fn backup_verify_state(&self, path: &str) -> restore_table::VerifyState {
         use phoenix_core::appdata::{JobKindTag, JobOutcome};
-        self.history.records.iter().any(|r| {
-            r.kind == JobKindTag::Verify
-                && r.outcome == JobOutcome::Success
-                && r.source.eq_ignore_ascii_case(path)
-        })
+        use restore_table::VerifyState;
+        let latest_definitive = self
+            .history
+            .records
+            .iter()
+            .rev()
+            .filter(|r| r.kind == JobKindTag::Verify && r.source.eq_ignore_ascii_case(path))
+            .find_map(|r| match &r.outcome {
+                JobOutcome::Success => Some(true),
+                JobOutcome::Failed(_) => Some(false),
+                JobOutcome::Cancelled => None,
+            });
+        match latest_definitive {
+            Some(true) => VerifyState::Verified,
+            Some(false) => VerifyState::Failed,
+            None => VerifyState::Unverified,
+        }
     }
 
     /// The display metadata for `path`, filled from the container header (for
@@ -1672,7 +1689,8 @@ impl PhoenixApp {
             let size = std::fs::metadata(path)
                 .map(|m| format_bytes(m.len()))
                 .unwrap_or_else(|_| "—".to_string());
-            self.backup_meta.insert(key.clone(), BackupMeta { created, size });
+            self.backup_meta
+                .insert(key.clone(), BackupMeta { created, size });
         }
         &self.backup_meta[&key]
     }
@@ -1688,7 +1706,7 @@ impl PhoenixApp {
                     path: r.path.clone(),
                     created: r.created.clone(),
                     size: r.size.clone(),
-                    verified: r.verified,
+                    verify: r.verify,
                 })
                 .collect();
         }
@@ -1701,13 +1719,13 @@ impl PhoenixApp {
         paths
             .into_iter()
             .map(|path| {
-                let verified = self.backup_is_verified(&path);
+                let verify = self.backup_verify_state(&path);
                 let meta = self.backup_meta(&path);
                 restore_table::BackupRow {
                     created: meta.created.clone(),
                     size: meta.size.clone(),
                     path,
-                    verified,
+                    verify,
                 }
             })
             .collect()
@@ -2242,7 +2260,11 @@ impl PhoenixApp {
                 if self.qemu.is_none() || self.vm_run.is_some() {
                     return None;
                 }
-                let ready = self.vm.summary.as_ref().is_some_and(|s| s.blocker.is_none());
+                let ready = self
+                    .vm
+                    .summary
+                    .as_ref()
+                    .is_some_and(|s| s.blocker.is_none());
                 StartAction {
                     label: "Boot VM",
                     icon: Some(egui_phosphor::fill::PLAY),
@@ -2358,9 +2380,7 @@ impl PhoenixApp {
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!modal_open, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&self.status).color(self.palette.subtle_text),
-                        );
+                        ui.label(egui::RichText::new(&self.status).color(self.palette.subtle_text));
                         // A staged update offers itself on the right as the one
                         // action the banner implies: close, install, come back
                         // on the new version. The left status line already
@@ -2802,10 +2822,7 @@ impl PhoenixApp {
         match action {
             ConfirmAction::Confirm => {
                 self.completed = None;
-                self.status = format!(
-                    "Resetting Windows Hello on disk {}…",
-                    pending.disk_index
-                );
+                self.status = format!("Resetting Windows Hello on disk {}…", pending.disk_index);
                 self.job_subject = pending.subject;
                 self.job = Some(spawn_reset_ngc(pending.disk_index, pending.partition_index));
             }
@@ -2851,7 +2868,11 @@ impl PhoenixApp {
                 self.completed = None;
                 self.status = format!(
                     "{} the built-in Administrator on disk {}…",
-                    if pending.enable { "Enabling" } else { "Disabling" },
+                    if pending.enable {
+                        "Enabling"
+                    } else {
+                        "Disabling"
+                    },
                     pending.disk_index
                 );
                 self.job_subject = pending.subject;
@@ -2864,9 +2885,7 @@ impl PhoenixApp {
             ConfirmAction::Cancel => {
                 self.status = "Administrator change cancelled — no changes were made".into();
             }
-            ConfirmAction::None | ConfirmAction::Extra => {
-                self.pending_admin_toggle = Some(pending)
-            }
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_admin_toggle = Some(pending),
         }
     }
 
@@ -3043,7 +3062,10 @@ impl PhoenixApp {
                 .collect::<Vec<_>>()
                 .join("   ")
         };
-        let details = vec![format!("Backup:  {name}"), format!("Drives:  {letters_str}")];
+        let details = vec![
+            format!("Backup:  {name}"),
+            format!("Drives:  {letters_str}"),
+        ];
 
         let mut ack_checked = self.enable_write_ack;
         let mut view = ConfirmView {
@@ -3129,7 +3151,8 @@ impl PhoenixApp {
                 {
                     Ok(m) => {
                         self.mounts.insert(index, m);
-                        self.status = format!("Couldn't enable write access: {e} — kept read-only.");
+                        self.status =
+                            format!("Couldn't enable write access: {e} — kept read-only.");
                     }
                     Err(e2) => {
                         self.status = format!(
@@ -3567,10 +3590,8 @@ fn backup_path_picker(
                     let choices = history_backup_choices(history, browsed);
                     if choices.is_empty() {
                         ui.label(
-                            egui::RichText::new(
-                                "No backups in the job history yet — use Browse…",
-                            )
-                            .color(ui.visuals().weak_text_color()),
+                            egui::RichText::new("No backups in the job history yet — use Browse…")
+                                .color(ui.visuals().weak_text_color()),
                         );
                     }
                     for choice in choices {
@@ -4638,8 +4659,7 @@ impl PhoenixApp {
             );
             ui.add_space(14.0);
             ui.label(
-                egui::RichText::new("WinFsp is required to mount backups")
-                    .font(fonts::bold(18.0)),
+                egui::RichText::new("WinFsp is required to mount backups").font(fonts::bold(18.0)),
             );
             ui.add_space(8.0);
             ui.label(
@@ -4924,8 +4944,11 @@ impl PhoenixApp {
         use phoenix_restore::bootrepair;
         if self.windows_installs.is_none() {
             let installs = bootrepair::detect_windows_installs(&self.disks);
-            let present =
-                |sel: (u32, u32)| installs.iter().any(|i| (i.disk_index, i.partition_index) == sel);
+            let present = |sel: (u32, u32)| {
+                installs
+                    .iter()
+                    .any(|i| (i.disk_index, i.partition_index) == sel)
+            };
             if self.bootrepair_selected.is_some_and(|s| !present(s)) {
                 self.bootrepair_selected = None;
                 self.bootrepair_plan = None;
@@ -5098,8 +5121,7 @@ impl PhoenixApp {
         );
 
         if let Some(i) = clicked {
-            self.bootrepair_selected =
-                Some((installs[i].disk_index, installs[i].partition_index));
+            self.bootrepair_selected = Some((installs[i].disk_index, installs[i].partition_index));
         }
         if rescan {
             self.rescan_windows_installs();
@@ -5277,7 +5299,10 @@ impl PhoenixApp {
             .map(|(k, _)| *k != sel)
             .unwrap_or(true);
         if stale {
-            let state = match installs.iter().find(|i| (i.disk_index, i.partition_index) == sel) {
+            let state = match installs
+                .iter()
+                .find(|i| (i.disk_index, i.partition_index) == sel)
+            {
                 Some(install) => {
                     winadmin::query_state(&self.disks, install).map_err(|e| e.to_string())
                 }
@@ -5596,7 +5621,8 @@ impl PhoenixApp {
         }
         // Keep the elapsed timer / poll ticking while a VM runs.
         if self.vm_run.is_some() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
         // Poll the guest-tools ISO worker (download or update check).
@@ -5634,7 +5660,8 @@ impl PhoenixApp {
             }
         }
         if self.drivers_dl.is_some() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         // Pull everything the page needs out of `self` into owned locals so the
@@ -5741,34 +5768,24 @@ impl PhoenixApp {
                     let _ = self.settings.save();
                 }
             }
-            vm_panel::VmAction::SetNetwork(up) => {
-                match self.running_vm_qmp_port() {
-                    Some(port) => {
-                        match phoenix_vm::qmp::set_link(
-                            port,
-                            phoenix_vm::config::NET_DEVICE_ID,
-                            up,
-                        ) {
-                            Ok(()) => {
-                                if let Some(run) = self.vm_run.as_mut() {
-                                    run.network_connected = up;
-                                }
-                                self.vm_last_status = if up {
-                                    "Network connected — the guest is online.".into()
-                                } else {
-                                    "Network disconnected.".into()
-                                };
+            vm_panel::VmAction::SetNetwork(up) => match self.running_vm_qmp_port() {
+                Some(port) => {
+                    match phoenix_vm::qmp::set_link(port, phoenix_vm::config::NET_DEVICE_ID, up) {
+                        Ok(()) => {
+                            if let Some(run) = self.vm_run.as_mut() {
+                                run.network_connected = up;
                             }
-                            Err(e) => {
-                                self.vm_last_status = format!("Couldn't change the network: {e}")
-                            }
+                            self.vm_last_status = if up {
+                                "Network connected — the guest is online.".into()
+                            } else {
+                                "Network disconnected.".into()
+                            };
                         }
-                    }
-                    None => {
-                        self.vm_last_status = "Couldn't find the VM's control port.".into()
+                        Err(e) => self.vm_last_status = format!("Couldn't change the network: {e}"),
                     }
                 }
-            }
+                None => self.vm_last_status = "Couldn't find the VM's control port.".into(),
+            },
             vm_panel::VmAction::FixAcceleration(blocker) => {
                 if self.accel_fix.is_none() {
                     // Off the UI thread: DISM routinely takes tens of seconds
@@ -5826,7 +5843,10 @@ impl PhoenixApp {
                     let (tx, rx) = std::sync::mpsc::channel();
                     virtio_iso::spawn_download(tx);
                     self.drivers_note.clear();
-                    self.drivers_dl = Some(DriversDl { rx, progress: (0, 0) });
+                    self.drivers_dl = Some(DriversDl {
+                        rx,
+                        progress: (0, 0),
+                    });
                 }
             }
             vm_panel::VmAction::CheckDriversUpdate => {
@@ -5834,19 +5854,28 @@ impl PhoenixApp {
                     let (tx, rx) = std::sync::mpsc::channel();
                     virtio_iso::spawn_update_check(tx);
                     self.drivers_note = "Checking for a newer driver ISO…".into();
-                    self.drivers_dl = Some(DriversDl { rx, progress: (0, 0) });
+                    self.drivers_dl = Some(DriversDl {
+                        rx,
+                        progress: (0, 0),
+                    });
                 }
             }
             vm_panel::VmAction::LoadSummary => self.load_vm_summary(),
             vm_panel::VmAction::Stop => self.stop_vm(),
-            vm_panel::VmAction::Resume { backup_path, vm_root } => {
+            vm_panel::VmAction::Resume {
+                backup_path,
+                vm_root,
+            } => {
                 self.vm.backup_path = backup_path;
                 self.load_vm_summary();
                 // Resume where the session lives — never where the scratch
                 // dropdown currently points.
                 self.start_vm(false, Some(vm_root));
             }
-            vm_panel::VmAction::Discard { backup_path, vm_root } => {
+            vm_panel::VmAction::Discard {
+                backup_path,
+                vm_root,
+            } => {
                 match phoenix_core::container::PhnxReader::open(std::path::Path::new(&backup_path))
                 {
                     Ok(reader) => {
@@ -5899,7 +5928,12 @@ impl PhoenixApp {
                     .partitions
                     .iter()
                     .find(|p| p.bitlocker.as_deref() == Some("locked"))
-                    .map(|p| format!("partition {} is a locked BitLocker volume — can't boot", p.index));
+                    .map(|p| {
+                        format!(
+                            "partition {} is a locked BitLocker volume — can't boot",
+                            p.index
+                        )
+                    });
                 self.vm.summary = Some(vm_panel::BackupSummary {
                     hostname: m.hostname.clone(),
                     blocker,
@@ -6058,9 +6092,17 @@ impl PhoenixApp {
                 return;
             }
         };
-        let name = self.vm.summary.as_ref().map(|s| s.hostname.clone()).unwrap_or_else(|| {
-            backup.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
-        });
+        let name = self
+            .vm
+            .summary
+            .as_ref()
+            .map(|s| s.hostname.clone())
+            .unwrap_or_else(|| {
+                backup
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
 
         let vm_root = vm_root_override.unwrap_or_else(|| self.vm_root(&backup));
         let sessions = phoenix_vm::SessionManager::new(vm_root.join("vm-sessions"));
@@ -6095,7 +6137,11 @@ impl PhoenixApp {
         };
         let iso = {
             let t = self.vm.iso_path.trim();
-            if t.is_empty() { None } else { Some(std::path::PathBuf::from(t)) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(t))
+            }
         };
         let boot_iso = self.vm.boot_iso;
         // The guest-tools / driver ISO rides along when present and the
@@ -6173,7 +6219,9 @@ impl PhoenixApp {
                     &sessions,
                     &scratch,
                 );
-                Err(anyhow::anyhow!("this build lacks the winfsp feature required to boot a VM"))
+                Err(anyhow::anyhow!(
+                    "this build lacks the winfsp feature required to boot a VM"
+                ))
             };
             // The share exists for the guest; the guest is gone. (The folder
             // and its contents stay.)
@@ -6224,7 +6272,8 @@ impl PhoenixApp {
         match port {
             Some(p) => match phoenix_vm::qmp::system_powerdown(p) {
                 Ok(()) => {
-                    self.vm_last_status = "Sent graceful shutdown; the guest is powering off…".into()
+                    self.vm_last_status =
+                        "Sent graceful shutdown; the guest is powering off…".into()
                 }
                 Err(e) => self.vm_last_status = format!("Graceful stop failed: {e}"),
             },
@@ -6259,7 +6308,10 @@ impl PhoenixApp {
                     finished = true;
                     view.note.clear();
                     self.qemu = phoenix_vm::Qemu::discover(
-                        self.settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
+                        self.settings
+                            .vm_qemu_dir
+                            .as_deref()
+                            .map(std::path::Path::new),
                     )
                     .ok();
                     // Only the failure is worth saying. On success the page
@@ -6685,22 +6737,39 @@ fn demo_backups_from_args() -> Option<Vec<restore_table::BackupRow>> {
     if !std::env::args().skip(1).any(|a| a == "--demo-backups") {
         return None;
     }
-    let row = |path: &str, created: &str, size: u64, verified: bool| restore_table::BackupRow {
-        path: path.into(),
-        created: created.into(),
-        size: format_bytes(size),
-        verified,
-    };
+    use restore_table::VerifyState;
+    let row =
+        |path: &str, created: &str, size: u64, verify: VerifyState| restore_table::BackupRow {
+            path: path.into(),
+            created: created.into(),
+            size: format_bytes(size),
+            verify,
+        };
     Some(vec![
-        row(r"D:\Backups\workstation.phnx", "2026-07-12 14:32:07", 61_240_000_000, true),
-        row(r"D:\Backups\usb-stick.phnx", "2026-07-13 09:14:55", 12_000_000_000, false),
+        row(
+            r"D:\Backups\workstation.phnx",
+            "2026-07-12 14:32:07",
+            61_240_000_000,
+            VerifyState::Verified,
+        ),
+        row(
+            r"D:\Backups\usb-stick.phnx",
+            "2026-07-13 09:14:55",
+            12_000_000_000,
+            VerifyState::Unverified,
+        ),
         row(
             r"\\nas\archive\simulacra\weekly\workstation-2026-07-06.phnx",
             "2026-07-06 02:00:11",
             512_110_190_592,
-            true,
+            VerifyState::Verified,
         ),
-        row(r"E:\Images\laptop-os.phnx", "2026-06-30 09:05:11", 118_700_000_000, false),
+        row(
+            r"E:\Images\corrupted-image.phnx",
+            "2026-06-30 09:05:11",
+            118_700_000_000,
+            VerifyState::Failed,
+        ),
     ])
 }
 

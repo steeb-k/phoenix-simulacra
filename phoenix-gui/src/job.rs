@@ -183,13 +183,23 @@ pub fn spawn_backup(opts: BackupOptions) -> BackgroundJob {
         });
         let elapsed = started.elapsed();
 
-        // If the worker bailed because the user cancelled, the partial
-        // `.phnx` on disk has no manifest footer and is unopenable. Best-
-        // effort delete it so the user's backup folder doesn't accumulate
-        // half-finished files after a cancel. We deliberately don't fail
-        // the result if removal fails — the cancel is still the headline
-        // outcome.
-        if result.is_err() && progress_worker.is_cancelled() {
+        // A cancel during the CAPTURE phase leaves a partial `.phnx` with no
+        // manifest footer — unopenable and useless — so best-effort delete it
+        // to keep the backup folder from accumulating half-finished files.
+        //
+        // But a cancel during the VERIFY phase must NEVER discard the file:
+        // verification runs only *after* the image is finalized, so the backup
+        // on disk is already complete and valid. A completed backup is kept
+        // whether its verification was cancelled or even failed outright —
+        // we don't throw away good data because a post-hoc check didn't finish.
+        //
+        // We tell the two phases apart by asking the file itself: `finalize`
+        // writes the footer that makes a `.phnx` openable, so if it opens as a
+        // complete backup it is finalized and off-limits to this cleanup.
+        // (We don't fail the result if removal fails — the cancel is still the
+        // headline outcome.)
+        let finalized = phoenix_core::container::PhnxReader::open(&output_path).is_ok();
+        if result.is_err() && progress_worker.is_cancelled() && !finalized {
             let _ = std::fs::remove_file(&output_path);
         }
 
@@ -406,11 +416,14 @@ pub fn spawn_admin_toggle(disk_index: u32, partition_index: u32, enable: bool) -
                      {partition_index} — the disk may have changed since the page was refreshed"
                 )
             })?;
-        let report =
-            winadmin::execute_set(&disks, &install, enable).map_err(|e| e.to_string())?;
+        let report = winadmin::execute_set(&disks, &install, enable).map_err(|e| e.to_string())?;
         let mut msg = format!(
             "Built-in Administrator {} for {}",
-            if report.enabled_now { "enabled" } else { "disabled" },
+            if report.enabled_now {
+                "enabled"
+            } else {
+                "disabled"
+            },
             install.display()
         );
         for a in &report.actions {
