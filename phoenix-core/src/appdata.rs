@@ -33,6 +33,10 @@ fn update_state_path() -> PathBuf {
     appdata_dir().join("update.json")
 }
 
+fn known_backups_path() -> PathBuf {
+    appdata_dir().join("backups.json")
+}
+
 /// `%LOCALAPPDATA%\PhoenixSimulacra\updates` (created on demand) — where the
 /// self-updater stages a downloaded installer while it verifies it.
 pub fn updates_dir() -> PathBuf {
@@ -367,6 +371,82 @@ impl UpdateState {
     }
 }
 
+/// One `.phnx` this computer has seen, remembered in the order it was first
+/// added here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownBackup {
+    /// Absolute path to the `.phnx`.
+    pub path: String,
+    /// Unix seconds when this backup was first added to this computer — the
+    /// earliest moment it was created here, verified, restored from, or
+    /// hand-added. Drives the Restore + Verify table's row order (oldest-added
+    /// first), which the user asked to be stable and independent of when each
+    /// image was *created*.
+    pub added_unix: i64,
+}
+
+/// The set of `.phnx` backups this computer knows about, in first-added order.
+///
+/// Persisted separately from the capped [`History`] so the Restore + Verify
+/// table keeps a stable order and remembers backups added from elsewhere even
+/// after their history records have aged out. Verified-status is NOT stored
+/// here — it is derived from the job history (a successful `Verify` record for
+/// the path) so the two can never disagree.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KnownBackups {
+    pub entries: Vec<KnownBackup>,
+}
+
+impl KnownBackups {
+    /// Load, falling back to an empty list on a missing or unreadable file
+    /// (same forgiving contract as [`Settings::load`]).
+    pub fn load() -> Self {
+        Self::load_from(&known_backups_path())
+    }
+
+    fn load_from(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<KnownBackups>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        save_atomic(&known_backups_path(), self)
+    }
+
+    /// Remember `path`, stamped `added_unix`, if it isn't already known
+    /// (case-insensitive). New entries append, so the list stays in
+    /// first-added order. Returns whether it was newly inserted.
+    pub fn add(&mut self, path: &str, added_unix: i64) -> bool {
+        let path = path.trim();
+        if path.is_empty() || !path.to_ascii_lowercase().ends_with(".phnx") {
+            return false;
+        }
+        if self
+            .entries
+            .iter()
+            .any(|e| e.path.eq_ignore_ascii_case(path))
+        {
+            return false;
+        }
+        self.entries.push(KnownBackup {
+            path: path.to_string(),
+            added_unix,
+        });
+        true
+    }
+
+    /// Drop entries whose file no longer exists so the table never lists a
+    /// dead path. Returns whether anything was removed.
+    pub fn prune_missing(&mut self) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| Path::new(&e.path).is_file());
+        self.entries.len() != before
+    }
+}
+
 /// Serialize `value` as pretty JSON to a temp file next to `path`, then rename
 /// it into place so a crash mid-write can't leave a half-written file.
 fn save_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
@@ -481,6 +561,27 @@ mod tests {
         let s: Settings = serde_json::from_slice(json).unwrap();
         assert_eq!(s.theme, ThemeChoice::Dark);
         assert!(s.default_verify_quick); // defaulted
+    }
+
+    #[test]
+    fn known_backups_add_dedups_case_insensitively_and_keeps_order() {
+        let mut k = KnownBackups::default();
+        assert!(k.add(r"D:\Backups\a.phnx", 100));
+        assert!(k.add(r"D:\Backups\b.phnx", 200));
+        // Same path, different case — not re-added, order unchanged.
+        assert!(!k.add(r"d:\backups\A.PHNX", 300));
+        // Non-.phnx and empty are rejected.
+        assert!(!k.add(r"D:\Backups\c.txt", 400));
+        assert!(!k.add("   ", 500));
+        let paths: Vec<&str> = k.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, [r"D:\Backups\a.phnx", r"D:\Backups\b.phnx"]);
+        assert_eq!(k.entries[0].added_unix, 100);
+    }
+
+    #[test]
+    fn known_backups_defaults_on_missing_file() {
+        let k = KnownBackups::load_from(Path::new("does-not-exist.json"));
+        assert!(k.entries.is_empty());
     }
 
     #[test]
