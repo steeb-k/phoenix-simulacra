@@ -3,10 +3,12 @@
 //! Same hand-painted, zebra-striped, click-to-select body as
 //! [`crate::bootrepair_table`], with one extra trick: the first column is a
 //! *shield* that is its own click target. A green filled shield means the
-//! image has already been verified on this machine (hover says so); a
-//! dull-yellow outline shield means it hasn't, and clicking it kicks off a
-//! verify of that one image (hover says so). Clicking anywhere else on the row
-//! selects it — the pick the action bar's "Restore" then acts on.
+//! image has already been verified on this machine (hover says so); a red
+//! filled warning shield means a verify ran and *failed* (the file is kept on
+//! disk regardless); a dull-yellow outline shield means it hasn't been
+//! verified yet. Clicking a red or yellow shield kicks off a verify of that one
+//! image (hover says so). Clicking anywhere else on the row selects it — the
+//! pick the action bar's "Restore" then acts on.
 //!
 //! ```text
 //! ⛊   BACKUP                               CREATED               SIZE
@@ -21,6 +23,23 @@ use crate::disk_map::with_alpha;
 use crate::fonts;
 use crate::theme::Palette;
 
+/// Verification standing of a backup, derived from the job history — drives
+/// the shield's colour, glyph, and whether it's a click-to-verify target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VerifyState {
+    /// A verify (explicit or verify-after-backup) succeeded for this path and
+    /// no later verify has failed — green filled shield.
+    Verified,
+    /// The most recent verify *ran and failed* (mismatch/error). The backup is
+    /// never discarded for this — the file stays on disk and the shield turns
+    /// red so the failure is visible. Clicking re-runs the verify.
+    Failed,
+    /// Never verified clean and no failure on record — this also covers a
+    /// verify that was cancelled mid-pass (integrity simply unknown). Dull-
+    /// yellow outline shield; clicking kicks off a verify.
+    Unverified,
+}
+
 /// One backup, flattened for display. `created`/`size` are pre-formatted by
 /// the caller (which owns the metadata cache), so the table does no file I/O.
 pub struct BackupRow {
@@ -31,9 +50,8 @@ pub struct BackupRow {
     pub created: String,
     /// On-disk image size (e.g. "482.1 GB"), or "—".
     pub size: String,
-    /// True once a successful Verify (explicit or verify-after-backup) for this
-    /// path is in the job history — the green-shield state.
-    pub verified: bool,
+    /// Verification standing — the shield's state (green / red / yellow).
+    pub verify: VerifyState,
 }
 
 /// What one [`show`] call produced. A shield click verifies; a row click
@@ -130,7 +148,16 @@ pub fn show(
     let mut body: Option<Rect> = None;
     let last = rows.len() - 1;
     for (i, row) in rows.iter().enumerate() {
-        let rect = paint_row(ui, width, i, last, row, selected == Some(i), palette, &mut event);
+        let rect = paint_row(
+            ui,
+            width,
+            i,
+            last,
+            row,
+            selected == Some(i),
+            palette,
+            &mut event,
+        );
         body = Some(body.map_or(rect, |b: Rect| b.union(rect)));
     }
     // Border last so it rides over the row fills.
@@ -181,8 +208,11 @@ fn paint_row(
     // TOP: egui gives an overlapped click to the last-registered widget, so a
     // click on the shield reaches the shield (not the row-select beneath it).
     let row_resp = ui.interact(rect, ui.id().with(("restore_row", index)), Sense::click());
-    let shield_resp =
-        ui.interact(shield_rect, ui.id().with(("restore_shield", index)), Sense::click());
+    let shield_resp = ui.interact(
+        shield_rect,
+        ui.id().with(("restore_shield", index)),
+        Sense::click(),
+    );
 
     if selected {
         ui.painter()
@@ -198,24 +228,46 @@ fn paint_row(
             .rect_filled(rect, rounding, with_alpha(palette.icon_color, 12));
     }
 
-    // Shield: green filled = verified; dull-yellow outline = not yet, brighter
-    // on hover to read as the actionable "click to verify" control it is.
-    let (glyph, font, color, tip) = if row.verified {
-        (
+    // Shield: green filled = verified; red filled warning = verify ran and
+    // failed (backup kept regardless); dull-yellow outline = not yet verified.
+    // The two actionable states (red, yellow) brighten on hover to read as the
+    // "click to verify" control they are.
+    let (glyph, font, color, tip) = match row.verify {
+        VerifyState::Verified => (
             egui_phosphor::fill::SHIELD_CHECK,
             fonts::icon_fill(19.0),
             palette.success,
             "This backup has been verified on this machine.",
-        )
-    } else {
-        let base = with_alpha(palette.warning, 190);
-        let color = if shield_resp.hovered() { palette.warning } else { base };
-        (
-            egui_phosphor::regular::SHIELD_CHECK,
-            fonts::icon(19.0),
-            color,
-            "Not verified on this machine — click to verify this backup.",
-        )
+        ),
+        VerifyState::Failed => {
+            let base = with_alpha(palette.danger, 210);
+            let color = if shield_resp.hovered() {
+                palette.danger
+            } else {
+                base
+            };
+            (
+                egui_phosphor::fill::SHIELD_WARNING,
+                fonts::icon_fill(19.0),
+                color,
+                "Verification FAILED for this backup — it did not verify clean. \
+                 The file is kept on disk; click to verify again.",
+            )
+        }
+        VerifyState::Unverified => {
+            let base = with_alpha(palette.warning, 190);
+            let color = if shield_resp.hovered() {
+                palette.warning
+            } else {
+                base
+            };
+            (
+                egui_phosphor::regular::SHIELD_CHECK,
+                fonts::icon(19.0),
+                color,
+                "Not verified on this machine — click to verify this backup.",
+            )
+        }
     };
     ui.painter().text(
         egui::pos2(cols.shield_x + SHIELD_W * 0.5, rect.center().y),
@@ -230,10 +282,11 @@ fn paint_row(
     if shield_resp.hovered() || row_resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    // Click routing: an unverified shield verifies; anything else (including a
-    // click on an already-green shield, which has nothing to verify) selects.
+    // Click routing: a red or yellow shield verifies; anything else (including
+    // a click on an already-green shield, which has nothing to verify) selects.
+    let actionable = matches!(row.verify, VerifyState::Failed | VerifyState::Unverified);
     let shield_resp = shield_resp.on_hover_text(tip);
-    if shield_resp.clicked() && !row.verified {
+    if shield_resp.clicked() && actionable {
         event.verify_clicked = Some(index);
     } else if row_resp.clicked() || shield_resp.clicked() {
         event.row_clicked = Some(index);
