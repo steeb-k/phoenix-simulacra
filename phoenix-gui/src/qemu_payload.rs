@@ -36,7 +36,10 @@ pub const PAYLOAD_MIB: u64 = 84;
 
 /// Events posted by the download worker.
 pub enum DlEvent {
-    Progress { downloaded: u64, total: u64 },
+    Progress {
+        downloaded: u64,
+        total: u64,
+    },
     /// Unpacking — no byte counter, but it takes long enough to say so.
     Extracting,
     Done,
@@ -87,7 +90,8 @@ fn run(tx: &Sender<DlEvent>) -> Result<(), String> {
     // Replace wholesale: a half-populated folder from an interrupted run must
     // not be mistaken for a working install.
     if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot replace {}: {e}", dir.display()))?;
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("cannot replace {}: {e}", dir.display()))?;
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     extract(&zip, &dir)?;
@@ -118,8 +122,8 @@ fn download(tx: &Sender<DlEvent>, dest: &std::path::Path) -> Result<String, Stri
         .unwrap_or(0);
 
     let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(dest)
-        .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded: u64 = 0;

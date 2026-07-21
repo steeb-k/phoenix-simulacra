@@ -51,7 +51,10 @@ impl WindowsInstall {
     /// One-line human label for pickers and reports.
     pub fn display(&self) -> String {
         let what = self.version.as_deref().unwrap_or("Windows");
-        let mut place = format!("disk {}, partition {}", self.disk_index, self.partition_index);
+        let mut place = format!(
+            "disk {}, partition {}",
+            self.disk_index, self.partition_index
+        );
         if let Some(l) = self.drive_letter {
             place = format!("{l}: on {place}");
         }
@@ -336,7 +339,10 @@ pub enum PostRepairOutcome {
 /// reportable variant instead of an `Err`.
 #[derive(Debug, Clone)]
 pub enum BootRepairStatus {
-    Repaired { install: String, actions: Vec<String> },
+    Repaired {
+        install: String,
+        actions: Vec<String>,
+    },
     NoWindowsFound,
     Failed(String),
 }

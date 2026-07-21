@@ -28,10 +28,10 @@ use std::time::Duration;
 use phoenix_capture::backup::{run_backup, BackupOptions};
 use phoenix_core::container::PhnxReader;
 use phoenix_core::disk::enumerate_disks;
-use phoenix_vm::serve_helper::spawn_serve_with_exe;
 use phoenix_systests::{
     cleanup_leaked_vhds, fill_fixture, require_admin, wait_for_letter, PartSpec, TestFs, TestVhd,
 };
+use phoenix_vm::serve_helper::spawn_serve_with_exe;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -49,12 +49,18 @@ fn qemu_tool(name: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files\qemu"));
     let tool = dir.join(name);
-    assert!(tool.exists(), "{} not found (set PHOENIX_QEMU_DIR)", tool.display());
+    assert!(
+        tool.exists(),
+        "{} not found (set PHOENIX_QEMU_DIR)",
+        tool.display()
+    );
     tool
 }
 
 fn run_ok(cmd: &mut Command, what: &str) -> String {
-    let out = cmd.output().unwrap_or_else(|e| panic!("{what}: spawn failed: {e}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{what}: spawn failed: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success(),
@@ -116,9 +122,13 @@ fn qcow2_overlay_lifecycle_and_resume() {
     assert!(wait_for_letter('X', 15_000), "source never mounted");
     fill_fixture('X', 0x00B2_FE00u64).ok();
     let disks = enumerate_disks().unwrap();
-    let disk = disks.iter().find(|d| d.index == source.disk_index()).unwrap();
+    let disk = disks
+        .iter()
+        .find(|d| d.index == source.disk_index())
+        .unwrap();
     let parts: Vec<u32> = disk.partitions.iter().map(|p| p.index).collect();
-    let backup = std::env::temp_dir().join(format!("vmqcow-{}.phnx", uuid::Uuid::new_v4().simple()));
+    let backup =
+        std::env::temp_dir().join(format!("vmqcow-{}.phnx", uuid::Uuid::new_v4().simple()));
     run_backup(BackupOptions {
         disk_index: source.disk_index(),
         partition_indices: parts,
@@ -130,8 +140,12 @@ fn qcow2_overlay_lifecycle_and_resume() {
     .expect("run_backup");
     drop(source);
 
-    let scratch = std::env::temp_dir().join("phoenix-systests").join("vmqcow-serve");
-    let session_dir = std::env::temp_dir().join("phoenix-systests").join("vmqcow-session");
+    let scratch = std::env::temp_dir()
+        .join("phoenix-systests")
+        .join("vmqcow-serve");
+    let session_dir = std::env::temp_dir()
+        .join("phoenix-systests")
+        .join("vmqcow-session");
     std::fs::create_dir_all(&session_dir).unwrap();
     let overlay = session_dir.join("session.qcow2");
     let _ = std::fs::remove_file(&overlay);
@@ -155,12 +169,21 @@ fn qcow2_overlay_lifecycle_and_resume() {
 
         // Unmodified region reads THROUGH the qcow2 to the served parent.
         let head = dd_from_qcow2(&qemu_img, &overlay, &dump, 1);
-        assert_eq!(&head[512..520], b"EFI PART", "leg1: GPT not readable through the backing chain");
+        assert_eq!(
+            &head[512..520],
+            b"EFI PART",
+            "leg1: GPT not readable through the backing chain"
+        );
 
         // Guest-style write lands in the qcow2 only.
         run_ok(
             Command::new(&qemu_io)
-                .args(["-f", "qcow2", "-c", &format!("write -P 0xab {marker_off} 4M")])
+                .args([
+                    "-f",
+                    "qcow2",
+                    "-c",
+                    &format!("write -P 0xab {marker_off} 4M"),
+                ])
                 .arg(&overlay),
             "qemu-io write marker",
         );
@@ -171,7 +194,10 @@ fn qcow2_overlay_lifecycle_and_resume() {
     }
 
     let overlay_len = std::fs::metadata(&overlay).unwrap().len();
-    assert!(overlay_len > 4 * MIB, "overlay didn't absorb the write ({overlay_len} bytes)");
+    assert!(
+        overlay_len > 4 * MIB,
+        "overlay didn't absorb the write ({overlay_len} bytes)"
+    );
 
     // ===================== leg 2: resume equivalent =========================
     // Re-serve at the SAME deterministic path; the qcow2's recorded backing file
@@ -183,7 +209,12 @@ fn qcow2_overlay_lifecycle_and_resume() {
         // (a) the qcow2's own writes survived
         let readback = run_ok(
             Command::new(&qemu_io)
-                .args(["-f", "qcow2", "-c", &format!("read -P 0xab {marker_off} 4M")])
+                .args([
+                    "-f",
+                    "qcow2",
+                    "-c",
+                    &format!("read -P 0xab {marker_off} 4M"),
+                ])
                 .arg(&overlay),
             "qemu-io read marker after resume",
         );

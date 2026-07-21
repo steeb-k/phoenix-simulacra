@@ -80,7 +80,11 @@ pub fn utility_card(
     // a dark card, so hover does two clearly-visible things at once: a stronger
     // fill lift and an accent-colored border (which reads in both themes).
     let border = if hovered {
-        painter.rect_filled(rect, Rounding::same(8.0), with_alpha(palette.icon_color, 34));
+        painter.rect_filled(
+            rect,
+            Rounding::same(8.0),
+            with_alpha(palette.icon_color, 34),
+        );
         Stroke::new(1.5, palette.accent)
     } else {
         Stroke::new(1.0, palette.panel_border)
@@ -89,7 +93,10 @@ pub fn utility_card(
 
     // Icon, centered in its left slot.
     painter.text(
-        Pos2::new(rect.left() + CARD_ICON_X + CARD_ICON_W / 2.0, rect.center().y),
+        Pos2::new(
+            rect.left() + CARD_ICON_X + CARD_ICON_W / 2.0,
+            rect.center().y,
+        ),
         Align2::CENTER_CENTER,
         icon,
         fonts::icon(28.0),
@@ -224,10 +231,8 @@ pub fn modal_shell(
 
                 let cancel = ui.add_sized(
                     button,
-                    egui::Button::new(
-                        egui::RichText::new("Cancel").color(palette.icon_color),
-                    )
-                    .fill(ui.visuals().widgets.inactive.bg_fill),
+                    egui::Button::new(egui::RichText::new("Cancel").color(palette.icon_color))
+                        .fill(ui.visuals().widgets.inactive.bg_fill),
                 );
                 if cancel.clicked() {
                     action = ModalAction::Cancel;
@@ -235,11 +240,9 @@ pub fn modal_shell(
 
                 let primary = ui.add_enabled(
                     primary_enabled,
-                    egui::Button::new(
-                        egui::RichText::new(primary_label).color(Color32::WHITE),
-                    )
-                    .fill(palette.accent)
-                    .min_size(button),
+                    egui::Button::new(egui::RichText::new(primary_label).color(Color32::WHITE))
+                        .fill(palette.accent)
+                        .min_size(button),
                 );
                 if primary.clicked() {
                     action = ModalAction::Primary;

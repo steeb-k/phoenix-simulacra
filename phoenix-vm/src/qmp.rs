@@ -29,11 +29,15 @@ pub fn system_powerdown(port: u16) -> Result<()> {
     // 2. Leave negotiation, enter command mode.
     writeln!(writer, "{{\"execute\":\"qmp_capabilities\"}}")?;
     line.clear();
-    reader.read_line(&mut line).context("read qmp_capabilities reply")?;
+    reader
+        .read_line(&mut line)
+        .context("read qmp_capabilities reply")?;
     // 3. The ACPI power button.
     writeln!(writer, "{{\"execute\":\"system_powerdown\"}}")?;
     line.clear();
-    reader.read_line(&mut line).context("read system_powerdown reply")?;
+    reader
+        .read_line(&mut line)
+        .context("read system_powerdown reply")?;
     Ok(())
 }
 
@@ -57,7 +61,9 @@ pub fn quit(port: u16) -> Result<()> {
     reader.read_line(&mut line).context("read QMP greeting")?;
     writeln!(writer, "{{\"execute\":\"qmp_capabilities\"}}")?;
     line.clear();
-    reader.read_line(&mut line).context("read qmp_capabilities reply")?;
+    reader
+        .read_line(&mut line)
+        .context("read qmp_capabilities reply")?;
     // No reply is read for `quit`: QEMU may close the socket before it lands.
     writeln!(writer, "{{\"execute\":\"quit\"}}")?;
     Ok(())
@@ -86,7 +92,9 @@ pub fn set_link(port: u16, id: &str, up: bool) -> Result<()> {
     reader.read_line(&mut line).context("read QMP greeting")?;
     writeln!(writer, "{{\"execute\":\"qmp_capabilities\"}}")?;
     line.clear();
-    reader.read_line(&mut line).context("read qmp_capabilities reply")?;
+    reader
+        .read_line(&mut line)
+        .context("read qmp_capabilities reply")?;
     writeln!(
         writer,
         "{{\"execute\":\"set_link\",\"arguments\":{{\"name\":\"{id}\",\"up\":{up}}}}}"

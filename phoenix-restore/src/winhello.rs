@@ -156,7 +156,9 @@ fn run_net(verb: &str) {
         Ok(o) if !o.status.success() => {
             warn!(target: "phoenix_restore::winhello", verb, stderr = %String::from_utf8_lossy(&o.stderr), "net WbioSrvc non-zero");
         }
-        Err(e) => warn!(target: "phoenix_restore::winhello", verb, "net WbioSrvc failed to launch: {e}"),
+        Err(e) => {
+            warn!(target: "phoenix_restore::winhello", verb, "net WbioSrvc failed to launch: {e}")
+        }
         _ => {}
     }
 }
@@ -233,9 +235,7 @@ mod tests {
         let p = ngc_dir(&install(Some('E'), 3)).expect("lettered volume yields a path");
         assert_eq!(
             p,
-            PathBuf::from(
-                r"E:\Windows\ServiceProfiles\LocalService\AppData\Local\Microsoft\Ngc"
-            )
+            PathBuf::from(r"E:\Windows\ServiceProfiles\LocalService\AppData\Local\Microsoft\Ngc")
         );
     }
 

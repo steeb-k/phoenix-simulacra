@@ -33,7 +33,7 @@ use phoenix_core::disk::DiskInfo;
 use phoenix_core::error::{PhoenixError, Result};
 use tracing::{info, warn};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError, LUID,
+    CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, LUID,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
@@ -106,7 +106,11 @@ pub fn query_state(disks: &[DiskInfo], install: &WindowsInstall) -> Result<Admin
 /// Set the built-in Administrator on `install` to `enable`. Idempotent: setting
 /// an already-matching state is a no-op success. On the live path, enabling
 /// also blanks the password (best-effort). Offline, the password is untouched.
-pub fn execute_set(disks: &[DiskInfo], install: &WindowsInstall, enable: bool) -> Result<ToggleReport> {
+pub fn execute_set(
+    disks: &[DiskInfo],
+    install: &WindowsInstall,
+    enable: bool,
+) -> Result<ToggleReport> {
     if system_disk_index(disks) == Some(install.disk_index) {
         execute_set_live(enable)
     } else {
@@ -269,8 +273,9 @@ fn execute_set_offline(install: &WindowsInstall, enable: bool) -> Result<ToggleR
         install.partition_index
     )];
     if enable {
-        actions
-            .push("Kept its existing password (the built-in Administrator is normally blank)".into());
+        actions.push(
+            "Kept its existing password (the built-in Administrator is normally blank)".into(),
+        );
     }
     Ok(ToggleReport {
         actions,
@@ -343,8 +348,7 @@ fn with_admin_user_key<T>(
     let result = (|| {
         let wsub = wide(RID500_SUBKEY);
         let mut hkey: HKEY = ptr::null_mut();
-        let rc =
-            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wsub.as_ptr(), 0, access, &mut hkey) };
+        let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wsub.as_ptr(), 0, access, &mut hkey) };
         if rc != ERROR_SUCCESS {
             return Err(PhoenixError::Other(format!(
                 "could not open the built-in Administrator account in the SAM (Win32 error {rc})"

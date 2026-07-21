@@ -139,14 +139,13 @@ impl ChunkStore {
                     .last()
                     .map(|p| p.start + p.chunk.uncompressed_len as u64)
                     .unwrap_or(0);
-                let expected = parse_blake3_hex(&rec.blake3).ok_or_else(|| {
-                    PhoenixError::TableCorrupt {
+                let expected =
+                    parse_blake3_hex(&rec.blake3).ok_or_else(|| PhoenixError::TableCorrupt {
                         what: format!(
                             "partition {}: chunk {} has a malformed BLAKE3 in the manifest ({:?})",
                             entry.index, chunk.chunk_index, rec.blake3
                         ),
-                    }
-                })?;
+                    })?;
                 placed.push(PlacedChunk {
                     start: at,
                     chunk: *chunk,
@@ -249,7 +248,9 @@ impl ChunkStore {
                 /// sequential walk for readahead.
                 slot: (usize, usize),
             },
-            Gap { len: u64 },
+            Gap {
+                len: u64,
+            },
         }
         let located = {
             let part = &self.partitions[pi];
@@ -416,8 +417,7 @@ impl ChunkStore {
                 self.cache.remove(&old);
             }
         }
-        self.cache
-            .insert(placed.chunk.file_offset, Arc::new(data));
+        self.cache.insert(placed.chunk.file_offset, Arc::new(data));
         self.cache_order.push_back(placed.chunk.file_offset);
     }
 }

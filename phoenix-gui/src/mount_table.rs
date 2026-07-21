@@ -389,7 +389,11 @@ pub(crate) fn table_button(
     let response = ui.interact(
         rect,
         id,
-        if enabled { Sense::click() } else { Sense::hover() },
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
     let raised = if palette.light_mode {
         blend(palette.content_card_bg, Color32::WHITE, 0.55)
@@ -417,7 +421,13 @@ pub(crate) fn table_button(
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(BTN_ROUNDING), fill);
     painter.rect_stroke(rect, Rounding::same(BTN_ROUNDING), Stroke::new(1.0, border));
-    let job = icon_label(icon, fonts::icon(15.0), label, fonts::regular(13.0), text_color);
+    let job = icon_label(
+        icon,
+        fonts::icon(15.0),
+        label,
+        fonts::regular(13.0),
+        text_color,
+    );
     let galley = ui.fonts(|f| f.layout_job(job));
     let pos = rect.center() - galley.size() * 0.5;
     ui.painter().galley(pos, galley, text_color);

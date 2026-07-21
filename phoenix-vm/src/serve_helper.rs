@@ -107,8 +107,8 @@ pub fn reap_orphan_helpers(scratch: &std::path::Path) {
 fn terminate_if_named(pid: u32, expected_name: &std::ffi::OsString) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
 
     // SAFETY: a failed open returns null, which we check before any use.
@@ -153,7 +153,10 @@ fn terminate_if_named(pid: u32, expected_name: &std::ffi::OsString) -> bool {
 /// Spawn a serve-helper subprocess for `backup`, serving at `scratch`, and wait
 /// (bounded) for it to report `READY`. Returns the running process plus the
 /// served parent path.
-pub fn spawn_serve(backup: &std::path::Path, scratch: &std::path::Path) -> anyhow::Result<ServeProcess> {
+pub fn spawn_serve(
+    backup: &std::path::Path,
+    scratch: &std::path::Path,
+) -> anyhow::Result<ServeProcess> {
     let exe = std::env::current_exe().map_err(|e| anyhow::anyhow!("locate current exe: {e}"))?;
     spawn_serve_with_exe(&exe, backup, scratch)
 }
@@ -212,7 +215,10 @@ pub fn spawn_serve_with_exe(
                 })
             } else {
                 let _ = child.kill();
-                anyhow::bail!("serve helper did not report READY (said: {:?})", line.trim_end());
+                anyhow::bail!(
+                    "serve helper did not report READY (said: {:?})",
+                    line.trim_end()
+                );
             }
         }
         Ok(Err(e)) => {
@@ -240,7 +246,10 @@ pub fn maybe_run(args: &[String]) -> Option<anyhow::Result<()>> {
     }
     let backup = args.get(2).cloned().unwrap_or_default();
     let scratch = args.get(3).cloned().unwrap_or_default();
-    Some(run(std::path::Path::new(&backup), std::path::Path::new(&scratch)))
+    Some(run(
+        std::path::Path::new(&backup),
+        std::path::Path::new(&scratch),
+    ))
 }
 
 /// Non-winfsp builds can't serve, so the sentinel is never handled (VM boot

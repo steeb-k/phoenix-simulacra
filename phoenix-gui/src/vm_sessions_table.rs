@@ -9,10 +9,10 @@
 use egui::{Align2, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
 use crate::disk_map::with_alpha;
+use crate::fonts;
 use crate::mount_table::{elided, table_button};
 use crate::theme::Palette;
 use crate::util::format_bytes;
-use crate::fonts;
 
 /// One saved session, flattened for display.
 pub struct SessionRow {

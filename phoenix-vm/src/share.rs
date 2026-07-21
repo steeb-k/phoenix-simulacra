@@ -318,8 +318,7 @@ mod tests {
         assert_eq!(mbr[0x1BE + 4], 0x0E);
         assert_eq!(&mbr[0x1BE + 8..0x1BE + 12], &2048u32.to_le_bytes());
 
-        let part =
-            fscommon::StreamSlice::new(file, 2048 * 512, 16 * 1024 * 1024).unwrap();
+        let part = fscommon::StreamSlice::new(file, 2048 * 512, 16 * 1024 * 1024).unwrap();
         let fs = fatfs::FileSystem::new(part, fatfs::FsOptions::new()).unwrap();
         assert_eq!(fs.volume_label(), "VMSCRIPTS");
         let mut cmd = String::new();

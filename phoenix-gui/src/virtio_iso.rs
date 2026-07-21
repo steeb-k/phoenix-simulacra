@@ -18,7 +18,10 @@ const ISO_NAME: &str = "virtio-win.iso";
 
 /// Events posted by the download / update-check workers.
 pub enum DlEvent {
-    Progress { downloaded: u64, total: u64 },
+    Progress {
+        downloaded: u64,
+        total: u64,
+    },
     /// Download finished (fresh install or update).
     Done,
     /// Update check ran and the local ISO is already current.
@@ -144,8 +147,12 @@ fn download(tx: &Sender<DlEvent>) -> Result<(), String> {
     let total = meta.length;
 
     let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(&part_path)
-        .map_err(|e| format!("cannot write next to the app ({}): {e}", part_path.display()))?;
+    let mut file = std::fs::File::create(&part_path).map_err(|e| {
+        format!(
+            "cannot write next to the app ({}): {e}",
+            part_path.display()
+        )
+    })?;
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded: u64 = 0;
     let mut last_report: u64 = 0;

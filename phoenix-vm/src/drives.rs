@@ -50,7 +50,10 @@ pub fn list_drives() -> Vec<DriveInfo> {
             continue;
         }
         let letter = (b'A' + i as u8) as char;
-        let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain(Some(0)).collect();
+        let root: Vec<u16> = format!("{letter}:\\")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         let mut free_avail = 0u64;
         let mut total = 0u64;
         // SAFETY: `root` is a NUL-terminated wide string; the out pointers are

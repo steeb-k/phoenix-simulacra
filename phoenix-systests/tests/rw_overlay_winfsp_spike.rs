@@ -100,8 +100,7 @@ fn differencing_overlay_over_winfsp_served_parent() {
     let scratch = std::env::temp_dir()
         .join("phoenix-systests")
         .join("ovl-serve");
-    let serve =
-        WinFspServe::serve(&backup_path, &scratch, true).expect("WinFsp serve (no attach)");
+    let serve = WinFspServe::serve(&backup_path, &scratch, true).expect("WinFsp serve (no attach)");
     let parent_path = serve.image_path();
     eprintln!(
         "WinFsp-served parent (never materialized): {}",
@@ -116,8 +115,10 @@ fn differencing_overlay_over_winfsp_served_parent() {
     // --- 3. Differencing child over the WINFSP-SERVED parent ------------------
     // The sharp new claim: CreateVirtualDisk reads the parent's VHDX metadata
     // straight through the user-mode filesystem and accepts it.
-    let child_vhdx =
-        std::env::temp_dir().join(format!("ovl2-child-{}.avhdx", uuid::Uuid::new_v4().simple()));
+    let child_vhdx = std::env::temp_dir().join(format!(
+        "ovl2-child-{}.avhdx",
+        uuid::Uuid::new_v4().simple()
+    ));
     create_differencing_vhdx(&child_vhdx, &parent_path)
         .expect("Windows must accept the WinFsp-served VHDX as a differencing parent");
     let child_len_fresh = std::fs::metadata(&child_vhdx).unwrap().len();
@@ -164,8 +165,14 @@ fn differencing_overlay_over_winfsp_served_parent() {
         .expect("reopen overlay file")
         .read_to_end(&mut read_back)
         .expect("read overlay file");
-    assert_eq!(read_back, proof_bytes, "overlay write did not read back intact");
-    eprintln!("wrote and read back {} bytes on the overlay", proof_bytes.len());
+    assert_eq!(
+        read_back, proof_bytes,
+        "overlay write did not read back intact"
+    );
+    eprintln!(
+        "wrote and read back {} bytes on the overlay",
+        proof_bytes.len()
+    );
 
     // --- 6. Detach the child, then tear down the served parent ----------------
     drop(attached);

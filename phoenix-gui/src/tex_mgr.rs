@@ -13,8 +13,12 @@ pub(crate) struct TexEntry {
 
 impl TexEntry {
     pub fn sample(&self, uv_x: f32, uv_y: f32) -> [f32; 4] {
-        let px = (uv_x * self.width as f32).floor().clamp(0.0, self.width as f32 - 1.0) as usize;
-        let py = (uv_y * self.height as f32).floor().clamp(0.0, self.height as f32 - 1.0) as usize;
+        let px = (uv_x * self.width as f32)
+            .floor()
+            .clamp(0.0, self.width as f32 - 1.0) as usize;
+        let py = (uv_y * self.height as f32)
+            .floor()
+            .clamp(0.0, self.height as f32 - 1.0) as usize;
         let idx = (py * self.width + px) * 4;
         if idx + 3 >= self.rgba.len() {
             return [1.0, 0.0, 1.0, 1.0];
@@ -95,10 +99,18 @@ impl TextureManager {
                     }
                     continue;
                 } else {
-                    TexEntry { width: w, height: h, rgba }
+                    TexEntry {
+                        width: w,
+                        height: h,
+                        rgba,
+                    }
                 }
             } else {
-                TexEntry { width: w, height: h, rgba }
+                TexEntry {
+                    width: w,
+                    height: h,
+                    rgba,
+                }
             };
 
             if *id == egui::TextureId::default() {
@@ -115,9 +127,15 @@ impl TextureManager {
 
     /// Alpha coverage for the font atlas — returns [0, 1].
     pub fn sample_alpha_f(&self, uv_x: f32, uv_y: f32) -> f32 {
-        let Some(atlas) = &self.font_atlas else { return 1.0 };
-        let px = (uv_x * atlas.width as f32).floor().clamp(0.0, atlas.width as f32 - 1.0) as usize;
-        let py = (uv_y * atlas.height as f32).floor().clamp(0.0, atlas.height as f32 - 1.0) as usize;
+        let Some(atlas) = &self.font_atlas else {
+            return 1.0;
+        };
+        let px = (uv_x * atlas.width as f32)
+            .floor()
+            .clamp(0.0, atlas.width as f32 - 1.0) as usize;
+        let py = (uv_y * atlas.height as f32)
+            .floor()
+            .clamp(0.0, atlas.height as f32 - 1.0) as usize;
         let idx = (py * atlas.width + px) * 4 + 3;
         atlas.rgba.get(idx).copied().unwrap_or(0) as f32 / 255.0
     }
