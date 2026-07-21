@@ -249,9 +249,7 @@ pub fn boot(
 
         let log_text = std::fs::read_to_string(&qemu_log_path).unwrap_or_default();
         let guest_reset = log_text.contains("Unexpected VP exit code");
-        if guest_reset
-            && launches < MAX_RELAUNCHES
-            && started.elapsed() >= MIN_UPTIME_FOR_RELAUNCH
+        if guest_reset && launches < MAX_RELAUNCHES && started.elapsed() >= MIN_UPTIME_FOR_RELAUNCH
         {
             tracing::info!(
                 "guest restart (WHPX cannot reset in place) — relaunching to continue \
@@ -286,7 +284,9 @@ pub fn boot(
         .and_then(|att| att.physical_drive_number().ok());
     drop(_attached);
     let detached = match drive_to_wait {
-        Some(drive) => phoenix_mount::wait_for_device_gone(drive, std::time::Duration::from_secs(15)),
+        Some(drive) => {
+            phoenix_mount::wait_for_device_gone(drive, std::time::Duration::from_secs(15))
+        }
         None => true,
     };
     if !detached {
@@ -391,7 +391,12 @@ fn qemu_process_handle_op(pid: u32, terminate: bool) -> bool {
     let mut len = buf.len() as u32;
     // SAFETY: handle is live; buf/len describe a valid writable buffer.
     let ok = unsafe {
-        QueryFullProcessImageNameW(handle, PROCESS_NAME_FORMAT::default(), buf.as_mut_ptr(), &mut len)
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT::default(),
+            buf.as_mut_ptr(),
+            &mut len,
+        )
     };
     let mut matches = false;
     if ok != 0 {

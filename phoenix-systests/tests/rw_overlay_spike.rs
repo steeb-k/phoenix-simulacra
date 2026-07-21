@@ -73,7 +73,10 @@ fn vhdx_storage_type() -> VIRTUAL_STORAGE_TYPE {
 }
 
 fn wide(p: &Path) -> Vec<u16> {
-    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    p.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Drive letters D..Z whose root holds a `phoenix-fixture` directory (the marker
@@ -352,8 +355,14 @@ fn differencing_overlay_over_synthetic_vhdx_parent() {
         .expect("reopen overlay file")
         .read_to_end(&mut read_back)
         .expect("read overlay file");
-    assert_eq!(read_back, proof_bytes, "overlay write did not read back intact");
-    eprintln!("wrote and read back {} bytes on the writable overlay", proof_bytes.len());
+    assert_eq!(
+        read_back, proof_bytes,
+        "overlay write did not read back intact"
+    );
+    eprintln!(
+        "wrote and read back {} bytes on the writable overlay",
+        proof_bytes.len()
+    );
 
     // --- 6. Detach -----------------------------------------------------------
     drop(attached);

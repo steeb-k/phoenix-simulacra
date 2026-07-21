@@ -53,14 +53,7 @@ const SELECT_BAR_W: f32 = 3.0;
 /// Narrowest the table renders at; callers size it to `max(viewport,
 /// min_width())`, the same discipline as the history and mounts tables.
 pub fn min_width() -> f32 {
-    PAD_X * 2.0
-        + VERSION_MIN_W
-        + DRIVE_W
-        + DISK_W
-        + PARTITION_W
-        + LABEL_W
-        + BOOT_W
-        + COL_GAP * 5.0
+    PAD_X * 2.0 + VERSION_MIN_W + DRIVE_W + DISK_W + PARTITION_W + LABEL_W + BOOT_W + COL_GAP * 5.0
 }
 
 /// Column x-positions for a row (or the header) of the given rect: version is
@@ -135,7 +128,16 @@ pub fn show(
     let mut body: Option<Rect> = None;
     let last = rows.len() - 1;
     for (i, row) in rows.iter().enumerate() {
-        let rect = paint_row(ui, width, i, last, row, selected == Some(i), palette, &mut clicked);
+        let rect = paint_row(
+            ui,
+            width,
+            i,
+            last,
+            row,
+            selected == Some(i),
+            palette,
+            &mut clicked,
+        );
         body = Some(body.map_or(rect, |b: Rect| b.union(rect)));
     }
     // Border last so it rides over the row fills.

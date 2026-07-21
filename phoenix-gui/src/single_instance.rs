@@ -16,9 +16,7 @@ pub use imp::{acquire, Guard};
 mod imp {
     use std::ptr::null;
 
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,

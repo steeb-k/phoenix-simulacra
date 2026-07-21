@@ -189,7 +189,11 @@ fn mbr_identity_survives_capture_and_synthesis() {
     // No GPT: LBA 1 must not be an EFI PART header.
     let mut lba1 = vec![0u8; 512];
     synth.read_at(512, &mut lba1).expect("read LBA 1");
-    assert_ne!(&lba1[0..8], b"EFI PART", "synthesized a GPT for an MBR source");
+    assert_ne!(
+        &lba1[0..8],
+        b"EFI PART",
+        "synthesized a GPT for an MBR source"
+    );
 
     for (i, want_type) in expected_types.iter().enumerate() {
         let base = 446 + i * 16;
@@ -199,7 +203,11 @@ fn mbr_identity_survives_capture_and_synthesis() {
             expected_active[i],
             "entry {i} active flag"
         );
-        assert_ne!(sector[base + 4], 0xEE, "entry {i} is a protective GPT entry");
+        assert_ne!(
+            sector[base + 4],
+            0xEE,
+            "entry {i} is a protective GPT entry"
+        );
     }
 
     // 3. Partition data still reads back through the synthesized disk. The

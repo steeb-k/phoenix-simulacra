@@ -340,7 +340,9 @@ fn fetch_expected_sha(agent: &ureq::Agent, url: &str) -> Result<String, FetchErr
     // Format is "<hex>  <filename>"; take the first whitespace-delimited token.
     let hash = text.split_whitespace().next().unwrap_or("");
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(FetchErr::Other("published checksum is malformed".to_string()));
+        return Err(FetchErr::Other(
+            "published checksum is malformed".to_string(),
+        ));
     }
     Ok(hash.to_string())
 }
@@ -412,8 +414,7 @@ fn download_and_verify(
     }
 
     // Only a fully verified file gets the runnable (non-`.part`) name.
-    std::fs::rename(&part_path, &final_path)
-        .map_err(|e| format!("cannot finalize update: {e}"))?;
+    std::fs::rename(&part_path, &final_path).map_err(|e| format!("cannot finalize update: {e}"))?;
     info!(target: "phoenix_gui::updater", %version, path = %final_path.display(), "update staged");
     Ok(StagedUpdate {
         version: version.to_string(),

@@ -205,7 +205,9 @@ fn accel_warning(ui: &mut Ui, palette: &Palette, accel: &AccelView, action: &mut
                         // Fixable from here, because the app already runs
                         // elevated. Firmware never is — that card only ever
                         // shows instructions.
-                        if ui.button(egui::RichText::new(label).font(fonts::regular(13.0))).clicked()
+                        if ui
+                            .button(egui::RichText::new(label).font(fonts::regular(13.0)))
+                            .clicked()
                         {
                             *action = VmAction::FixAcceleration(blocker);
                         }
@@ -226,7 +228,9 @@ fn accel_warning(ui: &mut Ui, palette: &Palette, accel: &AccelView, action: &mut
                     if !accel.note.is_empty() {
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(&accel.note).small().color(palette.danger),
+                            egui::RichText::new(&accel.note)
+                                .small()
+                                .color(palette.danger),
                         );
                     }
                 });
@@ -303,9 +307,7 @@ pub fn show(
     // actionable (one VM at a time in this first cut).
     if let Some(run) = &running {
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!("Running: {}", run.name)).font(fonts::bold(16.0)),
-        );
+        ui.label(egui::RichText::new(format!("Running: {}", run.name)).font(fonts::bold(16.0)));
         ui.label(
             egui::RichText::new(format!(
                 "up {}m {:02}s · overlay {} MB of guest writes",
@@ -403,10 +405,8 @@ pub fn show(
                     .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                     .show(ui, |ui| {
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(cmd).font(fonts::regular(13.0)),
-                            )
-                            .selectable(true),
+                            egui::Label::new(egui::RichText::new(cmd).font(fonts::regular(13.0)))
+                                .selectable(true),
                         );
                     });
                 let copy = crate::icon_label(
@@ -434,7 +434,7 @@ pub fn show(
         ui.separator();
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Saved sessions").font(fonts::bold(14.0)));
-    ui.add_space(8.0);
+        ui.add_space(8.0);
         show_sessions(ui, palette, sessions, running.as_ref(), &mut action);
         return action;
     }
@@ -603,7 +603,10 @@ pub fn show(
         let (note, tint) = if qemu.clipboard {
             ("clipboard sharing available", palette.accent)
         } else {
-            ("no clipboard sharing (needs QEMU 11.1+)", palette.subtle_text)
+            (
+                "no clipboard sharing (needs QEMU 11.1+)",
+                palette.subtle_text,
+            )
         };
         ui.label(egui::RichText::new("·").small().color(palette.subtle_text));
         ui.label(egui::RichText::new(note).small().color(tint));
@@ -814,7 +817,11 @@ fn scratch_dropdown(ui: &mut Ui, state: &mut VmPageState) {
                 "Same drive as the image",
             );
             for d in &drives {
-                ui.selectable_value(&mut state.scratch, ScratchChoice::Drive(d.letter), d.label());
+                ui.selectable_value(
+                    &mut state.scratch,
+                    ScratchChoice::Drive(d.letter),
+                    d.label(),
+                );
             }
         });
 }
@@ -837,8 +844,8 @@ fn show_sessions(
             let path = std::path::Path::new(&meta.backup_path);
             // The dirty flag is set for the whole time a guest runs, so the
             // ACTIVE session must read "running", not "interrupted".
-            let is_this_running = running
-                .is_some_and(|r| r.backup_path.eq_ignore_ascii_case(&meta.backup_path));
+            let is_this_running =
+                running.is_some_and(|r| r.backup_path.eq_ignore_ascii_case(&meta.backup_path));
             let state = if is_this_running {
                 RowState::Running
             } else if !meta.clean_shutdown {
@@ -856,7 +863,9 @@ fn show_sessions(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| meta.backup_path.clone()),
                 state,
-                overlay_bytes: std::fs::metadata(s.overlay_path()).map(|m| m.len()).unwrap_or(0),
+                overlay_bytes: std::fs::metadata(s.overlay_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0),
             }
         })
         .collect();
@@ -919,7 +928,9 @@ fn show_unavailable(
                 .color(palette.subtle_text),
         );
         ui.add_space(14.0);
-        ui.label(egui::RichText::new("QEMU is required to boot backups as VMs").font(fonts::bold(18.0)));
+        ui.label(
+            egui::RichText::new("QEMU is required to boot backups as VMs").font(fonts::bold(18.0)),
+        );
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
@@ -934,9 +945,17 @@ fn show_unavailable(
         ui.add_space(16.0);
 
         if let Some((got, total)) = download.progress {
-            let frac = if total > 0 { got as f32 / total as f32 } else { 0.0 };
+            let frac = if total > 0 {
+                got as f32 / total as f32
+            } else {
+                0.0
+            };
             let text = if total > 0 {
-                format!("Downloading QEMU… {} / {} MB", got / 1_000_000, total / 1_000_000)
+                format!(
+                    "Downloading QEMU… {} / {} MB",
+                    got / 1_000_000,
+                    total / 1_000_000
+                )
             } else {
                 format!("Downloading QEMU… {} MB", got / 1_000_000)
             };

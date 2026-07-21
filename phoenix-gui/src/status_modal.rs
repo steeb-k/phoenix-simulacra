@@ -506,7 +506,11 @@ fn animated_position(ui: &mut egui::Ui, target: f32) -> f32 {
     let from: f32 = ui.data(|d| d.get_temp(from_id)).unwrap_or(target);
     let start: f64 = ui.data(|d| d.get_temp(start_id)).unwrap_or(now);
 
-    let eased = smoothstep(0.0, 1.0, (((now - start) / STEP_ANIM_SECS as f64) as f32).clamp(0.0, 1.0));
+    let eased = smoothstep(
+        0.0,
+        1.0,
+        (((now - start) / STEP_ANIM_SECS as f64) as f32).clamp(0.0, 1.0),
+    );
     let displayed = from + (stored_target.unwrap_or(target) - from) * eased;
 
     if stored_target != Some(target) {

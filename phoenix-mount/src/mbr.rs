@@ -123,7 +123,10 @@ mod tests {
 
     #[test]
     fn synthesized_mbr_has_valid_structure() {
-        let parts = vec![part(2048, 1_048_576, 0x07, true), part(1_050_624, 4096, 0x27, false)];
+        let parts = vec![
+            part(2048, 1_048_576, 0x07, true),
+            part(1_050_624, 4096, 0x27, false),
+        ];
         let mbr = synthesize(0xDEAD_BEEF, None, &parts, 512);
 
         assert_eq!(mbr.len(), 512);

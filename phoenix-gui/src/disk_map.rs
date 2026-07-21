@@ -743,4 +743,3 @@ pub fn draw_backup_disk_row(
         },
     );
 }
-

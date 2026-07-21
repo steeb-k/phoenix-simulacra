@@ -846,7 +846,10 @@ mod tests {
         // be wrong — bootmgr lives on System Reserved, and that is what the
         // MBR boot code has to chain into.
         const MB: u64 = 1024 * 1024;
-        assert_eq!(guess_for(&[("ntfs", 500 * MB), ("ntfs", 200_000 * MB)]), Some(0));
+        assert_eq!(
+            guess_for(&[("ntfs", 500 * MB), ("ntfs", 200_000 * MB)]),
+            Some(0)
+        );
     }
 
     #[test]
@@ -862,7 +865,11 @@ mod tests {
         // breaks a naive "first partition" rule.
         const MB: u64 = 1024 * 1024;
         assert_eq!(
-            guess_for(&[("fat32", 500 * MB), ("ntfs", 500 * MB), ("ntfs", 200_000 * MB)]),
+            guess_for(&[
+                ("fat32", 500 * MB),
+                ("ntfs", 500 * MB),
+                ("ntfs", 200_000 * MB)
+            ]),
             Some(1)
         );
     }

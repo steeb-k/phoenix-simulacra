@@ -241,7 +241,10 @@ impl SessionManager {
     /// dirs — because sessions live on their image's drive, `list` has to look
     /// on every drive, not one fixed root.
     pub fn list_all() -> Vec<SessionMeta> {
-        Self::list_all_sessions().into_iter().map(|s| s.meta).collect()
+        Self::list_all_sessions()
+            .into_iter()
+            .map(|s| s.meta)
+            .collect()
     }
 
     /// The sessions root this manager writes to.
@@ -388,7 +391,10 @@ mod tests {
                 "t".into(),
             )
             .unwrap();
-        assert!(a.overlay_path().to_string_lossy().ends_with("session.avhdx"));
+        assert!(a
+            .overlay_path()
+            .to_string_lossy()
+            .ends_with("session.avhdx"));
         let q = mgr
             .open_or_create(
                 Uuid::from_u128(2),
@@ -397,7 +403,10 @@ mod tests {
                 "t".into(),
             )
             .unwrap();
-        assert!(q.overlay_path().to_string_lossy().ends_with("session.qcow2"));
+        assert!(q
+            .overlay_path()
+            .to_string_lossy()
+            .ends_with("session.qcow2"));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -474,8 +483,14 @@ mod tests {
             "stale helper pid file survived the sweep"
         );
         assert!(overlay.exists(), "sweep destroyed a kept session overlay");
-        assert!(!serve.join("serve-abc").exists(), "stale serve junction survived");
-        assert!(!serve.join("child-abc.avhdx").exists(), "leaked child survived");
+        assert!(
+            !serve.join("serve-abc").exists(),
+            "stale serve junction survived"
+        );
+        assert!(
+            !serve.join("child-abc.avhdx").exists(),
+            "leaked child survived"
+        );
         std::fs::remove_dir_all(&vm_root).ok();
     }
 
@@ -483,10 +498,20 @@ mod tests {
     fn list_and_discard() {
         let root = tmp_root();
         let mgr = SessionManager::new(root.clone());
-        mgr.open_or_create(Uuid::from_u128(10), Path::new("a"), WriteLayer::Avhdx, "t".into())
-            .unwrap();
-        mgr.open_or_create(Uuid::from_u128(11), Path::new("b"), WriteLayer::Qcow2, "t".into())
-            .unwrap();
+        mgr.open_or_create(
+            Uuid::from_u128(10),
+            Path::new("a"),
+            WriteLayer::Avhdx,
+            "t".into(),
+        )
+        .unwrap();
+        mgr.open_or_create(
+            Uuid::from_u128(11),
+            Path::new("b"),
+            WriteLayer::Qcow2,
+            "t".into(),
+        )
+        .unwrap();
         assert_eq!(mgr.list().len(), 2);
 
         mgr.discard(&Uuid::from_u128(10)).unwrap();

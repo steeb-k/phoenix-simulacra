@@ -44,7 +44,9 @@ impl ActiveMount {
     ) -> Result<Self> {
         #[cfg(feature = "winfsp")]
         let inner = WinfspInner::ReadOnly(crate::winfsp_mount::WinFspMount::mount_selected(
-            backup, scratch_dir, selection,
+            backup,
+            scratch_dir,
+            selection,
         )?);
         #[cfg(not(feature = "winfsp"))]
         let inner = crate::session::MountSession::mount_selected(backup, scratch_dir, selection)?;

@@ -60,7 +60,9 @@ fn qemu_tool(name: &str) -> PathBuf {
 
 /// Run a command, panic with full output on failure, return stdout.
 fn run_ok(cmd: &mut Command, what: &str) -> String {
-    let out = cmd.output().unwrap_or_else(|e| panic!("{what}: spawn failed: {e}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{what}: spawn failed: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -147,7 +149,9 @@ fn spike_a_raw_passthrough_over_offline_avhdx_child() {
     let backup = make_backup_fixture("a", 0x00D1_5C05);
 
     // --- serve the parent, hang the .avhdx child off it (as the writable mount)
-    let scratch = std::env::temp_dir().join("phoenix-systests").join("vmspk-a");
+    let scratch = std::env::temp_dir()
+        .join("phoenix-systests")
+        .join("vmspk-a");
     let serve = WinFspServe::serve(&backup, &scratch, true).expect("WinFsp serve");
     let parent = serve.image_path();
     let vdisk_size = serve.disk_size();
@@ -223,10 +227,8 @@ fn spike_a_raw_passthrough_over_offline_avhdx_child() {
     drop(raw);
 
     // --- QEMU's own block layer reads the same bytes ------------------------
-    let dd_out = std::env::temp_dir().join(format!(
-        "vmspk-a-dd-{}.bin",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let dd_out =
+        std::env::temp_dir().join(format!("vmspk-a-dd-{}.bin", uuid::Uuid::new_v4().simple()));
     run_ok(
         Command::new(&qemu_img)
             .arg("dd")
@@ -277,7 +279,9 @@ fn spike_a_raw_passthrough_over_offline_avhdx_child() {
     drop(serve);
 
     let mut reader = PhnxReader::open(&backup).expect("reopen backup");
-    reader.verify_all(false).expect(".phnx must verify after spike A");
+    reader
+        .verify_all(false)
+        .expect(".phnx must verify after spike A");
     eprintln!("SPIKE A PASS: offline raw passthrough works end-to-end, .phnx pristine");
 
     let _ = std::fs::remove_file(&dd_out);
@@ -296,7 +300,9 @@ fn spike_b_qcow2_overlay_over_served_vhdx() {
     let backup = make_backup_fixture("b", 0x00D1_5C0B);
 
     // --- serve the parent; NOTHING is ever attached in this spike -----------
-    let scratch = std::env::temp_dir().join("phoenix-systests").join("vmspk-b");
+    let scratch = std::env::temp_dir()
+        .join("phoenix-systests")
+        .join("vmspk-b");
     let serve = WinFspServe::serve(&backup, &scratch, true).expect("WinFsp serve");
     let parent = serve.image_path();
     let vdisk_size = serve.disk_size();
@@ -331,10 +337,8 @@ fn spike_b_qcow2_overlay_over_served_vhdx() {
     );
 
     // --- qcow2 overlay backed by the served VHDX ----------------------------
-    let overlay = std::env::temp_dir().join(format!(
-        "vmspk-b-{}.qcow2",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let overlay =
+        std::env::temp_dir().join(format!("vmspk-b-{}.qcow2", uuid::Uuid::new_v4().simple()));
     run_ok(
         Command::new(&qemu_img)
             .args(["create", "-f", "qcow2", "-F", "vhdx", "-b"])
@@ -435,7 +439,9 @@ fn spike_b_qcow2_overlay_over_served_vhdx() {
 
     drop(serve);
     let mut reader = PhnxReader::open(&backup).expect("reopen backup");
-    reader.verify_all(false).expect(".phnx must verify after spike B");
+    reader
+        .verify_all(false)
+        .expect(".phnx must verify after spike B");
     eprintln!("SPIKE B PASS: QEMU vhdx backing + qcow2 CoW works end-to-end, .phnx pristine");
 
     for f in [&overlay, &head_bin, &part_bin, &head_bin2] {
@@ -474,7 +480,11 @@ fn boot_smoke_windows_backup() {
     let sector_size = reader.manifest.disk.sector_size;
     eprintln!(
         "manifest: {} | {sector_size}-byte sectors | {} partitions:",
-        if is_gpt { "GPT (UEFI firmware)" } else { "MBR (SeaBIOS)" },
+        if is_gpt {
+            "GPT (UEFI firmware)"
+        } else {
+            "MBR (SeaBIOS)"
+        },
         reader.manifest.partitions.len()
     );
     for p in &reader.manifest.partitions {
@@ -539,8 +549,8 @@ fn boot_smoke_windows_backup() {
             let _ = std::fs::remove_file(&child);
             create_differencing_vhdx(&child, &parent)
                 .expect("differencing session child over served parent");
-            let attached = AttachedRw::attach_no_letters(&child)
-                .expect("attach session child RW, no letters");
+            let attached =
+                AttachedRw::attach_no_letters(&child).expect("attach session child RW, no letters");
             let drive = attached
                 .physical_drive_number()
                 .expect("physical drive number of session child");
@@ -642,13 +652,13 @@ fn boot_smoke_windows_backup() {
     drop(serve);
     for name in ["session.avhdx", "session.qcow2"] {
         if let Ok(m) = std::fs::metadata(session.join(name)) {
-            eprintln!("session overlay {name}: {} MiB of guest writes", m.len() / MIB);
+            eprintln!(
+                "session overlay {name}: {} MiB of guest writes",
+                m.len() / MIB
+            );
         }
     }
-    eprintln!(
-        "session kept for inspection/resume: {}",
-        session.display()
-    );
+    eprintln!("session kept for inspection/resume: {}", session.display());
 }
 
 // --- raw device I/O helpers (sector-aligned, as QEMU's raw driver does) -----

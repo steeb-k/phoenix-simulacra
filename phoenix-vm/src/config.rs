@@ -180,8 +180,8 @@ pub fn host_free_mem_mib() -> Option<u64> {
 pub fn usable_guest_resolution() -> Option<(u32, u32)> {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SystemParametersInfoW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
-        SM_CYCAPTION, SM_CYSIZEFRAME, SPI_GETWORKAREA,
+        GetSystemMetrics, SystemParametersInfoW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYCAPTION,
+        SM_CYSIZEFRAME, SPI_GETWORKAREA,
     };
 
     let mut rect = RECT {
@@ -192,9 +192,8 @@ pub fn usable_guest_resolution() -> Option<(u32, u32)> {
     };
     // SAFETY: rect is a properly-sized writable RECT; a failed call returns 0
     // and rect is not read.
-    let ok = unsafe {
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut rect as *mut RECT as *mut _, 0)
-    };
+    let ok =
+        unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut rect as *mut RECT as *mut _, 0) };
     if ok == 0 {
         return None;
     }
@@ -441,7 +440,9 @@ impl VmConfig {
         match &spec.disk {
             DiskSource::RawPhysicalDrive(n) => {
                 push("-drive");
-                push(&format!(r"file=\\.\PhysicalDrive{n},format=raw,if=none,id=disk0"));
+                push(&format!(
+                    r"file=\\.\PhysicalDrive{n},format=raw,if=none,id=disk0"
+                ));
             }
             DiskSource::File { path, format } => {
                 push("-drive");
@@ -476,10 +477,14 @@ impl VmConfig {
         // Port 1 is always free — the disk is ide.0 (AHCI) or on NVMe.
         if let Some(iso) = &spec.iso {
             push("-drive");
-            push(&format!("file={iso},format=raw,if=none,id=cd0,media=cdrom,readonly=on"));
+            push(&format!(
+                "file={iso},format=raw,if=none,id=cd0,media=cdrom,readonly=on"
+            ));
             let cd_bootindex = if booting_iso { 0 } else { 2 };
             push("-device");
-            push(&format!("ide-cd,drive=cd0,bus=ide.1,bootindex={cd_bootindex}"));
+            push(&format!(
+                "ide-cd,drive=cd0,bus=ide.1,bootindex={cd_bootindex}"
+            ));
         }
 
         // Guest-tools / driver ISO (virtio-win) as a second CD on its own SATA
@@ -487,7 +492,9 @@ impl VmConfig {
         // the guest, never booted.
         if let Some(iso) = &spec.drivers_iso {
             push("-drive");
-            push(&format!("file={iso},format=raw,if=none,id=cd1,media=cdrom,readonly=on"));
+            push(&format!(
+                "file={iso},format=raw,if=none,id=cd1,media=cdrom,readonly=on"
+            ));
             push("-device");
             push("ide-cd,drive=cd1,bus=ide.2");
         }
@@ -609,7 +616,11 @@ mod tests {
 
     #[test]
     fn gpt_512_windows_is_uefi_ahci() {
-        let m = manifest("gpt", 512, vec![part(0, "efi", None), part(1, "ntfs", None)]);
+        let m = manifest(
+            "gpt",
+            512,
+            vec![part(0, "efi", None), part(1, "ntfs", None)],
+        );
         let cfg = VmConfig::from_manifest(&m, &HostOptions::default()).unwrap();
         assert_eq!(cfg.firmware, Firmware::Uefi);
         assert_eq!(cfg.controller, DiskController::Ahci);
@@ -723,7 +734,9 @@ mod tests {
             ..spec_uefi_raw()
         };
         let args = cfg.qemu_args(&spec).join(" ");
-        assert!(args.contains(r"file=D:\winpe.iso,format=raw,if=none,id=cd0,media=cdrom,readonly=on"));
+        assert!(
+            args.contains(r"file=D:\winpe.iso,format=raw,if=none,id=cd0,media=cdrom,readonly=on")
+        );
         // CD boots first (on its own SATA port), disk second.
         assert!(args.contains("ide-cd,drive=cd0,bus=ide.1,bootindex=0"));
         assert!(args.contains("ide-hd,drive=disk0,bootindex=1"));
@@ -806,7 +819,10 @@ mod tests {
         // It is environment only — never an argument.
         let m = manifest("gpt", 512, vec![part(0, "ntfs", None)]);
         let cfg = VmConfig::from_manifest(&m, &host).unwrap();
-        assert!(!cfg.qemu_args(&spec_uefi_raw()).join(" ").contains("GTK_THEME"));
+        assert!(!cfg
+            .qemu_args(&spec_uefi_raw())
+            .join(" ")
+            .contains("GTK_THEME"));
     }
 
     #[test]
@@ -860,7 +876,9 @@ mod tests {
             ..spec_uefi_raw()
         };
         let args = cfg.qemu_args(&spec).join(" ");
-        assert!(args.contains(r"file=C:\app\virtio-win.iso,format=raw,if=none,id=cd1,media=cdrom,readonly=on"));
+        assert!(args.contains(
+            r"file=C:\app\virtio-win.iso,format=raw,if=none,id=cd1,media=cdrom,readonly=on"
+        ));
         assert!(args.contains("ide-cd,drive=cd1,bus=ide.2"));
         // The drivers CD carries no bootindex — only the rescue CD and disk do.
         assert!(!args.contains("cd1,bus=ide.2,bootindex"));
@@ -925,5 +943,4 @@ mod tests {
         // and absent by default
         assert!(!cfg.qemu_args(&spec_uefi_raw()).join(" ").contains("-qmp"));
     }
-
 }
