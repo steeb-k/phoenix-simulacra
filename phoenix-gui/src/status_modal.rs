@@ -299,16 +299,13 @@ fn show_verdict_badge(ui: &mut egui::Ui, palette: &Palette, verdict: Verdict<'_>
     });
 }
 
-/// The step checklist, height-capped so a many-partition job (e.g. a verify
-/// across a dozen partitions) scrolls instead of growing the modal taller than
-/// the window.
+/// The step display. Rather than a full checklist, we show a moving window of
+/// at most three steps — the one just finished, the current one, and the one
+/// coming up — so a many-partition job never grows the modal or needs a
+/// scrollbar. The current step is the focus: larger, brighter, and framed by a
+/// pair of accent rules that fade to transparent at the modal's edges.
 fn show_step_list(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
-    egui::ScrollArea::vertical()
-        .max_height(300.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            show_steps(ui, palette, view);
-        });
+    show_steps(ui, palette, view);
 }
 
 /// The running job's progress bar — a dark track, and a filled part that is a
@@ -392,72 +389,180 @@ fn show_progress_bar(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>)
     ui.ctx().request_repaint();
 }
 
+/// Font size of the current (focused) step. Slightly smaller than the first
+/// pass — it is still the headline, but no longer shouts.
+const STEP_CENTER_SIZE: f32 = 20.0;
+/// Font size a step settles to once it has floated out to a flanking slot.
+const STEP_FLANK_SIZE: f32 = 14.0;
+/// Vertical gap between adjacent step slots. A flanking step sits this far above
+/// or below the centered current step.
+const STEP_ROW_SPACING: f32 = 32.0;
+/// Half the distance between the two accent rules — they sit this far above and
+/// below the display's center line, framing whatever step is centered.
+const STEP_RULE_GAP: f32 = 22.0;
+/// Thickness of the accent rules that frame the current step.
+const STEP_RULE_HEIGHT: f32 = 2.0;
+/// Whether to frame the centered step with the pair of accent rules.
+const STEP_SHOW_RULES: bool = false;
+/// Fixed height of the step display region. Sized to hold the centered step
+/// plus one flanking step above and below with room for them to fade off.
+const STEP_REGION_HEIGHT: f32 = 128.0;
+/// How long a step takes to float from one slot to the next when the job
+/// advances. Short enough to feel responsive, long enough to read as motion.
+const STEP_ANIM_SECS: f32 = 0.35;
+/// Temp-memory keys for the step tween (see `animated_position`).
+const STEP_FROM_ID: &str = "status_modal_step_from";
+const STEP_TARGET_ID: &str = "status_modal_step_target";
+const STEP_START_ID: &str = "status_modal_step_start";
+
+/// The step display. Rather than a checklist, it shows the current step centered
+/// and bright, with the just-finished and upcoming steps flanking it, smaller
+/// and dimmer. When the job advances, the whole stack animates by one slot: the
+/// completing step shrinks and darkens as it floats up and out, and the upcoming
+/// step enlarges and brightens as it slides into the center — so at most three
+/// steps are ever on screen and the transition between them is continuous.
 fn show_steps(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) {
-    for (i, label) in view.steps.iter().enumerate() {
-        let style = step_style(i, view, palette);
-        let mut text = RichText::new(label).font(style.font).color(style.color);
-        if style.italic {
-            text = text.italics();
+    let len = view.steps.len();
+    if len == 0 {
+        return;
+    }
+    let current = view.current_step.min(len - 1) as f32;
+    // Eased position of the "center" of the display, in step-index units. Equal
+    // to `current` at rest; between two indices mid-transition.
+    let anim = animated_position(ui, current);
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), STEP_REGION_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let center_y = rect.center().y;
+    let rule_color = match view.finished {
+        Some(verdict) => verdict_color(palette, verdict.outcome),
+        None => palette.accent,
+    };
+    // The bright color the centered step reaches: the outcome's color on a
+    // finished modal, otherwise the normal bright text.
+    let bright = match view.finished {
+        Some(verdict) => verdict_color(palette, verdict.outcome),
+        None => palette.icon_color,
+    };
+
+    // The two accent rules stay put, framing the center line; steps float
+    // through them. Painted first so text sits on top.
+    if STEP_SHOW_RULES {
+        paint_hrule(ui.painter(), rect, center_y - STEP_RULE_GAP, rule_color);
+        paint_hrule(ui.painter(), rect, center_y + STEP_RULE_GAP, rule_color);
+    }
+
+    // Draw every step whose slot is close enough to the center to be visible.
+    let lo = (anim.floor() as isize) - 2;
+    let hi = (anim.ceil() as isize) + 2;
+    for i in lo..=hi {
+        if i < 0 || i as usize >= len {
+            continue;
         }
-        ui.label(text);
-        ui.add_space(2.0);
+        let d = i as f32 - anim; // signed slot distance from center
+        let ad = d.abs();
+        if ad >= 1.5 {
+            continue;
+        }
+        // t: 0 at the center slot, 1 out at a flanking slot.
+        let t = ad.min(1.0);
+        let size = STEP_CENTER_SIZE + (STEP_FLANK_SIZE - STEP_CENTER_SIZE) * t;
+        // Dim target depends on which side: the finished step above grays a
+        // little less than the not-yet-reached step below.
+        let dim = if d < 0.0 {
+            palette.subtle_text
+        } else {
+            palette.dim(palette.subtle_text)
+        };
+        let color = lerp_color(bright, dim, t);
+        // Fade to nothing as a step leaves the window past the flanking slots.
+        let alpha = 1.0 - smoothstep(1.0, 1.5, ad);
+        let color = color.gamma_multiply(alpha);
+        let y = center_y + d * STEP_ROW_SPACING;
+        ui.painter().text(
+            egui::pos2(rect.center().x, y),
+            Align2::CENTER_CENTER,
+            &view.steps[i as usize],
+            fonts::bold(size),
+            color,
+        );
     }
 }
 
-struct StepStyle {
-    font: egui::FontId,
-    color: Color32,
-    italic: bool,
+/// The eased center position of the step display, in step-index units. Tracks a
+/// tween in temp memory: whenever `target` changes it retargets from wherever
+/// the display currently sits, so an advance mid-animation stays smooth. A large
+/// jump (e.g. a brand-new job resetting to step 0) snaps rather than scrolling
+/// through every intervening step.
+fn animated_position(ui: &mut egui::Ui, target: f32) -> f32 {
+    let from_id = egui::Id::new(STEP_FROM_ID);
+    let target_id = egui::Id::new(STEP_TARGET_ID);
+    let start_id = egui::Id::new(STEP_START_ID);
+    let now = ui.input(|i| i.time);
+
+    let stored_target: Option<f32> = ui.data(|d| d.get_temp(target_id));
+    let from: f32 = ui.data(|d| d.get_temp(from_id)).unwrap_or(target);
+    let start: f64 = ui.data(|d| d.get_temp(start_id)).unwrap_or(now);
+
+    let eased = smoothstep(0.0, 1.0, (((now - start) / STEP_ANIM_SECS as f64) as f32).clamp(0.0, 1.0));
+    let displayed = from + (stored_target.unwrap_or(target) - from) * eased;
+
+    if stored_target != Some(target) {
+        // Retarget from where we are now — unless the gap is large, in which
+        // case snap so we don't fling through a dozen steps.
+        let new_from = if (target - displayed).abs() > 2.5 {
+            target
+        } else {
+            displayed
+        };
+        ui.data_mut(|d| {
+            d.insert_temp(from_id, new_from);
+            d.insert_temp(target_id, target);
+            d.insert_temp(start_id, now);
+        });
+        return new_from;
+    }
+
+    if (displayed - target).abs() > 0.001 {
+        ui.ctx().request_repaint();
+    }
+    displayed
 }
 
-fn step_style(i: usize, view: &ModalView<'_>, palette: &Palette) -> StepStyle {
-    // Finished step: italic + lightly grayed.
-    let done = StepStyle {
-        font: fonts::regular(15.0),
-        color: palette.subtle_text,
-        italic: true,
-    };
-    // Current step: bold + bright.
-    let current = StepStyle {
-        font: fonts::bold(15.0),
-        color: palette.icon_color,
-        italic: false,
-    };
-    // Upcoming step: darkly grayed out.
-    let upcoming = StepStyle {
-        font: fonts::regular(15.0),
-        color: palette.dim(palette.subtle_text),
-        italic: false,
-    };
+/// Linear interpolation between two opaque colors, channel-wise.
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
 
-    match view.finished {
-        // Finished — in practice a cancel or a failure, since a success shows
-        // its badge alone. Everything before the stop point is done, the step
-        // we stopped on is highlighted in the outcome's color, and anything
-        // after it stays dimmed (never reached).
-        Some(verdict) => {
-            if i < view.current_step {
-                done
-            } else if i == view.current_step {
-                StepStyle {
-                    font: fonts::bold(15.0),
-                    color: verdict_color(palette, verdict.outcome),
-                    italic: false,
-                }
-            } else {
-                upcoming
-            }
-        }
-        None => {
-            if i < view.current_step {
-                done
-            } else if i == view.current_step {
-                current
-            } else {
-                upcoming
-            }
-        }
-    }
+/// Smooth Hermite interpolation: 0 below `a`, 1 above `b`, eased in between.
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// A full-width horizontal rule at height `y` within `rect`, painted as a
+/// gradient mesh: `color` at the center, fading to transparent at both ends.
+fn paint_hrule(painter: &egui::Painter, rect: egui::Rect, y: f32, color: Color32) {
+    let transparent = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
+    let (top, bot) = (y - STEP_RULE_HEIGHT / 2.0, y + STEP_RULE_HEIGHT / 2.0);
+    let (xl, xc, xr) = (rect.left(), rect.center().x, rect.right());
+
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(egui::pos2(xl, top), transparent); // 0
+    mesh.colored_vertex(egui::pos2(xl, bot), transparent); // 1
+    mesh.colored_vertex(egui::pos2(xc, top), color); // 2
+    mesh.colored_vertex(egui::pos2(xc, bot), color); // 3
+    mesh.colored_vertex(egui::pos2(xr, top), transparent); // 4
+    mesh.colored_vertex(egui::pos2(xr, bot), transparent); // 5
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    mesh.add_triangle(2, 3, 4);
+    mesh.add_triangle(4, 3, 5);
+    painter.add(mesh);
 }
 
 fn show_button(ui: &mut egui::Ui, palette: &Palette, view: &ModalView<'_>) -> ModalAction {

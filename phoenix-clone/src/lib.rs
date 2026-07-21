@@ -184,17 +184,17 @@ fn clone_inner(source: &DiskInfo, target: &DiskInfo, opts: &CloneOptions) -> Res
     if let Some(ref p) = opts.progress {
         let mut steps = vec!["Preparing disks".to_string()];
         for (i, e) in opts.plan.entries.iter().enumerate() {
-            let name = source
+            let size = source
                 .partitions
                 .iter()
                 .find(|p| p.index == e.source_partition_index)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "partition".into());
+                .map(|p| p.size_bytes)
+                .unwrap_or(0);
             steps.push(format!(
-                "Cloning partition {} of {} — {}",
+                "Cloning Partition {} of {} ({})",
                 i + 1,
                 opts.plan.entries.len(),
-                name
+                phoenix_core::progress::format_size(size)
             ));
         }
         steps.push("Writing partition table".to_string());

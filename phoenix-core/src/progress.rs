@@ -32,6 +32,36 @@ pub fn format_rate(bytes: u64, secs: f64) -> String {
     )
 }
 
+/// Compact human-readable size for step labels: `"476.8 GB"`, `"15.7 GB"`,
+/// `"16 MB"`, `"512 KB"`. One decimal place, with a trailing `.0` trimmed so
+/// round sizes read cleanly. Binary units (1024-based) labelled GB/MB/KB to
+/// match the rest of the app's readouts.
+pub fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    let b = bytes as f64;
+    let (val, unit) = if b >= TB {
+        (b / TB, "TB")
+    } else if b >= GB {
+        (b / GB, "GB")
+    } else if b >= MB {
+        (b / MB, "MB")
+    } else if b >= KB {
+        (b / KB, "KB")
+    } else {
+        return format!("{bytes} B");
+    };
+    // One decimal, but drop a trailing ".0" so "16.0 GB" reads as "16 GB".
+    let rounded = (val * 10.0).round() / 10.0;
+    if (rounded.fract()).abs() < f64::EPSILON {
+        format!("{:.0} {unit}", rounded)
+    } else {
+        format!("{:.1} {unit}", rounded)
+    }
+}
+
 /// Thread-safe progress snapshot for GUI or CLI.
 #[derive(Clone, Debug, Default)]
 pub struct ProgressSnapshot {
@@ -151,5 +181,23 @@ impl ProgressHandle {
     /// future caller decides to share).
     pub fn reset_cancel(&self) {
         self.cancel.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_size;
+
+    #[test]
+    fn format_size_trims_and_scales() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(16 * 1024 * 1024), "16 MB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1 GB");
+        // 476.8 GB — the reference screenshot's largest partition.
+        let n = (476.8f64 * 1024.0 * 1024.0 * 1024.0) as u64;
+        assert_eq!(format_size(n), "476.8 GB");
+        // Round MB drops the decimal; a fractional GB keeps one place.
+        assert_eq!(format_size(1536 * 1024 * 1024), "1.5 GB");
     }
 }
