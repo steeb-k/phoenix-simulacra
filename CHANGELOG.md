@@ -2,6 +2,14 @@
 
 Notable changes per release. Releases are published on the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases).
 
+## 0.7.0 — 2026-07-21
+
+- **New Utilities section.** The Boot Repair page has become *Utilities* — a home for one-off maintenance tools you run on a drive you've just cloned, restored, or moved. Each tool is a card that opens a guided modal and only touches the installation you pick.
+- **Windows Boot Repair** now lives there, unchanged: point a drive's boot configuration at a Windows installation on it and rebuild its boot files with Windows' own tools.
+- **Reset Windows Hello** (new). Cloning or restoring a system disk changes the machine identity Windows ties Windows Hello to, so PINs and fingerprint or face sign-in on the copy stop working — and often can't even be removed from Settings. This clears the credential store on the installation you pick so Windows Hello can be set up fresh at the next sign-in. Works on an offline clone or the running system; passwords are unaffected.
+- **Enable/Disable Built-in Administrator** (new). Turn the hidden built-in Administrator account on or off on a chosen installation — a way back into a locked-out clone. The modal shows whether the account is currently enabled or disabled and the button switches it; enabling also blanks its password (on the running system). Works on an offline installation (by editing its account database directly) or on the live system.
+- Virtualize's keyboard shortcut moved to **Alt+V**, freed up now that Verify folded into the Restore + Verify page.
+
 ## 0.6.1 — 2026-07-20
 
 - **Shrinking is reliable.** Restoring or cloning a fragmented NTFS volume into a smaller partition could fail with "relocated run list grew to N bytes, past the N-1 byte attribute budget" — and it failed *after* the data had been copied, leaving the target holding data its metadata no longer described. Three changes fix it: relocated run lists now grow into the MFT record's free space instead of being limited to the handful of spare bytes inside their own attribute; relocated clusters are packed to keep each piece contiguous rather than splitting it across free runs; and every shrink is now checked against the source's MFT *before* anything is written, re-planning the relocation where a record would not fit.
