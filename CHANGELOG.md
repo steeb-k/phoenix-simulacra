@@ -2,6 +2,11 @@
 
 Notable changes per release. Releases are published on the [releases page](https://github.com/steeb-k/phoenix-simulacra-binaries/releases).
 
+## 0.7.1 — 2026-07-21
+
+- **Cancelling a backup's verification no longer deletes the backup.** The final verify pass runs *after* the image is already written and finalized, so cancelling it (or having it fail) now leaves the finished `.phnx` in place instead of discarding it. Only a backup cancelled mid-capture — which never finished and can't be opened — is still cleaned up.
+- **The Restore + Verify list gained a third shield.** Alongside the green shield (verified on this machine) and the yellow click-to-verify outline, a **red** shield now marks a backup whose verification actually *failed*, so a bad image is visible at a glance. A cancelled verify stays yellow — the image is kept and its integrity is simply unknown, so click the shield to check it.
+
 ## 0.7.0 — 2026-07-21
 
 - **New Utilities section.** The Boot Repair page has become *Utilities* — a home for one-off maintenance tools you run on a drive you've just cloned, restored, or moved. Each tool is a card that opens a guided modal and only touches the installation you pick.

@@ -190,6 +190,8 @@ simulacra-cli verify backup.phnx          # Full: re-hash every chunk
 simulacra-cli verify backup.phnx --quick  # Metadata + manifest hash only
 ```
 
+The verify pass runs only *after* the image is finalized, so a completed backup is never discarded because of it: cancelling or failing verification leaves the finished `.phnx` on disk. On the GUI's Restore + Verify page each backup carries a shield — **green** once it verifies clean on this machine, **red** if a verify actually failed, and a yellow click-to-verify outline when it hasn't been checked yet (a cancelled verify leaves it yellow, since integrity is simply unknown).
+
 ---
 
 ## GUI reference
