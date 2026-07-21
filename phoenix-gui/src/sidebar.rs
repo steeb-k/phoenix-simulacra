@@ -10,8 +10,10 @@ use crate::theme::{self, Palette};
 pub enum Page {
     Backup,
     Clone,
+    /// The merged Restore + Verify page: a table of known backups (verify each
+    /// in place via its shield) that slides to the restore layout editor once
+    /// one is picked.
     Restore,
-    Verify,
     Mount,
     Virtualize,
     BootRepair,
@@ -49,17 +51,10 @@ const TOP_ITEMS: &[NavItem] = &[
     },
     NavItem {
         page: Page::Restore,
-        label: "Restore",
+        label: "Restore + Verify",
         icon: egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE,
         key: Key::R,
         accel: 'R',
-    },
-    NavItem {
-        page: Page::Verify,
-        label: "Verify",
-        icon: egui_phosphor::regular::SHIELD_CHECK,
-        key: Key::V,
-        accel: 'V',
     },
     NavItem {
         page: Page::Mount,
@@ -138,7 +133,13 @@ const BRAND_WORDMARK_GAP: f32 = 6.0;
 /// brand panel itself sizes to the real glyph height, so this only needs to be
 /// close.
 const WORDMARK_HEIGHT_EST: f32 = 40.0;
-const SIDEBAR_H_PAD: f32 = 12.0;
+const SIDEBAR_H_PAD: f32 = 10.0;
+/// Left inset of a nav row's icon, and the gap from there to the label. Kept
+/// tight (rather than the roomier spacing a shorter menu could afford) so the
+/// longest label — "Restore + Verify" — clears the sidebar's right edge
+/// without wrapping at [`SIDEBAR_WIDTH`].
+const NAV_ICON_X: f32 = 16.0;
+const NAV_TEXT_X: f32 = 38.0;
 const BRAND_TOP_PAD: f32 = 14.0;
 const BRAND_BOTTOM_PAD: f32 = 12.0;
 /// Trailing space inside `draw_brand` between the wordmark and the panel edge.
@@ -494,7 +495,7 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
     };
     let icon_color = text_color;
 
-    let icon_pos = rect.left_center() + Vec2::new(18.0, 0.0);
+    let icon_pos = rect.left_center() + Vec2::new(NAV_ICON_X, 0.0);
     painter.text(
         icon_pos,
         Align2::CENTER_CENTER,
@@ -504,7 +505,7 @@ fn nav_row(ui: &mut Ui, item: &NavItem, current: &mut Page, palette: &Palette) -
     );
 
     let label_font = fonts::regular(14.0);
-    let text_pos = rect.left_center() + Vec2::new(42.0, 0.0);
+    let text_pos = rect.left_center() + Vec2::new(NAV_TEXT_X, 0.0);
     let text_rect = painter.text(
         text_pos,
         Align2::LEFT_CENTER,

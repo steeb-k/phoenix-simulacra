@@ -23,6 +23,7 @@ mod mount_table;
 mod raster;
 mod restore_layout;
 mod restore_panel;
+mod restore_table;
 mod sidebar;
 mod single_instance;
 mod status_modal;
@@ -663,6 +664,31 @@ fn validate_restore_plan(
     }))
 }
 
+/// How long the list⇄setup slide on the Restore + Verify page takes.
+const RESTORE_SLIDE_TIME: f32 = 0.22;
+
+/// Which of the Restore + Verify page's two sub-views is showing. The two
+/// slide horizontally: the list is the entry point, `Setup` the picked
+/// backup's restore editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreView {
+    /// The known-backups table: pick one to restore, or verify any in place.
+    List,
+    /// The restore layout editor for the picked backup (target + partitions).
+    Setup,
+}
+
+/// Cached display metadata for one `.phnx`, so the table needn't reopen files
+/// every frame. Filled from the header + filesystem the first time a path is
+/// shown; dropped on Refresh.
+struct BackupMeta {
+    /// Local wall-clock creation date read from the container header, or "—"
+    /// when the file couldn't be read.
+    created: String,
+    /// On-disk image size (e.g. "482.1 GB"), or "—".
+    size: String,
+}
+
 /// A restore plan being checked on a worker thread.
 ///
 /// Validating a shrink is no longer instant: the NTFS pre-flight reads the
@@ -887,6 +913,24 @@ struct PhoenixApp {
     restore_loaded_path: String,
     /// Set by the history dropdown or Browse to load on the next frame.
     restore_backup_load_now: bool,
+    /// Which of the Restore + Verify page's two views is showing. `List` picks
+    /// a backup (and verifies in place via the shields); `Setup` is the restore
+    /// layout editor for the picked backup. The action bar slides between them.
+    restore_view: RestoreView,
+    /// The selected row in the known-backups table (index into the rendered
+    /// list), or `None`. What the list view's green "Restore" acts on.
+    restore_selected: Option<usize>,
+    /// Every `.phnx` this machine knows about, in first-added order — the table
+    /// on the list view. Reconciled from the job history + browsed backups at
+    /// startup and after each job. See [`phoenix_core::appdata::KnownBackups`].
+    known_backups: phoenix_core::appdata::KnownBackups,
+    /// Per-path display metadata cache (creation date + on-disk size), keyed by
+    /// lowercased path so the table does no file I/O per frame. Cleared on
+    /// Refresh. See [`BackupMeta`].
+    backup_meta: std::collections::HashMap<String, BackupMeta>,
+    /// `--demo-backups`: canned table rows for styling/verification work, never
+    /// reconciled from real data and never written back.
+    demo_backups: Option<Vec<restore_table::BackupRow>>,
     restore_layout: Option<restore_layout::RestoreLayoutState>,
     /// Restore page's chosen target disk; `None` until the user picks one
     /// (deliberately never auto-selected — same contract as the Clone page).
@@ -1092,6 +1136,11 @@ impl PhoenixApp {
             restore_backup_path: String::new(),
             restore_loaded_path: String::new(),
             restore_backup_load_now: false,
+            restore_view: RestoreView::List,
+            restore_selected: None,
+            known_backups: phoenix_core::appdata::KnownBackups::load(),
+            backup_meta: std::collections::HashMap::new(),
+            demo_backups: demo_backups_from_args(),
             restore_layout: None,
             target_disk_index: None,
             restore_repair_boot: false,
@@ -1160,6 +1209,10 @@ impl PhoenixApp {
             portable: updater::is_portable(),
         };
         app.refresh_disks();
+        // Fold the job history and hand-browsed backups into the known-backups
+        // list so the Restore + Verify table shows a stable, first-added order
+        // from the first launch after this feature ships.
+        app.reconcile_known_backups();
         // Reclaim any mount artifacts a previous crashed run left in the scratch
         // dir (stale WinFsp junctions, orphaned writable-overlay children).
         phoenix_mount::cleanup_leaked_mounts(&phoenix_mount::mount_scratch_dir());
@@ -1355,7 +1408,7 @@ impl PhoenixApp {
             Page::BootRepair => {
                 self.bootrepair_selected = None;
             }
-            Page::Verify | Page::Mount | Page::Virtualize | Page::About => {}
+            Page::Mount | Page::Virtualize | Page::About => {}
         }
     }
 
@@ -1452,12 +1505,131 @@ impl PhoenixApp {
             .unwrap_or_else(default_backup_folder);
     }
 
-    /// Reset the Restore page to its default: no backup chosen, no layout,
-    /// no target picked.
+    /// Reset the Restore + Verify page to its default: back on the list view,
+    /// nothing selected or loaded, no target picked, and the display-metadata
+    /// cache dropped so sizes/dates re-read (a refresh is exactly when a file
+    /// may have grown or been replaced). The known-backups list is re-pruned
+    /// and reconciled so a file deleted since last time stops being listed.
     fn reset_restore_page(&mut self) {
         self.restore_backup_path.clear();
         self.clear_restore_ui_state();
         self.target_disk_index = None;
+        self.restore_view = RestoreView::List;
+        self.restore_selected = None;
+        self.backup_meta.clear();
+        self.reconcile_known_backups();
+    }
+
+    /// Fold the job history and hand-browsed backups into [`Self::known_backups`]
+    /// so the table shows every backup this machine has seen, in first-added
+    /// order, and drop any whose file has since disappeared. Idempotent —
+    /// `add` dedupes — so it is safe to call at startup and after each job.
+    ///
+    /// History records are already in chronological append order, so walking
+    /// them front-to-back stamps each path with its *earliest* mention; browsed
+    /// backups (no timestamp of their own) fall in oldest-first after them.
+    /// Nothing here runs against the `--demo-backups` rows, which are their own
+    /// display-only list.
+    fn reconcile_known_backups(&mut self) {
+        if self.demo_backups.is_some() {
+            return;
+        }
+        let mut changed = self.known_backups.prune_missing();
+        for rec in &self.history.records {
+            for cand in [&rec.target, &rec.source] {
+                changed |= self.known_backups.add(cand, rec.started_unix);
+            }
+        }
+        let now = phoenix_core::appdata::now_unix();
+        // `browsed_backups` is newest-first; add oldest-first so hand-added
+        // backups keep a sensible order among themselves.
+        for path in self.settings.browsed_backups.clone().iter().rev() {
+            changed |= self.known_backups.add(path, now);
+        }
+        if changed {
+            let _ = self.known_backups.save();
+        }
+    }
+
+    /// Remember a backup as known (first-added = now if new) and persist. Called
+    /// when a path is hand-added, browsed, or touched by a finished job, so the
+    /// table picks it up without waiting for a full reconcile.
+    fn remember_known_backup(&mut self, path: &str) {
+        if self.demo_backups.is_some() {
+            return;
+        }
+        if self
+            .known_backups
+            .add(path, phoenix_core::appdata::now_unix())
+        {
+            let _ = self.known_backups.save();
+        }
+    }
+
+    /// Whether `path` has a successful Verify record in the job history — the
+    /// green-shield state. Covers both an explicit Verify and the verify pass
+    /// that runs after a backup (both append a `Verify` record whose `source`
+    /// is the `.phnx` path), which is exactly the "explicit + auto" rule.
+    fn backup_is_verified(&self, path: &str) -> bool {
+        use phoenix_core::appdata::{JobKindTag, JobOutcome};
+        self.history.records.iter().any(|r| {
+            r.kind == JobKindTag::Verify
+                && r.outcome == JobOutcome::Success
+                && r.source.eq_ignore_ascii_case(path)
+        })
+    }
+
+    /// The display metadata for `path`, filled from the container header (for
+    /// the creation date) and the filesystem (for the on-disk size) the first
+    /// time it's needed and cached thereafter. Unreadable fields show "—".
+    fn backup_meta(&mut self, path: &str) -> &BackupMeta {
+        let key = path.to_ascii_lowercase();
+        if !self.backup_meta.contains_key(&key) {
+            let created = read_backup_created(Path::new(path))
+                .map(format_timestamp)
+                .unwrap_or_else(|| "—".to_string());
+            let size = std::fs::metadata(path)
+                .map(|m| format_bytes(m.len()))
+                .unwrap_or_else(|_| "—".to_string());
+            self.backup_meta.insert(key.clone(), BackupMeta { created, size });
+        }
+        &self.backup_meta[&key]
+    }
+
+    /// Build the known-backups table rows in first-added order (or the demo
+    /// rows). Derives each shield's verified state from the history and pulls
+    /// created/size from the metadata cache.
+    fn restore_rows(&mut self) -> Vec<restore_table::BackupRow> {
+        if let Some(demo) = &self.demo_backups {
+            return demo
+                .iter()
+                .map(|r| restore_table::BackupRow {
+                    path: r.path.clone(),
+                    created: r.created.clone(),
+                    size: r.size.clone(),
+                    verified: r.verified,
+                })
+                .collect();
+        }
+        let paths: Vec<String> = self
+            .known_backups
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        paths
+            .into_iter()
+            .map(|path| {
+                let verified = self.backup_is_verified(&path);
+                let meta = self.backup_meta(&path);
+                restore_table::BackupRow {
+                    created: meta.created.clone(),
+                    size: meta.size.clone(),
+                    path,
+                    verified,
+                }
+            })
+            .collect()
     }
 
     /// Reset the Clone page to its untouched default (no disks picked, no
@@ -1658,6 +1830,18 @@ impl PhoenixApp {
                     if job_kind == JobKind::Restore || job_kind == JobKind::Verify {
                         self.restore_backup_path.clear();
                         self.clear_restore_ui_state();
+                        // Back to the list — the finished job's file is done
+                        // with. A verify that just passed re-derives its green
+                        // shield from the record `record_job` appended above.
+                        self.restore_view = RestoreView::List;
+                        self.restore_selected = None;
+                    }
+                    // A finished backup produced a fresh image — surface it in
+                    // the Restore + Verify list straight away.
+                    if job_kind == JobKind::Backup {
+                        if let Some(out) = job_output.as_ref() {
+                            self.remember_known_backup(&out.display().to_string());
+                        }
                     }
                     if job_kind == JobKind::Clone {
                         self.clear_clone_ui_state();
@@ -1890,35 +2074,38 @@ impl PhoenixApp {
                     }),
                 }
             }
-            Page::Restore => {
-                let plan_ready = self
-                    .restore_layout
-                    .as_ref()
-                    .is_some_and(|l| l.has_restorable_entries());
-                StartAction {
-                    label: "Run Restore",
+            // The merged page's action depends on which view is showing: the
+            // list's green "Restore" advances the selected backup to the setup
+            // view; the setup view's "Run Restore" runs the built plan.
+            Page::Restore => match self.restore_view {
+                RestoreView::List => StartAction {
+                    label: "Restore",
                     icon: Some(egui_phosphor::fill::PLAY),
-                    enabled: !busy && plan_ready,
+                    enabled: !busy && self.restore_selected.is_some(),
                     disabled_hint: Some(if busy {
-                        "A restore is already running"
-                    } else if self.restore_layout.is_none() {
-                        "Choose a backup file first"
-                    } else if self.target_disk_index.is_none() {
-                        "Choose a target disk first"
+                        "A job is already running"
                     } else {
-                        "Map at least one partition onto the target"
+                        "Select a backup to restore"
                     }),
+                },
+                RestoreView::Setup => {
+                    let plan_ready = self
+                        .restore_layout
+                        .as_ref()
+                        .is_some_and(|l| l.has_restorable_entries());
+                    StartAction {
+                        label: "Run Restore",
+                        icon: Some(egui_phosphor::fill::PLAY),
+                        enabled: !busy && plan_ready,
+                        disabled_hint: Some(if busy {
+                            "A restore is already running"
+                        } else if self.target_disk_index.is_none() {
+                            "Choose a target disk first"
+                        } else {
+                            "Map at least one partition onto the target"
+                        }),
+                    }
                 }
-            }
-            Page::Verify => StartAction {
-                label: "Verify Backup",
-                icon: Some(egui_phosphor::fill::PLAY),
-                enabled: !busy && !self.restore_backup_path.trim().is_empty(),
-                disabled_hint: Some(if busy {
-                    "A verify is already running"
-                } else {
-                    "Choose a backup file first"
-                }),
             },
             Page::Clone => {
                 let plan_ready = self
@@ -2032,9 +2219,9 @@ impl PhoenixApp {
                 tracing::warn!("post-job disk reload failed: {e}");
             }
         }
-        // Both pages that name a `.phnx` want it parsed: the Restore page to
-        // seed its layout editor, the Verify page to preview the contents.
-        if matches!(self.page, Page::Restore | Page::Verify) {
+        // The Restore + Verify page names a `.phnx` to seed its layout editor
+        // when a backup is picked and the setup view slides in.
+        if self.page == Page::Restore {
             self.poll_restore_backup_load();
         }
 
@@ -2138,8 +2325,11 @@ impl PhoenixApp {
             if clicked {
                 match self.page {
                     Page::Backup => self.start_backup(),
-                    Page::Restore => self.start_restore(),
-                    Page::Verify => self.start_verify(),
+                    // List view advances the pick to setup; setup runs it.
+                    Page::Restore => match self.restore_view {
+                        RestoreView::List => self.advance_to_restore_setup(),
+                        RestoreView::Setup => self.start_restore(),
+                    },
                     Page::Clone => self.start_clone(),
                     Page::Mount => self.start_mount(),
                     Page::Virtualize => self.request_start_vm(),
@@ -2175,7 +2365,6 @@ impl PhoenixApp {
                     Page::Backup => self.ui_backup(ui, busy),
                     Page::Clone => disabled_when(ui, busy, |ui| self.ui_clone(ui)),
                     Page::Restore => self.ui_restore(ui, busy),
-                    Page::Verify => self.ui_verify(ui, busy),
                     Page::Mount => disabled_when(ui, busy, |ui| self.ui_mount(ui)),
                     // Not gated on `busy`: a running VM lives on a background
                     // thread, not a modal job, so the page stays interactive
@@ -2848,6 +3037,16 @@ pub struct StartAction<'a> {
 /// Deliberately absolute — "3 hours ago" tells you nothing the next time you
 /// open the app, and a backup's date is exactly what you came to the History
 /// page to find out.
+/// The backup's creation time (Unix seconds) read from the container header
+/// alone — a fixed-size prefix, so this never touches the (potentially huge)
+/// chunk index the way `PhnxReader::open` would. `None` if the file can't be
+/// opened or isn't a valid `.phnx`.
+fn read_backup_created(path: &Path) -> Option<i64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let header = phoenix_core::container::Header::read(&mut file).ok()?;
+    Some(header.timestamp as i64)
+}
+
 fn format_timestamp(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
         .map(|t| {
@@ -3326,6 +3525,9 @@ impl PhoenixApp {
         if self.settings.browsed_backups != before {
             let _ = self.settings.save();
         }
+        // Also seed the Restore + Verify list so a backup restored/verified/
+        // mounted from a fresh path shows up there without a full reconcile.
+        self.remember_known_backup(path);
     }
 
     fn ui_backup(&mut self, ui: &mut egui::Ui, busy: bool) {
@@ -3612,69 +3814,189 @@ impl PhoenixApp {
         self.job = Some(spawn_backup(first));
     }
 
+    /// The merged Restore + Verify page. Two views slide horizontally as a
+    /// pair: the [`RestoreView::List`] table of known backups, and the
+    /// [`RestoreView::Setup`] restore editor for the one that's picked. While
+    /// the slide is mid-flight both are drawn, each clipped to its own
+    /// translated rect so neither bleeds over the sidebar or action bar.
     fn ui_restore(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_scroll_shell(ui, "restore_page", |ui| {
-            page_header(ui, &self.palette, "Restore", "");
+        let t = ui.ctx().animate_bool_with_time(
+            egui::Id::new("restore_view_slide"),
+            self.restore_view == RestoreView::Setup,
+            RESTORE_SLIDE_TIME,
+        );
+        if t <= 0.0 {
+            self.ui_restore_list(ui, busy);
+        } else if t >= 1.0 {
+            self.ui_restore_setup(ui, busy);
+        } else {
+            ui.ctx().request_repaint();
+            let full = ui.max_rect();
+            let w = full.width();
+            // Outgoing list leaves to the left; incoming setup follows it in
+            // from the right (and vice-versa when going Back — the eased `t`
+            // simply runs the other way).
+            let list_rect = full.translate(Vec2::new(-t * w, 0.0));
+            let setup_rect = full.translate(Vec2::new((1.0 - t) * w, 0.0));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list_rect), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(list_rect));
+                self.ui_restore_list(ui, busy);
+            });
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(setup_rect), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(setup_rect));
+                self.ui_restore_setup(ui, busy);
+            });
+        }
+    }
+
+    /// The list view: `+ Add Existing Backup`, then the known-backups table.
+    /// Rows select the restore target; each row's shield verifies that image
+    /// in place (green = already verified here, dull-yellow = click to verify).
+    fn ui_restore_list(&mut self, ui: &mut egui::Ui, busy: bool) {
+        page_scroll_shell(ui, "restore_list_page", |ui| {
+            page_header(ui, &self.palette, "Restore + Verify", "");
+            ui.label(
+                egui::RichText::new(
+                    "Pick a backup to restore, or click its shield to verify the image is \
+                     intact. A green shield means it has already been verified on this machine; \
+                     a yellow one is unverified — click it to check.",
+                )
+                .color(self.palette.subtle_text),
+            );
+            ui.add_space(14.0);
+
             ui.add_enabled_ui(!busy, |ui| {
-                self.ui_restore_form(ui);
+                let add = icon_label(
+                    egui_phosphor::regular::PLUS,
+                    fonts::icon(16.0),
+                    "Add Existing Backup",
+                    fonts::regular(14.0),
+                    ui.visuals().widgets.inactive.fg_stroke.color,
+                );
+                if ui.add(egui::Button::new(add)).clicked() {
+                    self.restore_add_existing();
+                }
+                ui.add_space(12.0);
+
+                let rows = self.restore_rows();
+                if self.restore_selected.is_some_and(|s| s >= rows.len()) {
+                    self.restore_selected = None;
+                }
+                // Same width discipline as the Boot Repair table: fill the
+                // pane, and below the columns' minimum hand over to a
+                // horizontal scroller.
+                let table_width = ui.available_width().max(restore_table::min_width());
+                let palette = self.palette;
+                let selected = self.restore_selected;
+                let event = egui::ScrollArea::horizontal()
+                    .id_salt("restore_table_scroll")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        restore_table::show(ui, table_width, &rows, selected, &palette)
+                    })
+                    .inner;
+                if let Some(i) = event.row_clicked {
+                    self.restore_selected = Some(i);
+                }
+                if let Some(i) = event.verify_clicked {
+                    let path = rows[i].path.clone();
+                    self.start_verify_path(&path);
+                }
             });
         });
     }
 
-    /// The `.phnx` chooser row plus the load of whatever it names into
-    /// `restore_layout`. Shared by the Restore and Verify pages: both read
-    /// the same image, off the same path field, so both get the loaded
-    /// layout — the editor on one, the preview on the other. A choice (from
-    /// the history dropdown or Browse) loads immediately; there is no typed
-    /// input left to debounce.
-    fn ui_backup_file_picker(&mut self, ui: &mut egui::Ui, label: &str) {
-        let chosen = backup_path_picker(
-            ui,
-            label,
-            "Select or browse for a .phnx backup",
-            &mut self.restore_backup_path,
-            &self.history,
-            &mut self.settings.browsed_backups,
-            None,
-        );
-        if chosen {
-            self.restore_backup_load_now = true;
-            let _ = self.settings.save();
-        }
+    /// The setup view: `< Back`, then the same source→target layout editor the
+    /// Clone page runs, with the picked backup standing in for a source disk.
+    /// No file picker here — the backup is already loaded (`advance_to_restore_setup`).
+    fn ui_restore_setup(&mut self, ui: &mut egui::Ui, busy: bool) {
+        page_scroll_shell(ui, "restore_setup_page", |ui| {
+            // The picked backup's file name rides in the header's badge slot.
+            let name = Path::new(&self.restore_backup_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            page_header_badged(ui, &self.palette, "Restore + Verify", "", &name);
+
+            ui.add_enabled_ui(!busy, |ui| {
+                let back = icon_label(
+                    egui_phosphor::regular::ARROW_LEFT,
+                    fonts::icon(16.0),
+                    "Back",
+                    fonts::regular(14.0),
+                    ui.visuals().widgets.inactive.fg_stroke.color,
+                );
+                if ui.add(egui::Button::new(back)).clicked() {
+                    self.restore_view = RestoreView::List;
+                }
+                ui.add_space(12.0);
+
+                if self.disks.is_empty() {
+                    ui.label("No disks found. Run as Administrator, then hit Refresh.");
+                    return;
+                }
+                let viewport_width = ui.available_width();
+                let out = restore_panel::show(
+                    ui,
+                    &self.disks,
+                    &mut self.target_disk_index,
+                    self.restore_layout.as_mut(),
+                    &self.palette,
+                    viewport_width,
+                );
+                if out.target_changed {
+                    ui.ctx().request_repaint();
+                }
+                if self.restore_layout.is_some() {
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut self.restore_repair_boot,
+                        "Repair boot files on the target after restoring",
+                    )
+                    .on_hover_text(REPAIR_BOOT_HOVER);
+                }
+            });
+        });
     }
 
-    /// Greyed-when-busy portion of the Restore page: the `.phnx` Browse row,
-    /// then the same source→target layout editor the Clone page runs, with
-    /// the backup standing in for a source disk.
-    fn ui_restore_form(&mut self, ui: &mut egui::Ui) {
-        self.ui_backup_file_picker(ui, "Source media");
-
-        ui.add_space(8.0);
-        if self.disks.is_empty() {
-            ui.label("No disks found. Run as Administrator, then hit Refresh.");
+    /// "+ Add Existing Backup": pick a `.phnx` from anywhere, remember it in
+    /// the list, and select the row it now occupies.
+    fn restore_add_existing(&mut self) {
+        let Some(picked) = pick_backup_open_path(&self.restore_backup_path) else {
             return;
-        }
+        };
+        let path = picked.display().to_string();
+        self.remember_backup_in_use(&path); // browsed_backups + known_backups
+        self.backup_meta.remove(&path.to_ascii_lowercase()); // re-read fresh
+        self.restore_selected = self
+            .known_backups
+            .entries
+            .iter()
+            .position(|e| e.path.eq_ignore_ascii_case(&path));
+    }
 
-        let viewport_width = ui.available_width();
-        let out = restore_panel::show(
-            ui,
-            &self.disks,
-            &mut self.target_disk_index,
-            self.restore_layout.as_mut(),
-            &self.palette,
-            viewport_width,
-        );
-        if out.target_changed {
-            ui.ctx().request_repaint();
+    /// The list view's green "Restore" was clicked: load the selected backup
+    /// and slide to the setup view. On a load failure the status line explains
+    /// and the view stays on the list.
+    fn advance_to_restore_setup(&mut self) {
+        let Some(sel) = self.restore_selected else {
+            self.status = "Select a backup to restore first".into();
+            return;
+        };
+        let rows = self.restore_rows();
+        let Some(path) = rows.get(sel).map(|r| r.path.clone()) else {
+            self.restore_selected = None;
+            return;
+        };
+        self.restore_backup_path = path.clone();
+        self.restore_backup_load_now = false;
+        self.try_load_restore_backup();
+        if self.restore_layout.is_none() {
+            return; // try_load_restore_backup set the error status.
         }
-        if self.restore_layout.is_some() {
-            ui.add_space(8.0);
-            ui.checkbox(
-                &mut self.restore_repair_boot,
-                "Repair boot files on the target after restoring",
-            )
-            .on_hover_text(REPAIR_BOOT_HOVER);
-        }
+        self.remember_backup_in_use(&path);
+        self.restore_view = RestoreView::Setup;
     }
 
     fn start_restore(&mut self) {
@@ -3762,48 +4084,23 @@ impl PhoenixApp {
         }
     }
 
-    fn ui_verify(&mut self, ui: &mut egui::Ui, busy: bool) {
-        page_scroll_shell(ui, "verify_page", |ui| {
-            page_header(ui, &self.palette, "Verify Backup", "");
-            ui.add_enabled_ui(!busy, |ui| {
-                self.ui_verify_form(ui);
-            });
-        });
-    }
-
-    /// Greyed-when-busy portion of the Verify page: the `.phnx` Browse row,
-    /// then a read-only preview of the layout the chosen image holds — the
-    /// same row the Restore page drags partitions off, minus the dragging.
-    fn ui_verify_form(&mut self, ui: &mut egui::Ui) {
-        self.ui_backup_file_picker(ui, "Backup file");
-
-        let Some(layout) = self.restore_layout.as_ref() else {
+    /// Verify one image, kicked off by clicking its (dull-yellow) shield in the
+    /// Restore + Verify list. Runs the same full-image verify the old Verify
+    /// page did; on success `record_job` appends a `Verify` record, which is
+    /// what flips the shield green on the next frame. The picked path is
+    /// resolved (and, if it has vanished since the list was built, a file
+    /// dialog offers a re-pick) exactly as the old page did.
+    fn start_verify_path(&mut self, path_str: &str) {
+        let Some(path) = resolve_backup_open_path(path_str) else {
+            self.status = "Verify cancelled — backup file not found".into();
             return;
         };
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new("Backup contents").font(fonts::bold(14.0)));
-        ui.add_space(4.0);
-        let disk = &layout.source_disk;
-        egui::ScrollArea::horizontal()
-            .id_salt("verify_preview")
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                let row_width = ui.available_width().max(disk_dropdown::min_row_width(disk));
-                disk_map::draw_static_disk_row(ui, row_width, disk, &self.palette);
-            });
-    }
-
-    fn start_verify(&mut self) {
-        let Some(path) = resolve_backup_open_path(&self.restore_backup_path) else {
-            self.status = "Verify cancelled — no backup file chosen".into();
-            return;
-        };
-        self.restore_backup_path = path.display().to_string();
-        self.remember_backup_in_use(&self.restore_backup_path.clone());
+        let path_display = path.display().to_string();
+        self.remember_backup_in_use(&path_display);
         self.completed = None;
-        self.status = "Verify in progress…".into();
+        self.status = format!("Verifying {path_display}…");
         self.job_subject = JobSubject {
-            source: path.display().to_string(),
+            source: path_display,
             target: String::new(),
             image_path: Some(path.clone()),
         };
@@ -5687,6 +5984,36 @@ fn demo_mount_rows_from_args() -> Vec<mount_table::MountRow> {
     ]
 }
 
+/// Debug/verification aid: `--demo-backups` fills the Restore + Verify list
+/// with canned rows — a couple already verified (green shield), a couple not
+/// (dull-yellow, click-to-verify) — so the table's striping, the shields, row
+/// selection and the slide to the setup view can be eyeballed without a machine
+/// that already holds real `.phnx` files. The rows are display-only: they name
+/// no real file, so the shields don't kick off real verifies and the list
+/// view's "Restore" can't advance (there is nothing to load).
+fn demo_backups_from_args() -> Option<Vec<restore_table::BackupRow>> {
+    if !std::env::args().skip(1).any(|a| a == "--demo-backups") {
+        return None;
+    }
+    let row = |path: &str, created: &str, size: u64, verified: bool| restore_table::BackupRow {
+        path: path.into(),
+        created: created.into(),
+        size: format_bytes(size),
+        verified,
+    };
+    Some(vec![
+        row(r"D:\Backups\workstation.phnx", "2026-07-12 14:32:07", 61_240_000_000, true),
+        row(r"D:\Backups\usb-stick.phnx", "2026-07-13 09:14:55", 12_000_000_000, false),
+        row(
+            r"\\nas\archive\simulacra\weekly\workstation-2026-07-06.phnx",
+            "2026-07-06 02:00:11",
+            512_110_190_592,
+            true,
+        ),
+        row(r"E:\Images\laptop-os.phnx", "2026-06-30 09:05:11", 118_700_000_000, false),
+    ])
+}
+
 /// Debug/verification aid: `--demo-history` fills the History page with canned
 /// entries — a verified backup's two rows, a cancel, a failure with a long
 /// error, a clone — so the table's columns, striping, elision and remove flow
@@ -5775,8 +6102,9 @@ fn start_page_from_args() -> Option<Page> {
             return match args.next()?.to_ascii_lowercase().as_str() {
                 "backup" => Some(Page::Backup),
                 "clone" => Some(Page::Clone),
-                "restore" => Some(Page::Restore),
-                "verify" => Some(Page::Verify),
+                // "verify" kept as an alias — Verify folded into the merged
+                // Restore + Verify page.
+                "restore" | "verify" => Some(Page::Restore),
                 "mount" => Some(Page::Mount),
                 "virtualize" | "vm" => Some(Page::Virtualize)
                     .filter(|p| sidebar::page_available(*p, updater::is_portable())),
