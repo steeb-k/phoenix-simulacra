@@ -33,6 +33,7 @@ mod theme;
 mod titlebar;
 mod updater;
 mod util;
+mod utilities;
 mod version;
 
 use std::collections::{BTreeMap, HashSet};
@@ -56,13 +57,14 @@ use phoenix_restore::restore::RestoreOptions;
 
 use crate::confirm_dialog::{ConfirmAck, ConfirmAction, ConfirmView};
 use crate::job::{
-    spawn_backup, spawn_boot_repair, spawn_clone, spawn_restore, spawn_verify, BackgroundJob,
-    JobKind,
+    spawn_admin_toggle, spawn_backup, spawn_boot_repair, spawn_clone, spawn_reset_ngc,
+    spawn_restore, spawn_verify, BackgroundJob, JobKind,
 };
 use crate::sidebar::Page;
 use crate::status_modal::{CompletedJob, JobOutcome, ModalAction, ModalView, Verdict};
 use crate::theme::Palette;
 use crate::util::format_bytes;
+use crate::utilities::Utility;
 
 const THEME_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Minimum time the click-to-refresh dim/spinner overlay stays up. Disk
@@ -727,6 +729,39 @@ struct PendingBootRepair {
     ack: bool,
 }
 
+/// A Windows Hello reset parked while its confirmation dialog is up. Like
+/// [`PendingBootRepair`], the dialog restates the planned actions; when the
+/// target is the disk this machine is running from, Confirm is additionally
+/// gated on an acknowledgement checkbox (`ack`).
+struct PendingResetHello {
+    disk_index: u32,
+    partition_index: u32,
+    message: String,
+    details: Vec<String>,
+    subject: JobSubject,
+    /// True when the target is the live system disk (its own PIN/biometrics
+    /// are being cleared, and a reboot will be needed).
+    system_disk: bool,
+    ack: bool,
+}
+
+/// An enable/disable of the built-in Administrator parked while its
+/// confirmation dialog is up. `enable` is the target state chosen from what the
+/// modal showed the user. When the target is the running system, Confirm is
+/// gated on an acknowledgement checkbox (`ack`).
+struct PendingAdminToggle {
+    disk_index: u32,
+    partition_index: u32,
+    /// Target state: enable when true, disable when false.
+    enable: bool,
+    message: String,
+    details: Vec<String>,
+    subject: JobSubject,
+    /// True when the target is the live system disk.
+    system_disk: bool,
+    ack: bool,
+}
+
 /// A VM booted on a background thread. `boot()` blocks for the whole guest
 /// session, so it can't run on the UI thread; the outcome comes back over
 /// `result` and the page polls it each frame.
@@ -806,6 +841,14 @@ const CONVERSION_ACK_LABEL: &str =
 const BOOT_REPAIR_SYSTEM_ACK_LABEL: &str =
     "I understand this rewrites the boot files of the Windows installation this PC is \
      currently running.";
+
+const RESET_HELLO_SYSTEM_ACK_LABEL: &str =
+    "I understand this clears the Windows Hello PIN and biometrics of the Windows \
+     installation this PC is currently running.";
+
+const ADMIN_TOGGLE_SYSTEM_ACK_LABEL: &str =
+    "I understand this changes the built-in Administrator account of the Windows \
+     installation this PC is currently running.";
 
 /// Detail lines describing a pending 4Kn → 512e conversion, appended to the
 /// hazard dialog's details under the standard wrong-disk block (Alerts D/E).
@@ -1014,12 +1057,29 @@ struct PhoenixApp {
     /// Discovered QEMU install, or `None` when it isn't found — the page then
     /// shows an install notice (mirrors `mount_available`).
     qemu: Option<phoenix_vm::Qemu>,
-    /// Boot Repair page: Windows installations detected on the current disk
-    /// list. `None` means "scan on next page render" — cleared whenever the
-    /// disk list reloads so the page never shows installs from a stale world.
-    bootrepair_installs: Option<Vec<phoenix_restore::bootrepair::WindowsInstall>>,
-    /// The picked installation as `(disk_index, partition_index)`.
+    /// Which utility's guided modal is open, if any. `None` is the plain
+    /// Utilities menu page.
+    active_utility: Option<Utility>,
+    /// Windows installations detected on the current disk list, shared by every
+    /// utility that targets one (Boot Repair, Reset Windows Hello). `None` means
+    /// "scan on next use" — cleared whenever the disk list reloads so a utility
+    /// never shows installs from a stale world.
+    windows_installs: Option<Vec<phoenix_restore::bootrepair::WindowsInstall>>,
+    /// The Boot Repair modal's picked installation as `(disk_index, partition_index)`.
     bootrepair_selected: Option<(u32, u32)>,
+    /// The Reset Windows Hello modal's picked installation.
+    hello_selected: Option<(u32, u32)>,
+    /// The Enable/Disable Administrator modal's picked installation.
+    admin_selected: Option<(u32, u32)>,
+    /// Cached built-in-Administrator state for `admin_selected`, keyed by the
+    /// selection it was read for (re-read when the pick changes — reading it
+    /// means a PowerShell call or an offline SAM-hive load, too costly to redo
+    /// every frame). `Err` holds why it couldn't be read.
+    #[allow(clippy::type_complexity)]
+    admin_state: Option<(
+        (u32, u32),
+        std::result::Result<phoenix_restore::winadmin::AdminState, String>,
+    )>,
     /// Read-only repair plan preview for the picked installation, keyed by the
     /// selection it was computed for (recomputed when the pick changes). `Err`
     /// holds the human reason the install can't be repaired (e.g. GPT disk
@@ -1031,6 +1091,10 @@ struct PhoenixApp {
     )>,
     /// Boot repair waiting on its confirmation dialog.
     pending_boot_repair: Option<PendingBootRepair>,
+    /// Windows Hello reset waiting on its confirmation dialog.
+    pending_reset_hello: Option<PendingResetHello>,
+    /// Administrator enable/disable waiting on its confirmation dialog.
+    pending_admin_toggle: Option<PendingAdminToggle>,
     /// Persisted user settings and job history (loaded at startup).
     settings: phoenix_core::appdata::Settings,
     history: phoenix_core::appdata::History,
@@ -1181,10 +1245,16 @@ impl PhoenixApp {
                 settings.vm_qemu_dir.as_deref().map(std::path::Path::new),
             )
             .ok(),
-            bootrepair_installs: None,
+            active_utility: None,
+            windows_installs: None,
             bootrepair_selected: None,
+            hello_selected: None,
+            admin_selected: None,
+            admin_state: None,
             bootrepair_plan: None,
             pending_boot_repair: None,
+            pending_reset_hello: None,
+            pending_admin_toggle: None,
             settings,
             history,
             update_state,
@@ -1367,10 +1437,12 @@ impl PhoenixApp {
                 }
                 self.disks = disks;
                 self.prune_stale_selections();
-                // The Boot Repair page's install scan and plan preview were
-                // computed against the old disk list — rescan on next render.
-                self.bootrepair_installs = None;
+                // The utilities' install scan and the cached previews (Boot
+                // Repair plan, Administrator state) were computed against the
+                // old disk list — rescan/re-read on next use.
+                self.windows_installs = None;
                 self.bootrepair_plan = None;
+                self.admin_state = None;
                 Ok(self.disks.len())
             }
             Err(e) => Err(e.to_string()),
@@ -1403,10 +1475,16 @@ impl PhoenixApp {
                 self.history = phoenix_core::appdata::History::load()
             }
             Page::History => {}
-            // The install scan is already invalidated by `reload_disks`;
-            // a refresh also drops the pick, page-reset style.
-            Page::BootRepair => {
+            // The install scan is already invalidated by `reload_disks`; a
+            // refresh also drops both utility picks, page-reset style. (Any
+            // open utility modal is torn down too — F5 can't fire while a modal
+            // is up, but resetting keeps the state coherent regardless.)
+            Page::Utilities => {
                 self.bootrepair_selected = None;
+                self.hello_selected = None;
+                self.admin_selected = None;
+                self.admin_state = None;
+                self.active_utility = None;
             }
             Page::Mount | Page::Virtualize | Page::About => {}
         }
@@ -1482,6 +1560,9 @@ impl PhoenixApp {
             || self.pending_close
             || self.pending_enable_write.is_some()
             || self.pending_boot_repair.is_some()
+            || self.pending_reset_hello.is_some()
+            || self.pending_admin_toggle.is_some()
+            || self.active_utility.is_some()
             || self.vm_boot_prompt.is_some()
     }
 
@@ -1706,6 +1787,8 @@ impl PhoenixApp {
             JobKind::Verify => JobKindTag::Verify,
             JobKind::Clone => JobKindTag::Clone,
             JobKind::BootRepair => JobKindTag::BootRepair,
+            JobKind::ResetHello => JobKindTag::ResetHello,
+            JobKind::AdminToggle => JobKindTag::AdminToggle,
         };
         let total = self.job_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
         let ended = now_unix();
@@ -1952,6 +2035,8 @@ impl PhoenixApp {
                 JobKind::Restore => "Restore complete.".to_string(),
                 JobKind::Clone => "Clone complete.".to_string(),
                 JobKind::BootRepair => "Boot repair complete.".to_string(),
+                JobKind::ResetHello => "Windows Hello reset.".to_string(),
+                JobKind::AdminToggle => "Administrator account updated.".to_string(),
             },
             // The only thing that raises a Warning is the user cancelling.
             JobOutcome::Warning => format!("{}.", kind.cancelled_message()),
@@ -2171,25 +2256,9 @@ impl PhoenixApp {
                     }),
                 }
             }
-            Page::BootRepair => {
-                let plan_ok = self
-                    .bootrepair_plan
-                    .as_ref()
-                    .is_some_and(|(sel, plan)| Some(*sel) == self.bootrepair_selected && plan.is_ok());
-                StartAction {
-                    label: "Repair Boot",
-                    icon: Some(egui_phosphor::fill::PLAY),
-                    enabled: !busy && plan_ok,
-                    disabled_hint: Some(if busy {
-                        "A job is already running"
-                    } else if self.bootrepair_selected.is_none() {
-                        "Select a Windows installation first"
-                    } else {
-                        "The selected installation can't be repaired — see the note above"
-                    }),
-                }
-            }
-            Page::History | Page::About => return None,
+            // The Utilities page is a menu, not a staged operation — each tool
+            // runs from its own modal, so the page itself has no action bar.
+            Page::Utilities | Page::History | Page::About => return None,
         };
         Some(action)
     }
@@ -2333,7 +2402,6 @@ impl PhoenixApp {
                     Page::Clone => self.start_clone(),
                     Page::Mount => self.start_mount(),
                     Page::Virtualize => self.request_start_vm(),
-                    Page::BootRepair => self.start_boot_repair(),
                     _ => {}
                 }
             }
@@ -2370,7 +2438,9 @@ impl PhoenixApp {
                     // thread, not a modal job, so the page stays interactive
                     // (Stop button, sessions). `modal_open` still disables it.
                     Page::Virtualize => self.ui_virtualize(ui),
-                    Page::BootRepair => disabled_when(ui, busy, |ui| self.ui_bootrepair(ui)),
+                    // A menu, not a job: don't gate on `busy` (its cards are
+                    // already inert behind any modal via `modal_open`).
+                    Page::Utilities => self.ui_utilities(ui),
                     Page::History => disabled_when(ui, busy, |ui| self.ui_history(ui)),
                     Page::About => disabled_when(ui, busy, |ui| self.ui_about(ui)),
                 });
@@ -2404,6 +2474,12 @@ impl PhoenixApp {
         self.show_clone_confirm_dialog(ctx);
         self.show_restore_confirm_dialog(ctx);
         self.show_boot_repair_confirm_dialog(ctx);
+        self.show_reset_hello_confirm_dialog(ctx);
+        self.show_admin_toggle_confirm_dialog(ctx);
+        // The utility picker modals sit under the confirm dialogs above: a
+        // primary-click in one parks a `pending_*`, which the matching dialog
+        // then renders on top the same frame.
+        self.show_utility_modals(ctx);
         self.show_history_delete_dialog(ctx);
         self.show_demo_confirm_dialog(ctx);
         self.show_demo_progress_modal(ctx);
@@ -2698,6 +2774,99 @@ impl PhoenixApp {
                 self.status = "Boot repair cancelled — no changes were made".into();
             }
             ConfirmAction::None | ConfirmAction::Extra => self.pending_boot_repair = Some(pending),
+        }
+    }
+
+    fn show_reset_hello_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.pending_reset_hello.take() else {
+            return;
+        };
+        let action = {
+            let ack = pending.system_disk.then_some(ConfirmAck {
+                label: RESET_HELLO_SYSTEM_ACK_LABEL,
+                checked: &mut pending.ack,
+            });
+            let mut view = ConfirmView {
+                title: "Confirm Windows Hello reset",
+                message: &pending.message,
+                details: &pending.details,
+                confirm_label: "Reset Windows Hello",
+                cancel_label: "Cancel",
+                confirm_danger: true,
+                hazard_tape: true,
+                ack,
+                extra_label: None,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+        match action {
+            ConfirmAction::Confirm => {
+                self.completed = None;
+                self.status = format!(
+                    "Resetting Windows Hello on disk {}…",
+                    pending.disk_index
+                );
+                self.job_subject = pending.subject;
+                self.job = Some(spawn_reset_ngc(pending.disk_index, pending.partition_index));
+            }
+            ConfirmAction::Cancel => {
+                self.status = "Windows Hello reset cancelled — no changes were made".into();
+            }
+            ConfirmAction::None | ConfirmAction::Extra => self.pending_reset_hello = Some(pending),
+        }
+    }
+
+    fn show_admin_toggle_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.pending_admin_toggle.take() else {
+            return;
+        };
+        let action = {
+            let ack = pending.system_disk.then_some(ConfirmAck {
+                label: ADMIN_TOGGLE_SYSTEM_ACK_LABEL,
+                checked: &mut pending.ack,
+            });
+            let mut view = ConfirmView {
+                title: if pending.enable {
+                    "Confirm enabling Administrator"
+                } else {
+                    "Confirm disabling Administrator"
+                },
+                message: &pending.message,
+                details: &pending.details,
+                confirm_label: if pending.enable {
+                    "Enable Administrator"
+                } else {
+                    "Disable Administrator"
+                },
+                cancel_label: "Cancel",
+                confirm_danger: true,
+                hazard_tape: true,
+                ack,
+                extra_label: None,
+            };
+            confirm_dialog::show(ctx, &self.palette, &mut view)
+        };
+        match action {
+            ConfirmAction::Confirm => {
+                self.completed = None;
+                self.status = format!(
+                    "{} the built-in Administrator on disk {}…",
+                    if pending.enable { "Enabling" } else { "Disabling" },
+                    pending.disk_index
+                );
+                self.job_subject = pending.subject;
+                self.job = Some(spawn_admin_toggle(
+                    pending.disk_index,
+                    pending.partition_index,
+                    pending.enable,
+                ));
+            }
+            ConfirmAction::Cancel => {
+                self.status = "Administrator change cancelled — no changes were made".into();
+            }
+            ConfirmAction::None | ConfirmAction::Extra => {
+                self.pending_admin_toggle = Some(pending)
+            }
         }
     }
 
@@ -3066,6 +3235,8 @@ fn job_action_label(kind: phoenix_core::appdata::JobKindTag) -> &'static str {
         K::Verify => "Verify",
         K::Clone => "Clone",
         K::BootRepair => "Boot repair",
+        K::ResetHello => "Reset Hello",
+        K::AdminToggle => "Administrator",
     }
 }
 
@@ -3083,6 +3254,8 @@ fn describe_job(rec: &phoenix_core::appdata::JobRecord) -> String {
         K::Restore => format!("Restored {} → {}", rec.source, rec.target),
         K::Clone => format!("Cloned {} → {}", rec.source, rec.target),
         K::BootRepair => format!("Repaired boot files for {} on {}", rec.source, rec.target),
+        K::ResetHello => format!("Reset Windows Hello for {} on {}", rec.source, rec.target),
+        K::AdminToggle => format!("Changed {} on {}", rec.source, rec.target),
     }
 }
 
@@ -3118,6 +3291,32 @@ fn icon_label(
         },
     );
     job
+}
+
+/// A small frameless "↻ Rescan drives" control, right-aligned within a
+/// fixed-height row `width` wide, for the install-picker modals. Returns
+/// whether it was clicked this frame; the caller re-enumerates and refreshes
+/// just the modal's list (see [`PhoenixApp::rescan_windows_installs`]) rather
+/// than doing the full-window F5 refresh.
+///
+/// The row is a bounded [`egui::Ui::allocate_ui_with_layout`], NOT a bare
+/// `with_layout`: a right-to-left layout claims the full *remaining* height and
+/// centers in it, which inside an auto-sizing modal Window blew the modal up to
+/// full-window height. An explicit `width × row-height` keeps it a thin row.
+fn rescan_button(ui: &mut egui::Ui, palette: &Palette, width: f32) -> bool {
+    let job = icon_label(
+        egui_phosphor::regular::ARROWS_CLOCKWISE,
+        fonts::icon(14.0),
+        "Rescan drives",
+        fonts::regular(13.0),
+        palette.accent,
+    );
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 22.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| ui.add(egui::Button::new(job).frame(false)).clicked(),
+    )
+    .inner
 }
 
 /// Common page shell: the whole page scrolls vertically as a unit, with
@@ -4661,129 +4860,620 @@ impl PhoenixApp {
     /// The Boot Repair page: pick a detected Windows installation, preview
     /// exactly what the repair would do, and hand off to the action bar's
     /// "Repair Boot" (which parks the job behind a hazard dialog).
-    fn ui_bootrepair(&mut self, ui: &mut egui::Ui) {
-        use phoenix_restore::bootrepair;
-
-        page_scroll_shell(ui, "bootrepair_page", |ui| {
-            page_header(ui, &self.palette, "Boot Repair", "");
+    /// The Utilities menu page: an intro and one clickable card per tool.
+    /// Clicking a card arms its guided modal (`active_utility`), which
+    /// `show_utility_modals` renders over the top next frame.
+    fn ui_utilities(&mut self, ui: &mut egui::Ui) {
+        let palette = self.palette;
+        // Set outside the closure: the card taps only report a click, so the
+        // page never mutates `self` mid-render.
+        let mut open: Option<Utility> = None;
+        page_scroll_shell(ui, "utilities_page", |ui| {
+            page_header(ui, &palette, "Utilities", "");
             ui.label(
                 egui::RichText::new(
-                    "Point a drive's boot configuration at a Windows installation on it; for \
-                     a clone that won't start, a restored system disk, or a drive moved from \
-                     another machine. The boot files are rebuilt with Windows' own built-in \
-                     utilities. Only the selected drive is modified.",
+                    "Guided one-off tools for a drive you've just cloned, restored, or moved. \
+                     Each opens a short wizard and only touches the installation you pick.",
                 )
-                .color(self.palette.subtle_text),
+                .color(palette.subtle_text),
             );
-            ui.add_space(14.0);
+            ui.add_space(16.0);
 
-            // Scan lazily — `reload_disks` clears the cache, so a refresh or a
-            // finished job re-detects against the fresh disk list.
-            if self.bootrepair_installs.is_none() {
-                let installs = bootrepair::detect_windows_installs(&self.disks);
-                if let Some(sel) = self.bootrepair_selected {
-                    if !installs
-                        .iter()
-                        .any(|i| (i.disk_index, i.partition_index) == sel)
-                    {
-                        self.bootrepair_selected = None;
-                        self.bootrepair_plan = None;
-                    }
-                }
-                self.bootrepair_installs = Some(installs);
+            if utilities::utility_card(
+                ui,
+                &palette,
+                egui_phosphor::regular::BOOT,
+                "Windows Boot Repair",
+                "Rebuild the boot files so a clone, restored system disk, or moved drive starts.",
+            ) {
+                open = Some(Utility::BootRepair);
             }
-            let installs = self.bootrepair_installs.clone().unwrap_or_default();
+            ui.add_space(10.0);
+            if utilities::utility_card(
+                ui,
+                &palette,
+                egui_phosphor::regular::FINGERPRINT,
+                "Reset Windows Hello",
+                "Clear broken PINs and biometric sign-in on a cloned Windows so they can be set up \
+                 again.",
+            ) {
+                open = Some(Utility::ResetHello);
+            }
+            ui.add_space(10.0);
+            if utilities::utility_card(
+                ui,
+                &palette,
+                egui_phosphor::regular::IDENTIFICATION_BADGE,
+                "Enable/Disable Built-in Administrator",
+                "Turn the hidden built-in Administrator account on (blank password) or off, for \
+                 getting back into a locked-out clone.",
+            ) {
+                open = Some(Utility::EnableAdmin);
+            }
+        });
+        if let Some(u) = open {
+            self.active_utility = Some(u);
+        }
+    }
 
-            let rows: Vec<bootrepair_table::InstallRow> = installs
-                .iter()
-                .map(|install| bootrepair_table::InstallRow {
-                    version: install
-                        .version
-                        .clone()
-                        .unwrap_or_else(|| "Windows".to_string()),
-                    drive: install
-                        .drive_letter
-                        .map(|l| format!("{l}:"))
-                        .unwrap_or_default(),
-                    disk: install.disk_index.to_string(),
-                    partition: install.partition_index.to_string(),
-                    label: install.volume_label.clone().unwrap_or_default(),
-                    boot: match self.disks.iter().find(|d| d.index == install.disk_index) {
-                        Some(d) if d.is_gpt => "GPT · UEFI".to_string(),
-                        Some(_) => "MBR · BIOS".to_string(),
-                        None => String::new(),
-                    },
-                })
-                .collect();
-            let selected_row = self.bootrepair_selected.and_then(|sel| {
+    /// Populate (once) and return the shared Windows-installations scan every
+    /// utility picker draws from. Lazy — `reload_disks` clears the cache, so a
+    /// refresh or a finished job re-detects against the fresh disk list. Prunes
+    /// each utility's stored pick if the scan no longer contains it.
+    fn ensure_windows_installs(&mut self) -> Vec<phoenix_restore::bootrepair::WindowsInstall> {
+        use phoenix_restore::bootrepair;
+        if self.windows_installs.is_none() {
+            let installs = bootrepair::detect_windows_installs(&self.disks);
+            let present =
+                |sel: (u32, u32)| installs.iter().any(|i| (i.disk_index, i.partition_index) == sel);
+            if self.bootrepair_selected.is_some_and(|s| !present(s)) {
+                self.bootrepair_selected = None;
+                self.bootrepair_plan = None;
+            }
+            if self.hello_selected.is_some_and(|s| !present(s)) {
+                self.hello_selected = None;
+            }
+            if self.admin_selected.is_some_and(|s| !present(s)) {
+                self.admin_selected = None;
+                self.admin_state = None;
+            }
+            self.windows_installs = Some(installs);
+        }
+        self.windows_installs.clone().unwrap_or_default()
+    }
+
+    /// Refresh just an open picker modal's install list: re-enumerate disks (to
+    /// pick up a drive attached since the modal opened) and drop the install
+    /// cache so `ensure_windows_installs` re-detects next frame. Deliberately
+    /// NOT the F5 path — no full-window dim, no page reset, and the modal stays
+    /// open with its selection intact (pruned only if it genuinely vanished).
+    fn rescan_windows_installs(&mut self) {
+        if let Err(e) = self.reload_disks() {
+            self.status = format!("Rescan failed: {e}");
+        }
+    }
+
+    /// Flatten the install scan into the picker table's display rows.
+    fn install_rows(
+        &self,
+        installs: &[phoenix_restore::bootrepair::WindowsInstall],
+    ) -> Vec<bootrepair_table::InstallRow> {
+        installs
+            .iter()
+            .map(|install| bootrepair_table::InstallRow {
+                version: install
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| "Windows".to_string()),
+                drive: install
+                    .drive_letter
+                    .map(|l| format!("{l}:"))
+                    .unwrap_or_default(),
+                disk: install.disk_index.to_string(),
+                partition: install.partition_index.to_string(),
+                label: install.volume_label.clone().unwrap_or_default(),
+                boot: match self.disks.iter().find(|d| d.index == install.disk_index) {
+                    Some(d) if d.is_gpt => "GPT · UEFI".to_string(),
+                    Some(_) => "MBR · BIOS".to_string(),
+                    None => String::new(),
+                },
+            })
+            .collect()
+    }
+
+    /// Recompute (if stale) and read the Boot Repair plan for the current pick.
+    /// Returns `(primary_enabled, inline_warning)` — the same two cues the old
+    /// full page surfaced before the click: an unrepairable pick disables the
+    /// button and explains why; a live-system pick warns but still allows it.
+    fn boot_plan_status(
+        &mut self,
+        installs: &[phoenix_restore::bootrepair::WindowsInstall],
+    ) -> (bool, Option<(String, egui::Color32)>) {
+        use phoenix_restore::bootrepair;
+        let Some(sel) = self.bootrepair_selected else {
+            return (false, None);
+        };
+        let stale = self
+            .bootrepair_plan
+            .as_ref()
+            .map(|(key, _)| *key != sel)
+            .unwrap_or(true);
+        if stale {
+            let plan = match (
+                self.disks.iter().find(|d| d.index == sel.0),
                 installs
                     .iter()
-                    .position(|i| (i.disk_index, i.partition_index) == sel)
-            });
-            // Same width discipline as the History table: fill the pane, and
-            // below the columns' minimum hand over to a horizontal scroller.
-            let viewport_width = ui.available_width();
-            let table_width = viewport_width.max(bootrepair_table::min_width());
-            let palette = self.palette;
-            let clicked = egui::ScrollArea::horizontal()
-                .id_salt("bootrepair_table")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    bootrepair_table::show(ui, table_width, &rows, selected_row, &palette)
-                })
-                .inner;
-            if let Some(i) = clicked {
-                self.bootrepair_selected =
-                    Some((installs[i].disk_index, installs[i].partition_index));
+                    .find(|i| (i.disk_index, i.partition_index) == sel),
+            ) {
+                (Some(disk), Some(install)) => {
+                    bootrepair::plan_boot_repair(disk, install).map_err(|e| e.to_string())
+                }
+                _ => Err("the selected disk is no longer present".to_string()),
+            };
+            self.bootrepair_plan = Some((sel, plan));
+        }
+        match &self.bootrepair_plan.as_ref().expect("computed above").1 {
+            Ok(_) => {
+                if bootrepair::system_disk_index(&self.disks) == Some(sel.0) {
+                    (
+                        true,
+                        Some((
+                            "This is the disk this PC is currently running from — the live \
+                             system's own boot files will be rewritten."
+                                .to_string(),
+                            self.palette.warning,
+                        )),
+                    )
+                } else {
+                    (true, None)
+                }
             }
+            Err(e) => (
+                false,
+                Some((
+                    format!("This installation can't be repaired: {e}"),
+                    self.palette.warning,
+                )),
+            ),
+        }
+    }
 
-            // The plan itself is previewed by the confirmation dialog; here we
-            // only surface the cases that need saying before the click — an
-            // unrepairable pick, or a pick aimed at the live system disk.
-            if let Some(sel) = self.bootrepair_selected {
-                let stale = self
-                    .bootrepair_plan
-                    .as_ref()
-                    .map(|(key, _)| *key != sel)
-                    .unwrap_or(true);
-                if stale {
-                    let plan = match (
-                        self.disks.iter().find(|d| d.index == sel.0),
-                        installs
-                            .iter()
-                            .find(|i| (i.disk_index, i.partition_index) == sel),
-                    ) {
-                        (Some(disk), Some(install)) => {
-                            bootrepair::plan_boot_repair(disk, install).map_err(|e| e.to_string())
-                        }
-                        _ => Err("the selected disk is no longer present".to_string()),
-                    };
-                    self.bootrepair_plan = Some((sel, plan));
+    /// Render whichever utility's guided modal is armed.
+    fn show_utility_modals(&mut self, ctx: &egui::Context) {
+        match self.active_utility {
+            Some(Utility::BootRepair) => self.boot_repair_modal(ctx),
+            Some(Utility::ResetHello) => self.reset_hello_modal(ctx),
+            Some(Utility::EnableAdmin) => self.admin_modal(ctx),
+            None => {}
+        }
+    }
+
+    /// The Windows Boot Repair guided modal: the old Boot Repair page's
+    /// explainer + install picker + inline warnings, compacted into a modal.
+    /// The primary button hands off to the existing hazard-tape confirm dialog
+    /// (`show_boot_repair_confirm_dialog`), so the destructive path is unchanged.
+    fn boot_repair_modal(&mut self, ctx: &egui::Context) {
+        use crate::utilities::ModalAction;
+        let installs = self.ensure_windows_installs();
+        let rows = self.install_rows(&installs);
+        let selected_row = self.bootrepair_selected.and_then(|sel| {
+            installs
+                .iter()
+                .position(|i| (i.disk_index, i.partition_index) == sel)
+        });
+        let (plan_ok, warning) = self.boot_plan_status(&installs);
+        let palette = self.palette;
+        // Fixed width so the reused picker table lays out with no horizontal
+        // scroller — the modal is sized to fit its columns exactly.
+        let width = bootrepair_table::min_width();
+
+        let mut clicked = None;
+        let mut rescan = false;
+        let action = utilities::modal_shell(
+            ctx,
+            &palette,
+            "Windows Boot Repair",
+            "Repair Boot",
+            plan_ok,
+            width,
+            |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Point a drive's boot configuration at a Windows installation on it; for \
+                         a clone that won't start, a restored system disk, or a drive moved from \
+                         another machine. The boot files are rebuilt with Windows' own built-in \
+                         utilities. Only the selected drive is modified.",
+                    )
+                    .color(palette.subtle_text),
+                );
+                ui.add_space(12.0);
+                rescan = rescan_button(ui, &palette, width);
+                ui.add_space(6.0);
+                clicked = bootrepair_table::show(ui, width, &rows, selected_row, &palette);
+                if let Some((text, color)) = &warning {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(text).color(*color));
                 }
-                match &self.bootrepair_plan.as_ref().expect("computed above").1 {
-                    Ok(_) => {
-                        if bootrepair::system_disk_index(&self.disks) == Some(sel.0) {
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "This is the disk this PC is currently running from — the \
-                                     live system's own boot files will be rewritten.",
-                                )
-                                .color(self.palette.warning),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "This installation can't be repaired: {e}"
-                            ))
-                            .color(self.palette.warning),
-                        );
-                    }
-                }
+            },
+        );
+
+        if let Some(i) = clicked {
+            self.bootrepair_selected =
+                Some((installs[i].disk_index, installs[i].partition_index));
+        }
+        if rescan {
+            self.rescan_windows_installs();
+        }
+        match action {
+            ModalAction::Primary => {
+                self.start_boot_repair();
+                self.active_utility = None;
             }
+            ModalAction::Cancel => self.active_utility = None,
+            ModalAction::None => {}
+        }
+    }
+
+    /// The Reset Windows Hello guided modal: explainer + the same install
+    /// picker, gated on the pick having a reachable volume. Hands off to
+    /// `show_reset_hello_confirm_dialog` on the primary button.
+    fn reset_hello_modal(&mut self, ctx: &egui::Context) {
+        use crate::utilities::ModalAction;
+        use phoenix_restore::{bootrepair, winhello};
+        let installs = self.ensure_windows_installs();
+        let rows = self.install_rows(&installs);
+        let selected_row = self.hello_selected.and_then(|sel| {
+            installs
+                .iter()
+                .position(|i| (i.disk_index, i.partition_index) == sel)
+        });
+
+        // Validity + inline note for the current pick: a letterless volume
+        // can't be reached (disable + explain); the live system warns that its
+        // own Hello is being cleared but is still allowed.
+        let picked = self.hello_selected.and_then(|sel| {
+            installs
+                .iter()
+                .find(|i| (i.disk_index, i.partition_index) == sel)
+        });
+        let (enabled, warning) = match picked {
+            None => (false, None),
+            Some(install) if winhello::ngc_dir(install).is_none() => (
+                false,
+                Some((
+                    "This Windows volume has no drive letter — assign one (Disk Management) so \
+                     its files can be reached, then reopen this tool."
+                        .to_string(),
+                    self.palette.warning,
+                )),
+            ),
+            Some(install)
+                if bootrepair::system_disk_index(&self.disks) == Some(install.disk_index) =>
+            {
+                (
+                    true,
+                    Some((
+                        "This is the Windows you're running now — its own PIN and biometrics \
+                         will be cleared. You'll sign in with your password afterward, and \
+                         should reboot before setting Hello up again."
+                            .to_string(),
+                        self.palette.warning,
+                    )),
+                )
+            }
+            Some(_) => (true, None),
+        };
+
+        let palette = self.palette;
+        let width = bootrepair_table::min_width();
+        let mut clicked = None;
+        let mut rescan = false;
+        let action = utilities::modal_shell(
+            ctx,
+            &palette,
+            "Reset Windows Hello",
+            "Reset Windows Hello",
+            enabled,
+            width,
+            |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Cloning or restoring a system disk changes the machine identity Windows \
+                         ties Windows Hello to, so the PIN and fingerprint or face sign-in on the \
+                         copy stop working — and often can't be removed from Settings. This \
+                         clears the credential store on the installation you pick, so Windows \
+                         Hello can be set up fresh at the next sign-in. Passwords are not \
+                         affected, and only the selected installation is touched.",
+                    )
+                    .color(palette.subtle_text),
+                );
+                ui.add_space(12.0);
+                rescan = rescan_button(ui, &palette, width);
+                ui.add_space(6.0);
+                clicked = bootrepair_table::show(ui, width, &rows, selected_row, &palette);
+                if let Some((text, color)) = &warning {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(text).color(*color));
+                }
+            },
+        );
+
+        if let Some(i) = clicked {
+            self.hello_selected = Some((installs[i].disk_index, installs[i].partition_index));
+        }
+        if rescan {
+            self.rescan_windows_installs();
+        }
+        match action {
+            ModalAction::Primary => {
+                self.start_reset_hello();
+                self.active_utility = None;
+            }
+            ModalAction::Cancel => self.active_utility = None,
+            ModalAction::None => {}
+        }
+    }
+
+    /// Validate the Reset Windows Hello pick and park it behind the confirmation
+    /// dialog. Mirrors `start_boot_repair`.
+    fn start_reset_hello(&mut self) {
+        use phoenix_restore::winhello;
+
+        let Some(sel) = self.hello_selected else {
+            return;
+        };
+        let installs = self.windows_installs.clone().unwrap_or_default();
+        let Some(install) = installs
+            .iter()
+            .find(|i| (i.disk_index, i.partition_index) == sel)
+        else {
+            return;
+        };
+        let plan = match winhello::plan_reset(&self.disks, install) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Can't reset Windows Hello: {e}");
+                return;
+            }
+        };
+        let mut details = vec![
+            format!("Installation: {}", install.display()),
+            format!("NGC store: {}", plan.ngc_path.display()),
+            String::new(),
+        ];
+        details.extend(plan.actions.iter().cloned());
+        self.pending_reset_hello = Some(PendingResetHello {
+            disk_index: sel.0,
+            partition_index: sel.1,
+            message: format!(
+                "This clears every Windows Hello PIN and biometric enrolment on {}. Sign-in \
+                 passwords are not affected. Verify this is the right installation:",
+                install.display()
+            ),
+            details,
+            subject: JobSubject {
+                source: install.display(),
+                target: self.disk_label(sel.0),
+                image_path: None,
+            },
+            system_disk: plan.is_live_system,
+            ack: false,
+        });
+    }
+
+    /// Read (if stale) and cache the built-in Administrator's state for the
+    /// current Admin-modal pick. Reading is comparatively costly — a PowerShell
+    /// call on the live system, an offline SAM-hive load otherwise — so it runs
+    /// only when the selection changes, not every frame.
+    fn ensure_admin_state(&mut self, installs: &[phoenix_restore::bootrepair::WindowsInstall]) {
+        use phoenix_restore::winadmin;
+        let Some(sel) = self.admin_selected else {
+            self.admin_state = None;
+            return;
+        };
+        let stale = self
+            .admin_state
+            .as_ref()
+            .map(|(k, _)| *k != sel)
+            .unwrap_or(true);
+        if stale {
+            let state = match installs.iter().find(|i| (i.disk_index, i.partition_index) == sel) {
+                Some(install) => {
+                    winadmin::query_state(&self.disks, install).map_err(|e| e.to_string())
+                }
+                None => Err("the selected disk is no longer present".to_string()),
+            };
+            self.admin_state = Some((sel, state));
+        }
+    }
+
+    /// The Enable/Disable Built-in Administrator modal: the same install picker,
+    /// plus the picked account's current state and a primary button that reads
+    /// "Enable" or "Disable" to match. Hands off to
+    /// `show_admin_toggle_confirm_dialog`.
+    fn admin_modal(&mut self, ctx: &egui::Context) {
+        use crate::utilities::ModalAction;
+        let installs = self.ensure_windows_installs();
+        let rows = self.install_rows(&installs);
+        let selected_row = self.admin_selected.and_then(|sel| {
+            installs
+                .iter()
+                .position(|i| (i.disk_index, i.partition_index) == sel)
+        });
+        self.ensure_admin_state(&installs);
+
+        // Primary label + info lines follow the cached state. `enable_target`
+        // is what the primary button would do (enable a disabled account, or
+        // disable an enabled one).
+        let mut enable_target = true;
+        let mut primary_enabled = false;
+        let mut primary_label = "Enable Administrator";
+        let mut info: Vec<(String, egui::Color32)> = Vec::new();
+        if let Some(sel) = self.admin_selected {
+            match self.admin_state.as_ref() {
+                Some((k, Ok(state))) if *k == sel => {
+                    primary_enabled = true;
+                    if state.enabled {
+                        enable_target = false;
+                        primary_label = "Disable Administrator";
+                        info.push((
+                            format!(
+                                "The built-in Administrator ({}) is currently ENABLED — \
+                                 continuing will disable it.",
+                                state.account_name
+                            ),
+                            self.palette.icon_color,
+                        ));
+                    } else {
+                        enable_target = true;
+                        primary_label = "Enable Administrator";
+                        let tail = if state.is_live {
+                            " and clear its password (blank)."
+                        } else {
+                            "; its existing password is kept (normally blank)."
+                        };
+                        info.push((
+                            format!(
+                                "The built-in Administrator ({}) is currently DISABLED — \
+                                 continuing will enable it{tail}",
+                                state.account_name
+                            ),
+                            self.palette.icon_color,
+                        ));
+                    }
+                    if state.is_live {
+                        info.push((
+                            "This is the Windows you're running now — the change takes effect on \
+                             this live system."
+                                .to_string(),
+                            self.palette.warning,
+                        ));
+                    }
+                }
+                Some((k, Err(e))) if *k == sel => {
+                    info.push((
+                        format!("Can't read this installation's Administrator account: {e}"),
+                        self.palette.warning,
+                    ));
+                }
+                // State not read yet for this selection (recomputes next frame).
+                _ => {}
+            }
+        }
+
+        let palette = self.palette;
+        let width = bootrepair_table::min_width();
+        let mut clicked = None;
+        let mut rescan = false;
+        let action = utilities::modal_shell(
+            ctx,
+            &palette,
+            "Enable / Disable Built-in Administrator",
+            primary_label,
+            primary_enabled,
+            width,
+            |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "The built-in Administrator is a hidden account, disabled by default. \
+                         Enabling it on a locked-out clone gives an admin login to get back in \
+                         (it normally has a blank password). Pick an installation below — this \
+                         shows whether the account is currently on or off, and the button \
+                         switches it.",
+                    )
+                    .color(palette.subtle_text),
+                );
+                ui.add_space(12.0);
+                rescan = rescan_button(ui, &palette, width);
+                ui.add_space(6.0);
+                clicked = bootrepair_table::show(ui, width, &rows, selected_row, &palette);
+                for (text, color) in &info {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(text).color(*color));
+                }
+            },
+        );
+
+        if let Some(i) = clicked {
+            self.admin_selected = Some((installs[i].disk_index, installs[i].partition_index));
+        }
+        if rescan {
+            self.rescan_windows_installs();
+        }
+        match action {
+            ModalAction::Primary => {
+                self.start_admin_toggle(enable_target);
+                self.active_utility = None;
+            }
+            ModalAction::Cancel => self.active_utility = None,
+            ModalAction::None => {}
+        }
+    }
+
+    /// Validate the Administrator pick and park it behind the confirmation
+    /// dialog. `enable` is the target state chosen from what the modal showed.
+    fn start_admin_toggle(&mut self, enable: bool) {
+        use phoenix_restore::winadmin;
+
+        let Some(sel) = self.admin_selected else {
+            return;
+        };
+        let installs = self.windows_installs.clone().unwrap_or_default();
+        let Some(install) = installs
+            .iter()
+            .find(|i| (i.disk_index, i.partition_index) == sel)
+        else {
+            return;
+        };
+        // Prefer the cached state; fall back to a fresh read (e.g. cache was
+        // dropped between render and click).
+        let state = match self.admin_state.as_ref() {
+            Some((k, Ok(s))) if *k == sel => s.clone(),
+            _ => match winadmin::query_state(&self.disks, install) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.status = format!("Can't read the Administrator account: {e}");
+                    return;
+                }
+            },
+        };
+        let mut details = vec![
+            format!("Installation: {}", install.display()),
+            format!("Account: built-in Administrator ({})", state.account_name),
+            format!(
+                "Current state: {}",
+                if state.enabled { "enabled" } else { "disabled" }
+            ),
+            String::new(),
+        ];
+        if enable {
+            details.push("Enable the built-in Administrator".to_string());
+            if state.is_live {
+                details.push("Clear its password (blank)".to_string());
+            } else {
+                details.push("Keep its existing password (normally blank)".to_string());
+            }
+        } else {
+            details.push("Disable the built-in Administrator".to_string());
+        }
+        let verb = if enable { "enable" } else { "disable" };
+        self.pending_admin_toggle = Some(PendingAdminToggle {
+            disk_index: sel.0,
+            partition_index: sel.1,
+            enable,
+            message: format!(
+                "This will {verb} the built-in Administrator account on {}. Verify this is the \
+                 right installation:",
+                install.display()
+            ),
+            details,
+            subject: JobSubject {
+                source: format!("Built-in Administrator ({})", state.account_name),
+                target: self.disk_label(sel.0),
+                image_path: None,
+            },
+            system_disk: state.is_live,
+            ack: false,
         });
     }
 
@@ -6108,7 +6798,9 @@ fn start_page_from_args() -> Option<Page> {
                 "mount" => Some(Page::Mount),
                 "virtualize" | "vm" => Some(Page::Virtualize)
                     .filter(|p| sidebar::page_available(*p, updater::is_portable())),
-                "bootrepair" | "boot-repair" => Some(Page::BootRepair),
+                // "bootrepair" kept as an alias — Boot Repair folded into the
+                // Utilities page.
+                "utilities" | "bootrepair" | "boot-repair" => Some(Page::Utilities),
                 "history" => Some(Page::History),
                 "about" => Some(Page::About),
                 _ => None,

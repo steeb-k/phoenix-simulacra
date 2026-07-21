@@ -20,6 +20,8 @@ pub enum JobKind {
     Verify,
     Clone,
     BootRepair,
+    ResetHello,
+    AdminToggle,
 }
 
 impl JobKind {
@@ -30,6 +32,8 @@ impl JobKind {
             JobKind::Verify => "Verify cancelled",
             JobKind::Clone => "Clone cancelled",
             JobKind::BootRepair => "Boot repair cancelled",
+            JobKind::ResetHello => "Windows Hello reset cancelled",
+            JobKind::AdminToggle => "Administrator change cancelled",
         }
     }
 
@@ -42,6 +46,8 @@ impl JobKind {
             JobKind::Verify => "Verifying backup",
             JobKind::Clone => "Cloning disk",
             JobKind::BootRepair => "Repairing boot files",
+            JobKind::ResetHello => "Resetting Windows Hello",
+            JobKind::AdminToggle => "Updating Administrator account",
         }
     }
 
@@ -54,6 +60,8 @@ impl JobKind {
             JobKind::Verify => "Verify",
             JobKind::Clone => "Clone",
             JobKind::BootRepair => "Boot repair",
+            JobKind::ResetHello => "Windows Hello reset",
+            JobKind::AdminToggle => "Administrator account",
         }
     }
 }
@@ -325,6 +333,91 @@ pub fn spawn_boot_repair(disk_index: u32, partition_index: u32) -> BackgroundJob
             msg.push_str(a);
         }
         info!(target: "phoenix_gui::job", disk_index, partition_index, "boot repair completed");
+        Ok(msg)
+    })
+}
+
+/// Reset Windows Hello (delete the NGC credential store) for the installation
+/// on `disk_index`/`partition_index`. Like [`spawn_boot_repair`], detection and
+/// planning run again on the worker so a disk change between the page's preview
+/// and the click is caught rather than acted on blindly.
+pub fn spawn_reset_ngc(disk_index: u32, partition_index: u32) -> BackgroundJob {
+    use phoenix_restore::{bootrepair, winhello};
+
+    let progress = ProgressHandle::new();
+    let progress_worker = progress.clone();
+    make_job(JobKind::ResetHello, progress, move || {
+        progress_worker.set_detail(format!(
+            "Clearing Windows Hello on disk {disk_index}, partition {partition_index}"
+        ));
+        let mut disks = phoenix_core::disk::enumerate_disks().map_err(|e| e.to_string())?;
+        for d in &mut disks {
+            for p in &mut d.partitions {
+                phoenix_core::disk::refine_partition_fs(p);
+            }
+        }
+        let install = bootrepair::detect_windows_installs(&disks)
+            .into_iter()
+            .find(|i| i.disk_index == disk_index && i.partition_index == partition_index)
+            .ok_or_else(|| {
+                format!(
+                    "no Windows installation found on disk {disk_index}, partition \
+                     {partition_index} — the disk may have changed since the page was refreshed"
+                )
+            })?;
+        let plan = winhello::plan_reset(&disks, &install).map_err(|e| e.to_string())?;
+        let report = winhello::execute_reset(&plan).map_err(|e| e.to_string())?;
+        let mut msg = format!("Windows Hello reset for {}", install.display());
+        for a in &report.actions {
+            msg.push_str("\n• ");
+            msg.push_str(a);
+        }
+        info!(target: "phoenix_gui::job", disk_index, partition_index, "windows hello reset completed");
+        Ok(msg)
+    })
+}
+
+/// Enable or disable the built-in Administrator on the installation at
+/// `disk_index`/`partition_index`. `enable` is the target state (not a blind
+/// toggle) so a stale reading can't invert the action. Detection runs again on
+/// the worker for the same disk-changed safety as the other utility jobs.
+pub fn spawn_admin_toggle(disk_index: u32, partition_index: u32, enable: bool) -> BackgroundJob {
+    use phoenix_restore::{bootrepair, winadmin};
+
+    let progress = ProgressHandle::new();
+    let progress_worker = progress.clone();
+    make_job(JobKind::AdminToggle, progress, move || {
+        progress_worker.set_detail(format!(
+            "{} the built-in Administrator on disk {disk_index}, partition {partition_index}",
+            if enable { "Enabling" } else { "Disabling" }
+        ));
+        let mut disks = phoenix_core::disk::enumerate_disks().map_err(|e| e.to_string())?;
+        for d in &mut disks {
+            for p in &mut d.partitions {
+                phoenix_core::disk::refine_partition_fs(p);
+            }
+        }
+        let install = bootrepair::detect_windows_installs(&disks)
+            .into_iter()
+            .find(|i| i.disk_index == disk_index && i.partition_index == partition_index)
+            .ok_or_else(|| {
+                format!(
+                    "no Windows installation found on disk {disk_index}, partition \
+                     {partition_index} — the disk may have changed since the page was refreshed"
+                )
+            })?;
+        let report =
+            winadmin::execute_set(&disks, &install, enable).map_err(|e| e.to_string())?;
+        let mut msg = format!(
+            "Built-in Administrator {} for {}",
+            if report.enabled_now { "enabled" } else { "disabled" },
+            install.display()
+        );
+        for a in &report.actions {
+            msg.push_str("\n• ");
+            msg.push_str(a);
+        }
+        info!(target: "phoenix_gui::job", disk_index, partition_index, enable, "admin toggle completed");
         Ok(msg)
     })
 }
