@@ -260,7 +260,7 @@ fn empty_row(ui: &mut Ui, width: f32, palette: &Palette) {
     ui.painter().text(
         egui::pos2(rect.left() + PAD_X, rect.center().y),
         Align2::LEFT_CENTER,
-        "No Windows installations detected — attach the drive and press F5 to rescan.",
+        "No Windows installations detected — attach the drive, then Rescan.",
         fonts::regular(14.0),
         with_alpha(palette.subtle_text, 140),
     );

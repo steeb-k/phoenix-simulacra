@@ -7,6 +7,8 @@ pub mod partition_table;
 pub mod plan;
 pub mod relocation;
 pub mod restore;
+pub mod winadmin;
+pub mod winhello;
 
 pub use plan::{
     build_full_disk_plan, build_partial_plan, default_plan_from_backup, partition_allows_resize,

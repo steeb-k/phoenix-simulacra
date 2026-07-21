@@ -16,7 +16,11 @@ pub enum Page {
     Restore,
     Mount,
     Virtualize,
-    BootRepair,
+    /// Landing page for the one-off maintenance tools (Windows Boot Repair,
+    /// Reset Windows Hello). Unlike the primary pages it runs nothing itself —
+    /// each tool opens its own guided modal — so it is pinned at the bottom
+    /// next to History rather than living in the main nav.
+    Utilities,
     History,
     About,
 }
@@ -28,9 +32,9 @@ struct NavItem {
     /// Alt+key accelerator.
     key: Key,
     /// The letter of `label` the accelerator maps to — underlined as the
-    /// hint while Alt is held. Usually the first letter; different only
-    /// when that letter is already claimed by another page (Boot Repair
-    /// vs Backup).
+    /// hint while Alt is held. The first letter of the label, unless that
+    /// letter is already claimed by another page, in which case a later one
+    /// is picked and named here.
     accel: char,
 }
 
@@ -67,15 +71,8 @@ const TOP_ITEMS: &[NavItem] = &[
         page: Page::Virtualize,
         label: "Virtualize",
         icon: egui_phosphor::regular::MONITOR,
-        key: Key::Z,
-        accel: 'z',
-    },
-    NavItem {
-        page: Page::BootRepair,
-        label: "Boot Repair",
-        icon: egui_phosphor::regular::WRENCH,
-        key: Key::O,
-        accel: 'o',
+        key: Key::V,
+        accel: 'V',
     },
 ];
 
@@ -99,6 +96,13 @@ pub fn page_available(page: Page, portable: bool) -> bool {
 }
 
 const BOTTOM_ITEMS: &[NavItem] = &[
+    NavItem {
+        page: Page::Utilities,
+        label: "Utilities",
+        icon: egui_phosphor::regular::WRENCH,
+        key: Key::U,
+        accel: 'U',
+    },
     NavItem {
         page: Page::History,
         label: "History",
