@@ -241,16 +241,16 @@ pub fn run_restore(opts: RestoreOptions) -> Result<RestoreSummary> {
     };
     let restore_step_base = steps.len();
     for (i, entry) in restoring.iter().enumerate() {
-        let name = entry
+        let size = entry
             .source_partition_index
             .and_then(|src| reader.index.iter().find(|e| e.index == src))
-            .map(|e| e.name.clone())
-            .unwrap_or_else(|| "partition".to_string());
+            .map(|e| e.original_size)
+            .unwrap_or(0);
         steps.push(format!(
-            "Restoring partition {} of {} — {}",
+            "Restoring Partition {} of {} ({})",
             i + 1,
             restore_count,
-            name
+            phoenix_core::progress::format_size(size)
         ));
     }
     let layout_step = if writes_layout {

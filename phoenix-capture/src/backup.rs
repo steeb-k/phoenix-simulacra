@@ -157,20 +157,14 @@ pub fn run_backup(opts: BackupOptions) -> Result<()> {
         let mut steps = Vec::with_capacity(partition_count + 3);
         steps.push("Preparing volumes".to_string());
         for (idx, part) in selected.iter().enumerate() {
-            // Many partitions (the ESP especially) carry no GPT name; append it
-            // only when present so an unnamed partition doesn't render a
-            // dangling separator.
-            let step = if part.name.trim().is_empty() {
-                format!("Backing up partition {} of {}", idx + 1, partition_count)
-            } else {
-                format!(
-                    "Backing up partition {} of {} ({})",
-                    idx + 1,
-                    partition_count,
-                    part.name
-                )
-            };
-            steps.push(step);
+            // Steps are named by ordinal and size rather than partition type or
+            // label, so a job reads as a sequence of numbered steps.
+            steps.push(format!(
+                "Backing up Partition {} of {} ({})",
+                idx + 1,
+                partition_count,
+                phoenix_core::progress::format_size(part.size_bytes)
+            ));
         }
         steps.push("Finalizing backup file".to_string());
         if opts.verify_after {

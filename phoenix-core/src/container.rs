@@ -1088,16 +1088,23 @@ impl PhnxReader {
         // upcoming partitions grayed out.
         let indices: Vec<u32> = self.index.iter().map(|e| e.index).collect();
         if let Some(ref p) = progress {
+            let total = indices.len();
             let steps: Vec<String> = indices
                 .iter()
-                .map(|idx| {
-                    let name = self
+                .enumerate()
+                .map(|(pos, idx)| {
+                    let size = self
                         .index
                         .iter()
                         .find(|e| e.index == *idx)
-                        .map(|e| e.name.as_str())
-                        .unwrap_or("partition");
-                    format!("Verifying {name}")
+                        .map(|e| e.original_size)
+                        .unwrap_or(0);
+                    format!(
+                        "Verifying Partition {} of {} ({})",
+                        pos + 1,
+                        total,
+                        crate::progress::format_size(size)
+                    )
                 })
                 .collect();
             p.set_steps(steps);

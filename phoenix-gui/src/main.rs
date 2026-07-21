@@ -2792,20 +2792,26 @@ impl PhoenixApp {
             return;
         }
         const SWEEP_SECS: f64 = 12.0;
-        const TOTAL: u64 = 931_500_000_000;
-        let fraction = ((ctx.input(|i| i.time) % SWEEP_SECS) / SWEEP_SECS) as f32;
+        const TOTAL: u64 = 39_970_000_000;
+        let time = ctx.input(|i| i.time);
+        let fraction = ((time % SWEEP_SECS) / SWEEP_SECS) as f32;
 
         let steps = vec![
-            "Reading partition table".to_string(),
-            "Capturing partition 1 (EFI System, 260 MB)".to_string(),
-            "Capturing partition 2 (Basic data, 931.2 GB)".to_string(),
-            "Verifying backup".to_string(),
+            "Preparing volumes".to_string(),
+            "Verifying Partition 1 of 4 (16 MB)".to_string(),
+            "Verifying Partition 2 of 4 (16 MB)".to_string(),
+            "Verifying Partition 3 of 4 (476.8 GB)".to_string(),
+            "Verifying Partition 4 of 4 (15.7 GB)".to_string(),
+            "Finalizing".to_string(),
         ];
+        // Advance the current step every few seconds so the 3-step window can be
+        // seen sliding (done step leaving the top, upcoming arriving at bottom).
+        let current_step = ((time / 3.0) as usize) % steps.len();
         let view = ModalView {
-            title: "Backing up",
+            title: "Verifying backup",
             steps: &steps,
-            current_step: 2,
-            detail: "Writing chunk 4,182 of 14,206…",
+            current_step,
+            detail: "Chunk 678 / 13233",
             fraction,
             current_bytes: (TOTAL as f64 * fraction as f64) as u64,
             total_bytes: TOTAL,
@@ -5609,8 +5615,8 @@ fn demo_completed_job_from_args() -> Option<CompletedJob> {
         title: "Restore".to_string(),
         steps: vec![
             "Writing partition table".to_string(),
-            "Restoring partition 1 (EFI System, 260 MB)".to_string(),
-            "Restoring partition 2 (Basic data, 931.2 GB)".to_string(),
+            "Restoring Partition 1 of 2 (260 MB)".to_string(),
+            "Restoring Partition 2 of 2 (931.2 GB)".to_string(),
         ],
         current_step: 2,
         outcome,
