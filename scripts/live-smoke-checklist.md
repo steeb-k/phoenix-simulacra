@@ -85,3 +85,23 @@ or a spare disk you can afford to overwrite.
 
 - [ ] Back up and restore a partition on a true 4Kn (`LogicalSectorSize = 4096`) disk.
 - [ ] Repeat on a USB-attached disk.
+
+## 8. Wiki freshness
+
+> The user-facing docs live in the [wiki](https://github.com/steeb-k/phoenix-simulacra/wiki),
+> a separate repo (`phoenix-simulacra.wiki.git`). It has a page per page of the
+> app, and its screenshots are generated rather than captured — so a UI change
+> here does not update them, and nothing will fail if they go stale.
+
+- [ ] Skim the wiki page for anything whose UI changed this cycle. Labels quoted
+      in the text are verbatim from the app, so a renamed button or a reworded
+      disabled-button hint makes the page wrong.
+- [ ] If a page gained, lost or moved controls, regenerate its screenshots:
+      `python tools/mockgen/render.py --all` in the wiki checkout. The design
+      tokens in `tools/mockgen/theme.py` are transcribed from `phoenix-gui/src`,
+      so a theme or metric change needs updating there first.
+- [ ] `python tools/check.py` in the wiki checkout — verifies image references,
+      internal links, heading anchors, sidebar orphans and encoding.
+- [ ] If a page was added or removed from the sidebar (`sidebar.rs`), the wiki
+      needs a matching page and a `_Sidebar.md` entry.
+- [ ] Version number on the wiki's About page still matches.
