@@ -233,6 +233,10 @@ if ($Draft) {
 if ($PreRelease) {
     Write-Host "Pre-releases are NOT returned by /releases/latest — the in-app updater still sees the last full release." -ForegroundColor DarkGray
 }
+Write-Host ""
+Write-Host "Reminder: check the wiki still matches the app -- https://github.com/steeb-k/phoenix-simulacra/wiki" -ForegroundColor Cyan
+Write-Host "  Its screenshots are generated, not captured, so a UI change here does not update them." -ForegroundColor DarkGray
+Write-Host "  See scripts/live-smoke-checklist.md section 8." -ForegroundColor DarkGray
 if ($ZipOnly -and -not ($Draft -or $PreRelease)) {
     Write-Host "ZIP-only: this release carries NO installer asset, so the in-app updater's manual check reports 'release has no installer asset' until a full release supersedes it." -ForegroundColor Yellow
 }
