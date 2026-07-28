@@ -23,13 +23,30 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # act on. Transitive unmaintained crates are upstream's call, and failing on them
 # turns CI permanently red for something we cannot fix.
 unmaintained = "workspace"
+#
+# THIS LIST IS NOT A COMPLETE INVENTORY OF KNOWN ADVISORIES, and a green
+# cargo-deny run is not proof that a given advisory is gone. RustSec marks some
+# advisories `informational = "unsound"` (or "notice"), and cargo-deny does not
+# fail on those — they never appear here, and removing one from this list
+# proves nothing, because the check would pass either way.
+#
+# RUSTSEC-2026-0190 (anyhow), removed below, is one of those: the bump to
+# 1.0.104 was verified by reading the resolved version in Cargo.lock, NOT by
+# the green check. Note also that such advisories can cover several version
+# ranges at once — if a crate appears more than once in Cargo.lock, check every
+# instance, not just the one you bumped.
+#
+# So: cross-check the repo's Dependabot alerts against this file. They cover
+# different sets, and neither is a superset of the other.
+#
 # Open advisories as of 2026-07-26, suppressed so CI is green on merge.
 # These are earmarked work, NOT accepted risk. Removing an entry from this
 # list is how each one gets fixed — re-run `cargo deny check advisories`
 # after any dependency bump to see if it can go.
 ignore = [
-    # FIXED and removed, not suppressed — cargo-deny passing without it is the
-    # proof: RUSTSEC-2026-0190, anyhow 1.0.102 -> 1.0.104.
+    # FIXED and removed, not suppressed: RUSTSEC-2026-0190, anyhow 1.0.102 ->
+    # 1.0.104. That advisory is informational, so cargo-deny passing without it
+    # is NOT the proof — the resolved version in Cargo.lock is.
     # quick-xml — NOT APPLICABLE rather than deferred:
     #
     #   0194  quadratic run time on duplicate attribute names
