@@ -7,6 +7,12 @@
 # No `targets` filter, so dependencies for every platform are checked. An
 # advisory affecting a target we build only occasionally still fails CI.
 #
+# Do NOT add a `targets` filter to silence platform-specific advisories. It
+# would not fix anything — it stops cargo-deny evaluating that platform at all,
+# hiding the *entire* dependency surface there, not just the advisory that
+# prompted it. This project is Windows-only today but a Linux port is intended,
+# so a targets filter would build a blind spot precisely where it is heading.
+#
 # `all-features` is intentionally not set here: CI runs with `--all-features` so
 # that optional dependencies are covered too. Local `cargo deny check` runs
 # without it and will see a slightly smaller graph.
@@ -24,11 +30,30 @@ unmaintained = "workspace"
 ignore = [
     # FIXED and removed, not suppressed — cargo-deny passing without it is the
     # proof: RUSTSEC-2026-0190, anyhow 1.0.102 -> 1.0.104.
-    # quick-xml: quadratic run time on duplicate attribute names
-    #   fix: needs quick-xml >=0.41; transitive, not a direct bump
+    # quick-xml — NOT APPLICABLE rather than deferred:
+    #
+    #   0194  quadratic run time on duplicate attribute names
+    #   0195  unbounded namespace-declaration allocation (memory DoS)
+    #
+    # `cargo tree -i quick-xml` shows exactly one consumer, and every path ends
+    # at the same place:
+    #
+    #   quick-xml -> wayland-scanner (proc-macro)
+    #
+    # wayland-scanner is a build-time code generator: it parses the fixed
+    # Wayland protocol XML that ships inside wayland-protocols and emits Rust.
+    # quick-xml never links into a binary, on ANY platform — `cargo tree
+    # -e normal` shows no runtime path either.
+    #
+    # Both advisories are denial-of-service on parser *input*. The only input
+    # here is trusted XML vendored in the dependency tree, parsed on the build
+    # machine. Triggering either would require controlling that XML, which is
+    # already arbitrary code execution via build.rs. There is no runtime
+    # exposure to have, so this does not become reachable after a Linux port.
+    #
+    # No action needed and none possible: quick-xml >=0.41 is transitive, so it
+    # clears itself whenever wayland-scanner bumps.
     "RUSTSEC-2026-0194",
-    # quick-xml: unbounded namespace-declaration allocation (memory DoS)
-    #   fix: needs quick-xml >=0.41; transitive, not a direct bump
     "RUSTSEC-2026-0195",
 ]
 
