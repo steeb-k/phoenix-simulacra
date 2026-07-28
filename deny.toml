@@ -22,9 +22,8 @@ unmaintained = "workspace"
 # list is how each one gets fixed — re-run `cargo deny check advisories`
 # after any dependency bump to see if it can go.
 ignore = [
-    # anyhow: unsoundness in Error::downcast_mut()
-    #   fix: cargo update -p anyhow (>=1.0.103)
-    "RUSTSEC-2026-0190",
+    # FIXED and removed, not suppressed — cargo-deny passing without it is the
+    # proof: RUSTSEC-2026-0190, anyhow 1.0.102 -> 1.0.104.
     # quick-xml: quadratic run time on duplicate attribute names
     #   fix: needs quick-xml >=0.41; transitive, not a direct bump
     "RUSTSEC-2026-0194",
