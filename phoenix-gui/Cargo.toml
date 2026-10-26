@@ -26,7 +26,7 @@ phoenix-vm.workspace = true
 # exactly where a bare-metal restore tool has to run. Software rasterizing is
 # heavier per frame but runs anywhere; the UI is static 2D so idle CPU stays 0%.
 # Same approach as the Diskoria app, which is verified in this PE. (2026-07-15)
-egui = "0.29"
+egui = "0.34"
 # Parallel CPU rasterization (raster.rs): the framebuffer is split into
 # horizontal bands, one rayon task each. Only active while painting a frame.
 rayon = "1"
